@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://endfield-extractor.local/schema/webui-first-run-job-v1.json",
+  "title": "Endfield WebUI first-run data preparation request",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["format", "game_root", "export_root"],
+  "properties": {
+    "format": { "const": "EndfieldWebUIFirstRunRequest/1" },
+    "game_root": { "type": "string", "minLength": 1 },
+    "export_root": { "type": "string", "minLength": 1 },
+    "cache_root": { "type": "string", "minLength": 1 },
+    "run_name": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$",
+      "default": "bootstrap_v1"
+    }
+  }
+}

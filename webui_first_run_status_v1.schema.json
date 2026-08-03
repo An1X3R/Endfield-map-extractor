@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://endfield-extractor.local/schema/webui-first-run-status-v1.json",
+  "title": "Endfield WebUI first-run status",
+  "type": "object",
+  "required": ["format", "state", "phase", "progress", "progress_scope", "phase_count", "message", "ready", "cancel_requested", "resume_available", "actions", "defaults", "capabilities"],
+  "properties": {
+    "format": {"const": "EndfieldWebUIFirstRunStatus/1"},
+    "state": {"enum": ["idle", "queued", "running", "partial", "failed", "cancelled", "completed"]},
+    "phase": {"type": "string"},
+    "progress": {"type": "number", "minimum": 0, "maximum": 1},
+    "progress_scope": {"const": "phase"},
+    "phase_index": {"type": ["integer", "null"], "minimum": 0},
+    "phase_count": {"type": "integer", "minimum": 1},
+    "message": {"type": "string"},
+    "ready": {"type": "boolean"},
+    "cancel_requested": {"type": "boolean"},
+    "resume_available": {"type": "boolean"},
+    "actions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["can_validate", "can_start", "can_resume", "can_cancel"],
+      "properties": {
+        "can_validate": {"type": "boolean"},
+        "can_start": {"type": "boolean"},
+        "can_resume": {"type": "boolean"},
+        "can_cancel": {"type": "boolean"}
+      }
+    },
+    "defaults": {"type": "object"},
+    "request": {"type": "object"},
+    "request_identity": {
+      "type": "object",
+      "required": ["run_name", "sha256"],
+      "properties": {
+        "run_name": {"type": "string"},
+        "sha256": {"type": "string", "pattern": "^[0-9A-F]{64}$"}
+      }
+    },
+    "capabilities": {
+      "type": "object",
+      "required": ["map_dataset", "asset_resolution", "blender_build", "profile_scan"],
+      "properties": {
+        "map_dataset": {"type": "string"},
+        "asset_resolution": {"type": "object"},
+        "blender_build": {"type": "string"},
+        "profile_scan": {"type": "string"}
+      }
+    },
+    "result": {"type": "object"},
+    "error": {"type": ["object", "null"]},
+    "disposition": {"enum": ["already_ready"]}
+  }
+}

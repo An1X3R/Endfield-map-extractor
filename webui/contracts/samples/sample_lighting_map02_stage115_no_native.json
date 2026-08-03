@@ -1,0 +1,36 @@
+{
+  "format": "EndfieldLightingLayer/1",
+  "mapId": "map02",
+  "levelId": null,
+  "coordinateConvention": {
+    "unityWorld": "(X,Y,Z); Y up; Transform.forward is local +Z",
+    "mapProjection": "screenX <- Unity X; screenY <- Unity Z; +Z north/up",
+    "blenderPreview": "(X,Y,Z) = (Unity X,-Unity Z,Unity Y); Spot/Area/Sun emission axis is local -Z"
+  },
+  "scan": {
+    "status": "no_native_light_detected",
+    "scannedClasses": ["Light", "VolumetricLight", "KodamaRealtimeLight", "MonoBehaviour", "MonoScript"],
+    "sourceEvidence": [
+      {
+        "kind": "probe_report",
+        "source": "F:\\Endfield_Map_Exports\\log\\map02_dam_light_probe_stage115_custom_20260731_final\\light_probe_inventory.json",
+        "className": "Light probe inventory",
+        "pathId": null,
+        "bundleHash": null,
+        "bindingStatus": "not_applicable"
+      },
+      {
+        "kind": "probe_report",
+        "source": "F:\\Endfield_Map_Exports\\log\\map02_energyflow_light_probe_stage115_custom_20260731_final\\light_probe_inventory.json",
+        "className": "Light probe inventory",
+        "pathId": null,
+        "bundleHash": null,
+        "bindingStatus": "not_applicable"
+      }
+    ],
+    "nativeLightCount": 0,
+    "customLightCandidateCount": 0,
+    "exclusionPolicy": "Do not promote lamp meshes, material emission, object names, or unconfirmed VFX scripts to lighting records."
+  },
+  "records": []
+}

@@ -1,0 +1,9 @@
+{
+  "format": "EndfieldRuntimeConfig/1",
+  "paths": {
+    "game_root": "${ENDFIELD_GAME_ROOT}",
+    "cache_root": "${ENDFIELD_CACHE_ROOT}",
+    "export_root": "${ENDFIELD_EXPORT_ROOT}",
+    "blender_exe": null
+  }
+}

@@ -1,0 +1,129 @@
+diff --git a/AnimeStudio/Classes/Shader.cs b/AnimeStudio/Classes/Shader.cs
+index 3c4043ba34fe5048e03fa49a2ebacdbc5dac7aef..64bce17ecab0d866b9198ed8727b837f490e365b 100644
+--- a/AnimeStudio/Classes/Shader.cs
++++ b/AnimeStudio/Classes/Shader.cs
+@@ -569,7 +569,10 @@ namespace AnimeStudio
+         ConsoleDS = 29,
+         ConsoleGS = 30,
+         RayTracing = 31,
+-        PS5NGGC = 32
++        PS5NGGC = 32,
++        // Endfield PC shaders use a stage-agnostic DXBC program type. The
++        // containing SerializedProgram still identifies vertex/fragment/etc.
++        DXBC = 33
+     };
+ 
+     public class SerializedProgramParameters
+@@ -1213,6 +1216,27 @@ namespace AnimeStudio
+         }
+     }
+ 
++    // Endfield's shader assets can store compiled programs inline after the
++    // serialized shader form instead of using PPtr<SubShaderBinaryData>.
++    public class SubShaderBlob
++    {
++        public int m_ShaderLOD;
++        public byte[] m_CompressedBlob;
++        public uint[][] m_Offsets;
++        public uint[][] m_CompressedLengths;
++        public uint[][] m_DecompressedLengths;
++
++        public SubShaderBlob(ObjectReader reader)
++        {
++            m_ShaderLOD = reader.ReadInt32();
++            m_CompressedBlob = reader.ReadUInt8Array();
++            reader.AlignStream();
++            m_Offsets = reader.ReadUInt32ArrayArray();
++            m_CompressedLengths = reader.ReadUInt32ArrayArray();
++            m_DecompressedLengths = reader.ReadUInt32ArrayArray();
++        }
++    }
++
+     public class Shader : NamedObject
+     {
+         public byte[] m_Script;
+@@ -1231,6 +1255,8 @@ namespace AnimeStudio
+         public byte[] compressedBlob;
+         public uint[] stageCounts;
+         public ShaderPlatformInfos[] platformInfos;
++        public bool m_EnableShaderLODStreaming;
++        public List<SubShaderBlob> subShaderBlobs;
+ 
+         public override string Name => m_ParsedForm?.m_Name ?? m_Name;
+         // public static bool HasPlatformInfos(SerializedType type) => type.Match("D114ED797139152A2E4A42339CF4AA8E"); // Star Rail
+@@ -1247,7 +1273,35 @@ namespace AnimeStudio
+                     Logger.Error($"Cannot parse shader, no more bytes left for asset {reader.assetsFile.fileName} of {reader.assetsFile.originalPath} at path {reader.m_PathID}.");
+                     return;
+                 }
+-                if (reader.Game.Type.IsArknightsEndfieldCB3() || reader.Game.Type.IsArknightsEndfield())
++                var forceStandardShaderTail = string.Equals(
++                    Environment.GetEnvironmentVariable("ANIMESTUDIO_FORCE_STANDARD_SHADER_TAIL"),
++                    "1",
++                    StringComparison.Ordinal);
++                if (forceStandardShaderTail &&
++                    (reader.Game.Type.IsArknightsEndfieldCB3() || reader.Game.Type.IsArknightsEndfield()))
++                {
++                    m_EnableShaderLODStreaming = reader.ReadBoolean();
++                    reader.AlignStream();
++                    int numSubShaderBlobs = reader.ReadInt32();
++                    subShaderBlobs = new List<SubShaderBlob>(numSubShaderBlobs);
++                    for (int i = 0; i < numSubShaderBlobs; i++)
++                    {
++                        subShaderBlobs.Add(new SubShaderBlob(reader));
++                    }
++
++                    // The current shader converter consumes one program table per
++                    // platform. Endfield stores that table inside the inline blob.
++                    if (subShaderBlobs.Count > 0)
++                    {
++                        var blob = subShaderBlobs[0];
++                        offsets = blob.m_Offsets;
++                        compressedLengths = blob.m_CompressedLengths;
++                        decompressedLengths = blob.m_DecompressedLengths;
++                        compressedBlob = blob.m_CompressedBlob;
++                    }
++                }
++                else if (!forceStandardShaderTail &&
++                         (reader.Game.Type.IsArknightsEndfieldCB3() || reader.Game.Type.IsArknightsEndfield()))
+                 {
+                     m_UseExternalBlobs = reader.ReadBoolean();
+                     reader.AlignStream();
+@@ -1317,6 +1371,17 @@ namespace AnimeStudio
+                     }
+                 }
+ 
++                // The inline Endfield table is the authoritative program blob;
++                // the legacy top-level arrays are present but empty.
++                if (forceStandardShaderTail && subShaderBlobs?.Count > 0)
++                {
++                    var blob = subShaderBlobs[0];
++                    offsets = blob.m_Offsets;
++                    compressedLengths = blob.m_CompressedLengths;
++                    decompressedLengths = blob.m_DecompressedLengths;
++                    compressedBlob = blob.m_CompressedBlob;
++                }
++
+                 if (reader.Game.Type.IsArknightsEndfieldCB3() || reader.Game.Type.IsArknightsEndfield())
+                 {
+                     var m_CompressionType = reader.ReadInt32();
+diff --git a/AnimeStudio/AnimeStudio.csproj b/AnimeStudio/AnimeStudio.csproj
+--- a/AnimeStudio/AnimeStudio.csproj
++++ b/AnimeStudio/AnimeStudio.csproj
+@@ -1,7 +1,7 @@
+ <Project Sdk="Microsoft.NET.Sdk">
+ 
+ 	<PropertyGroup>
+-		<TargetFrameworks>net9.0;net10.0</TargetFrameworks>
++		<TargetFramework>net9.0</TargetFramework>
+ 		<Copyright>Copyright © Escartem 2024-2025; Copyright © yarik0chka 2024-2025; Copyright © Hashblen 2024-2025; Copyright © Razmoth 2022-2024; Copyright © Perfare 2018-2022</Copyright>
+ 		<DebugType>embedded</DebugType>
+ 	</PropertyGroup>
+@@ -11,7 +11,7 @@
+ 		<PackageReference Include="K4os.Hash.xxHash" Version="1.0.8" />
+ 		<PackageReference Include="Kyaru.Texture2DDecoder" Version="0.17.0" />
+ 		<PackageReference Include="Kyaru.Texture2DDecoder.Windows" Version="0.1.0" />
+-		<PackageReference Include="MessagePack" Version="3.1.4" />
++		<PackageReference Include="MessagePack" Version="3.1.8" />
+ 		<PackageReference Include="Newtonsoft.Json" Version="13.0.4" />
+ 		<PackageReference Include="ZstdSharp.Port" Version="0.8.6" />
+ 		<PackageReference Include="SixLabors.ImageSharp.Drawing" Version="2.1.7" />

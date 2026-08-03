@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "EndfieldChunkSelection.schema.json",
+  "title": "Endfield Chunk Selection",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "format",
+    "resolverVersion",
+    "mapId",
+    "requestedBounds",
+    "canonicalBounds",
+    "sectorSizeMetres",
+    "sectors",
+    "batches"
+  ],
+  "properties": {
+    "format": {
+      "const": "EndfieldChunkSelection/1"
+    },
+    "resolverVersion": {
+      "const": "endfield-sector128-v1"
+    },
+    "mapId": {
+      "enum": [
+        "map01",
+        "map02"
+      ]
+    },
+    "requestedBounds": {
+      "type": "object"
+    },
+    "canonicalBounds": {
+      "type": "object"
+    },
+    "sectorSizeMetres": {
+      "const": 128
+    },
+    "sectors": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "batches": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    }
+  }
+}

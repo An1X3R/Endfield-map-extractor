@@ -1,0 +1,132 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local.endfield.invalid/schema/region_map_layer_manifest.schema.json",
+  "title": "Endfield Region Map Layer Manifest",
+  "type": "object",
+  "required": [
+    "format",
+    "resolverVersion",
+    "generatorVersion",
+    "generatedAt",
+    "datasetFingerprint",
+    "coordinateConvention",
+    "maps",
+    "sourceEvidence",
+    "validation"
+  ],
+  "properties": {
+    "format": { "const": "EndfieldRegionMapLayerManifest/1" },
+    "resolverVersion": { "const": "endfield-sector128-v1" },
+    "generatorVersion": { "type": "string", "minLength": 1 },
+    "generatedAt": { "type": "string", "minLength": 1 },
+    "datasetFingerprint": { "type": "string", "pattern": "^[A-F0-9]{64}$" },
+    "coordinateConvention": { "type": "object", "minProperties": 1 },
+    "layerDefinitions": { "type": "object" },
+    "sourceEvidence": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/sourceEvidence" }
+    },
+    "maps": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": { "$ref": "#/$defs/map" }
+    },
+    "validation": {
+      "type": "object",
+      "required": ["status", "path", "samplesPath"],
+      "properties": {
+        "status": { "enum": ["passed", "failed"] },
+        "path": { "type": "string", "minLength": 1 },
+        "samplesPath": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": true
+    }
+  },
+  "$defs": {
+    "sourceEvidence": {
+      "type": "object",
+      "required": ["evidenceId", "role", "path", "bytes", "sha256"],
+      "properties": {
+        "evidenceId": { "type": "string", "pattern": "^source:[0-9]{3,}$" },
+        "role": { "type": "string", "minLength": 1 },
+        "path": { "type": "string", "minLength": 1 },
+        "bytes": { "type": "integer", "minimum": 0 },
+        "sha256": { "type": "string", "pattern": "^[A-F0-9]{64}$" }
+      },
+      "additionalProperties": true
+    },
+    "worldBounds": {
+      "type": "object",
+      "required": ["xmin", "xmax", "zmin", "zmax"],
+      "properties": {
+        "xmin": { "type": "number" },
+        "xmax": { "type": "number" },
+        "zmin": { "type": "number" },
+        "zmax": { "type": "number" }
+      },
+      "additionalProperties": true
+    },
+    "layer": {
+      "type": "object",
+      "required": [
+        "mapId",
+        "domainId",
+        "layer",
+        "indexPath",
+        "worldBounds",
+        "sectorKeys",
+        "geometryTypes",
+        "bindingStatus",
+        "coverageCount",
+        "duplicateCount",
+        "pendingCount",
+        "recordCount",
+        "scanStatus"
+      ],
+      "properties": {
+        "mapId": { "type": "string", "minLength": 1 },
+        "domainId": { "type": "string", "minLength": 1 },
+        "layer": { "enum": ["instances", "water", "effects", "lights", "roads"] },
+        "indexPath": { "type": "string", "minLength": 1 },
+        "worldBounds": { "$ref": "#/$defs/worldBounds" },
+        "sectorKeys": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "type": "string", "pattern": "^sector:-?[0-9]+:-?[0-9]+$" }
+        },
+        "geometryTypes": { "type": "array", "items": { "type": "string" } },
+        "bindingStatus": { "type": "string" },
+        "coverageCount": { "type": "integer", "minimum": 0 },
+        "duplicateCount": { "type": "integer", "minimum": 0 },
+        "pendingCount": { "type": "integer", "minimum": 0 },
+        "recordCount": { "type": "integer", "minimum": 0 },
+        "scanStatus": { "enum": ["complete", "partial", "not_started"] }
+      },
+      "additionalProperties": true
+    },
+    "map": {
+      "type": "object",
+      "required": ["mapId", "domainId", "worldBounds", "levels", "layers"],
+      "properties": {
+        "mapId": { "type": "string", "minLength": 1 },
+        "domainId": { "type": "string", "minLength": 1 },
+        "worldBounds": { "$ref": "#/$defs/worldBounds" },
+        "levels": { "type": "array" },
+        "layers": {
+          "type": "object",
+          "required": ["instances", "water", "effects", "lights", "roads"],
+          "properties": {
+            "instances": { "$ref": "#/$defs/layer" },
+            "water": { "$ref": "#/$defs/layer" },
+            "effects": { "$ref": "#/$defs/layer" },
+            "lights": { "$ref": "#/$defs/layer" },
+            "roads": { "$ref": "#/$defs/layer" }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true
+}

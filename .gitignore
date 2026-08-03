@@ -1,0 +1,93 @@
+# Python environments and caches
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local runtime state and secrets
+.runtime_status.json
+.env
+.env.*
+!.env.example
+
+# WebUI dependencies, builds, logs and browser captures
+webui/node_modules/
+webui/dist/
+webui/output/
+webui/.playwright-cli/
+webui/.vite/
+webui/*.log
+webui/.stage119-test.*
+
+# Extracted or generated game data
+*.blend
+*.blend1
+*.sqlite
+*.sqlite3
+*.db
+*.db-journal
+*.jsonl
+*.jsonl.gz
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.tga
+*.dds
+*.exr
+*.abc
+*.fbx
+*.obj
+*.glb
+*.gltf
+
+# Local-only manifests, profiles, jobs and audit output
+endfield_blender_worker_profiles_v1.json
+/stage*_*.json
+*_audit.json
+*_report.json
+*_inventory.json
+
+# Internal implementation reports contain local evidence paths and are not runtime inputs
+/webui/STAGE*_*.md
+
+# Generated export/log folders
+exports/
+output/
+logs/
+reports/
+
+# .NET build products; publish source and lock files only
+dotnet/**/bin/
+dotnet/**/obj/
+
+# Local historical reconstruction experiments. These depend on private Stage
+# outputs or machine-specific baselines and are not part of the portable app.
+/audit_map01_*.py
+/audit_map02_water_reference_hits_stage122.py
+/blender_add_map02_polygonwater_stage122_v1.py
+/blender_audit_map01_*.py
+/blender_audit_map02_polygonwater_stage122_v1.py
+/blender_build_map01_chunk_stage121_footprintfix_v1.py
+/blender_build_map01_fx_prototypes_20260725.py
+/blender_build_map02_chunk_*.py
+/blender_endfield_fx_ui.py
+/blender_inspect_*.py
+/blender_integrate_map01_fx_instances_20260725.py
+/blender_postprocess_*.py
+/blender_render_map01_fx_instance_clusters_20260725.py
+/blender_render_map01_gate03c_overlap_stage124.py
+/blender_render_map01_groundmud_stage121_review_v1.py
+/blender_render_map01_mud02a_nearby_stage124.py
+/blender_render_map02_water_coverage_stage122.py
+/blender_scan_material_library_stage121.py
+/blender_select_map02_water_mode_stage121.py
+/build_map02_flowmap_atlas_patch_stage122.py
+/endfield_fx_catalog.py
+/endfield_fx_export.py
+/endfield_fx_tk_ui.py
+/endfield_fx_ui.py
+/launch_extractor.ps1
+/test_endfield_fx_export.py

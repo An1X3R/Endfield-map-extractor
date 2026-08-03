@@ -1,0 +1,193 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "EndfieldRegionMapRuntimeManifest.schema.json",
+  "title": "Endfield Region Map Runtime Manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "format",
+    "resolverVersion",
+    "coordinateConvention",
+    "maps"
+  ],
+  "properties": {
+    "format": {
+      "const": "EndfieldRegionMapRuntimeManifest/1"
+    },
+    "resolverVersion": {
+      "const": "endfield-sector128-v1"
+    },
+    "coordinateConvention": {
+      "type": "object"
+    },
+    "sourceEvidence": {
+      "type": "object"
+    },
+    "maps": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "map01",
+        "map02"
+      ],
+      "properties": {
+        "map01": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "mapId",
+            "domainId",
+            "worldBounds",
+            "sideSectors",
+            "sectorSizeMetres",
+            "ownershipGrid",
+            "ownershipGridOrder",
+            "levels",
+            "overview"
+          ],
+          "properties": {
+            "mapId": {
+              "const": "map01"
+            },
+            "domainId": {
+              "type": "string"
+            },
+            "worldBounds": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "xmin",
+                "xmax",
+                "zmin",
+                "zmax"
+              ],
+              "properties": {
+                "xmin": {
+                  "type": "number"
+                },
+                "xmax": {
+                  "type": "number"
+                },
+                "zmin": {
+                  "type": "number"
+                },
+                "zmax": {
+                  "type": "number"
+                }
+              }
+            },
+            "sideSectors": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "sectorSizeMetres": {
+              "const": 128
+            },
+            "ownershipGridOrder": {
+              "const": "rows south-to-north; columns west-to-east"
+            },
+            "ownershipGrid": {
+              "type": "array",
+              "items": {
+                "type": "array",
+                "items": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              }
+            },
+            "levels": {
+              "type": "array",
+              "items": {
+                "type": "object"
+              }
+            },
+            "overview": {
+              "type": "object"
+            }
+          }
+        },
+        "map02": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "mapId",
+            "domainId",
+            "worldBounds",
+            "sideSectors",
+            "sectorSizeMetres",
+            "ownershipGrid",
+            "ownershipGridOrder",
+            "levels",
+            "overview"
+          ],
+          "properties": {
+            "mapId": {
+              "const": "map02"
+            },
+            "domainId": {
+              "type": "string"
+            },
+            "worldBounds": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "xmin",
+                "xmax",
+                "zmin",
+                "zmax"
+              ],
+              "properties": {
+                "xmin": {
+                  "type": "number"
+                },
+                "xmax": {
+                  "type": "number"
+                },
+                "zmin": {
+                  "type": "number"
+                },
+                "zmax": {
+                  "type": "number"
+                }
+              }
+            },
+            "sideSectors": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "sectorSizeMetres": {
+              "const": 128
+            },
+            "ownershipGridOrder": {
+              "const": "rows south-to-north; columns west-to-east"
+            },
+            "ownershipGrid": {
+              "type": "array",
+              "items": {
+                "type": "array",
+                "items": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              }
+            },
+            "levels": {
+              "type": "array",
+              "items": {
+                "type": "object"
+              }
+            },
+            "overview": {
+              "type": "object"
+            }
+          }
+        }
+      }
+    }
+  }
+}

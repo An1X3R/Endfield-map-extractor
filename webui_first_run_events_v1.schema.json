@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://endfield-extractor.local/schema/webui-first-run-events-v1.json",
+  "title": "Endfield WebUI first-run event page",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["format", "events", "next_after", "has_more", "progress_scope"],
+  "properties": {
+    "format": {"const": "EndfieldWebUIFirstRunEvents/1"},
+    "events": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["sequence", "source_sequence", "phase", "progress", "progress_scope", "phase_count"],
+        "properties": {
+          "sequence": {"type": "integer", "minimum": 1},
+          "source_sequence": {"type": ["integer", "null"]},
+          "phase": {"type": "string"},
+          "progress": {"type": "number", "minimum": 0, "maximum": 1},
+          "progress_scope": {"const": "phase"},
+          "phase_index": {"type": ["integer", "null"], "minimum": 0},
+          "phase_count": {"type": "integer", "minimum": 1},
+          "message": {"type": "string"}
+        }
+      }
+    },
+    "next_after": {"type": "integer", "minimum": 0},
+    "has_more": {"type": "boolean"},
+    "progress_scope": {"const": "phase"}
+  }
+}

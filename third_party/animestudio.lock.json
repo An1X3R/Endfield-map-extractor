@@ -1,0 +1,31 @@
+{
+  "format": "EndfieldPinnedDependency/1",
+  "name": "AnimeStudio",
+  "repository": "https://github.com/Escartem/AnimeStudio.git",
+  "commit": "7cfb26b9c158f6150c887f9157de97a3fa7672e1",
+  "license": "MIT",
+  "sdk": "9.0.308",
+  "targetFramework": "net9.0-windows",
+  "patches": [
+    {
+      "role": "required_core",
+      "path": "patches/animestudio-endfield-core.patch",
+      "sha256": "3437E98DA1528C3F18E7CD293CB408C56AB7D4BE9A7633B07EAB39AE5404B3A9"
+    },
+    {
+      "role": "optional_shader_diagnostics",
+      "path": "patches/animestudio-endfield-shader-diagnostics.patch",
+      "sha256": "AF416213B7DC65226ACEB38218B8C07559C3FFA8C4B443498981D9EE0541408B"
+    }
+  ],
+  "upstreamFiles": [
+    {
+      "path": "AnimeStudio/CNKeys.json",
+      "sha256": "A5338D955B09046EC0B16F3A9625B7955C763AAE07DC722E474E6078745F932F"
+    },
+    {
+      "path": "AnimeStudio.Libraries/AnimeStudio.Ooz.dll",
+      "sha256": "AA007FA0FDD62370876FA368E6262E8C8DE425F5C3A2967D0EDC9A76E9E7F470"
+    }
+  ]
+}

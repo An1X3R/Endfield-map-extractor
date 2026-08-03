@@ -1,0 +1,174 @@
+{
+  "format": "EndfieldChunkSelection/1",
+  "resolverVersion": "endfield-sector128-v1",
+  "mapId": "map01",
+  "requestedBounds": {
+    "xmin": -256,
+    "xmax": 0,
+    "zmin": -512,
+    "zmax": -256
+  },
+  "canonicalBounds": {
+    "xmin": -256,
+    "xmax": 0,
+    "zmin": -512,
+    "zmax": -256
+  },
+  "sectorSizeMetres": 128,
+  "sectors": [
+    {
+      "key": "sector:-2:-4",
+      "sectorX": -2,
+      "sectorZ": -4,
+      "unityBoundsXZ": {
+        "xmin": -256,
+        "xmax": -128,
+        "zmin": -512,
+        "zmax": -384
+      },
+      "blenderBoundsXY": {
+        "xmin": -256,
+        "xmax": -128,
+        "ymin": 384,
+        "ymax": 512
+      },
+      "levelId": "map01_lv001",
+      "hTile": {
+        "levelId": "map01_lv001",
+        "tileX": 6,
+        "tileY": 3
+      },
+      "coverage": "mapped"
+    },
+    {
+      "key": "sector:-1:-4",
+      "sectorX": -1,
+      "sectorZ": -4,
+      "unityBoundsXZ": {
+        "xmin": -128,
+        "xmax": 0,
+        "zmin": -512,
+        "zmax": -384
+      },
+      "blenderBoundsXY": {
+        "xmin": -128,
+        "xmax": 0,
+        "ymin": 384,
+        "ymax": 512
+      },
+      "levelId": "map01_lv001",
+      "hTile": {
+        "levelId": "map01_lv001",
+        "tileX": 7,
+        "tileY": 3
+      },
+      "coverage": "mapped"
+    },
+    {
+      "key": "sector:-2:-3",
+      "sectorX": -2,
+      "sectorZ": -3,
+      "unityBoundsXZ": {
+        "xmin": -256,
+        "xmax": -128,
+        "zmin": -384,
+        "zmax": -256
+      },
+      "blenderBoundsXY": {
+        "xmin": -256,
+        "xmax": -128,
+        "ymin": 256,
+        "ymax": 384
+      },
+      "levelId": "map01_lv001",
+      "hTile": {
+        "levelId": "map01_lv001",
+        "tileX": 6,
+        "tileY": 4
+      },
+      "coverage": "mapped"
+    },
+    {
+      "key": "sector:-1:-3",
+      "sectorX": -1,
+      "sectorZ": -3,
+      "unityBoundsXZ": {
+        "xmin": -128,
+        "xmax": 0,
+        "zmin": -384,
+        "zmax": -256
+      },
+      "blenderBoundsXY": {
+        "xmin": -128,
+        "xmax": 0,
+        "ymin": 256,
+        "ymax": 384
+      },
+      "levelId": "map01_lv001",
+      "hTile": {
+        "levelId": "map01_lv001",
+        "tileX": 7,
+        "tileY": 4
+      },
+      "coverage": "mapped"
+    }
+  ],
+  "batches": [
+    {
+      "id": "sector:-2:-4",
+      "mode": "per_sector",
+      "sectorKeys": [
+        "sector:-2:-4"
+      ],
+      "selectedBounds": {
+        "xmin": -256,
+        "xmax": -128,
+        "zmin": -512,
+        "zmax": -384
+      },
+      "alignedClusterBounds": null
+    },
+    {
+      "id": "sector:-1:-4",
+      "mode": "per_sector",
+      "sectorKeys": [
+        "sector:-1:-4"
+      ],
+      "selectedBounds": {
+        "xmin": -128,
+        "xmax": 0,
+        "zmin": -512,
+        "zmax": -384
+      },
+      "alignedClusterBounds": null
+    },
+    {
+      "id": "sector:-2:-3",
+      "mode": "per_sector",
+      "sectorKeys": [
+        "sector:-2:-3"
+      ],
+      "selectedBounds": {
+        "xmin": -256,
+        "xmax": -128,
+        "zmin": -384,
+        "zmax": -256
+      },
+      "alignedClusterBounds": null
+    },
+    {
+      "id": "sector:-1:-3",
+      "mode": "per_sector",
+      "sectorKeys": [
+        "sector:-1:-3"
+      ],
+      "selectedBounds": {
+        "xmin": -128,
+        "xmax": 0,
+        "zmin": -384,
+        "zmax": -256
+      },
+      "alignedClusterBounds": null
+    }
+  ]
+}

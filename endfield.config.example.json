@@ -1,0 +1,17 @@
+{
+  "format": "EndfieldFirstRunConfig/1",
+  "paths": {
+    "gameRoot": "${ENDFIELD_GAME_ROOT}",
+    "cacheRoot": "${ENDFIELD_CACHE_ROOT}",
+    "exportRoot": "${ENDFIELD_EXPORT_ROOT}",
+    "blenderExe": "${ENDFIELD_BLENDER}"
+  },
+  "firstRun": {
+    "maps": [
+      "map01",
+      "map02"
+    ],
+    "gameAccess": "read_only",
+    "optionalLayerFallback": "not_started"
+  }
+}

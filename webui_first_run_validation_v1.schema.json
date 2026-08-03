@@ -1,0 +1,61 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://endfield-extractor.local/schema/webui-first-run-validation-v1.json",
+  "title": "Endfield WebUI first-run path validation",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["format", "status", "game_read_only", "checks", "missing", "canonical", "space", "space_warning", "prerequisites"],
+  "properties": {
+    "format": {"const": "EndfieldWebUIFirstRunValidation/1"},
+    "status": {"enum": ["valid", "incomplete"]},
+    "game_read_only": {"const": true},
+    "checks": {"type": "object", "additionalProperties": {"type": "boolean"}},
+    "missing": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+    "canonical": {"$ref": "#/$defs/request"},
+    "space": {
+      "type": "object",
+      "required": ["cache", "export"],
+      "additionalProperties": false,
+      "properties": {
+        "cache": {"$ref": "#/$defs/space"},
+        "export": {"$ref": "#/$defs/space"}
+      }
+    },
+    "space_warning": {"type": "boolean"},
+    "prerequisites": {
+      "type": "object",
+      "required": ["git_available", "dotnet_available", "network_required_for_initial_helper_checkout", "helper_commit_is_pinned"],
+      "properties": {
+        "git_available": {"type": "boolean"},
+        "dotnet_available": {"type": "boolean"},
+        "network_required_for_initial_helper_checkout": {"type": "boolean"},
+        "helper_commit_is_pinned": {"type": "boolean"}
+      }
+    }
+  },
+  "$defs": {
+    "request": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["format", "game_root", "export_root", "cache_root", "run_name"],
+      "properties": {
+        "format": {"const": "EndfieldWebUIFirstRunRequest/1"},
+        "game_root": {"type": "string", "minLength": 1},
+        "export_root": {"type": "string", "minLength": 1},
+        "cache_root": {"type": "string", "minLength": 1},
+        "run_name": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$"}
+      }
+    },
+    "space": {
+      "type": "object",
+      "required": ["status", "path", "required_bytes", "free_bytes", "warning"],
+      "properties": {
+        "status": {"enum": ["baseline_estimate", "unknown"]},
+        "path": {"type": "string"},
+        "required_bytes": {"type": "integer", "minimum": 0},
+        "free_bytes": {"type": ["integer", "null"], "minimum": 0},
+        "warning": {"type": "boolean"}
+      }
+    }
+  }
+}

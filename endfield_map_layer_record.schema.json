@@ -1,0 +1,159 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local.endfield.invalid/schema/endfield_map_layer_record.schema.json",
+  "title": "Endfield Map Layer Record",
+  "type": "object",
+  "required": ["recordType", "mapId"],
+  "properties": {
+    "recordType": { "type": "string" },
+    "mapId": { "type": "string", "minLength": 1 },
+    "domainId": { "type": ["string", "null"] },
+    "sourceLevelId": { "type": ["string", "null"] },
+    "spatialLevelId": { "type": ["string", "null"] },
+    "bindingStatus": { "enum": ["mapped", "candidate", "unmapped"] },
+    "sectorKeys": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "type": "string", "pattern": "^sector:-?[0-9]+:-?[0-9]+$" }
+    },
+    "anchorSector": { "$ref": "#/$defs/sector" },
+    "positionUnity": { "$ref": "#/$defs/vector3Nullable" },
+    "positionBlender": { "$ref": "#/$defs/vector3Nullable" },
+    "boundsUnity": { "$ref": "#/$defs/boundsNullableY" },
+    "source": {
+      "type": ["object", "null"],
+      "properties": {
+        "texturePathId": { "$ref": "#/$defs/decimalIntegerStringNullable" }
+      },
+      "additionalProperties": true
+    }
+  },
+  "oneOf": [
+    {
+      "properties": { "recordType": { "const": "instance" } },
+      "required": ["instanceId", "assetId", "positionUnity", "anchorSector", "category", "bindingStatus"]
+    },
+    {
+      "properties": { "recordType": { "const": "water" } },
+      "required": ["waterId", "geometry", "sectorKeys", "waterType", "bindingStatus"]
+    },
+    {
+      "properties": { "recordType": { "const": "effect" } },
+      "required": ["effectId", "anchorId", "fullSystemGroup", "positionUnity", "sectorKeys", "bindingStatus"]
+    },
+    {
+      "properties": { "recordType": { "const": "effect-anchor" } },
+      "required": ["anchorId", "memberEffectIds", "prototypeMemberIds", "anchorSelectionPolicy", "bindingStatus"]
+    },
+    {
+      "properties": { "recordType": { "const": "effect-prototype-member" } },
+      "required": [
+        "prototypeMemberId",
+        "prototypeId",
+        "memberIndex",
+        "localPositionUnity",
+        "pathId",
+        "transformPathId",
+        "parentTransformPathId",
+        "mesh",
+        "materials",
+        "particleSystems"
+      ],
+      "properties": {
+        "pathId": { "$ref": "#/$defs/decimalIntegerStringNullable" },
+        "transformPathId": { "$ref": "#/$defs/decimalIntegerStringNullable" },
+        "parentTransformPathId": { "$ref": "#/$defs/decimalIntegerStringNullable" },
+        "mesh": { "$ref": "#/$defs/assetReferenceNullable" },
+        "materials": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/assetReference" }
+        },
+        "particleSystems": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/particleSystemSummary" }
+        }
+      }
+    },
+    {
+      "properties": { "recordType": { "const": "effect-prototype" } },
+      "required": ["prototypeId", "name", "memberIds", "rootAsset"],
+      "properties": {
+        "rootAsset": { "$ref": "#/$defs/assetReferenceNullable" }
+      }
+    },
+    {
+      "properties": { "recordType": { "const": "light" } },
+      "required": ["lightId", "anchorId", "type", "bindingStatus"]
+    }
+  ],
+  "$defs": {
+    "decimalIntegerString": {
+      "type": "string",
+      "pattern": "^-?[0-9]+$"
+    },
+    "decimalIntegerStringNullable": {
+      "oneOf": [
+        { "$ref": "#/$defs/decimalIntegerString" },
+        { "type": "null" }
+      ]
+    },
+    "assetReference": {
+      "type": "object",
+      "required": ["source", "pathId", "type", "name"],
+      "properties": {
+        "source": { "type": ["string", "integer", "null"] },
+        "pathId": { "$ref": "#/$defs/decimalIntegerStringNullable" },
+        "type": { "type": ["string", "null"] },
+        "name": { "type": ["string", "null"] }
+      },
+      "additionalProperties": false
+    },
+    "assetReferenceNullable": {
+      "oneOf": [
+        { "$ref": "#/$defs/assetReference" },
+        { "type": "null" }
+      ]
+    },
+    "particleSystemSummary": {
+      "type": "object",
+      "required": ["gameObject"],
+      "properties": {
+        "gameObject": { "$ref": "#/$defs/assetReferenceNullable" }
+      },
+      "additionalProperties": true
+    },
+    "sector": {
+      "type": ["object", "null"],
+      "required": ["sectorX", "sectorZ", "key"],
+      "properties": {
+        "sectorX": { "type": "integer" },
+        "sectorZ": { "type": "integer" },
+        "key": { "type": "string", "pattern": "^sector:-?[0-9]+:-?[0-9]+$" }
+      },
+      "additionalProperties": true
+    },
+    "vector3Nullable": {
+      "type": ["object", "null"],
+      "properties": {
+        "x": { "type": ["number", "null"] },
+        "y": { "type": ["number", "null"] },
+        "z": { "type": ["number", "null"] }
+      },
+      "additionalProperties": false
+    },
+    "boundsNullableY": {
+      "type": ["object", "null"],
+      "required": ["xmin", "xmax", "ymin", "ymax", "zmin", "zmax"],
+      "properties": {
+        "xmin": { "type": "number" },
+        "xmax": { "type": "number" },
+        "ymin": { "type": ["number", "null"] },
+        "ymax": { "type": ["number", "null"] },
+        "zmin": { "type": "number" },
+        "zmax": { "type": "number" }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": true
+}

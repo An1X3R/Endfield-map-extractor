@@ -1,0 +1,28 @@
+{
+  "name": "endfield-atlas-composer-webui-2",
+  "private": true,
+  "version": "2.0.0",
+  "license": "PolyForm-Noncommercial-1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview --host 127.0.0.1",
+    "test:stage119": "node --experimental-strip-types tests/stage119LayerApi.contract.test.mjs",
+    "test:first-run-stage-pointer": "node --experimental-strip-types tests/stage119DynamicPointer.contract.test.mjs"
+  },
+  "dependencies": {
+    "lucide-react": "1.28.0",
+    "motion": "12.43.0",
+    "pixi.js": "8.19.0",
+    "react": "19.3.0-canary-0f42eac2-20260730",
+    "react-dom": "19.3.0-canary-0f42eac2-20260730"
+  },
+  "devDependencies": {
+    "@types/react": "19.2.18",
+    "@types/react-dom": "19.2.4",
+    "@vitejs/plugin-react": "6.0.5",
+    "typescript": "7.0.2",
+    "vite": "8.2.0"
+  }
+}

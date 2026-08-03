@@ -1,0 +1,357 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local.endfield.invalid/schema/endfield_blender_selection_worker_v1.schema.json",
+  "title": "Endfield Blender Selection Worker Job v1",
+  "description": "Standalone input contract for the versioned half-open selection worker. Runtime validation additionally enforces positive bounds, agreement with the configured audited dataset fingerprint, a read-only game installation, a new output directory below the configured export root, and a profile-specific allowlisted blender.exe binary.",
+  "$comment": "When invoked with --export-package, audit.json must have status=passed and contain canonicalRequestSha256, manifestSha256 and selectionSha256 matching canonical_request.json, export_manifest.json and selection.json respectively.",
+  "oneOf": [
+    { "$ref": "#/$defs/workerJob" },
+    { "$ref": "#/$defs/canonicalJob" }
+  ],
+  "$defs": {
+    "label": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 80,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$"
+    },
+    "path": {
+      "type": "string",
+      "minLength": 1
+    },
+    "logDirPath": {
+      "allOf": [{ "$ref": "#/$defs/path" }],
+      "description": "Runtime constraint: logDir must resolve inside ENDFIELD_EXPORT_ROOT\\log, outside the game installation, must not already exist, and must not contain or be contained by outputDir."
+    },
+    "eventsPath": {
+      "allOf": [{ "$ref": "#/$defs/path" }],
+      "description": "Runtime constraint: eventsPath must resolve inside ENDFIELD_EXPORT_ROOT\\log and outside the game installation; the worker refuses to append if it already exists."
+    },
+    "cancelMarkerPath": {
+      "allOf": [{ "$ref": "#/$defs/path" }],
+      "description": "Runtime constraint: cancelMarker must resolve inside ENDFIELD_EXPORT_ROOT\\log and outside the game installation."
+    },
+    "nullablePath": {
+      "type": ["string", "null"],
+      "minLength": 1
+    },
+    "bounds": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["xmin", "xmax", "zmin", "zmax"],
+      "properties": {
+        "xmin": { "type": "number" },
+        "xmax": { "type": "number" },
+        "zmin": { "type": "number" },
+        "zmax": { "type": "number" }
+      },
+      "$comment": "The worker enforces finite positive half-open ranges: xmax > xmin and zmax > zmin."
+    },
+    "sectorKey": {
+      "type": "string",
+      "pattern": "^sector:-?[0-9]+:-?[0-9]+$"
+    },
+    "sectorKeys": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/sectorKey" }
+    },
+    "batchMode": {
+      "enum": ["per_sector", "cluster_4x4_sectors", "merged_selection"]
+    },
+    "waterMode": {
+      "enum": ["stable_eevee", "flowmap_fresnel"]
+    },
+    "exportGroups": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "enum": ["all", "lighting", "particle", "vegetation", "terrain", "road", "water", "effects", "unknown"]
+      }
+    },
+    "layers": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "terrain": { "type": "boolean" },
+        "instances": { "type": "boolean" },
+        "roads": { "type": "boolean" },
+        "vegetation": { "type": "boolean" },
+        "effects": { "type": "boolean" },
+        "water": { "type": "boolean" },
+        "lights": { "type": "boolean" }
+      },
+      "anyOf": [
+        { "properties": { "terrain": { "const": true } }, "required": ["terrain"] },
+        { "properties": { "instances": { "const": true } }, "required": ["instances"] },
+        { "properties": { "roads": { "const": true } }, "required": ["roads"] },
+        { "properties": { "vegetation": { "const": true } }, "required": ["vegetation"] },
+        { "properties": { "effects": { "const": true } }, "required": ["effects"] },
+        { "properties": { "water": { "const": true } }, "required": ["water"] },
+        { "properties": { "lights": { "const": true } }, "required": ["lights"] }
+      ]
+    },
+    "workerEffects": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "selectionMode": {
+          "enum": ["full_system_by_anchor", "anchor_overlap", "all_active"]
+        },
+        "selection_mode": {
+          "enum": ["full_system_by_anchor", "anchor_overlap", "all_active"]
+        }
+      }
+    },
+    "canonicalEffects": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["selection_mode"],
+      "properties": {
+        "selection_mode": {
+          "enum": ["full_system_by_anchor", "anchor_overlap", "all_active"]
+        }
+      }
+    },
+    "stage119": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "root": { "$ref": "#/$defs/path" },
+        "fingerprint": {
+          "pattern": "^[0-9A-F]{64}$"
+        },
+        "datasetFingerprint": {
+          "pattern": "^[0-9A-F]{64}$"
+        }
+      }
+    },
+    "output": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["root"],
+      "properties": {
+        "root": { "$ref": "#/$defs/path" },
+        "label": { "$ref": "#/$defs/label" }
+      }
+    },
+    "blenderExtension": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "batchMode": { "$ref": "#/$defs/batchMode" },
+        "batch_mode": { "$ref": "#/$defs/batchMode" },
+        "sectorKeys": { "$ref": "#/$defs/sectorKeys" },
+        "sector_keys": { "$ref": "#/$defs/sectorKeys" },
+        "outputDir": { "$ref": "#/$defs/path" },
+        "output_dir": { "$ref": "#/$defs/path" },
+        "logDir": { "$ref": "#/$defs/logDirPath" },
+        "log_dir": { "$ref": "#/$defs/logDirPath" },
+        "eventsPath": { "$ref": "#/$defs/eventsPath" },
+        "events_path": { "$ref": "#/$defs/eventsPath" },
+        "cancelMarker": { "$ref": "#/$defs/cancelMarkerPath" },
+        "cancel_marker": { "$ref": "#/$defs/cancelMarkerPath" },
+        "blenderExe": { "$ref": "#/$defs/path" },
+        "blender_exe": { "$ref": "#/$defs/path" }
+      }
+    },
+    "source": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["game_root", "blender_exe"],
+      "properties": {
+        "game_root": { "$ref": "#/$defs/path" },
+        "blender_exe": { "$ref": "#/$defs/path" }
+      }
+    },
+    "workerJob": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["format", "bounds", "layers"],
+      "properties": {
+        "format": { "const": "EndfieldBlenderSelectionJob/1" },
+        "sourceFormat": {
+          "enum": ["EndfieldBlenderSelectionJob/1", "EndfieldCanonicalExportJob/2"]
+        },
+        "requestId": { "type": ["string", "null"] },
+        "request_id": { "type": ["string", "null"] },
+        "jobId": { "$ref": "#/$defs/label" },
+        "job_id": { "$ref": "#/$defs/label" },
+        "label": { "$ref": "#/$defs/label" },
+        "mapId": { "enum": ["map01", "map02"] },
+        "map_id": { "enum": ["map01", "map02"] },
+        "bounds": { "$ref": "#/$defs/bounds" },
+        "boundsSemantics": { "type": "string" },
+        "sectorKeys": { "$ref": "#/$defs/sectorKeys" },
+        "sector_keys": { "$ref": "#/$defs/sectorKeys" },
+        "derivedSectorKeys": { "$ref": "#/$defs/sectorKeys" },
+        "batchMode": { "$ref": "#/$defs/batchMode" },
+        "batch_mode": { "$ref": "#/$defs/batchMode" },
+        "layers": { "$ref": "#/$defs/layers" },
+        "exportGroups": { "$ref": "#/$defs/exportGroups" },
+        "export_groups": { "$ref": "#/$defs/exportGroups" },
+        "effects": { "$ref": "#/$defs/workerEffects" },
+        "waterMode": { "$ref": "#/$defs/waterMode" },
+        "water_mode": { "$ref": "#/$defs/waterMode" },
+        "outputDir": { "$ref": "#/$defs/path" },
+        "output_dir": { "$ref": "#/$defs/path" },
+        "output": { "$ref": "#/$defs/output" },
+        "logDir": { "$ref": "#/$defs/logDirPath" },
+        "log_dir": { "$ref": "#/$defs/logDirPath" },
+        "eventsPath": { "$ref": "#/$defs/eventsPath" },
+        "events_path": { "$ref": "#/$defs/eventsPath" },
+        "cancelMarker": { "$ref": "#/$defs/cancelMarkerPath" },
+        "cancel_marker": { "$ref": "#/$defs/cancelMarkerPath" },
+        "gameRoot": { "$ref": "#/$defs/path" },
+        "game_root": { "$ref": "#/$defs/path" },
+        "stage119": { "$ref": "#/$defs/stage119" },
+        "datasetFingerprint": {
+          "pattern": "^[0-9A-F]{64}$"
+        },
+        "blenderExe": { "$ref": "#/$defs/nullablePath" },
+        "blender_exe": { "$ref": "#/$defs/nullablePath" },
+        "blender": { "$ref": "#/$defs/blenderExtension" },
+        "exportPackage": { "$ref": "#/$defs/nullablePath" },
+        "source": { "$ref": "#/$defs/source" }
+      },
+      "allOf": [
+        {
+          "anyOf": [
+            { "required": ["mapId"] },
+            { "required": ["map_id"] }
+          ]
+        },
+        {
+          "anyOf": [
+            { "required": ["outputDir"] },
+            { "required": ["output_dir"] },
+            { "required": ["output"] },
+            {
+              "required": ["blender"],
+              "properties": {
+                "blender": {
+                  "anyOf": [
+                    { "required": ["outputDir"] },
+                    { "required": ["output_dir"] }
+                  ]
+                }
+              }
+            }
+          ]
+        },
+        {
+          "if": {
+            "properties": {
+              "layers": {
+                "properties": { "effects": { "const": true } },
+                "required": ["effects"]
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "effects": {
+                "anyOf": [
+                  {
+                    "required": ["selectionMode"],
+                    "properties": { "selectionMode": { "const": "full_system_by_anchor" } }
+                  },
+                  {
+                    "required": ["selection_mode"],
+                    "properties": { "selection_mode": { "const": "full_system_by_anchor" } }
+                  },
+                  { "maxProperties": 0 }
+                ]
+              }
+            }
+          }
+        }
+      ]
+    },
+    "canonicalJob": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "format",
+        "job_id",
+        "map_id",
+        "bounds",
+        "layers",
+        "export_groups",
+        "water_mode",
+        "effects",
+        "output"
+      ],
+      "properties": {
+        "format": { "const": "EndfieldCanonicalExportJob/2" },
+        "request_id": { "type": ["string", "null"] },
+        "job_id": { "$ref": "#/$defs/label" },
+        "label": { "$ref": "#/$defs/label" },
+        "map_id": { "enum": ["map01", "map02"] },
+        "bounds": { "$ref": "#/$defs/bounds" },
+        "bounds_semantics": { "const": "half_open_xz" },
+        "selection_grid": { "const": 128.0 },
+        "preview": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["origin", "v_direction"],
+          "properties": {
+            "origin": { "const": "top_left" },
+            "v_direction": { "enum": ["z_increasing", "z_decreasing"] }
+          }
+        },
+        "baseline_policy": { "type": "string", "minLength": 1 },
+        "water_binding_status": { "type": "string", "minLength": 1 },
+        "source": { "$ref": "#/$defs/source" },
+        "layers": { "$ref": "#/$defs/layers" },
+        "export_groups": { "$ref": "#/$defs/exportGroups" },
+        "water_mode": { "$ref": "#/$defs/waterMode" },
+        "effects": { "$ref": "#/$defs/canonicalEffects" },
+        "output": { "$ref": "#/$defs/output" },
+        "sectorKeys": { "$ref": "#/$defs/sectorKeys" },
+        "sector_keys": { "$ref": "#/$defs/sectorKeys" },
+        "batchMode": { "$ref": "#/$defs/batchMode" },
+        "batch_mode": { "$ref": "#/$defs/batchMode" },
+        "outputDir": { "$ref": "#/$defs/path" },
+        "output_dir": { "$ref": "#/$defs/path" },
+        "logDir": { "$ref": "#/$defs/logDirPath" },
+        "log_dir": { "$ref": "#/$defs/logDirPath" },
+        "eventsPath": { "$ref": "#/$defs/eventsPath" },
+        "events_path": { "$ref": "#/$defs/eventsPath" },
+        "cancelMarker": { "$ref": "#/$defs/cancelMarkerPath" },
+        "cancel_marker": { "$ref": "#/$defs/cancelMarkerPath" },
+        "gameRoot": { "$ref": "#/$defs/path" },
+        "game_root": { "$ref": "#/$defs/path" },
+        "stage119": { "$ref": "#/$defs/stage119" },
+        "datasetFingerprint": {
+          "pattern": "^[0-9A-F]{64}$"
+        },
+        "blenderExe": { "$ref": "#/$defs/nullablePath" },
+        "blender_exe": { "$ref": "#/$defs/nullablePath" },
+        "blender": { "$ref": "#/$defs/blenderExtension" }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "layers": {
+                "properties": { "effects": { "const": true } },
+                "required": ["effects"]
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "effects": {
+                "properties": {
+                  "selection_mode": { "const": "full_system_by_anchor" }
+                }
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

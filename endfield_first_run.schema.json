@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local.endfield.invalid/schemas/endfield_first_run.schema.json",
+  "title": "Endfield first-run local configuration",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "format",
+    "paths"
+  ],
+  "properties": {
+    "format": {
+      "const": "EndfieldFirstRunConfig/1"
+    },
+    "paths": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "gameRoot",
+        "cacheRoot",
+        "exportRoot"
+      ],
+      "properties": {
+        "gameRoot": {
+          "type": "string",
+          "minLength": 1
+        },
+        "cacheRoot": {
+          "type": "string",
+          "minLength": 1
+        },
+        "exportRoot": {
+          "type": "string",
+          "minLength": 1
+        },
+        "blenderExe": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "firstRun": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "maps": {
+          "type": "array",
+          "const": [
+            "map01",
+            "map02"
+          ]
+        },
+        "gameAccess": {
+          "const": "read_only"
+        },
+        "optionalLayerFallback": {
+          "const": "not_started"
+        }
+      }
+    }
+  }
+}

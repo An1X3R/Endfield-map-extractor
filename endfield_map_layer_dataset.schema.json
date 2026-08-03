@@ -1,0 +1,230 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local.endfield.invalid/schema/endfield_map_layer_dataset.schema.json",
+  "title": "Endfield Map Layer Dataset Index",
+  "type": "object",
+  "required": [
+    "format",
+    "datasetId",
+    "generatorVersion",
+    "generatedAt",
+    "mapId",
+    "domainId",
+    "layer",
+    "recordType",
+    "recordEncoding",
+    "geometryTypes",
+    "scan",
+    "recordCount",
+    "coverageCount",
+    "duplicateCount",
+    "pendingCount",
+    "bindingCounts",
+    "sourceEvidenceIds",
+    "validation"
+  ],
+  "properties": {
+    "format": { "const": "EndfieldMapLayerDataset/1" },
+    "datasetId": { "type": "string", "pattern": "^map0[12]\\.(instances|water|effects|lights|roads)\\.stage119$" },
+    "generatorVersion": { "const": "stage119-v1" },
+    "generatedAt": { "type": "string", "minLength": 1 },
+    "mapId": { "enum": ["map01", "map02"] },
+    "domainId": { "type": "string", "minLength": 1 },
+    "layer": { "enum": ["instances", "water", "effects", "lights", "roads"] },
+    "recordType": { "type": "string", "minLength": 1 },
+    "recordEncoding": { "enum": ["jsonl+gzip", "view-reference"] },
+    "geometryTypes": { "type": "array", "uniqueItems": true, "items": { "type": "string" } },
+    "scan": { "$ref": "#/$defs/scan" },
+    "recordCount": { "$ref": "#/$defs/nonNegativeInteger" },
+    "coverageCount": { "$ref": "#/$defs/nonNegativeInteger" },
+    "duplicateCount": { "$ref": "#/$defs/nonNegativeInteger" },
+    "pendingCount": { "$ref": "#/$defs/nonNegativeInteger" },
+    "bindingCounts": { "$ref": "#/$defs/counts" },
+    "sectorKeys": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/sectorKey" } },
+    "spatialLevelIds": { "type": "array", "uniqueItems": true, "items": { "type": "string" } },
+    "sourceEvidenceIds": { "type": "array", "uniqueItems": true, "items": { "type": "string", "minLength": 1 } },
+    "validation": { "type": "object" }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "layer": { "const": "instances" } }, "required": ["layer"] },
+      "then": {
+        "required": [
+          "assetTable",
+          "categoryCounts",
+          "categoryBindingCounts",
+          "assetResolutionCounts",
+          "assetResolutionInstanceCounts",
+          "assetPendingCount",
+          "assetPendingInstanceCount",
+          "shardCount",
+          "shards"
+        ],
+        "properties": {
+          "recordType": { "const": "instance" },
+          "recordEncoding": { "const": "jsonl+gzip" },
+          "assetTable": { "$ref": "#/$defs/assetTable" },
+          "categoryCounts": { "$ref": "#/$defs/counts" },
+          "categoryBindingCounts": { "type": "object", "additionalProperties": { "$ref": "#/$defs/counts" } },
+          "assetResolutionCounts": { "$ref": "#/$defs/resolutionCounts" },
+          "assetResolutionInstanceCounts": { "$ref": "#/$defs/resolutionCounts" },
+          "assetPendingCount": { "$ref": "#/$defs/nonNegativeInteger" },
+          "assetPendingInstanceCount": { "$ref": "#/$defs/nonNegativeInteger" },
+          "shardCount": { "$ref": "#/$defs/nonNegativeInteger" },
+          "shards": { "type": "array", "items": { "$ref": "#/$defs/instanceShard" } }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "layer": { "const": "effects" } }, "required": ["layer"] },
+      "then": {
+        "required": [
+          "anchorSelectionPolicy",
+          "anchorCount",
+          "prototypeCount",
+          "prototypeMemberCount",
+          "records",
+          "anchors",
+          "prototypes",
+          "prototypeMembers",
+          "sectorKeys"
+        ],
+        "properties": {
+          "recordType": { "const": "effect" },
+          "recordEncoding": { "const": "jsonl+gzip" },
+          "anchorSelectionPolicy": { "const": "full_system_by_anchor" },
+          "anchorCount": { "$ref": "#/$defs/nonNegativeInteger" },
+          "prototypeCount": { "$ref": "#/$defs/nonNegativeInteger" },
+          "prototypeMemberCount": { "$ref": "#/$defs/nonNegativeInteger" },
+          "records": { "$ref": "#/$defs/fileReference" },
+          "anchors": { "$ref": "#/$defs/fileReference" },
+          "prototypes": { "$ref": "#/$defs/fileReference" },
+          "prototypeMembers": { "$ref": "#/$defs/fileReference" }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "layer": { "const": "water" } }, "required": ["layer"] },
+      "then": {
+        "required": ["configCount", "geometryTypeCounts", "records", "configs", "sectorKeys"],
+        "properties": {
+          "recordType": { "const": "water" },
+          "recordEncoding": { "const": "jsonl+gzip" },
+          "configCount": { "$ref": "#/$defs/nonNegativeInteger" },
+          "geometryTypeCounts": { "$ref": "#/$defs/counts" },
+          "records": { "$ref": "#/$defs/fileReference" },
+          "configs": { "$ref": "#/$defs/fileReference" }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "layer": { "const": "lights" } }, "required": ["layer"] },
+      "then": {
+        "required": ["records", "sectorKeys"],
+        "properties": {
+          "recordType": { "const": "light" },
+          "recordEncoding": { "const": "jsonl+gzip" },
+          "records": { "$ref": "#/$defs/fileReference" }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "layer": { "const": "roads" } }, "required": ["layer"] },
+      "then": {
+        "required": ["viewOf", "filter", "sectorKeys", "roadShards"],
+        "properties": {
+          "recordType": { "const": "instance-view" },
+          "recordEncoding": { "const": "view-reference" },
+          "viewOf": { "type": "string", "pattern": "^map0[12]/instances/index\\.json$" },
+          "filter": {
+            "type": "object",
+            "required": ["category"],
+            "properties": { "category": { "const": "road" } },
+            "additionalProperties": false
+          },
+          "roadShards": { "type": "array", "items": { "$ref": "#/$defs/roadShard" } }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "nonNegativeInteger": { "type": "integer", "minimum": 0 },
+    "sectorKey": { "type": "string", "pattern": "^sector:-?[0-9]+:-?[0-9]+$" },
+    "sha256": { "type": "string", "pattern": "^[A-F0-9]{64}$" },
+    "counts": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/nonNegativeInteger" }
+    },
+    "resolutionCounts": {
+      "type": "object",
+      "propertyNames": { "enum": ["resolved", "unresolved", "proxy_only", "missing_resolution"] },
+      "additionalProperties": { "$ref": "#/$defs/nonNegativeInteger" }
+    },
+    "scan": {
+      "type": "object",
+      "required": ["status", "coverageScope", "recordsFound", "limitations"],
+      "properties": {
+        "status": { "enum": ["complete", "partial", "not_started"] },
+        "coverageScope": { "type": "string", "minLength": 1 },
+        "recordsFound": { "$ref": "#/$defs/nonNegativeInteger" },
+        "limitations": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "fileReference": {
+      "type": "object",
+      "required": ["path", "bytes", "sha256"],
+      "properties": {
+        "path": { "type": "string", "minLength": 1 },
+        "recordCount": { "$ref": "#/$defs/nonNegativeInteger" },
+        "bytes": { "$ref": "#/$defs/nonNegativeInteger" },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "assetTable": {
+      "allOf": [
+        { "$ref": "#/$defs/fileReference" },
+        { "required": ["recordCount", "boundsStatus"] }
+      ]
+    },
+    "instanceShard": {
+      "type": "object",
+      "required": [
+        "sectorKey",
+        "sectorX",
+        "sectorZ",
+        "path",
+        "recordCount",
+        "bytes",
+        "sha256",
+        "categoryCounts",
+        "bindingCounts"
+      ],
+      "properties": {
+        "sectorKey": { "$ref": "#/$defs/sectorKey" },
+        "sectorX": { "type": "integer" },
+        "sectorZ": { "type": "integer" },
+        "spatialLevelId": { "type": ["string", "null"] },
+        "coverage": { "enum": ["mapped", "unmapped"] },
+        "path": { "type": "string", "minLength": 1 },
+        "recordCount": { "$ref": "#/$defs/nonNegativeInteger" },
+        "bytes": { "$ref": "#/$defs/nonNegativeInteger" },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "categoryCounts": { "$ref": "#/$defs/counts" },
+        "bindingCounts": { "$ref": "#/$defs/counts" }
+      }
+    },
+    "roadShard": {
+      "type": "object",
+      "required": ["sectorKey", "path", "sourceShardRecordCount", "roadRecordCount", "sourceShardSha256"],
+      "properties": {
+        "sectorKey": { "$ref": "#/$defs/sectorKey" },
+        "path": { "type": "string", "minLength": 1 },
+        "sourceShardRecordCount": { "$ref": "#/$defs/nonNegativeInteger" },
+        "roadRecordCount": { "type": "integer", "minimum": 1 },
+        "sourceShardSha256": { "$ref": "#/$defs/sha256" }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": true
+}

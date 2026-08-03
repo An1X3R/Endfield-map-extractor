@@ -1,0 +1,267 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "EndfieldLightingLayer.schema.json",
+  "title": "Endfield WebUI Lighting Layer",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "format",
+    "mapId",
+    "coordinateConvention",
+    "scan",
+    "records"
+  ],
+  "properties": {
+    "format": {
+      "const": "EndfieldLightingLayer/1"
+    },
+    "mapId": {
+      "enum": ["map01", "map02"]
+    },
+    "levelId": {
+      "type": ["string", "null"]
+    },
+    "coordinateConvention": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["unityWorld", "mapProjection", "blenderPreview"],
+      "properties": {
+        "unityWorld": {
+          "const": "(X,Y,Z); Y up; Transform.forward is local +Z"
+        },
+        "mapProjection": {
+          "const": "screenX <- Unity X; screenY <- Unity Z; +Z north/up"
+        },
+        "blenderPreview": {
+          "const": "(X,Y,Z) = (Unity X,-Unity Z,Unity Y); Spot/Area/Sun emission axis is local -Z"
+        }
+      }
+    },
+    "scan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "scannedClasses",
+        "sourceEvidence",
+        "nativeLightCount",
+        "customLightCandidateCount",
+        "exclusionPolicy"
+      ],
+      "properties": {
+        "status": {
+          "enum": ["complete", "partial", "no_native_light_detected", "unavailable"]
+        },
+        "scannedClasses": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "enum": ["Light", "VolumetricLight", "KodamaRealtimeLight", "MonoBehaviour", "MonoScript"]
+          },
+          "uniqueItems": true
+        },
+        "sourceEvidence": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/sourceEvidence" }
+        },
+        "nativeLightCount": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "customLightCandidateCount": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "exclusionPolicy": {
+          "const": "Do not promote lamp meshes, material emission, object names, or unconfirmed VFX scripts to lighting records."
+        }
+      }
+    },
+    "records": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/lightingRecord" }
+    }
+  },
+  "$defs": {
+    "vec3": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["x", "y", "z"],
+      "properties": {
+        "x": { "type": "number" },
+        "y": { "type": "number" },
+        "z": { "type": "number" }
+      }
+    },
+    "quat": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["x", "y", "z", "w"],
+      "properties": {
+        "x": { "type": "number" },
+        "y": { "type": "number" },
+        "z": { "type": "number" },
+        "w": { "type": "number" }
+      }
+    },
+    "sourceEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "source", "className", "pathId", "bindingStatus"],
+      "properties": {
+        "kind": {
+          "enum": ["native_component", "custom_component", "probe_report", "synthetic_validation"]
+        },
+        "source": { "type": "string" },
+        "className": { "type": "string" },
+        "pathId": { "type": ["integer", "null"] },
+        "bundleHash": { "type": ["string", "null"] },
+        "bindingStatus": {
+          "enum": ["mapped", "candidate", "unmapped", "not_applicable"]
+        }
+      }
+    },
+    "transformStep": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source", "pathId", "localPosition", "localRotation", "applied"],
+      "properties": {
+        "source": { "type": "string" },
+        "pathId": { "type": "integer" },
+        "localPosition": { "$ref": "#/$defs/vec3" },
+        "localRotation": { "$ref": "#/$defs/quat" },
+        "applied": { "type": "boolean" }
+      }
+    },
+    "lightingRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "lightId",
+        "signalKind",
+        "type",
+        "positionUnity",
+        "directionUnity",
+        "directionStatus",
+        "colorLinear",
+        "intensity",
+        "rangeMetres",
+        "owner",
+        "transformChain",
+        "anchorId",
+        "sectorKeys",
+        "bindingStatus",
+        "sourceEvidence"
+      ],
+      "properties": {
+        "lightId": { "type": "string", "minLength": 1 },
+        "signalKind": {
+          "enum": ["native_light", "custom_light_component", "emissive_proxy", "fx_light_proxy"]
+        },
+        "type": {
+          "enum": ["point", "spot", "area", "directional", "unknown"]
+        },
+        "positionUnity": {
+          "oneOf": [
+            { "$ref": "#/$defs/vec3" },
+            { "type": "null" }
+          ]
+        },
+        "directionUnity": {
+          "oneOf": [
+            { "$ref": "#/$defs/vec3" },
+            { "type": "null" }
+          ]
+        },
+        "directionStatus": {
+          "enum": ["resolved_world", "local_only", "not_applicable", "unavailable"]
+        },
+        "colorLinear": {
+          "type": ["array", "null"],
+          "prefixItems": [
+            { "type": "number", "minimum": 0 },
+            { "type": "number", "minimum": 0 },
+            { "type": "number", "minimum": 0 }
+          ],
+          "items": false
+        },
+        "intensity": { "type": ["number", "null"], "minimum": 0 },
+        "rangeMetres": { "type": ["number", "null"], "minimum": 0 },
+        "spot": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "required": ["outerAngleDegrees", "innerAngleDegrees"],
+          "properties": {
+            "outerAngleDegrees": { "type": ["number", "null"], "minimum": 0, "maximum": 180 },
+            "innerAngleDegrees": { "type": ["number", "null"], "minimum": 0, "maximum": 180 }
+          }
+        },
+        "area": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "required": ["shape", "widthMetres", "heightMetres"],
+          "properties": {
+            "shape": { "enum": ["rectangle", "disk", "unknown"] },
+            "widthMetres": { "type": ["number", "null"], "minimum": 0 },
+            "heightMetres": { "type": ["number", "null"], "minimum": 0 }
+          }
+        },
+        "owner": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["gameObjectName", "source", "pathId"],
+          "properties": {
+            "gameObjectName": { "type": "string" },
+            "source": { "type": "string" },
+            "pathId": { "type": "integer" }
+          }
+        },
+        "transformChain": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["steps", "worldResolution", "outerDynamicStreamingApplied"],
+          "properties": {
+            "steps": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/transformStep" }
+            },
+            "worldResolution": {
+              "enum": ["composed_once", "local_only", "unavailable"]
+            },
+            "outerDynamicStreamingApplied": { "type": "boolean" }
+          }
+        },
+        "anchorId": { "type": ["string", "null"] },
+        "sectorKeys": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+        "bindingStatus": {
+          "enum": ["mapped", "candidate", "unmapped"]
+        },
+        "sourceEvidence": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/sourceEvidence" }
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "type": { "const": "point" } }, "required": ["type"] },
+          "then": {
+            "properties": {
+              "directionUnity": { "type": "null" },
+              "directionStatus": { "const": "not_applicable" }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "type": { "const": "directional" } }, "required": ["type"] },
+          "then": {
+            "properties": {
+              "positionUnity": { "type": "null" },
+              "directionStatus": { "const": "resolved_world" }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

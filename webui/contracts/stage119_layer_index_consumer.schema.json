@@ -1,0 +1,132 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local.endfield.invalid/schema/stage119_layer_index_consumer.schema.json",
+  "title": "Stage119 WebUI Layer Index Consumer Shape",
+  "description": "Consumer-facing compatibility schema. Non-shard records may be a legacy string path or a file descriptor. Effective sectors are derived from sectorKeys, shards[].sectorKey, and roadShards[].sectorKey.",
+  "type": "object",
+  "required": [
+    "format",
+    "mapId",
+    "layer",
+    "recordEncoding",
+    "recordCount"
+  ],
+  "properties": {
+    "format": {
+      "const": "EndfieldMapLayerDataset/1"
+    },
+    "mapId": {
+      "enum": ["map01", "map02"]
+    },
+    "layer": {
+      "enum": ["instances", "water", "effects", "lights", "roads"]
+    },
+    "recordEncoding": {
+      "enum": ["jsonl+gzip", "view-reference"]
+    },
+    "recordCount": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "records": {
+      "oneOf": [
+        {
+          "type": "string",
+          "minLength": 1,
+          "description": "Compatibility form accepted by the consumer."
+        },
+        {
+          "$ref": "#/$defs/fileDescriptor"
+        }
+      ]
+    },
+    "sectorKeys": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/sectorKey"
+      }
+    },
+    "shards": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/shard"
+      }
+    },
+    "roadShards": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/roadShard"
+      }
+    }
+  },
+  "$defs": {
+    "sectorKey": {
+      "type": "string",
+      "pattern": "^sector:-?[0-9]+:-?[0-9]+$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[A-F0-9]{64}$"
+    },
+    "fileDescriptor": {
+      "type": "object",
+      "required": ["path", "bytes", "sha256"],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "recordCount": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      },
+      "additionalProperties": true
+    },
+    "shard": {
+      "type": "object",
+      "required": ["path", "sectorKey"],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sectorKey": {
+          "$ref": "#/$defs/sectorKey"
+        },
+        "recordCount": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": true
+    },
+    "roadShard": {
+      "type": "object",
+      "required": ["path", "sectorKey", "roadRecordCount"],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sectorKey": {
+          "$ref": "#/$defs/sectorKey"
+        },
+        "roadRecordCount": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true
+}

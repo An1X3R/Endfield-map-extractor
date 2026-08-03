@@ -1,0 +1,431 @@
+diff --git a/AnimeStudio.Utility/ShaderConverter.cs b/AnimeStudio.Utility/ShaderConverter.cs
+index 4851c23009c59c99793ae318f983c3c4a2d5f847..09a1a453abd63214f14e236e7acd6c0b980ddad5 100644
+--- a/AnimeStudio.Utility/ShaderConverter.cs
++++ b/AnimeStudio.Utility/ShaderConverter.cs
+@@ -162,45 +162,45 @@ namespace AnimeStudio
+                 {
+                     sb.Append(ConvertSerializedShaderState(m_Passe.m_State));
+ 
+-                    if (m_Passe.progVertex.m_SubPrograms.Count > 0)
++                    if (HasSerializedSubPrograms(m_Passe.progVertex))
+                     {
+                         sb.Append("Program \"vp\" {\n");
+-                        sb.Append(ConvertSerializedSubPrograms(m_Passe.progVertex.m_SubPrograms, platforms, shaderPrograms));
++                        sb.Append(ConvertSerializedProgram(m_Passe.progVertex, platforms, shaderPrograms));
+                         sb.Append("}\n");
+                     }
+ 
+-                    if (m_Passe.progFragment.m_SubPrograms.Count > 0)
++                    if (HasSerializedSubPrograms(m_Passe.progFragment))
+                     {
+                         sb.Append("Program \"fp\" {\n");
+-                        sb.Append(ConvertSerializedSubPrograms(m_Passe.progFragment.m_SubPrograms, platforms, shaderPrograms));
++                        sb.Append(ConvertSerializedProgram(m_Passe.progFragment, platforms, shaderPrograms));
+                         sb.Append("}\n");
+                     }
+ 
+-                    if (m_Passe.progGeometry.m_SubPrograms.Count > 0)
++                    if (HasSerializedSubPrograms(m_Passe.progGeometry))
+                     {
+                         sb.Append("Program \"gp\" {\n");
+-                        sb.Append(ConvertSerializedSubPrograms(m_Passe.progGeometry.m_SubPrograms, platforms, shaderPrograms));
++                        sb.Append(ConvertSerializedProgram(m_Passe.progGeometry, platforms, shaderPrograms));
+                         sb.Append("}\n");
+                     }
+ 
+-                    if (m_Passe.progHull.m_SubPrograms.Count > 0)
++                    if (HasSerializedSubPrograms(m_Passe.progHull))
+                     {
+                         sb.Append("Program \"hp\" {\n");
+-                        sb.Append(ConvertSerializedSubPrograms(m_Passe.progHull.m_SubPrograms, platforms, shaderPrograms));
++                        sb.Append(ConvertSerializedProgram(m_Passe.progHull, platforms, shaderPrograms));
+                         sb.Append("}\n");
+                     }
+ 
+-                    if (m_Passe.progDomain.m_SubPrograms.Count > 0)
++                    if (HasSerializedSubPrograms(m_Passe.progDomain))
+                     {
+                         sb.Append("Program \"dp\" {\n");
+-                        sb.Append(ConvertSerializedSubPrograms(m_Passe.progDomain.m_SubPrograms, platforms, shaderPrograms));
++                        sb.Append(ConvertSerializedProgram(m_Passe.progDomain, platforms, shaderPrograms));
+                         sb.Append("}\n");
+                     }
+ 
+-                    if (m_Passe.progRayTracing?.m_SubPrograms.Count > 0)
++                    if (HasSerializedSubPrograms(m_Passe.progRayTracing))
+                     {
+                         sb.Append("Program \"rtp\" {\n");
+-                        sb.Append(ConvertSerializedSubPrograms(m_Passe.progRayTracing.m_SubPrograms, platforms, shaderPrograms));
++                        sb.Append(ConvertSerializedProgram(m_Passe.progRayTracing, platforms, shaderPrograms));
+                         sb.Append("}\n");
+                     }
+                 }
+@@ -209,6 +209,59 @@ namespace AnimeStudio
+             return sb.ToString();
+         }
+ 
++        private static bool HasSerializedSubPrograms(SerializedProgram program)
++        {
++            return program != null &&
++                   (program.m_SubPrograms?.Count > 0 ||
++                    program.m_PlayerSubPrograms?.Any(group => group.Count > 0) == true);
++        }
++
++        private static string ConvertSerializedProgram(SerializedProgram program, ShaderCompilerPlatform[] platforms, ShaderProgram[] shaderPrograms)
++        {
++            if (program.m_SubPrograms?.Count > 0)
++            {
++                return ConvertSerializedSubPrograms(program.m_SubPrograms, platforms, shaderPrograms);
++            }
++
++            return ConvertSerializedPlayerSubPrograms(program.m_PlayerSubPrograms, platforms, shaderPrograms);
++        }
++
++        private static string ConvertSerializedPlayerSubPrograms(List<List<SerializedPlayerSubProgram>> playerSubPrograms, ShaderCompilerPlatform[] platforms, ShaderProgram[] shaderPrograms)
++        {
++            var sb = new StringBuilder();
++            var programs = playerSubPrograms
++                .SelectMany(group => group)
++                .GroupBy(program => new { program.m_BlobIndex, program.m_GpuProgramType });
++            foreach (var programGroup in programs)
++            {
++                for (var platformIndex = 0; platformIndex < platforms.Length; platformIndex++)
++                {
++                    var platform = platforms[platformIndex];
++                    if (!CheckGpuProgramUsable(platform, programGroup.Key.m_GpuProgramType))
++                    {
++                        continue;
++                    }
++
++                    sb.Append($"SubProgram \"{GetPlatformString(platform)} \" {{\n");
++                    var blobIndex = checked((int)programGroup.Key.m_BlobIndex);
++                    var runtimePrograms = shaderPrograms[platformIndex]?.m_SubPrograms;
++                    if (runtimePrograms == null ||
++                        blobIndex >= runtimePrograms.Length ||
++                        runtimePrograms[blobIndex] == null)
++                    {
++                        sb.Append($"// missing runtime shader program blob {blobIndex}\n");
++                    }
++                    else
++                    {
++                        sb.Append(runtimePrograms[blobIndex].Export());
++                    }
++                    sb.Append("\n}\n");
++                    break;
++                }
++            }
++            return sb.ToString();
++        }
++
+         private static string ConvertSerializedSubPrograms(List<SerializedSubProgram> m_SubPrograms, ShaderCompilerPlatform[] platforms, ShaderProgram[] shaderPrograms)
+         {
+             var sb = new StringBuilder();
+@@ -796,7 +849,8 @@ namespace AnimeStudio
+                         || programType == ShaderGpuProgramType.DX11GeometrySM40
+                         || programType == ShaderGpuProgramType.DX11GeometrySM50
+                         || programType == ShaderGpuProgramType.DX11HullSM50
+-                        || programType == ShaderGpuProgramType.DX11DomainSM50;
++                        || programType == ShaderGpuProgramType.DX11DomainSM50
++                        || programType == ShaderGpuProgramType.DXBC;
+                 case ShaderCompilerPlatform.GLES20:
+                     return programType == ShaderGpuProgramType.GLES;
+                 case ShaderCompilerPlatform.NaCl: //Obsolete
+@@ -913,6 +967,7 @@ namespace AnimeStudio
+     {
+         public ShaderSubProgramEntry[] entries;
+         public ShaderSubProgram[] m_SubPrograms;
++        public string[] m_SubProgramErrors;
+ 
+         private bool hasUpdatedGpuProgram = false;
+ 
+@@ -925,6 +980,7 @@ namespace AnimeStudio
+                 entries[i] = new ShaderSubProgramEntry(reader, shader.version);
+             }
+             m_SubPrograms = new ShaderSubProgram[subProgramsCapacity];
++            m_SubProgramErrors = new string[subProgramsCapacity];
+             if (shader.assetsFile.game.Type.IsGI())
+             {
+                 hasUpdatedGpuProgram = SerializedSubProgram.HasInstancedStructuredBuffers(shader.serializedType) || SerializedSubProgram.HasGlobalLocalKeywordIndices(shader.serializedType);
+@@ -938,8 +994,32 @@ namespace AnimeStudio
+                 var entry = entries[i];
+                 if (entry.Segment == segment)
+                 {
+-                    reader.BaseStream.Position = entry.Offset;
+-                    m_SubPrograms[i] = new ShaderSubProgram(reader, hasUpdatedGpuProgram);
++                    try
++                    {
++                        if (entry.Offset < 0 || entry.Length < 0 ||
++                            (long)entry.Offset + entry.Length > reader.BaseStream.Length)
++                        {
++                            throw new InvalidDataException(
++                                $"Shader program entry is outside the segment: offset={entry.Offset} " +
++                                $"length={entry.Length} segmentBytes={reader.BaseStream.Length}");
++                        }
++
++                        reader.BaseStream.Position = entry.Offset;
++                        var entryBytes = reader.ReadBytes(entry.Length);
++                        using (var entryReader = new EndianBinaryReader(
++                                   new MemoryStream(entryBytes, writable: false),
++                                   EndianType.LittleEndian))
++                        {
++                            m_SubPrograms[i] = new ShaderSubProgram(entryReader, hasUpdatedGpuProgram);
++                        }
++                    }
++                    catch (Exception ex)
++                    {
++                        m_SubProgramErrors[i] = $"{ex.GetType().Name}: {ex.Message}";
++                        Logger.Warning(
++                            $"Cannot parse shader program entry {i}: offset={entry.Offset} " +
++                            $"length={entry.Length} segment={entry.Segment}: {m_SubProgramErrors[i]}");
++                    }
+                 }
+             }
+         }
+@@ -1010,6 +1090,10 @@ namespace AnimeStudio
+         public string Export()
+         {
+             var sb = new StringBuilder();
++            var allowNativeD3dTools = string.Equals(
++                Environment.GetEnvironmentVariable("ANIMESTUDIO_ENABLE_NATIVE_D3D_SHADER_TOOLS"),
++                "1",
++                StringComparison.Ordinal);
+             if (m_Keywords.Length > 0)
+             {
+                 sb.Append("Keywords { ");
+@@ -1050,6 +1134,12 @@ namespace AnimeStudio
+                     case ShaderGpuProgramType.DX9PixelSM20:
+                     case ShaderGpuProgramType.DX9PixelSM30:
+                         {
++                            if (!allowNativeD3dTools)
++                            {
++                                sb.Append($"// hash: {ComputeHash64(m_ProgramCode):x8}\n");
++                                sb.Append("// native D3D shader tools disabled; set ANIMESTUDIO_ENABLE_NATIVE_D3D_SHADER_TOOLS=1 to enable\n");
++                                break;
++                            }
+                             try
+                             {
+                                 var programCodeSpan = m_ProgramCode.AsSpan();
+@@ -1075,24 +1165,27 @@ namespace AnimeStudio
+                     case ShaderGpuProgramType.DX11GeometrySM50:
+                     case ShaderGpuProgramType.DX11HullSM50:
+                     case ShaderGpuProgramType.DX11DomainSM50:
++                    case ShaderGpuProgramType.DXBC:
+                         {
+-                            int type = m_ProgramCode[0];
+-                            int start = 1;
+-                            if (type > 0)
++                            var containers = DxbcContainerValidator.FindAll(m_ProgramCode);
++                            if (containers.Count == 0)
+                             {
+-                                if (type == 1)
+-                                {
+-                                    start = 6;
+-                                }
+-                                else if (type == 2)
+-                                {
+-                                    start = 38;
+-                                }
++                                sb.Append($"// hash: {ComputeHash64(m_ProgramCode):x8}\n");
++                                sb.Append("// no structurally valid DXBC container found\n");
++                                break;
+                             }
+ 
+-                            var buffSpan = m_ProgramCode.AsSpan(start);
+-
++                            var container = containers[0];
++                            var buffSpan = m_ProgramCode.AsSpan(container.Offset, container.TotalSize);
+                             sb.Append($"// hash: {ComputeHash64(buffSpan):x8}\n");
++                            sb.Append(
++                                $"// validated DXBC container offset={container.Offset} bytes={container.TotalSize} chunks={container.Chunks.Count}\n");
++                            if (!allowNativeD3dTools)
++                            {
++                                sb.Append("// native D3D shader tools disabled; use the validated .dxbc sidecar\n");
++                                break;
++                            }
++
+                             try
+                             {
+                                 HLSLDecompiler.DecompileShader(buffSpan.ToArray(), buffSpan.Length, out var hlslText);
+diff --git a/AnimeStudio.Utility/DxbcContainerValidator.cs b/AnimeStudio.Utility/DxbcContainerValidator.cs
+new file mode 100644
+index 0000000000000000000000000000000000000000..0cf22ec99bee99ce54eda4c555e2ecfb0a1fad53
+--- /dev/null
++++ b/AnimeStudio.Utility/DxbcContainerValidator.cs
+@@ -0,0 +1,177 @@
++using System;
++using System.Buffers.Binary;
++using System.Collections.Generic;
++using System.Text;
++
++namespace AnimeStudio
++{
++    public sealed class DxbcChunkInfo
++    {
++        public int Index { get; }
++        public string FourCC { get; }
++        public int Offset { get; }
++        public int Size { get; }
++
++        internal DxbcChunkInfo(int index, string fourCC, int offset, int size)
++        {
++            Index = index;
++            FourCC = fourCC;
++            Offset = offset;
++            Size = size;
++        }
++    }
++
++    public sealed class DxbcContainerInfo
++    {
++        public int Offset { get; }
++        public int Version { get; }
++        public int TotalSize { get; }
++        public IReadOnlyList<DxbcChunkInfo> Chunks { get; }
++
++        internal DxbcContainerInfo(
++            int offset,
++            int version,
++            int totalSize,
++            IReadOnlyList<DxbcChunkInfo> chunks)
++        {
++            Offset = offset;
++            Version = version;
++            TotalSize = totalSize;
++            Chunks = chunks;
++        }
++    }
++
++    public static class DxbcContainerValidator
++    {
++        private const int FixedHeaderSize = 32;
++        private const int MaxChunkCount = 128;
++
++        public static IReadOnlyList<DxbcContainerInfo> FindAll(ReadOnlySpan<byte> data)
++        {
++            var containers = new List<DxbcContainerInfo>();
++            for (var offset = 0; offset <= data.Length - FixedHeaderSize; offset++)
++            {
++                if (!HasMagic(data, offset))
++                {
++                    continue;
++                }
++
++                if (TryValidate(data, offset, out var container, out _))
++                {
++                    containers.Add(container);
++                    offset += container.TotalSize - 1;
++                }
++            }
++            return containers;
++        }
++
++        public static bool TryValidate(
++            ReadOnlySpan<byte> data,
++            int offset,
++            out DxbcContainerInfo container,
++            out string error)
++        {
++            container = null;
++            error = null;
++
++            if (offset < 0 || offset > data.Length - FixedHeaderSize)
++            {
++                error = "DXBC header is outside the source buffer";
++                return false;
++            }
++            if (!HasMagic(data, offset))
++            {
++                error = "DXBC magic is missing";
++                return false;
++            }
++
++            var version = BinaryPrimitives.ReadUInt32LittleEndian(data.Slice(offset + 20, 4));
++            var totalSize = BinaryPrimitives.ReadUInt32LittleEndian(data.Slice(offset + 24, 4));
++            var chunkCount = BinaryPrimitives.ReadUInt32LittleEndian(data.Slice(offset + 28, 4));
++            if (version != 1)
++            {
++                error = $"unsupported DXBC container version {version}";
++                return false;
++            }
++            if (totalSize < FixedHeaderSize || totalSize > int.MaxValue ||
++                totalSize > data.Length - offset)
++            {
++                error = $"invalid DXBC total size {totalSize}";
++                return false;
++            }
++            if (chunkCount < 1 || chunkCount > MaxChunkCount)
++            {
++                error = $"invalid DXBC chunk count {chunkCount}";
++                return false;
++            }
++
++            var chunkTableSize = checked((int)chunkCount * sizeof(uint));
++            var minimumChunkOffset = FixedHeaderSize + chunkTableSize;
++            if (minimumChunkOffset > totalSize)
++            {
++                error = "DXBC chunk table extends beyond the container";
++                return false;
++            }
++
++            var chunks = new List<DxbcChunkInfo>((int)chunkCount);
++            var ranges = new List<(int Start, int End)>((int)chunkCount);
++            for (var index = 0; index < chunkCount; index++)
++            {
++                var tableOffset = offset + FixedHeaderSize + checked((int)index * sizeof(uint));
++                var chunkOffsetValue = BinaryPrimitives.ReadUInt32LittleEndian(data.Slice(tableOffset, 4));
++                if (chunkOffsetValue < minimumChunkOffset ||
++                    chunkOffsetValue > totalSize - 8 ||
++                    chunkOffsetValue > int.MaxValue)
++                {
++                    error = $"DXBC chunk {index} has invalid offset {chunkOffsetValue}";
++                    return false;
++                }
++
++                var chunkOffset = (int)chunkOffsetValue;
++                var chunkHeader = data.Slice(offset + chunkOffset, 8);
++                var chunkSizeValue = BinaryPrimitives.ReadUInt32LittleEndian(chunkHeader.Slice(4, 4));
++                if (chunkSizeValue > int.MaxValue ||
++                    chunkSizeValue > totalSize - (uint)chunkOffset - 8)
++                {
++                    error = $"DXBC chunk {index} has invalid size {chunkSizeValue}";
++                    return false;
++                }
++
++                var fourCC = Encoding.ASCII.GetString(chunkHeader.Slice(0, 4));
++                for (var charIndex = 0; charIndex < fourCC.Length; charIndex++)
++                {
++                    if (fourCC[charIndex] < 0x20 || fourCC[charIndex] > 0x7e)
++                    {
++                        error = $"DXBC chunk {index} has a non-printable FourCC";
++                        return false;
++                    }
++                }
++
++                var chunkSize = (int)chunkSizeValue;
++                var range = (Start: chunkOffset, End: checked(chunkOffset + 8 + chunkSize));
++                foreach (var existing in ranges)
++                {
++                    if (range.Start < existing.End && existing.Start < range.End)
++                    {
++                        error = $"DXBC chunk {index} overlaps another chunk";
++                        return false;
++                    }
++                }
++
++                ranges.Add(range);
++                chunks.Add(new DxbcChunkInfo((int)index, fourCC, chunkOffset, chunkSize));
++            }
++
++            container = new DxbcContainerInfo(offset, (int)version, (int)totalSize, chunks);
++            return true;
++        }
++
++        private static bool HasMagic(ReadOnlySpan<byte> data, int offset)
++        {
++            return data[offset] == (byte)'D' &&
++                   data[offset + 1] == (byte)'X' &&
++                   data[offset + 2] == (byte)'B' &&
++                   data[offset + 3] == (byte)'C';
++        }
++    }
++}

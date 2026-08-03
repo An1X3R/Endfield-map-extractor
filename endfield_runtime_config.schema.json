@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local.endfield.invalid/schemas/endfield_runtime_config.schema.json",
+  "title": "Endfield local runtime configuration",
+  "type": "object",
+  "required": ["format", "paths"],
+  "properties": {
+    "format": {
+      "const": "EndfieldRuntimeConfig/1"
+    },
+    "paths": {
+      "type": "object",
+      "required": ["game_root", "cache_root", "export_root"],
+      "properties": {
+        "game_root": {"type": "string", "minLength": 1},
+        "cache_root": {"type": "string", "minLength": 1},
+        "export_root": {"type": "string", "minLength": 1},
+        "stage119_root": {"type": "string", "minLength": 1},
+        "webui_output_root": {"type": "string", "minLength": 1},
+        "blender_exe": {"type": ["string", "null"], "minLength": 1},
+        "blender_profile_registry": {"type": "string", "minLength": 1}
+      },
+      "additionalProperties": true
+    },
+    "extraction": {"type": "object"},
+    "helperDependencies": {"type": "object"},
+    "sceneDiscovery": {"type": "object"},
+    "blenderBuild": {"type": "object"}
+  },
+  "additionalProperties": false
+}

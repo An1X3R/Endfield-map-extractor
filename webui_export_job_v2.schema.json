@@ -1,0 +1,73 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "EndfieldWebUIExportJob-2",
+  "title": "Endfield WebUI bounded export job v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["format", "map_id", "selection", "layers", "water_mode", "effects", "output"],
+  "properties": {
+    "format": {"const": "EndfieldWebUIExportJob/2"},
+    "request_id": {"type": ["string", "null"]},
+    "job_id": {"type": ["string", "null"], "maxLength": 80, "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$"},
+    "map_id": {"type": "string", "enum": ["map01", "map02"]},
+    "source": {
+      "type": ["object", "null"], "additionalProperties": false,
+      "required": ["game_root"],
+      "properties": {
+        "game_root": {"type": "string", "minLength": 1},
+        "blender_exe": {"type": "string", "minLength": 1}
+      }
+    },
+    "selection": {
+      "oneOf": [
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["type", "umin", "umax", "vmin", "vmax"],
+          "properties": {
+            "type": {"const": "preview_rect"},
+            "umin": {"type": "number", "minimum": 0, "maximum": 1},
+            "umax": {"type": "number", "minimum": 0, "maximum": 1},
+            "vmin": {"type": "number", "minimum": 0, "maximum": 1},
+            "vmax": {"type": "number", "minimum": 0, "maximum": 1}
+          }
+        },
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["type", "xmin", "xmax", "zmin", "zmax"],
+          "properties": {
+            "type": {"const": "world_bounds"},
+            "xmin": {"type": "number"}, "xmax": {"type": "number"},
+            "zmin": {"type": "number"}, "zmax": {"type": "number"}
+          }
+        }
+      ]
+    },
+    "layers": {
+      "type": "object", "additionalProperties": false,
+      "required": ["terrain", "instances", "water", "effects"],
+      "properties": {
+        "terrain": {"type": "boolean"}, "instances": {"type": "boolean"},
+        "roads": {"type": "boolean"}, "vegetation": {"type": "boolean"},
+        "water": {"type": "boolean"}, "effects": {"type": "boolean"},
+        "lights": {"type": "boolean"}
+      }
+    },
+    "export_groups": {
+      "type": "array", "minItems": 1, "uniqueItems": true,
+      "items": {"type": "string", "enum": ["all", "lighting", "particle", "vegetation", "terrain", "road", "water", "effects", "unknown"]}
+    },
+    "water_mode": {"type": "string", "enum": ["stable_eevee", "flowmap_fresnel"]},
+    "effects": {
+      "type": "object", "additionalProperties": false,
+      "required": ["selection_mode"],
+      "properties": {
+        "selection_mode": {"type": "string", "enum": ["full_system_by_anchor", "anchor_overlap", "all_active"]}
+      }
+    },
+    "output": {
+      "type": "object", "additionalProperties": false,
+      "required": ["root"],
+      "properties": {"root": {"type": "string", "minLength": 1}, "label": {"type": "string"}}
+    }
+  }
+}

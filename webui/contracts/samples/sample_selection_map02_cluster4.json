@@ -1,0 +1,990 @@
+{
+  "format": "EndfieldChunkSelection/1",
+  "resolverVersion": "endfield-sector128-v1",
+  "mapId": "map02",
+  "requestedBounds": {
+    "xmin": -1536,
+    "xmax": -768,
+    "zmin": -1024,
+    "zmax": -256
+  },
+  "canonicalBounds": {
+    "xmin": -1536,
+    "xmax": -768,
+    "zmin": -1024,
+    "zmax": -256
+  },
+  "sectorSizeMetres": 128,
+  "sectors": [
+    {
+      "key": "sector:-12:-8",
+      "sectorX": -12,
+      "sectorZ": -8,
+      "unityBoundsXZ": {
+        "xmin": -1536,
+        "xmax": -1408,
+        "zmin": -1024,
+        "zmax": -896
+      },
+      "blenderBoundsXY": {
+        "xmin": -1536,
+        "xmax": -1408,
+        "ymin": 896,
+        "ymax": 1024
+      },
+      "levelId": "map02_lv004",
+      "hTile": {
+        "levelId": "map02_lv004",
+        "tileX": 5,
+        "tileY": 8
+      },
+      "coverage": "mapped"
+    },
+    {
+      "key": "sector:-11:-8",
+      "sectorX": -11,
+      "sectorZ": -8,
+      "unityBoundsXZ": {
+        "xmin": -1408,
+        "xmax": -1280,
+        "zmin": -1024,
+        "zmax": -896
+      },
+      "blenderBoundsXY": {
+        "xmin": -1408,
+        "xmax": -1280,
+        "ymin": 896,
+        "ymax": 1024
+      },
+      "levelId": "map02_lv004",
+      "hTile": {
+        "levelId": "map02_lv004",
+        "tileX": 6,
+        "tileY": 8
+      },
+      "coverage": "mapped"
+    },
+    {
+      "key": "sector:-10:-8",
+      "sectorX": -10,
+      "sectorZ": -8,
+      "unityBoundsXZ": {
+        "xmin": -1280,
+        "xmax": -1152,
+        "zmin": -1024,
+        "zmax": -896
+      },
+      "blenderBoundsXY": {
+        "xmin": -1280,
+        "xmax": -1152,
+        "ymin": 896,
+        "ymax": 1024
+      },
+      "levelId": "map02_lv004",
+      "hTile": {
+        "levelId": "map02_lv004",
+        "tileX": 7,
+        "tileY": 8
+      },
+      "coverage": "mapped"
+    },
+    {
+      "key": "sector:-9:-8",
+      "sectorX": -9,
+      "sectorZ": -8,
+      "unityBoundsXZ": {
+        "xmin": -1152,
+        "xmax": -1024,
+        "zmin": -1024,
+        "zmax": -896
+      },
+      "blenderBoundsXY": {
+        "xmin": -1152,
+        "xmax": -1024,
+        "ymin": 896,
+        "ymax": 1024
+      },
+      "levelId": null,
+      "hTile": null,
+      "coverage": "unmapped"
+    },
+    {
+      "key": "sector:-8:-8",
+      "sectorX": -8,
+      "sectorZ": -8,
+      "unityBoundsXZ": {
+        "xmin": -1024,
+        "xmax": -896,
+        "zmin": -1024,
+        "zmax": -896
+      },
+      "blenderBoundsXY": {
+        "xmin": -1024,
+        "xmax": -896,
+        "ymin": 896,
+        "ymax": 1024
+      },
+      "levelId": "map02_lv002",
+      "hTile": {
+        "levelId": "map02_lv002",
+        "tileX": 6,
+        "tileY": 1
+      },
+      "coverage": "mapped"
+    },
+    {
+      "key": "sector:-7:-8",
+      "sectorX": -7,
+      "sectorZ": -8,
+      "unityBoundsXZ": {
+        "xmin": -896,
+        "xmax": -768,
+        "zmin": -1024,
+        "zmax": -896
+      },
+      "blenderBoundsXY": {
+        "xmin": -896,
+        "xmax": -768,
+        "ymin": 896,
+        "ymax": 1024
+      },
+      "levelId": "map02_lv001",
+      "hTile": {
+        "levelId": "map02_lv001",
+        "tileX": 5,
+        "tileY": 9
+      },
+      "coverage": "mapped"
+    },
+    {
+      "key": "sector:-12:-7",
+      "sectorX": -12,
+      "sectorZ": -7,
+      "unityBoundsXZ": {
+        "xmin": -1536,
+        "xmax": -1408,
+        "zmin": -896,
+        "zmax": -768
+      },
+      "blenderBoundsXY": {
+        "xmin": -1536,
+        "xmax": -1408,
+        "ymin": 768,
+        "ymax": 896
+      },
+      "levelId": "map02_lv002",
+      "hTile": {
+        "levelId": "map02_lv002",
+        "tileX": 2,
+        "tileY": 2
+      },
+      "coverage": "mapped"
+    },
+    {
+      "key": "sector:-11:-7",
+      "sectorX": -11,
+      "sectorZ": -7,
+      "unityBoundsXZ": {
+        "xmin": -1408,
+        "xmax": -1280,
+        "zmin": -896,
+        "zmax": -768
+      },
+      "blenderBoundsXY": {
+        "xmin": -1408,
+        "xmax": -1280,
+        "ymin": 768,
+        "ymax": 896
+      },
+      "levelId": "map02_lv002",
+      "hTile": {
+        "levelId": "map02_lv002",
+        "tileX": 3,
+        "tileY": 2
+      },
+      "coverage": "mapped"
+    },
+    {
+      "key": "sector:-10:-7",
+      "sectorX": -10,
+      "sectorZ": -7,
+      "unityBoundsXZ": {
+        "xmin": -1280,
+        "xmax": -1152,
+        "zmin": -896,
+        "zmax": -768
+      },
+      "blenderBoundsXY": {
+        "xmin": -1280,
+        "xmax": -1152,
+        "ymin": 768,
+        "ymax": 896
+      },
+      "levelId": "map02_lv002",
+      "hTile": {
+        "levelId": "map02_lv002",
+        "tileX": 4,
+        "tileY": 2
+      },
+      "coverage": "mapped"
+    },
+    {
+      "key": "sector:-9:-7",
+      "sectorX": -9,
+      "sectorZ": -7,
+      "unityBoundsXZ": {
+        "xmin": -1152,
+        "xmax": -1024,
+        "zmin": -896,
+        "zmax": -768
+      },
+      "blenderBoundsXY": {
+        "xmin": -1152,
+        "xmax": -1024,
+        "ymin": 768,
+        "ymax": 896
+      },
+      "levelId": "map02_lv002",
+      "hTile": {
+        "levelId": "map02_lv002",
+        "tileX": 5,
+        "tileY": 2
+      },
+      "coverage": "mapped"
+    },
+    {
+      "key": "sector:-8:-7",
+      "sectorX": -8,
+      "sectorZ": -7,
+      "unityBoundsXZ": {
+        "xmin": -1024,
+        "xmax": -896,
+        "zmin": -896,
+        "zmax": -768
+      },
+      "blenderBoundsXY": {
+        "xmin": -1024,
+        "xmax": -896,
+        "ymin": 768,
+        "ymax": 896
+      },
+      "levelId": "map02_lv002",
+      "hTile": {
+        "levelId": "map02_lv002",
+        "tileX": 6,
+        "tileY": 2
+      },
+      "coverage": "mapped"
+    },
+    {
+      "key": "sector:-7:-7",
+      "sectorX": -7,
+      "sectorZ": -7,
+      "unityBoundsXZ": {
+        "xmin": -896,
+        "xmax": -768,
+        "zmin": -896,
+        "zmax": -768
+      },
+      "blenderBoundsXY": {
+        "xmin": -896,
+        "xmax": -768,
+        "ymin": 768,
+        "ymax": 896
+      },
+      "levelId": "map02_lv002",
+      "hTile": {
+        "levelId": "map02_lv002",
+        "tileX": 7,
+        "tileY": 2
+      },
+      "coverage": "mapped"
+    },
+    {
+      "key": "sector:-12:-6",
+      "sectorX": -12,
+      "sectorZ": -6,
+      "unityBoundsXZ": {
+        "xmin": -1536,
+        "xmax": -1408,
+        "zmin": -768,
+        "zmax": -640
+      },
+      "blenderBoundsXY": {
+        "xmin": -1536,
+        "xmax": -1408,
+        "ymin": 640,
+        "ymax": 768
+      },
+      "levelId": "map02_lv002",
+      "hTile": {
+        "levelId": "map02_lv002",
+        "tileX": 2,
+        "tileY": 3
+      },
+      "coverage": "mapped"
+    },
+    {
+      "key": "sector:-11:-6",
+      "sectorX": -11,
+      "sectorZ": -6,
+      "unityBoundsXZ": {
+        "xmin": -1408,
+        "xmax": -1280,
+        "zmin": -768,
+        "zmax": -640
+      },
+      "blenderBoundsXY": {
+        "xmin": -1408,
+        "xmax": -1280,
+        "ymin": 640,
+        "ymax": 768
+      },
+      "levelId": "map02_lv002",
+      "hTile": {
+        "levelId": "map02_lv002",
+        "tileX": 3,
+        "tileY": 3
+      },
+      "coverage": "mapped"
+    },
+    {
+      "key": "sector:-10:-6",
+      "sectorX": -10,
+      "sectorZ": -6,
+      "unityBoundsXZ": {
+        "xmin": -1280,
+        "xmax": -1152,
+        "zmin": -768,
+        "zmax": -640
+      },
+      "blenderBoundsXY": {
+        "xmin": -1280,
+        "xmax": -1152,
+        "ymin": 640,
+        "ymax": 768
+      },
+      "levelId": "map02_lv002",
+      "hTile": {
+        "levelId": "map02_lv002",
+        "tileX": 4,
+        "tileY": 3
+      },
+      "coverage": "mapped"
+    },
+    {
+      "key": "sector:-9:-6",
+      "sectorX": -9,
+      "sectorZ": -6,
+      "unityBoundsXZ": {
+        "xmin": -1152,
+        "xmax": -1024,
+        "zmin": -768,
+        "zmax": -640
+      },
+      "blenderBoundsXY": {
+        "xmin": -1152,
+        "xmax": -1024,
+        "ymin": 640,
+        "ymax": 768
+      },
+      "levelId": "map02_lv002",
+      "hTile": {
+        "levelId": "map02_lv002",
+        "tileX": 5,
+        "tileY": 3
+      },
+      "coverage": "mapped"
+    },
+    {
+      "key": "sector:-8:-6",
+      "sectorX": -8,
+      "sectorZ": -6,
+      "unityBoundsXZ": {
+        "xmin": -1024,
+        "xmax": -896,
+        "zmin": -768,
+        "zmax": -640
+      },
+      "blenderBoundsXY": {
+        "xmin": -1024,
+        "xmax": -896,
+        "ymin": 640,
+        "ymax": 768
+      },
+      "levelId": "map02_lv002",
+      "hTile": {
+        "levelId": "map02_lv002",
+        "tileX": 6,
+        "tileY": 3
+      },
+      "coverage": "mapped"
+    },
+    {
+      "key": "sector:-7:-6",
+      "sectorX": -7,
+      "sectorZ": -6,
+      "unityBoundsXZ": {
+        "xmin": -896,
+        "xmax": -768,
+        "zmin": -768,
+        "zmax": -640
+      },
+      "blenderBoundsXY": {
+        "xmin": -896,
+        "xmax": -768,
+        "ymin": 640,
+        "ymax": 768
+      },
+      "levelId": "map02_lv002",
+      "hTile": {
+        "levelId": "map02_lv002",
+        "tileX": 7,
+        "tileY": 3
+      },
+      "coverage": "mapped"
+    },
+    {
+      "key": "sector:-12:-5",
+      "sectorX": -12,
+      "sectorZ": -5,
+      "unityBoundsXZ": {
+        "xmin": -1536,
+        "xmax": -1408,
+        "zmin": -640,
+        "zmax": -512
+      },
+      "blenderBoundsXY": {
+        "xmin": -1536,
+        "xmax": -1408,
+        "ymin": 512,
+        "ymax": 640
+      },
+      "levelId": "map02_lv002",
+      "hTile": {
+        "levelId": "map02_lv002",
+        "tileX": 2,
+        "tileY": 4
+      },
+      "coverage": "mapped"
+    },
+    {
+      "key": "sector:-11:-5",
+      "sectorX": -11,
+      "sectorZ": -5,
+      "unityBoundsXZ": {
+        "xmin": -1408,
+        "xmax": -1280,
+        "zmin": -640,
+        "zmax": -512
+      },
+      "blenderBoundsXY": {
+        "xmin": -1408,
+        "xmax": -1280,
+        "ymin": 512,
+        "ymax": 640
+      },
+      "levelId": "map02_lv002",
+      "hTile": {
+        "levelId": "map02_lv002",
+        "tileX": 3,
+        "tileY": 4
+      },
+      "coverage": "mapped"
+    },
+    {
+      "key": "sector:-10:-5",
+      "sectorX": -10,
+      "sectorZ": -5,
+      "unityBoundsXZ": {
+        "xmin": -1280,
+        "xmax": -1152,
+        "zmin": -640,
+        "zmax": -512
+      },
+      "blenderBoundsXY": {
+        "xmin": -1280,
+        "xmax": -1152,
+        "ymin": 512,
+        "ymax": 640
+      },
+      "levelId": "map02_lv002",
+      "hTile": {
+        "levelId": "map02_lv002",
+        "tileX": 4,
+        "tileY": 4
+      },
+      "coverage": "mapped"
+    },
+    {
+      "key": "sector:-9:-5",
+      "sectorX": -9,
+      "sectorZ": -5,
+      "unityBoundsXZ": {
+        "xmin": -1152,
+        "xmax": -1024,
+        "zmin": -640,
+        "zmax": -512
+      },
+      "blenderBoundsXY": {
+        "xmin": -1152,
+        "xmax": -1024,
+        "ymin": 512,
+        "ymax": 640
+      },
+      "levelId": "map02_lv002",
+      "hTile": {
+        "levelId": "map02_lv002",
+        "tileX": 5,
+        "tileY": 4
+      },
+      "coverage": "mapped"
+    },
+    {
+      "key": "sector:-8:-5",
+      "sectorX": -8,
+      "sectorZ": -5,
+      "unityBoundsXZ": {
+        "xmin": -1024,
+        "xmax": -896,
+        "zmin": -640,
+        "zmax": -512
+      },
+      "blenderBoundsXY": {
+        "xmin": -1024,
+        "xmax": -896,
+        "ymin": 512,
+        "ymax": 640
+      },
+      "levelId": "map02_lv002",
+      "hTile": {
+        "levelId": "map02_lv002",
+        "tileX": 6,
+        "tileY": 4
+      },
+      "coverage": "mapped"
+    },
+    {
+      "key": "sector:-7:-5",
+      "sectorX": -7,
+      "sectorZ": -5,
+      "unityBoundsXZ": {
+        "xmin": -896,
+        "xmax": -768,
+        "zmin": -640,
+        "zmax": -512
+      },
+      "blenderBoundsXY": {
+        "xmin": -896,
+        "xmax": -768,
+        "ymin": 512,
+        "ymax": 640
+      },
+      "levelId": "map02_lv002",
+      "hTile": {
+        "levelId": "map02_lv002",
+        "tileX": 7,
+        "tileY": 4
+      },
+      "coverage": "mapped"
+    },
+    {
+      "key": "sector:-12:-4",
+      "sectorX": -12,
+      "sectorZ": -4,
+      "unityBoundsXZ": {
+        "xmin": -1536,
+        "xmax": -1408,
+        "zmin": -512,
+        "zmax": -384
+      },
+      "blenderBoundsXY": {
+        "xmin": -1536,
+        "xmax": -1408,
+        "ymin": 384,
+        "ymax": 512
+      },
+      "levelId": "map02_lv002",
+      "hTile": {
+        "levelId": "map02_lv002",
+        "tileX": 2,
+        "tileY": 5
+      },
+      "coverage": "mapped"
+    },
+    {
+      "key": "sector:-11:-4",
+      "sectorX": -11,
+      "sectorZ": -4,
+      "unityBoundsXZ": {
+        "xmin": -1408,
+        "xmax": -1280,
+        "zmin": -512,
+        "zmax": -384
+      },
+      "blenderBoundsXY": {
+        "xmin": -1408,
+        "xmax": -1280,
+        "ymin": 384,
+        "ymax": 512
+      },
+      "levelId": "map02_lv002",
+      "hTile": {
+        "levelId": "map02_lv002",
+        "tileX": 3,
+        "tileY": 5
+      },
+      "coverage": "mapped"
+    },
+    {
+      "key": "sector:-10:-4",
+      "sectorX": -10,
+      "sectorZ": -4,
+      "unityBoundsXZ": {
+        "xmin": -1280,
+        "xmax": -1152,
+        "zmin": -512,
+        "zmax": -384
+      },
+      "blenderBoundsXY": {
+        "xmin": -1280,
+        "xmax": -1152,
+        "ymin": 384,
+        "ymax": 512
+      },
+      "levelId": "map02_lv002",
+      "hTile": {
+        "levelId": "map02_lv002",
+        "tileX": 4,
+        "tileY": 5
+      },
+      "coverage": "mapped"
+    },
+    {
+      "key": "sector:-9:-4",
+      "sectorX": -9,
+      "sectorZ": -4,
+      "unityBoundsXZ": {
+        "xmin": -1152,
+        "xmax": -1024,
+        "zmin": -512,
+        "zmax": -384
+      },
+      "blenderBoundsXY": {
+        "xmin": -1152,
+        "xmax": -1024,
+        "ymin": 384,
+        "ymax": 512
+      },
+      "levelId": "map02_lv002",
+      "hTile": {
+        "levelId": "map02_lv002",
+        "tileX": 5,
+        "tileY": 5
+      },
+      "coverage": "mapped"
+    },
+    {
+      "key": "sector:-8:-4",
+      "sectorX": -8,
+      "sectorZ": -4,
+      "unityBoundsXZ": {
+        "xmin": -1024,
+        "xmax": -896,
+        "zmin": -512,
+        "zmax": -384
+      },
+      "blenderBoundsXY": {
+        "xmin": -1024,
+        "xmax": -896,
+        "ymin": 384,
+        "ymax": 512
+      },
+      "levelId": "map02_lv002",
+      "hTile": {
+        "levelId": "map02_lv002",
+        "tileX": 6,
+        "tileY": 5
+      },
+      "coverage": "mapped"
+    },
+    {
+      "key": "sector:-7:-4",
+      "sectorX": -7,
+      "sectorZ": -4,
+      "unityBoundsXZ": {
+        "xmin": -896,
+        "xmax": -768,
+        "zmin": -512,
+        "zmax": -384
+      },
+      "blenderBoundsXY": {
+        "xmin": -896,
+        "xmax": -768,
+        "ymin": 384,
+        "ymax": 512
+      },
+      "levelId": "map02_lv002",
+      "hTile": {
+        "levelId": "map02_lv002",
+        "tileX": 7,
+        "tileY": 5
+      },
+      "coverage": "mapped"
+    },
+    {
+      "key": "sector:-12:-3",
+      "sectorX": -12,
+      "sectorZ": -3,
+      "unityBoundsXZ": {
+        "xmin": -1536,
+        "xmax": -1408,
+        "zmin": -384,
+        "zmax": -256
+      },
+      "blenderBoundsXY": {
+        "xmin": -1536,
+        "xmax": -1408,
+        "ymin": 256,
+        "ymax": 384
+      },
+      "levelId": "map02_lv002",
+      "hTile": {
+        "levelId": "map02_lv002",
+        "tileX": 2,
+        "tileY": 6
+      },
+      "coverage": "mapped"
+    },
+    {
+      "key": "sector:-11:-3",
+      "sectorX": -11,
+      "sectorZ": -3,
+      "unityBoundsXZ": {
+        "xmin": -1408,
+        "xmax": -1280,
+        "zmin": -384,
+        "zmax": -256
+      },
+      "blenderBoundsXY": {
+        "xmin": -1408,
+        "xmax": -1280,
+        "ymin": 256,
+        "ymax": 384
+      },
+      "levelId": "map02_lv002",
+      "hTile": {
+        "levelId": "map02_lv002",
+        "tileX": 3,
+        "tileY": 6
+      },
+      "coverage": "mapped"
+    },
+    {
+      "key": "sector:-10:-3",
+      "sectorX": -10,
+      "sectorZ": -3,
+      "unityBoundsXZ": {
+        "xmin": -1280,
+        "xmax": -1152,
+        "zmin": -384,
+        "zmax": -256
+      },
+      "blenderBoundsXY": {
+        "xmin": -1280,
+        "xmax": -1152,
+        "ymin": 256,
+        "ymax": 384
+      },
+      "levelId": "map02_lv002",
+      "hTile": {
+        "levelId": "map02_lv002",
+        "tileX": 4,
+        "tileY": 6
+      },
+      "coverage": "mapped"
+    },
+    {
+      "key": "sector:-9:-3",
+      "sectorX": -9,
+      "sectorZ": -3,
+      "unityBoundsXZ": {
+        "xmin": -1152,
+        "xmax": -1024,
+        "zmin": -384,
+        "zmax": -256
+      },
+      "blenderBoundsXY": {
+        "xmin": -1152,
+        "xmax": -1024,
+        "ymin": 256,
+        "ymax": 384
+      },
+      "levelId": "map02_lv002",
+      "hTile": {
+        "levelId": "map02_lv002",
+        "tileX": 5,
+        "tileY": 6
+      },
+      "coverage": "mapped"
+    },
+    {
+      "key": "sector:-8:-3",
+      "sectorX": -8,
+      "sectorZ": -3,
+      "unityBoundsXZ": {
+        "xmin": -1024,
+        "xmax": -896,
+        "zmin": -384,
+        "zmax": -256
+      },
+      "blenderBoundsXY": {
+        "xmin": -1024,
+        "xmax": -896,
+        "ymin": 256,
+        "ymax": 384
+      },
+      "levelId": "map02_lv002",
+      "hTile": {
+        "levelId": "map02_lv002",
+        "tileX": 6,
+        "tileY": 6
+      },
+      "coverage": "mapped"
+    },
+    {
+      "key": "sector:-7:-3",
+      "sectorX": -7,
+      "sectorZ": -3,
+      "unityBoundsXZ": {
+        "xmin": -896,
+        "xmax": -768,
+        "zmin": -384,
+        "zmax": -256
+      },
+      "blenderBoundsXY": {
+        "xmin": -896,
+        "xmax": -768,
+        "ymin": 256,
+        "ymax": 384
+      },
+      "levelId": "map02_lv002",
+      "hTile": {
+        "levelId": "map02_lv002",
+        "tileX": 7,
+        "tileY": 6
+      },
+      "coverage": "mapped"
+    }
+  ],
+  "batches": [
+    {
+      "id": "cluster4:-2:-1",
+      "mode": "cluster_4x4_sectors",
+      "sectorKeys": [
+        "sector:-8:-4",
+        "sector:-7:-4",
+        "sector:-8:-3",
+        "sector:-7:-3"
+      ],
+      "selectedBounds": {
+        "xmin": -1024,
+        "xmax": -768,
+        "zmin": -512,
+        "zmax": -256
+      },
+      "alignedClusterBounds": {
+        "xmin": -1024,
+        "xmax": -512,
+        "zmin": -512,
+        "zmax": 0
+      }
+    },
+    {
+      "id": "cluster4:-2:-2",
+      "mode": "cluster_4x4_sectors",
+      "sectorKeys": [
+        "sector:-8:-8",
+        "sector:-7:-8",
+        "sector:-8:-7",
+        "sector:-7:-7",
+        "sector:-8:-6",
+        "sector:-7:-6",
+        "sector:-8:-5",
+        "sector:-7:-5"
+      ],
+      "selectedBounds": {
+        "xmin": -1024,
+        "xmax": -768,
+        "zmin": -1024,
+        "zmax": -512
+      },
+      "alignedClusterBounds": {
+        "xmin": -1024,
+        "xmax": -512,
+        "zmin": -1024,
+        "zmax": -512
+      }
+    },
+    {
+      "id": "cluster4:-3:-1",
+      "mode": "cluster_4x4_sectors",
+      "sectorKeys": [
+        "sector:-12:-4",
+        "sector:-11:-4",
+        "sector:-10:-4",
+        "sector:-9:-4",
+        "sector:-12:-3",
+        "sector:-11:-3",
+        "sector:-10:-3",
+        "sector:-9:-3"
+      ],
+      "selectedBounds": {
+        "xmin": -1536,
+        "xmax": -1024,
+        "zmin": -512,
+        "zmax": -256
+      },
+      "alignedClusterBounds": {
+        "xmin": -1536,
+        "xmax": -1024,
+        "zmin": -512,
+        "zmax": 0
+      }
+    },
+    {
+      "id": "cluster4:-3:-2",
+      "mode": "cluster_4x4_sectors",
+      "sectorKeys": [
+        "sector:-12:-8",
+        "sector:-11:-8",
+        "sector:-10:-8",
+        "sector:-9:-8",
+        "sector:-12:-7",
+        "sector:-11:-7",
+        "sector:-10:-7",
+        "sector:-9:-7",
+        "sector:-12:-6",
+        "sector:-11:-6",
+        "sector:-10:-6",
+        "sector:-9:-6",
+        "sector:-12:-5",
+        "sector:-11:-5",
+        "sector:-10:-5",
+        "sector:-9:-5"
+      ],
+      "selectedBounds": {
+        "xmin": -1536,
+        "xmax": -1024,
+        "zmin": -1024,
+        "zmax": -512
+      },
+      "alignedClusterBounds": {
+        "xmin": -1536,
+        "xmax": -1024,
+        "zmin": -1024,
+        "zmax": -512
+      }
+    }
+  ]
+}

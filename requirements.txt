@@ -1,0 +1,6 @@
+# Optional image thumbnails in the Tk UI. The UI has a standard-library fallback
+# when Pillow cannot be downloaded (for example, in an offline environment).
+Pillow>=10.4,<12
+pycryptodome>=3.20,<4
+brotli>=1.1,<2
+jsonschema>=4.23,<5

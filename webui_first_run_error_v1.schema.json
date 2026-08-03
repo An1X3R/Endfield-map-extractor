@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://endfield-extractor.local/schema/webui-first-run-error-v1.json",
+  "title": "Endfield WebUI first-run error",
+  "type": "object",
+  "required": ["format", "error"],
+  "properties": {
+    "format": {"const": "EndfieldWebUIFirstRunError/1"},
+    "error": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "message", "retryable"],
+      "properties": {
+        "code": {
+          "enum": ["invalid_request", "first_run_paths_incomplete", "already_running", "first_run_required", "already_ready", "dependency_install_failed", "cancelled", "backend_failure", "internal_error", "invalid_path_kind"]
+        },
+        "message": {"type": "string"},
+        "retryable": {"type": "boolean"},
+        "details": {"type": "object"}
+      }
+    },
+    "firstRun": {"type": "object"}
+  }
+}
