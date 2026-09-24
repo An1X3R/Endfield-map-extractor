@@ -59,9 +59,176 @@ class WebUIFirstRunBackendTests(unittest.TestCase):
 
             self.assertEqual("valid", validation["status"])
             self.assertTrue(validation["game_read_only"])
+            self.assertNotIn("blender_exe", request)
             self.assertEqual(str(export / "cache" / "first_run_work"), request["cache_root"])
             self.assertIn("cache", validation["space"])
             self.assertIn("git_available", validation["prerequisites"])
+
+    def test_optional_blender_path_is_checked_without_crossing_game_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            game = self.make_game_root(root)
+            export = root / "exports"
+            export.mkdir()
+            blender = root / "tools" / "blender.exe"
+            blender.parent.mkdir()
+            blender.write_bytes(b"fixture executable")
+            request = canonicalize_first_run_request(
+                {
+                    "format": REQUEST_FORMAT,
+                    "game_root": str(game),
+                    "export_root": str(export),
+                    "blender_exe": str(blender),
+                }
+            )
+            validation = validate_first_run_paths(request)
+
+            self.assertEqual(str(blender.resolve()), request["blender_exe"])
+            self.assertTrue(validation["game_read_only"])
+            self.assertTrue(validation["checks"]["blender_exe"])
+            self.assertEqual("valid", validation["status"])
+
+            with self.assertRaisesRegex(ValueError, "non-empty path"):
+                canonicalize_first_run_request(
+                    {
+                        "format": REQUEST_FORMAT,
+                        "game_root": str(game),
+                        "export_root": str(export),
+                        "blender_exe": None,
+                    }
+                )
+            with self.assertRaisesRegex(ValueError, "existing blender.exe"):
+                canonicalize_first_run_request(
+                    {
+                        "format": REQUEST_FORMAT,
+                        "game_root": str(game),
+                        "export_root": str(export),
+                        "blender_exe": str(root / "missing.exe"),
+                    }
+                )
+            with self.assertRaisesRegex(ValueError, "existing blender.exe"):
+                canonicalize_first_run_request(
+                    {
+                        "format": REQUEST_FORMAT,
+                        "game_root": str(game),
+                        "export_root": str(export),
+                        "blender_exe": str(root / "tools" / "not-blender.exe"),
+                    }
+                )
+
+            game_blender = game / "tools" / "blender.exe"
+            game_blender.parent.mkdir()
+            game_blender.write_bytes(b"fixture executable")
+            with self.assertRaisesRegex(ValueError, "outside game_root"):
+                canonicalize_first_run_request(
+                    {
+                        "format": REQUEST_FORMAT,
+                        "game_root": str(game),
+                        "export_root": str(export),
+                        "blender_exe": str(game_blender),
+                    }
+                )
+
+    def test_first_run_child_uses_external_cache_for_temp_and_pip(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            game = self.make_game_root(root)
+            export = root / "exports"
+            export.mkdir()
+            cache = root / "external-cache"
+            request = canonicalize_first_run_request(
+                {
+                    "format": REQUEST_FORMAT,
+                    "game_root": str(game),
+                    "export_root": str(export),
+                    "cache_root": str(cache),
+                    "run_name": "process-env-check",
+                }
+            )
+            coordinator = FirstRunCoordinator(
+                extractor_root=root,
+                interpreter_provider=lambda: Path(sys.executable),
+            )
+            report_path = root / "child-environment.json"
+            code = (
+                "import json,os,sys;"
+                "keys=('TEMP','TMP','PIP_CACHE_DIR','PYTHONDONTWRITEBYTECODE');"
+                "json.dump({key:os.environ.get(key) for key in keys},open(sys.argv[1],'w'))"
+            )
+            original_environment = {
+                key: os.environ.get(key)
+                for key in ("TEMP", "TMP", "PIP_CACHE_DIR", "PYTHONDONTWRITEBYTECODE")
+            }
+            with (root / "child.log").open("w", encoding="utf-8") as console:
+                process = coordinator._spawn_process(
+                    [sys.executable, "-c", code, str(report_path)],
+                    console,
+                    request=request,
+                )
+                self.assertEqual(0, process.wait(timeout=10))
+
+            child_environment = json.loads(report_path.read_text(encoding="utf-8"))
+            process_root = cache / "webui_first_run_process"
+            self.assertEqual(str(process_root / "temp"), child_environment["TEMP"])
+            self.assertEqual(child_environment["TEMP"], child_environment["TMP"])
+            self.assertEqual(str(process_root / "pip"), child_environment["PIP_CACHE_DIR"])
+            self.assertEqual("1", child_environment["PYTHONDONTWRITEBYTECODE"])
+            self.assertTrue((process_root / "temp").is_dir())
+            self.assertTrue((process_root / "pip").is_dir())
+            self.assertFalse(Path(child_environment["TEMP"]).is_relative_to(game))
+            self.assertFalse(Path(child_environment["PIP_CACHE_DIR"]).is_relative_to(game))
+            self.assertEqual(
+                original_environment,
+                {key: os.environ.get(key) for key in original_environment},
+            )
+
+    def test_scene_input_capability_requires_complete_game_bound_sceneprobe_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            game = self.make_game_root(root)
+            export = root / "exports"
+            export.mkdir()
+            cache = root / "external-cache"
+            request = canonicalize_first_run_request(
+                {
+                    "format": REQUEST_FORMAT,
+                    "game_root": str(game),
+                    "export_root": str(export),
+                    "cache_root": str(cache),
+                    "run_name": "scene-input-check",
+                }
+            )
+            coordinator = FirstRunCoordinator(
+                extractor_root=root,
+                interpreter_provider=lambda: Path(sys.executable),
+            )
+            paths = coordinator._paths(request)
+            paths["run_root"].mkdir(parents=True)
+            maps = {}
+            for map_id in ("map01", "map02"):
+                instances = paths["run_root"] / f"{map_id}.sqlite"
+                sceneprobe = paths["run_root"] / f"{map_id}_sceneprobe.json"
+                instances.write_bytes(b"read-only fixture")
+                sceneprobe.write_text("{}", encoding="utf-8")
+                maps[map_id] = {"instances": str(instances), "sceneProbe": {"path": str(sceneprobe)}}
+            paths["runtime"].write_text(
+                json.dumps(
+                    {
+                        "format": "EndfieldRuntimeConfig/1",
+                        "paths": {"game_root": str(game)},
+                        "extraction": {"maps": maps},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            completed = coordinator._result_summary(paths, {}, "completed", request, exit_code=0)
+            partial = coordinator._result_summary(paths, {}, "completed_with_deferred_helpers", request, exit_code=0)
+            failed_exit = coordinator._result_summary(paths, {}, "completed", request, exit_code=1)
+
+            self.assertEqual("ready", completed["capabilities"]["blender_build"])
+            self.assertEqual("not_ready", partial["capabilities"]["blender_build"])
+            self.assertEqual("not_ready", failed_exit["capabilities"]["blender_build"])
 
     def test_deferred_launcher_paths_allow_a_fresh_unconfigured_clone(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -164,12 +331,24 @@ class WebUIFirstRunBackendTests(unittest.TestCase):
                     "export_root": str(export),
                 }
             )
+            blender = root / "tools" / "blender.exe"
+            blender.parent.mkdir()
+            blender.write_bytes(b"fixture executable")
+            blender_request = canonicalize_first_run_request(
+                {
+                    "format": REQUEST_FORMAT,
+                    "game_root": str(game),
+                    "export_root": str(export),
+                    "blender_exe": str(blender),
+                }
+            )
             coordinator = FirstRunCoordinator(
                 extractor_root=root,
                 interpreter_provider=lambda: Path(sys.executable),
             )
             fixtures = (
                 ("webui_first_run_validation_v1.schema.json", validate_first_run_paths(request)),
+                ("webui_first_run_validation_v1.schema.json", validate_first_run_paths(blender_request)),
                 ("webui_first_run_status_v1.schema.json", coordinator.status()),
                 ("webui_first_run_events_v1.schema.json", coordinator.events()),
                 (
@@ -183,26 +362,57 @@ class WebUIFirstRunBackendTests(unittest.TestCase):
                     (schema_root / schema_name).read_text(encoding="utf-8")
                 )
                 jsonschema.Draft202012Validator(schema).validate(payload)
+            request_schema = json.loads(
+                (schema_root / "webui_first_run_job_v1.schema.json").read_text(encoding="utf-8")
+            )
+            request_validator = jsonschema.Draft202012Validator(request_schema)
+            base_request = {
+                "format": REQUEST_FORMAT,
+                "game_root": str(game),
+                "export_root": str(export),
+            }
+            request_validator.validate(base_request)
+            request_validator.validate(
+                {**base_request, "blender_exe": str(root / "tools" / "blender.exe")}
+            )
+            with self.assertRaises(jsonschema.ValidationError):
+                request_validator.validate({**base_request, "blender_exe": 17})
 
-    def test_command_is_complete_resumable_and_does_not_activate_config(self) -> None:
-        request = {
-            "game_root": r"X:\Games\Endfield Game",
-            "cache_root": r"Y:\EndfieldCache",
-            "export_root": r"Y:\EndfieldExports",
-            "run_name": "bootstrap_v1",
-        }
-        command = build_first_run_command(
-            Path(r"C:\Python\python.exe"),
-            Path(r"C:\Extractor\endfield_first_run.py"),
-            request,
-            cancel_marker=Path(r"Y:\EndfieldExports\log\first_run_bootstrap_v1\CANCEL.webui.1"),
-            resume=True,
-        )
+    def test_command_passes_optional_blender_without_changing_legacy_requests(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            base_request = {
+                "game_root": str(root / "Endfield Game"),
+                "cache_root": str(root / "cache"),
+                "export_root": str(root / "exports"),
+                "run_name": "bootstrap_v1",
+            }
+            python = root / "python.exe"
+            script = root / "endfield_first_run.py"
+            cancel_marker = root / "cancel.marker"
+            legacy_command = build_first_run_command(
+                python, script, base_request, cancel_marker=cancel_marker, resume=False
+            )
+            blender = root / "blender.exe"
+            blender.write_bytes(b"fixture executable")
+            command = build_first_run_command(
+                python,
+                script,
+                {**base_request, "blender_exe": str(blender)},
+                cancel_marker=cancel_marker,
+                resume=True,
+            )
 
-        self.assertIn("--resume", command)
-        self.assertIn("--no-activate-runtime-config", command)
-        self.assertNotIn("--skip-helper-bootstrap", command)
-        self.assertNotIn("--skip-scene-discovery", command)
+            self.assertNotIn("--blender-exe", legacy_command)
+            self.assertIn("--resume", command)
+            self.assertIn("--no-activate-runtime-config", command)
+            blender_index = command.index("--blender-exe")
+            self.assertEqual(
+                ["--blender-exe", str(blender)],
+                command[blender_index:blender_index + 2],
+            )
+            self.assertNotIn("--skip-helper-bootstrap", command)
+            self.assertNotIn("--skip-scene-discovery", command)
 
     def test_completed_state_restores_ready_gate_and_runtime(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -358,14 +568,14 @@ class WebUIFirstRunBackendTests(unittest.TestCase):
             original_spawn = coordinator._spawn_process
             spawned: list[subprocess.Popen[str]] = []
 
-            def spawn_long_tree(_command, console):
+            def spawn_long_tree(_command, console, *, request):
                 code = (
                     "import pathlib,subprocess,sys,time;"
                     "child=subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)']);"
                     f"pathlib.Path({str(pid_file)!r}).write_text(str(child.pid));"
                     "time.sleep(60)"
                 )
-                process = original_spawn([sys.executable, "-c", code], console)
+                process = original_spawn([sys.executable, "-c", code], console, request=request)
                 spawned.append(process)
                 return process
 
@@ -517,6 +727,44 @@ class WebUIFirstRunBackendTests(unittest.TestCase):
             server.shutdown()
             server.server_close()
             thread.join(timeout=2)
+
+    def test_real_bridge_initializes_with_complete_runtime_defaults(self) -> None:
+        first_run_name = "public_update_material_regions_20260907_0001"
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            game = self.make_game_root(root)
+            export = root / "exports"
+            cache = root / "cache"
+            export.mkdir()
+            cache.mkdir()
+            defaults = {
+                "game_root": str(game),
+                "export_root": str(export),
+                "cache_root": str(cache),
+                "run_name": first_run_name,
+            }
+            original_defaults = dict(defaults)
+            server, thread = launch_webui.start_path_picker(
+                None,
+                first_run_name=first_run_name,
+                first_run_defaults=defaults,
+            )
+            try:
+                request = Request(
+                    f"http://127.0.0.1:{server.server_port}/first-run",
+                    headers={"X-Endfield-Path-Picker-Token": server.token},
+                )
+                with urlopen(request, timeout=5) as response:
+                    status = json.loads(response.read().decode("utf-8"))
+                self.assertEqual(200, response.status)
+                self.assertEqual("idle", status["state"])
+                self.assertEqual(first_run_name, status["defaults"]["run_name"])
+                self.assertEqual(str(game.resolve()), status["defaults"]["game_root"])
+                self.assertEqual(original_defaults, defaults)
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
 
 
 if __name__ == "__main__":

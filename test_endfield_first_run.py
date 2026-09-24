@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import closing
 import json
 import os
 from pathlib import Path
@@ -21,6 +22,48 @@ from extractor_core.terrain import decode_dxt5
 
 
 class FirstRunPlanTests(unittest.TestCase):
+    def test_cli_blender_path_is_resolved_without_running_the_binary(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            game = root / "Endfield Game"
+            game.mkdir()
+            cache = root / "cache"
+            export = root / "exports"
+            blender = root / "tools" / "blender.exe"
+            blender.parent.mkdir()
+            blender.write_bytes(b"fixture executable")
+            config = root / "runtime.json"
+            config.write_text(
+                json.dumps(
+                    {
+                        "format": "EndfieldRuntimeConfig/1",
+                        "paths": {
+                            "game_root": str(game),
+                            "cache_root": str(cache),
+                            "export_root": str(export),
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            args = argparse.Namespace(
+                config=config,
+                game_root=None,
+                cache_root=None,
+                export_root=None,
+                blender_exe=blender,
+            )
+
+            resolved = endfield_first_run.resolve_paths(args)
+            selected = endfield_first_run.validate_blender(
+                resolved["blenderExe"], required=False
+            )
+
+            self.assertEqual(blender.resolve(), selected)
+            self.assertTrue(game.is_dir())
+            self.assertFalse(cache.exists())
+            self.assertFalse(export.exists())
+
     def test_event_file_survives_detached_stdout(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             events = Path(temporary) / "events.jsonl"
@@ -138,8 +181,38 @@ class BundleDiscoveryBootstrapTests(unittest.TestCase):
             )
             self.assertFalse(
                 endfield_first_run.automatic_asset_upgrade_needed(
-                    {"format": "EndfieldAutomaticAssetResolutionSummary/1"}, scan
+                    {
+                        "format": "EndfieldAutomaticAssetResolutionSummary/1",
+                        "asset_resolution_policy_version": endfield_first_run.ASSET_RESOLUTION_POLICY_VERSION,
+                        "bundle_scan_sha256": endfield_first_run.sha256_file(scan),
+                    },
+                    scan,
                 )
+            )
+
+    def test_asset_step_upgrades_when_scene_probe_input_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            scan = root / "bundle_candidates.jsonl"
+            probe = root / "scene_manifest.json"
+            scan.write_text("{}\n", encoding="utf-8")
+            probe.write_text("{}\n", encoding="utf-8")
+            meta = {
+                "format": "EndfieldAutomaticAssetResolutionSummary/1",
+                "asset_resolution_policy_version": endfield_first_run.ASSET_RESOLUTION_POLICY_VERSION,
+                "bundle_scan_sha256": endfield_first_run.sha256_file(scan),
+                "scene_probe_manifest_sha256": endfield_first_run.sha256_file(probe),
+            }
+            self.assertFalse(
+                endfield_first_run.automatic_asset_upgrade_needed(meta, scan, probe)
+            )
+            old_policy = {key: value for key, value in meta.items() if key != "asset_resolution_policy_version"}
+            self.assertTrue(endfield_first_run.automatic_asset_upgrade_needed(old_policy, scan, probe))
+            old_policy["asset_resolution_policy_version"] = "obsolete"
+            self.assertTrue(endfield_first_run.automatic_asset_upgrade_needed(old_policy, scan, probe))
+            probe.write_text('{"changed":true}\n', encoding="utf-8")
+            self.assertTrue(
+                endfield_first_run.automatic_asset_upgrade_needed(meta, scan, probe)
             )
 
     def test_scan_index_and_candidate_names_are_generated_from_local_outputs(self) -> None:
@@ -260,6 +333,186 @@ class BundleDiscoveryBootstrapTests(unittest.TestCase):
             finally:
                 connection.close()
             self.assertEqual(row, ("prefab", "main/map01.ab", "CAB-map01"))
+
+    def test_resolution_and_binding_evidence_remain_consistent(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            instances, resources, output = (root / name for name in ("instances.sqlite", "resources.sqlite", "assets.sqlite"))
+            floor = "assets/map02/s_mod_map02_floor+1_009_20_lod0.fbx"
+            gate = "assets/map02/p_module_gate+1_001_01.prefab"
+            bridge = "assets/map02/p_module_bridge+1_001_01.prefab"
+            house = "assets/map02/s_build_map02_house+1_001_01_lod0.fbx"
+            expected = {
+                "P_mod_map02_floor+1_009_20": ("bundle_scanner", "bundle_model_exact"),
+                "P_mod_map02_floor+1_009_20b": ("bundle_scanner", "bundle_model_family_candidate"),
+                "P_mod_map02_gate+1_001_01": ("bundle_scanner", "bundle_prefab_canonical"),
+                "P_mod_map02_bridge+1_001_01": ("scene_probe", "probe_prefab_container"),
+                "P_build_map02_house+1_001_01b": ("scene_probe", "probe_mesh_family_candidate"),
+            }
+            with closing(sqlite3.connect(instances)) as database, database:
+                database.execute("CREATE TABLE instances (entity_base TEXT)")
+                database.executemany("INSERT INTO instances VALUES (?)", ((base,) for base in expected))
+            with closing(sqlite3.connect(resources)) as database, database:
+                database.execute("CREATE TABLE paths (path TEXT, path_folded TEXT)")
+                path = floor + "##S_mod_map02_floor+1_009_20_lod0"
+                database.execute("INSERT INTO paths VALUES (?,?)", (path, path.casefold()))
+            scan = root / "scan.jsonl"
+            scan.write_text("\n".join(json.dumps({"kind": "match", "logical_name": name,
+                "containers": [container], "serialized": [{"name": cab}]})
+                for name, container, cab in (("main/floor.ab", floor, "CAB-floor"),
+                                             ("main/gate.ab", gate, "CAB-gate"))), encoding="utf-8")
+            mesh = {"Source": "CAB-house", "PathId": 1, "Name": "S_build_map02_house+1_001_01_lod0", "Type": "Mesh"}
+            probe = root / "scene_manifest.json"
+            probe.write_text(json.dumps({"Format": "EndfieldSceneProbe/1", "Containers": [
+                {"Container": bridge, "Asset": {"Source": "CAB-bridge", "PathId": 2, "Type": "GameObject", "Name": "bridge"}},
+                {"Container": house, "Asset": mesh}], "MeshExports": [{"Asset": mesh, "File": "house.obj"}]}), encoding="utf-8")
+            summary = build_asset_resolution_database("map02", instances, resources, scan, output, probe)
+            self.assertEqual(endfield_first_run.ASSET_RESOLUTION_POLICY_VERSION, summary["asset_resolution_policy_version"])
+            with closing(sqlite3.connect(output)) as database:
+                rows = database.execute("SELECT r.entity_base,b.source_kind,b.evidence_level,r.container_path,b.container_path,"
+                    "r.root_cab,b.root_cab,b.binding_status FROM resolutions r JOIN asset_bindings b USING(entity_base)").fetchall()
+                self.assertEqual(endfield_first_run.ASSET_RESOLUTION_POLICY_VERSION, database.execute(
+                    "SELECT value FROM meta WHERE key='asset_resolution_policy_version'").fetchone()[0])
+            self.assertEqual(len(expected), len(rows))
+            for base, source, evidence, container, binding_container, cab, binding_cab, status in rows:
+                self.assertEqual(expected[base], (source, evidence))
+                self.assertEqual((container, cab), (binding_container, binding_cab))
+                self.assertEqual("resolved", status)
+
+    def test_scene_probe_fallback_resolves_model_when_bundle_scan_has_no_match(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            instances = root / "instances.sqlite"
+            connection = sqlite3.connect(instances)
+            connection.execute("CREATE TABLE instances (entity_base TEXT)")
+            connection.execute(
+                "INSERT INTO instances VALUES (?)",
+                ("P_build_map02_house+1_001_02",),
+            )
+            connection.commit()
+            connection.close()
+
+            resources = root / "resources.sqlite"
+            connection = sqlite3.connect(resources)
+            connection.execute("CREATE TABLE paths (path TEXT, path_folded TEXT)")
+            connection.commit()
+            connection.close()
+
+            scan = root / "scan.jsonl"
+            scan.write_text(json.dumps({"kind": "complete"}) + "\n", encoding="utf-8")
+            probe = root / "scene_manifest.json"
+            mesh = {
+                "Source": "CAB-house",
+                "PathId": 11,
+                "Type": "Mesh",
+                "Name": "S_build_map02_house+1_001_02_lod0",
+            }
+            probe.write_text(
+                json.dumps(
+                    {
+                        "Format": "EndfieldSceneProbe/1",
+                        "Containers": [
+                            {
+                                "Container": "assets/beyond/arts/environment/sceneassets/map02/build/build_map02_house+1_001/models/s_build_map02_house+1_001_02_lod0.fbx",
+                                "Asset": mesh,
+                                "DeclaredBy": "CAB-house",
+                            }
+                        ],
+                        "MeshExports": [{"Asset": mesh, "File": "meshes/house.obj"}],
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            output = root / "assets.sqlite"
+            summary = build_asset_resolution_database(
+                "map02",
+                instances,
+                resources,
+                scan,
+                output,
+                scene_probe_manifest=probe,
+            )
+            self.assertEqual(summary["uniqueByMethod"], {"model": 1})
+            self.assertTrue(summary["probeFallbackEnabled"])
+            connection = sqlite3.connect(output)
+            try:
+                row = connection.execute(
+                    "SELECT method,container_path,root_cab,model_asset_name FROM resolutions"
+                ).fetchone()
+                logical_name = connection.execute(
+                    "SELECT logical_name FROM resolutions"
+                ).fetchone()
+            finally:
+                connection.close()
+            self.assertEqual(
+                row,
+                (
+                    "model",
+                    "assets/beyond/arts/environment/sceneassets/map02/build/build_map02_house+1_001/models/s_build_map02_house+1_001_02_lod0.fbx",
+                    "CAB-house",
+                    "S_build_map02_house+1_001_02_lod0",
+                ),
+            )
+            self.assertEqual(logical_name, (None,))
+
+    def test_scene_probe_hlod_is_kept_as_proxy_candidate_not_model(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            instances = root / "instances.sqlite"
+            connection = sqlite3.connect(instances)
+            connection.execute("CREATE TABLE instances (entity_base TEXT)")
+            connection.execute(
+                "INSERT INTO instances VALUES (?)",
+                ("HLOD0_25_40_Cluster_-1192744638",),
+            )
+            connection.commit()
+            connection.close()
+
+            resources = root / "resources.sqlite"
+            connection = sqlite3.connect(resources)
+            connection.execute("CREATE TABLE paths (path TEXT, path_folded TEXT)")
+            connection.commit()
+            connection.close()
+
+            scan = root / "scan.jsonl"
+            scan.write_text(json.dumps({"kind": "complete"}) + "\n", encoding="utf-8")
+            probe = root / "scene_manifest.json"
+            mesh = {
+                "Source": "CAB-HLOD",
+                "PathId": 7,
+                "Type": "Mesh",
+                "Name": "S_HLOD0_25_40_Cluster_-1192744638",
+            }
+            probe.write_text(
+                json.dumps(
+                    {
+                        "Format": "EndfieldSceneProbe/1",
+                        "MeshExports": [{"Asset": mesh, "File": "meshes/hlod.obj"}],
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            output = root / "assets.sqlite"
+            summary = build_asset_resolution_database(
+                "map02", instances, resources, scan, output, scene_probe_manifest=probe
+            )
+            self.assertEqual(summary["uniqueByMethod"], {"unresolved": 1})
+            connection = sqlite3.connect(output)
+            try:
+                self.assertEqual(
+                    connection.execute("SELECT COUNT(*) FROM hlod_candidates").fetchone(),
+                    (1,),
+                )
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT source_name FROM hlod_candidates"
+                    ).fetchone(),
+                    ("S_HLOD0_25_40_Cluster_-1192744638",),
+                )
+            finally:
+                connection.close()
 
     def test_embedded_dxt5_decoder_has_no_external_fixture_dependency(self) -> None:
         block = bytes([255, 0]) + bytes(6) + (0xF800).to_bytes(2, "little")

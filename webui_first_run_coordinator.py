@@ -57,6 +57,7 @@ PHASES = (
     "scene_candidate_bundles",
     "asset_bootstrap",
     "map_layers",
+    "map_overviews",
     "audit",
     "complete",
 )
@@ -116,6 +117,9 @@ def build_first_run_command(
         str(cancel_marker),
         "--no-activate-runtime-config",
     ]
+    blender_exe = request.get("blender_exe")
+    if blender_exe is not None:
+        command.extend(["--blender-exe", str(blender_exe)])
     if resume:
         command.append("--resume")
     return command
@@ -266,6 +270,7 @@ class FirstRunCoordinator:
         paths: Mapping[str, Path],
         state_payload: Mapping[str, Any],
         source_status: str,
+        request: Mapping[str, Any],
         *,
         exit_code: int | None = None,
     ) -> dict[str, Any]:
@@ -285,20 +290,15 @@ class FirstRunCoordinator:
             if isinstance(status, str):
                 capabilities["asset_resolution"][map_id] = status
         capabilities["map_dataset"] = "ready" if actual_stage.is_dir() else "not_ready"
-        blender_build = runtime_payload.get("blenderBuild") or {}
-        if isinstance(blender_build.get("status"), str):
-            capabilities["blender_build"] = blender_build["status"]
-        profile_path_value = (runtime_payload.get("paths") or {}).get("blender_profile_registry")
-        if isinstance(profile_path_value, str) and profile_path_value.strip():
-            profile_path = Path(profile_path_value).expanduser().resolve()
-            if profile_path.is_file():
-                try:
-                    profile = json.loads(profile_path.read_text(encoding="utf-8-sig"))
-                    scan_status = (profile.get("scan") or {}).get("status")
-                    if isinstance(scan_status, str):
-                        capabilities["profile_scan"] = scan_status
-                except (OSError, json.JSONDecodeError):
-                    pass
+        if source_status == "completed" and exit_code in (None, 0) and runtime_path.is_file():
+            from endfield_scene_export import scene_runtime
+
+            try:
+                for map_id in ("map01", "map02"):
+                    scene_runtime(runtime_path, Path(str(request["game_root"])), map_id)
+                capabilities["blender_build"] = "ready"
+            except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+                capabilities["blender_build"] = "not_ready"
         reports = sorted(
             paths["log_root"].glob("first_run_report*.json") if paths["log_root"].is_dir() else [],
             key=lambda item: item.stat().st_mtime_ns,
@@ -387,7 +387,7 @@ class FirstRunCoordinator:
             if source_status in {"failed", "cancelled"}
             else "idle"
         )
-        result = self._result_summary(paths, state_payload, source_status)
+        result = self._result_summary(paths, state_payload, source_status, request)
         self._status = self._decorate_status({
             "format": STATUS_FORMAT,
             "job_id": request["run_name"],
@@ -417,12 +417,55 @@ class FirstRunCoordinator:
                 {**self._status, **changes, "format": STATUS_FORMAT, "updated_at": utc_now()}
             )
 
-    def _spawn_process(self, command: list[str], console: Any) -> subprocess.Popen[str]:
+    def _spawn_process(
+        self,
+        command: list[str],
+        console: Any,
+        *,
+        request: Mapping[str, Any],
+    ) -> subprocess.Popen[str]:
+        game_root = Path(str(request["game_root"])).resolve()
+        cache_root = Path(str(request["cache_root"])).resolve()
+        if (
+            cache_root == game_root
+            or cache_root.is_relative_to(game_root)
+            or game_root.is_relative_to(cache_root)
+        ):
+            raise FirstRunCoordinatorError(
+                "invalid_request",
+                "First-run process cache must remain separate from the game installation",
+            )
+        process_root = cache_root / "webui_first_run_process"
+        temporary = process_root / "temp"
+        pip_cache = process_root / "pip"
+        temporary.mkdir(parents=True, exist_ok=True)
+        pip_cache.mkdir(parents=True, exist_ok=True)
+        resolved_process_paths = (temporary.resolve(), pip_cache.resolve())
+        if any(
+            not path.is_relative_to(cache_root)
+            or path == game_root
+            or path.is_relative_to(game_root)
+            for path in resolved_process_paths
+        ):
+            raise FirstRunCoordinatorError(
+                "invalid_request",
+                "First-run TEMP and pip cache paths must resolve inside the external cache root",
+            )
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "TEMP": str(resolved_process_paths[0]),
+                "TMP": str(resolved_process_paths[0]),
+                "PIP_CACHE_DIR": str(resolved_process_paths[1]),
+                "PYTHONDONTWRITEBYTECODE": "1",
+            }
+        )
         kwargs: dict[str, Any] = {
             "cwd": str(self.extractor_root),
             "stdout": console,
             "stderr": subprocess.STDOUT,
             "text": True,
+            "env": environment,
         }
         if os.name == "nt":
             kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
@@ -527,6 +570,7 @@ class FirstRunCoordinator:
                             str(self.requirements_path),
                         ],
                         console,
+                        request=request,
                     )
                     dependency_code = self._wait_process(dependency_process)
                     if dependency_code != 0:
@@ -535,7 +579,7 @@ class FirstRunCoordinator:
                             f"Python dependency installation failed with exit code {dependency_code}",
                         )
                     console.flush()
-                process = self._spawn_process(command, console)
+                process = self._spawn_process(command, console, request=request)
                 self._set_status(phase="preflight", progress=0.0, message="First-run extraction started")
                 exit_code = self._wait_process(process, cancel_marker=cancel_marker)
 
@@ -561,7 +605,7 @@ class FirstRunCoordinator:
             else:
                 final_state = "failed"
                 ready = False
-            result = self._result_summary(paths, state_payload, source_status, exit_code=exit_code)
+            result = self._result_summary(paths, state_payload, source_status, request, exit_code=exit_code)
             self._set_status(
                 state=final_state,
                 phase="complete" if ready else final_state,
@@ -592,7 +636,7 @@ class FirstRunCoordinator:
                     state_payload = json.loads(paths["state"].read_text(encoding="utf-8"))
                 except (OSError, json.JSONDecodeError):
                     state_payload = {}
-            result = self._result_summary(paths, state_payload, "cancelled")
+            result = self._result_summary(paths, state_payload, "cancelled", request)
             self._set_status(
                 state="cancelled",
                 phase="cancelled",

@@ -387,7 +387,7 @@ def start_path_picker(
             on_stage_ready(generated_config, generated_stage)
 
     complete_initial_request = (
-        first_run_defaults
+        {**first_run_defaults, "format": REQUEST_FORMAT}
         if first_run_defaults
         and all(first_run_defaults.get(name) for name in ("game_root", "export_root", "cache_root"))
         else None
@@ -584,7 +584,7 @@ def validate_runtime_paths(paths: dict[str, Path | None], *, include_interactive
         if missing:
             errors.append(
                 f"Endfield game directory is incomplete at {game_root}; missing: {', '.join(missing)}. "
-                "Select the read-only 'Endfield Game' directory."
+                "Select the installation directory containing Endfield.exe and Endfield_Data."
             )
     blender_exe = paths["blender_exe"]
     if blender_exe is not None and (not blender_exe.is_file() or blender_exe.name.casefold() != "blender.exe"):

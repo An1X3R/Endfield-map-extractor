@@ -22,6 +22,7 @@ export type FirstRunRequest = {
   game_root: string
   export_root: string
   cache_root?: string
+  blender_exe?: string
   run_name: string
 }
 
@@ -113,6 +114,25 @@ export type JobPhase =
   | 'auditing'
   | 'completed'
   | 'cancelled'
+
+export type ExportMode = 'data_package' | 'blend'
+
+export type BlenderBuildScene = {
+  path: string
+  audit: string
+  plan: string
+  bytes: number
+  sha256: string
+  instances: number
+  pending: number
+}
+
+export type BlenderBuildResult = {
+  status: string
+  scheduled?: boolean
+  scenes?: BlenderBuildScene[]
+  pending?: number
+}
 
 export type LogTone = 'neutral' | 'accent' | 'success' | 'warning'
 

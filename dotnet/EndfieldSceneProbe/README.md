@@ -8,6 +8,8 @@ It accepts one already-extracted Endfield AssetBundle or a small folder of bundl
 - `meshes/*.obj`: meshes referenced by renderers.
 - `textures/*.png`: textures referenced by selected materials when the decoder supports the format and the streamed data is available.
 
+The manifest also includes `DecalProjectors` with HGDecalProjector parameters and exact material references. Shader names are read from the serialized type tree to support the current Endfield shader layout. Runtime decal instances still require the separate InitChunkData/StreamingChunkData join performed by `extract_projected_decals.py`; prefab parameters alone do not identify every runtime material variant.
+
 The output directory must not already exist; the tool refuses to overwrite it. It does not read process memory, start the game, or modify the game installation.
 
 Build:
@@ -28,6 +30,6 @@ For diagnostic bundles containing standalone meshes/textures but no GameObjects,
 
 For a broader dependency/inventory pass without writing OBJ or PNG files, append `--manifest-only`.
 
+Material records retain serialized disabled passes, valid keywords and render queues. Resolved shader references also include the original pass names. These describe source render state; they do not reconstruct HGRP execution. For focused pipeline-resource research, `--dump-metadata` writes original type-tree dumps for MonoBehaviour, TextAsset, Shader and ComputeShader objects and records them in `MetadataExports`. Use a small selected bundle set; missing type trees fail explicitly.
+
 `AssetMap` and `CABMap` in AnimeStudio solve a different layer: AssetMap indexes objects/containers/source files, while CABMap maps Unity CAB names to physical bundle paths so PPtr dependencies can be loaded. This probe consumes the resulting small physical bundle set and records the scene relationships needed by a later Blender builder.
-
-

@@ -5,7 +5,7 @@ using System.Text.Json.Serialization;
 using AnimeStudio;
 using Object = AnimeStudio.Object;
 
-internal static class Program
+internal static partial class Program
 {
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -59,7 +59,7 @@ internal static class Program
             ClassIDType.AssetBundle, ClassIDType.ResourceManager,
             ClassIDType.GameObject, ClassIDType.Transform, ClassIDType.RectTransform,
             ClassIDType.MeshFilter, ClassIDType.MeshRenderer, ClassIDType.SkinnedMeshRenderer,
-            ClassIDType.Mesh, ClassIDType.Material, ClassIDType.Texture2D, ClassIDType.Shader,
+            ClassIDType.Mesh, ClassIDType.Material, ClassIDType.Texture2D,
         })
             TypeFlags.SetType(type, true, false);
 
@@ -78,6 +78,8 @@ internal static class Program
         var allMeshes = allObjects.OfType<Mesh>().ToList();
         var allMaterials = allObjects.OfType<Material>().ToList();
         var allTextures = allObjects.OfType<Texture2D>().ToList();
+        var shaderReferences = allObjects.Where(obj => obj.type == ClassIDType.Shader)
+            .ToDictionary(obj => (obj.assetsFile.fileName, obj.m_PathID), ReadShaderReference);
 
         var meshRefs = new HashSet<Mesh>();
         var materialRefs = new HashSet<Material>();
@@ -125,6 +127,14 @@ internal static class Program
             });
         }
 
+        var projectors = new List<DecalProjectorRecord>();
+        foreach (var obj in allObjects.Where(obj => obj.type == ClassIDType.HGDecalProjector))
+        {
+            var (projector, material) = ReadDecalProjector(obj);
+            projectors.Add(projector);
+            materialRefs.Add(material);
+        }
+
         if (options.IncludeUnreferenced)
         {
             meshRefs.UnionWith(allMeshes);
@@ -151,12 +161,15 @@ internal static class Program
                 });
             }
 
+            var shaderReference = ToRef(material.m_Shader, material.assetsFile);
             materialRecords.Add(new MaterialRecord
             {
                 Name = material.m_Name,
                 Source = material.assetsFile.fileName,
                 PathId = material.m_PathID,
-                Shader = ToRef(material.m_Shader, material.assetsFile),
+                Shader = shaderReferences.GetValueOrDefault(
+                    (shaderReference.Source, shaderReference.PathId), shaderReference),
+                RenderState = ReadMaterialRenderState(material),
                 Textures = texEnvs,
                 Ints = material.m_SavedProperties.m_Ints?.ToDictionary(x => x.Key, x => x.Value),
                 Floats = material.m_SavedProperties.m_Floats.ToDictionary(x => x.Key, x => x.Value),
@@ -201,7 +214,7 @@ internal static class Program
             {
                 error = ex.Message;
             }
-            textureRecords.Add(new ExportRecord(ToRef(texture), error == null ? Path.GetRelativePath(output, path) : null, error));
+            textureRecords.Add(new ExportRecord(TextureReference(texture), error == null ? Path.GetRelativePath(output, path) : null, error));
         }
 
         var containers = BuildContainers(allObjects);
@@ -218,9 +231,11 @@ internal static class Program
                 ObjectCount = f.Objects.Count,
             }).ToList(),
             Nodes = nodes,
+            DecalProjectors = projectors,
             Materials = materialRecords,
             MeshExports = meshRecords,
             TextureExports = textureRecords,
+            MetadataExports = options.DumpMetadata ? ExportSerializedMetadata(allObjects, output) : [],
             Containers = containers,
             Summary = new Dictionary<string, int>
             {
@@ -234,6 +249,7 @@ internal static class Program
                 ["allTextures"] = allTextures.Count,
                 ["selectedTextures"] = textureRefs.Count,
                 ["containers"] = containers.Count,
+                ["decalProjectors"] = projectors.Count,
             },
         };
 
@@ -260,6 +276,14 @@ internal static class Program
     }
 
     private static AssetRef ToRef(Object obj) => new(obj.assetsFile.fileName, obj.m_PathID, obj.type.ToString(), obj.Name);
+
+    private static AssetRef TextureReference(Texture2D texture)
+    {
+        var fields = texture.ToType();
+        if (fields?["m_ColorSpace"] is not int colorSpace || colorSpace is not (0 or 1))
+            throw new InvalidDataException($"Texture2D requires serialized m_ColorSpace 0/1: source={texture.assetsFile.fileName}, pathId={texture.m_PathID}");
+        return ToRef(texture) with { ColorSpace = colorSpace };
+    }
 
     private static AssetRef ToRef<T>(PPtr<T> pointer, SerializedFile owner) where T : Object
     {
@@ -332,14 +356,14 @@ internal static class Program
         return true;
     }
 
-    private sealed record Options(string Input, string Output, bool IncludeUnreferenced, bool ManifestOnly)
+    private sealed record Options(string Input, string Output, bool IncludeUnreferenced, bool ManifestOnly, bool DumpMetadata)
     {
         public static Options Parse(string[] args)
         {
             if (args.Length < 2)
-                throw new ArgumentException("Usage: EndfieldSceneProbe <input-file-or-folder> <new-output-folder> [--include-unreferenced] [--manifest-only]");
+                throw new ArgumentException("Usage: EndfieldSceneProbe <input-file-or-folder> <new-output-folder> [--include-unreferenced] [--manifest-only] [--dump-metadata]");
             var flags = args.Skip(2).ToHashSet(StringComparer.OrdinalIgnoreCase);
-            return new Options(args[0], args[1], flags.Contains("--include-unreferenced"), flags.Contains("--manifest-only"));
+            return new Options(args[0], args[1], flags.Contains("--include-unreferenced"), flags.Contains("--manifest-only"), flags.Contains("--dump-metadata"));
         }
     }
 }
@@ -350,9 +374,11 @@ internal sealed class SceneReport
     public required string[] InputFiles { get; init; }
     public required List<SerializedFileRecord> SerializedFiles { get; init; }
     public required List<NodeRecord> Nodes { get; init; }
+    public required List<DecalProjectorRecord> DecalProjectors { get; init; }
     public required List<MaterialRecord> Materials { get; init; }
     public required List<ExportRecord> MeshExports { get; init; }
     public required List<ExportRecord> TextureExports { get; init; }
+    public required List<ExportRecord> MetadataExports { get; init; }
     public required List<ContainerRecord> Containers { get; init; }
     public required Dictionary<string, int> Summary { get; init; }
 }
@@ -389,6 +415,7 @@ internal sealed class MaterialRecord
     public required string Source { get; init; }
     public required long PathId { get; init; }
     public required AssetRef Shader { get; init; }
+    public required MaterialRenderState RenderState { get; init; }
     public required List<TextureSlotRecord> Textures { get; init; }
     public Dictionary<string, int>? Ints { get; init; }
     public required Dictionary<string, float> Floats { get; init; }
@@ -403,8 +430,10 @@ internal sealed class TextureSlotRecord
     public required float[] Offset { get; init; }
 }
 
-internal sealed record AssetRef(string Source, long PathId, string Type, string? Name);
+internal sealed record AssetRef(string Source, long PathId, string Type, string? Name)
+{
+    public string[]? PassNames { get; init; }
+    public int? ColorSpace { get; init; }
+}
 internal sealed record ExportRecord(AssetRef Asset, string? File, string? Error);
 internal sealed record ContainerRecord(string Container, AssetRef Asset, string DeclaredBy);
-
-

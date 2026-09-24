@@ -188,6 +188,11 @@ def canonicalize_job(payload: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError(f"Unsupported batch_mode: {batch_mode!r}")
     raw_source = payload.get("source")
     source = None if raw_source is None else validate_source_paths(dict(raw_source))
+    export_mode = payload.get("export_mode", "data_package")
+    if export_mode not in ("data_package", "blend"):
+        raise ValueError(f"Unsupported export_mode: {export_mode!r}")
+    if export_mode == "blend" and (source is None or not source.get("blender_exe")):
+        raise ValueError("Blender scene export requires source.blender_exe and source.game_root")
     export_groups = normalize_export_groups(payload.get("export_groups"))
     request_id = payload.get("request_id")
     if request_id is not None and not isinstance(request_id, str):
@@ -211,6 +216,7 @@ def canonicalize_job(payload: Mapping[str, Any]) -> dict[str, Any]:
         "baseline_policy": spec.baseline_policy,
         "water_binding_status": spec.water_binding_status,
         "source": source,
+        "export_mode": export_mode,
         "layers": normalized_layers,
         "export_groups": export_groups,
         "water_mode": water_mode,

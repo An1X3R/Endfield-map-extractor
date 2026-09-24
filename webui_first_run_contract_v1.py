@@ -101,6 +101,8 @@ def canonicalize_first_run_request(
     game_text = payload.get("game_root")
     export_text = payload.get("export_root")
     cache_text = payload.get("cache_root")
+    blender_provided = "blender_exe" in payload
+    blender_text = payload.get("blender_exe")
     run_name = payload.get("run_name", default_run_name)
     if not isinstance(game_text, str) or not game_text.strip():
         raise FirstRunRequestError("invalid_request", "game_root must be a non-empty path")
@@ -109,6 +111,12 @@ def canonicalize_first_run_request(
     if cache_text is not None and (not isinstance(cache_text, str) or not cache_text.strip()):
         raise FirstRunRequestError(
             "invalid_request", "cache_root must be a non-empty path when provided"
+        )
+    if blender_provided and (
+        not isinstance(blender_text, str) or not blender_text.strip()
+    ):
+        raise FirstRunRequestError(
+            "invalid_request", "blender_exe must be a non-empty path when provided"
         )
     if not isinstance(run_name, str) or not RUN_NAME_RE.fullmatch(run_name):
         raise FirstRunRequestError(
@@ -122,6 +130,11 @@ def canonicalize_first_run_request(
         if isinstance(cache_text, str)
         else (export_root / "cache" / "first_run_work").resolve()
     )
+    blender_exe = (
+        Path(blender_text).expanduser().resolve()
+        if blender_provided and isinstance(blender_text, str)
+        else None
+    )
     if any(
         (
             _inside(game_root, export_root),
@@ -134,14 +147,28 @@ def canonicalize_first_run_request(
             "invalid_request",
             "game_root, export_root, and cache_root must be disjoint external roots",
         )
+    if blender_exe is not None:
+        if not blender_exe.is_file() or blender_exe.name.casefold() != "blender.exe":
+            raise FirstRunRequestError(
+                "invalid_request",
+                f"blender_exe must point to an existing blender.exe: {blender_exe}",
+            )
+        if _inside(game_root, blender_exe):
+            raise FirstRunRequestError(
+                "invalid_request",
+                "blender_exe must be outside game_root to preserve the game read-only boundary",
+            )
 
-    return {
+    canonical = {
         "format": REQUEST_FORMAT,
         "game_root": str(game_root),
         "export_root": str(export_root),
         "cache_root": str(cache_root),
         "run_name": run_name,
     }
+    if blender_exe is not None:
+        canonical["blender_exe"] = str(blender_exe)
+    return canonical
 
 
 def validate_first_run_paths(request: Mapping[str, Any]) -> dict[str, Any]:
@@ -157,6 +184,11 @@ def validate_first_run_paths(request: Mapping[str, Any]) -> dict[str, Any]:
         "cache_root_not_file": not cache_root.is_file(),
         "cache_parent_writable": _writable_parent(cache_root),
     }
+    if "blender_exe" in request:
+        blender_exe = Path(str(request["blender_exe"]))
+        checks["blender_exe"] = (
+            blender_exe.is_file() and blender_exe.name.casefold() == "blender.exe"
+        )
     missing = [name for name, valid in checks.items() if not valid]
     space = {
         "cache": _disk_space(cache_root, BASELINE_CACHE_BYTES),

@@ -50,6 +50,8 @@ export const LAYER_LABELS = {
 } as const
 
 export const EXPORT_GROUPS = [
+  ['building', '建筑', 'G09'],
+  ['prop', '道具', 'G10'],
   ['lighting', '光源', 'G01'],
   ['particle', '粒子', 'G02'],
   ['vegetation', '植被', 'G03'],
@@ -57,7 +59,7 @@ export const EXPORT_GROUPS = [
   ['road', '道路', 'G05'],
   ['water', '水体', 'G06'],
   ['effects', '特效', 'G07'],
-  ['unknown', '未知', 'G08'],
+  ['unknown', '未知 / 其它', 'G08'],
 ] as const
 
 export const JOB_PHASES = [

@@ -10,15 +10,6 @@ from webui_export_worker import ExportCoordinator
 from webui_job_store import JobStore
 
 
-class PackageOnlyCoordinator(ExportCoordinator):
-    def _load_dataset(self):
-        return {
-            "format": "EndfieldRegionMapLayerManifest/1",
-            "datasetFingerprint": "A" * 64,
-            "maps": {"map01": {"layers": {}}},
-        }, {}
-
-
 class PackageOnlyExportTests(unittest.TestCase):
     def request(self, output: Path) -> dict:
         return {
@@ -50,8 +41,15 @@ class PackageOnlyExportTests(unittest.TestCase):
             output = root / "output"
             jobs = root / "jobs"
             stage.mkdir()
+            fingerprint = "A" * 64
+            (stage / "region_map_layer_manifest.json").write_text(json.dumps({
+                "format": "EndfieldRegionMapLayerManifest/1", "datasetFingerprint": fingerprint,
+                "maps": {"map01": {"layers": {"instances": {"indexPath": "instances.json"}}}},
+            }), encoding="utf-8")
+            (stage / "full_audit.json").write_text(json.dumps({"status": "passed", "datasetFingerprint": fingerprint}), encoding="utf-8")
+            (stage / "instances.json").write_text(json.dumps({"shards": []}), encoding="utf-8")
             output.mkdir()
-            coordinator = PackageOnlyCoordinator(stage119_root=stage, store=JobStore(jobs))
+            coordinator = ExportCoordinator(stage119_root=stage, store=JobStore(jobs))
 
             validation = coordinator.validate(self.request(output))
             self.assertEqual(validation["exportMode"], "data_package")

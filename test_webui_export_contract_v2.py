@@ -11,6 +11,16 @@ import jsonschema
 import webui_export_contract_v2 as contract
 
 
+def create_game_install(root: Path) -> Path:
+    root.mkdir(parents=True)
+    (root / "Endfield.exe").write_bytes(b"")
+    global_managers = root / "Endfield_Data" / "globalgamemanagers"
+    global_managers.parent.mkdir(parents=True)
+    global_managers.write_bytes(b"")
+    (root / "Endfield_Data" / "StreamingAssets" / "VFS").mkdir(parents=True)
+    return root
+
+
 def payload(map_id: str = "map01") -> dict:
     return {
         "format": contract.CONTRACT_FORMAT,
@@ -25,6 +35,35 @@ def payload(map_id: str = "map01") -> dict:
 
 
 class ContractTests(unittest.TestCase):
+    def test_blend_requires_current_user_blender(self) -> None:
+        value = payload()
+        value["export_mode"] = "blend"
+        with self.assertRaisesRegex(ValueError, "source.blender_exe"):
+            contract.canonicalize_job(value)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            game = create_game_install(root / "renamed-install")
+            blender = root / "custom-blender" / "blender.exe"
+            blender.parent.mkdir()
+            blender.write_bytes(b"test")
+            output = root / "output"
+            output.mkdir()
+            value["source"] = {"game_root": str(game), "blender_exe": str(blender)}
+            value["output"]["root"] = str(output)
+            value["export_groups"] = ["building", "prop"]
+            result = contract.canonicalize_job(value)
+            self.assertEqual(result["export_mode"], "blend")
+            self.assertEqual(result["source"]["blender_exe"], str(blender.resolve()))
+            self.assertEqual(result["export_groups"], ["building", "prop"])
+            schema = json.loads(Path(__file__).with_name("webui_export_job_v2.schema.json").read_text())
+            jsonschema.validate(value, schema)
+
+    def test_unknown_export_mode_fails(self) -> None:
+        value = payload()
+        value["export_mode"] = "pretend_blend"
+        with self.assertRaisesRegex(ValueError, "Unsupported export_mode"):
+            contract.canonicalize_job(value)
+
     def test_map01_preview_uses_decreasing_z(self) -> None:
         canonical = contract.canonicalize_job(payload("map01"))
         self.assertEqual(canonical["preview"]["v_direction"], "z_decreasing")
@@ -50,8 +89,7 @@ class ContractTests(unittest.TestCase):
         value["export_groups"] = ["lighting", "particle", "lighting"]
         with tempfile.TemporaryDirectory() as temporary:
             temporary_root = Path(temporary)
-            root = temporary_root / "game" / "Endfield Game"
-            root.mkdir(parents=True)
+            root = create_game_install(temporary_root / "game" / "renamed-install")
             output = temporary_root / "output"
             output.mkdir()
             blender = temporary_root / "blender.exe"
@@ -66,8 +104,7 @@ class ContractTests(unittest.TestCase):
         value = payload()
         with tempfile.TemporaryDirectory() as temporary:
             temporary_root = Path(temporary)
-            root = temporary_root / "game" / "Endfield Game"
-            root.mkdir(parents=True)
+            root = create_game_install(temporary_root / "game" / "portable-build")
             output = temporary_root / "output"
             output.mkdir()
             value["source"] = {"game_root": str(root)}
@@ -75,6 +112,31 @@ class ContractTests(unittest.TestCase):
             canonical = contract.canonicalize_job(value)
         self.assertNotIn("blender_exe", canonical["source"])
         self.assertTrue(canonical["source"]["game_read_only"])
+
+    def test_source_paths_require_endfield_install_structure(self) -> None:
+        missing_entries = (
+            ("missing-executable", Path("Endfield.exe"), "Endfield.exe", False),
+            (
+                "missing-global-managers",
+                Path("Endfield_Data") / "globalgamemanagers",
+                "Endfield_Data/globalgamemanagers",
+                False,
+            ),
+            (
+                "missing-vfs",
+                Path("Endfield_Data") / "StreamingAssets" / "VFS",
+                "Endfield_Data/StreamingAssets/VFS",
+                True,
+            ),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            for case_name, relative_path, expected_label, is_directory in missing_entries:
+                with self.subTest(missing=expected_label):
+                    root = create_game_install(Path(temporary) / case_name)
+                    missing_path = root / relative_path
+                    missing_path.rmdir() if is_directory else missing_path.unlink()
+                    with self.assertRaisesRegex(ValueError, expected_label.replace("/", r"\/")):
+                        contract.validate_source_paths({"game_root": str(root)})
 
     def test_request_schema_accepts_package_only_source_and_all_layer_flags(self) -> None:
         value = payload()
@@ -94,8 +156,7 @@ class ContractTests(unittest.TestCase):
     def test_output_root_is_restricted(self) -> None:
         value = payload()
         with tempfile.TemporaryDirectory() as temporary:
-            game_root = Path(temporary) / "Endfield Game"
-            game_root.mkdir()
+            game_root = create_game_install(Path(temporary) / "renamed-game-root")
             blender = Path(temporary) / "blender.exe"
             blender.write_text("demo", encoding="ascii")
             value["source"] = {"game_root": str(game_root), "blender_exe": str(blender)}

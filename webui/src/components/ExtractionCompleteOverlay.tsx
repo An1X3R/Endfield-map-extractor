@@ -1,13 +1,15 @@
 import { useEffect } from 'react'
 import type { CSSProperties } from 'react'
 import { AnimatePresence, motion, useReducedMotion } from 'motion/react'
-import type { MapId } from '../types'
+import type { BlenderBuildResult, ExportMode, MapId } from '../types'
 
 type Props = {
   visible: boolean
   mapId: MapId
   mapName: string
   sectorCount: number
+  exportMode: ExportMode
+  blenderBuild: BlenderBuildResult | null
   onFinished: () => void
 }
 
@@ -27,16 +29,22 @@ export function ExtractionCompleteOverlay({
   mapId,
   mapName,
   sectorCount,
+  exportMode,
+  blenderBuild,
   onFinished,
 }: Props) {
   const reduceMotion = useReducedMotion()
   const copy = completionCopy[mapId]
+  const scenes = blenderBuild?.scenes ?? []
+  const partialSceneBuild = exportMode === 'blend' && (
+    blenderBuild?.status === 'partial' || (blenderBuild?.pending ?? 0) > 0
+  )
 
   useEffect(() => {
-    if (!visible) return
+    if (!visible || exportMode === 'blend') return
     const timer = window.setTimeout(onFinished, reduceMotion ? 1700 : 4100)
     return () => window.clearTimeout(timer)
-  }, [onFinished, reduceMotion, visible])
+  }, [exportMode, onFinished, reduceMotion, visible])
 
   return (
     <AnimatePresence initial={false}>
@@ -143,7 +151,7 @@ export function ExtractionCompleteOverlay({
             </div>
 
             <motion.div
-              className="completion-copy"
+              className={`completion-copy ${partialSceneBuild ? 'completion-copy--partial' : ''}`}
               initial={reduceMotion ? false : { opacity: 0, x: -18 }}
               animate={{ opacity: 1, x: 0 }}
               transition={{
@@ -153,11 +161,42 @@ export function ExtractionCompleteOverlay({
               }}
             >
               <span>{copy.code}</span>
-              <h2>提取完成</h2>
+              <h2>{exportMode === 'blend'
+                ? partialSceneBuild ? '场景已导出 · 有待处理项' : '场景已导出'
+                : '提取完成'}</h2>
               <p>{mapName} / {sectorCount} SECTORS</p>
-              <small>{copy.detail}</small>
+              <small>{exportMode === 'blend'
+                ? partialSceneBuild ? 'BLEND FILES VERIFIED / ITEMS REMAIN PENDING' : 'BLEND FILES VERIFIED / SCENE EXPORT COMPLETE'
+                : copy.detail}</small>
             </motion.div>
           </motion.div>
+
+          {exportMode === 'blend' && (
+            <div className="completion-scene-report" aria-label="Blender 场景构建结果">
+              <div className="completion-scene-report__heading">
+                <div>
+                  <strong>{partialSceneBuild ? 'BLENDER SCENES / PARTIAL' : 'BLENDER SCENES / VERIFIED'}</strong>
+                  <span>{scenes.length} 批 · 路径相对输出目录 · {blenderBuild?.pending ?? 0} 项待处理</span>
+                </div>
+                <button type="button" onClick={onFinished}>关闭</button>
+              </div>
+              {scenes.length > 0 ? (
+                <>
+                  <ul>
+                    {scenes.map((scene) => (
+                      <li key={scene.path}>
+                        <code title={scene.path}>{scene.path}</code>
+                        <span>{scene.instances} 个实例 · {scene.pending} 项待处理</span>
+                      </li>
+                    ))}
+                  </ul>
+                  {partialSceneBuild && <p>待处理数包含尚未接入的组件，不等同于缺失资产数量；场景文件已写入并通过重开校验。</p>}
+                </>
+              ) : (
+                <p>任务已完成，但后端没有返回场景路径；请检查导出报告。</p>
+              )}
+            </div>
+          )}
 
           <motion.div
             className="completion-confirm-line"

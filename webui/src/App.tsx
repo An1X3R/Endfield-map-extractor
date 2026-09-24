@@ -41,6 +41,8 @@ import type {
   FirstRunRequest,
   FirstRunStatus,
   FirstRunValidation,
+  BlenderBuildResult,
+  ExportMode,
   LayerId,
   LayerState,
   MapId,
@@ -117,6 +119,7 @@ const FIRST_RUN_PHASE_LABELS: Record<string, string> = {
   scene_candidate_bundles: '收束候选资源',
   asset_bootstrap: '构建自动资产层',
   map_layers: '生成地图图层',
+  map_overviews: '生成地图底图',
   audit: '执行完整审计',
   complete: '数据准备完成',
   partial: '保留部分结果',
@@ -161,9 +164,17 @@ const JOB_PHASES = [
   ['PREPARE', '准备只读索引', 0],
   ['CHUNKS', '生成区块清单', 18],
   ['EXTRACT', '导出分层数据', 32],
-  ['BUILD', '签名数据包', 48],
-  ['AUDIT', '数据包哈希审计', 91],
+  ['BUILD', '构建场景与数据包', 48],
+  ['AUDIT', '校验输出文件', 91],
 ] as const
+
+const RECONSTRUCTABLE_BLEND_GROUPS = ['building', 'prop', 'vegetation', 'terrain', 'road', 'unknown']
+const EXPORT_GROUP_NOTES: Record<string, string> = {
+  lighting: '仅数据记录',
+  particle: '仅数据记录',
+  water: '自动绑定待接入',
+  effects: '场景重建待接入',
+}
 
 type LaunchState = 'idle' | 'running' | 'completed' | 'cancelled' | 'failed'
 
@@ -173,8 +184,8 @@ type ExportJob = {
   phase: string
   progress: number
   result?: {
-    package?: { output_dir?: string; status?: string; warnings?: string[] }
-    blenderBuild?: { status?: string; scheduled?: boolean; reason?: string }
+    package?: { output_dir?: string; status?: string; exportMode?: ExportMode; warnings?: string[] }
+    blenderBuild?: BlenderBuildResult
   } | null
   error?: { message?: string; type?: string } | null
 }
@@ -393,7 +404,7 @@ function LegalArchive() {
   )
 }
 
-function MapTransitionVeil({ mapId, direction, overviewSource }: { mapId: MapId; direction: 'forward' | 'back'; overviewSource: 'loading' | 'dev-override' | 'generated-cache' | 'fallback' }) {
+function MapTransitionVeil({ mapId, direction, overviewSource }: { mapId: MapId; direction: 'forward' | 'back'; overviewSource: 'loading' | 'dev-override' | 'runtime-config' | 'fallback' }) {
   const ready = overviewSource !== 'loading'
   const reduceMotion = useReducedMotion()
 
@@ -444,11 +455,9 @@ export default function App() {
   const [firstRunEvents, setFirstRunEvents] = useState<FirstRunEvent[]>([])
   const [firstRunAction, setFirstRunAction] = useState<'status' | 'validate' | 'start' | 'resume' | 'cancel' | null>('status')
   const [firstRunError, setFirstRunError] = useState('')
-  const [selectedGroups, setSelectedGroups] = useState<string[]>([
-    'lighting',
-    'particle',
-    'terrain',
-  ])
+  const [exportMode, setExportMode] = useState<ExportMode>('blend')
+  const [allGroupsSelected, setAllGroupsSelected] = useState(true)
+  const [selectedGroups, setSelectedGroups] = useState<string[]>([])
   const [effectsMode, setEffectsMode] = useState('full_system_by_anchor')
   const [waterMode, setWaterMode] = useState('stable_eevee')
   const [chunkMode, setChunkMode] = useState<ChunkMode>('per_sector')
@@ -456,13 +465,15 @@ export default function App() {
   const [drawerCollapsed, setDrawerCollapsed] = useState(false)
   const [launchState, setLaunchState] = useState<LaunchState>('idle')
   const [completionVisible, setCompletionVisible] = useState(false)
+  const [completedExportMode, setCompletedExportMode] = useState<ExportMode>('blend')
+  const [completedBlenderBuild, setCompletedBlenderBuild] = useState<BlenderBuildResult | null>(null)
   const [progress, setProgress] = useState(0)
   const [activeJobId, setActiveJobId] = useState<string | null>(null)
   const [jobMessage, setJobMessage] = useState('')
   const [jobError, setJobError] = useState('')
   const [armReveal, setArmReveal] = useState(false)
   const [toast, setToast] = useState<string | null>(null)
-  const [overviewSource, setOverviewSource] = useState<'loading' | 'dev-override' | 'generated-cache' | 'fallback'>('loading')
+  const [overviewSource, setOverviewSource] = useState<'loading' | 'dev-override' | 'runtime-config' | 'fallback'>('loading')
   const [transitionDirection, setTransitionDirection] = useState<'forward' | 'back'>('forward')
   const jobTimer = useRef<number | null>(null)
   const toastTimer = useRef<number | null>(null)
@@ -480,15 +491,20 @@ export default function App() {
   )
   const sourceReady = Boolean(firstRunStatus?.ready)
   const firstRunRunning = firstRunStatus?.state === 'queued' || firstRunStatus?.state === 'running'
+  const overviewRevision = [
+    String(firstRunStatus?.result?.runtime_config ?? ''),
+    firstRunStatus?.ready ? 'ready' : 'pending',
+    firstRunStatus?.request_identity?.sha256 ?? '',
+  ].join(':')
   const overviewLabel = overviewSource === 'dev-override'
     ? 'DEV LOCAL OVERVIEW / SECTOR128'
-    : overviewSource === 'generated-cache'
-      ? 'GENERATED CACHE / SECTOR128'
+    : overviewSource === 'runtime-config'
+      ? 'ACTIVE RUNTIME / OVERVIEW READY'
       : overviewSource === 'loading'
         ? 'RUNTIME OVERVIEW / CONNECTING'
         : 'SCHEMATIC / NO GAME ASSETS'
 
-  const handleOverviewSourceChange = useCallback((source: 'loading' | 'dev-override' | 'generated-cache' | 'fallback') => {
+  const handleOverviewSourceChange = useCallback((source: 'loading' | 'dev-override' | 'runtime-config' | 'fallback') => {
     setOverviewSource(source)
   }, [])
 
@@ -507,6 +523,7 @@ export default function App() {
       game: current.game || paths.game_root || '',
       output: current.output || paths.export_root || '',
       cache: current.cache || paths.cache_root || '',
+      blender: current.blender || paths.blender_exe || '',
     }))
   }, [])
 
@@ -552,6 +569,15 @@ export default function App() {
   const dismissCompletion = useCallback(() => {
     setCompletionVisible(false)
   }, [])
+
+  const invalidateExportAttempt = useCallback(() => {
+    if (launchState === 'running') return
+    setLaunchState('idle')
+    setProgress(0)
+    setJobError('')
+    setJobMessage('')
+    setCompletedBlenderBuild(null)
+  }, [launchState])
 
   useEffect(
     () => () => {
@@ -621,13 +647,31 @@ export default function App() {
   }
 
   const toggleGroup = (group: string) => {
-    setSelectedGroups((current) =>
-      current.includes(group)
-        ? current.filter((item) => item !== group)
-        : [...current, group],
-    )
-    setLaunchState('idle')
-    setProgress(0)
+    if (launchState === 'running') return
+    if (allGroupsSelected) {
+      setAllGroupsSelected(false)
+      setSelectedGroups([group])
+    } else {
+      setSelectedGroups((current) =>
+        current.includes(group)
+          ? current.filter((item) => item !== group)
+          : [...current, group],
+      )
+    }
+    invalidateExportAttempt()
+  }
+
+  const selectAllGroups = () => {
+    if (launchState === 'running') return
+    setAllGroupsSelected(true)
+    setSelectedGroups([])
+    invalidateExportAttempt()
+  }
+
+  const updateExportMode = (nextMode: ExportMode) => {
+    if (launchState === 'running') return
+    setExportMode(nextMode)
+    invalidateExportAttempt()
   }
 
   const choosePath = async (kind: PathKind) => {
@@ -644,8 +688,7 @@ export default function App() {
       if (payload.status === 'cancelled') return
       if (payload.status !== 'selected' || !payload.path) throw new Error(payload.error ?? 'path_picker_unavailable')
       setSourcePaths((current) => ({ ...current, [kind]: payload.path as string }))
-      setLaunchState('idle')
-      setProgress(0)
+      invalidateExportAttempt()
       if (kind !== 'blender') {
         setFirstRunValidation(null)
         setFirstRunError('')
@@ -666,8 +709,9 @@ export default function App() {
     game_root: sourcePaths.game.trim(),
     export_root: sourcePaths.output.trim(),
     ...(sourcePaths.cache.trim() ? { cache_root: sourcePaths.cache.trim() } : {}),
+    ...(sourcePaths.blender.trim() ? { blender_exe: sourcePaths.blender.trim() } : {}),
     run_name: firstRunStatus?.request?.run_name || firstRunStatus?.defaults?.run_name || 'bootstrap_v1',
-  }), [firstRunStatus?.defaults?.run_name, firstRunStatus?.request?.run_name, sourcePaths.cache, sourcePaths.game, sourcePaths.output])
+  }), [firstRunStatus?.defaults?.run_name, firstRunStatus?.request?.run_name, sourcePaths.blender, sourcePaths.cache, sourcePaths.game, sourcePaths.output])
 
   const validateFirstRun = async () => {
     if (firstRunAction || firstRunRunning) return
@@ -765,6 +809,7 @@ export default function App() {
       game: firstRunStatus.request?.game_root ?? current.game,
       output: firstRunStatus.request?.export_root ?? current.output,
       cache: firstRunStatus.request?.cache_root ?? current.cache,
+      blender: firstRunStatus.request?.blender_exe ?? '',
     }))
     setFirstRunValidation(null)
     setFirstRunError('')
@@ -781,7 +826,9 @@ export default function App() {
       setMapId('map01')
       setLayers(DEFAULT_LAYERS)
       setSelection(null)
-      setSelectedGroups(['lighting', 'particle', 'terrain'])
+      setAllGroupsSelected(true)
+      setSelectedGroups([])
+      setExportMode('blend')
       setEffectsMode('full_system_by_anchor')
       setWaterMode('stable_eevee')
       setChunkMode('per_sector')
@@ -803,15 +850,22 @@ export default function App() {
       return '还需完成首次运行数据准备'
     }
     if (!selection) return '还需在地图中框选导出区块'
-    if (selectedGroups.length === 0) return '至少选择一个导出分组'
+    if (!allGroupsSelected && selectedGroups.length === 0) return '至少选择一个导出分组'
+    if (exportMode === 'blend' && !sourcePaths.blender.trim()) return 'Blender 场景模式需要选择本机 Blender 4.4 或更新版本'
+    if (exportMode === 'blend' && !allGroupsSelected && !selectedGroups.some((group) => RECONSTRUCTABLE_BLEND_GROUPS.includes(group))) {
+      return '当前分组只有待接入组件，无法生成场景；请选择建筑、道具、植被、地形、道路或未知 / 其它'
+    }
     if (!outputLabel.trim()) return '请填写输出标签'
     return '所有前置条件已完成'
-  }, [firstRunAction, firstRunRunning, firstRunStatus, outputLabel, preparedPathsMatch, selectedGroups.length, selection, sourceReady])
+  }, [allGroupsSelected, exportMode, firstRunAction, firstRunRunning, firstRunStatus, outputLabel, preparedPathsMatch, selectedGroups, selection, sourcePaths.blender, sourceReady])
+
+  const reconstructableSelection = allGroupsSelected || selectedGroups.some((group) => RECONSTRUCTABLE_BLEND_GROUPS.includes(group))
 
   const isReady = Boolean(
     sourceReady &&
       selection &&
-      selectedGroups.length > 0 &&
+      (allGroupsSelected || selectedGroups.length > 0) &&
+      (exportMode !== 'blend' || (sourcePaths.blender.trim() && reconstructableSelection)) &&
       outputLabel.trim() &&
       launchState !== 'running',
   )
@@ -840,9 +894,10 @@ export default function App() {
     setLaunchState('running')
     setProgress(0)
     setJobError('')
-    setJobMessage('正在提交真实异步任务')
+    setJobMessage('正在校验请求并准备本机构建')
     const request = {
       format: 'EndfieldWebUIExportJob/2',
+      export_mode: exportMode,
       map_id: mapId,
       selection: { type: 'world_bounds', ...selection.canonicalBounds },
       batch_mode: chunkMode,
@@ -855,10 +910,10 @@ export default function App() {
         effects: layers.effects,
         lights: layers.effects,
       },
-      export_groups: selectedGroups,
+      export_groups: allGroupsSelected ? ['all'] : selectedGroups,
       effects: { selection_mode: effectsMode },
-      water_mode: waterMode,
-      source: { game_root: sourcePaths.game },
+      water_mode: exportMode === 'blend' ? 'stable_eevee' : waterMode,
+      source: { game_root: sourcePaths.game, blender_exe: sourcePaths.blender.trim() },
       output: { root: sourcePaths.output, label: outputLabel },
     }
 
@@ -879,9 +934,22 @@ export default function App() {
           setProgress(Math.max(0, Math.min(100, job.progress * 100)))
           if (job.state === 'completed') {
             stopJob()
+            const resultMode = job.result?.package?.exportMode === 'blend'
+              ? 'blend'
+              : job.result?.package?.exportMode === 'data_package'
+                ? 'data_package'
+                : request.export_mode
+            const build = job.result?.blenderBuild ?? null
+            setCompletedExportMode(resultMode)
+            setCompletedBlenderBuild(build)
             setLaunchState('completed')
             setActiveJobId(null)
-            notify(`数据包导出完成：${job.result?.package?.status ?? 'completed'}`)
+            const partialBuild = build?.status === 'partial' || (build?.pending ?? 0) > 0
+            notify(resultMode === 'blend'
+              ? partialBuild
+                ? `场景文件已导出；${build?.pending ?? 0} 项待处理，详见报告`
+                : `场景文件已导出：${build?.scenes?.length ?? 0} 批`
+              : `数据包导出完成：${job.result?.package?.status ?? 'completed'}`)
             return
           }
           if (job.state === 'cancelled') {
@@ -913,12 +981,26 @@ export default function App() {
       void tick()
     }
 
-    void fetch('/api/v2/export-jobs', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(request),
-    })
-      .then(async (response) => {
+    void (async () => {
+      try {
+        const validationResponse = await fetch('/api/v2/export-jobs/validate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(request),
+        })
+        const validation = await validationResponse.json() as {
+          status?: string
+          message?: string
+          error?: { message?: string }
+        }
+        if (!validationResponse.ok || validation.status !== 'valid') {
+          throw new Error(validation.message ?? validation.error?.message ?? 'export_request_validation_failed')
+        }
+        const response = await fetch('/api/v2/export-jobs', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(request),
+        })
         const payload = await response.json() as (ExportJob & { message?: string }) | FirstRunApiError
         if (!response.ok || !('job_id' in payload) || !payload.job_id) {
           const firstRunPayload = payload as FirstRunApiError
@@ -930,15 +1012,15 @@ export default function App() {
           throw new Error('message' in payload && payload.message ? payload.message : firstRunErrorMessage(firstRunPayload, 'export_job_submit_failed'))
         }
         setActiveJobId(payload.job_id)
-        notify('数据包导出任务已提交；Blender build 当前为 not_ready，不会启动 Blender')
+        notify(exportMode === 'blend' ? 'Blender 场景构建任务已提交' : '数据包导出任务已提交')
         poll(payload.job_id)
-      })
-      .catch((error) => {
+      } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
         setJobError(message)
         setLaunchState('failed')
         notify(`无法启动提取：${message}`)
-      })
+      }
+    })()
   }
 
   const cancelVisualTask = async () => {
@@ -946,8 +1028,8 @@ export default function App() {
     try {
       const response = await fetch(`/api/v2/export-jobs/${encodeURIComponent(activeJobId)}/cancel`, { method: 'POST' })
       if (!response.ok) throw new Error('cancel_request_failed')
-      setJobMessage('已请求协作取消；等待当前数据包阶段安全结束')
-      notify('取消请求已提交；不会删除已经写入的部分数据包')
+      setJobMessage('已请求协作取消；等待当前安全阶段结束')
+      notify('取消请求已提交；已经写入的结果会保留')
     } catch {
       notify('取消请求发送失败；任务仍在运行')
     }
@@ -956,7 +1038,8 @@ export default function App() {
   const copyRequest = async () => {
     const summary = {
       format: 'EndfieldWebUIExportJob/2',
-      mode: 'stage119-data-package-export',
+      mode: exportMode === 'blend' ? 'portable-scene-and-data-package-export' : 'stage119-data-package-export',
+      export_mode: exportMode,
       map_id: mapId,
       requested_bounds: selection?.requestedBounds ?? null,
       canonical_bounds: selection?.canonicalBounds ?? null,
@@ -964,12 +1047,12 @@ export default function App() {
       batch_mode: chunkMode,
       resolver_version: REGION_MAP_RUNTIME_MANIFEST.resolverVersion,
       preview_layers: layers,
-      export_groups: selectedGroups,
-      ui_requested_groups: selectedGroups,
+      export_groups: allGroupsSelected ? ['all'] : selectedGroups,
+      ui_requested_groups: allGroupsSelected ? ['all'] : selectedGroups,
       effects_mode: effectsMode,
-      water_mode: waterMode,
+      water_mode: exportMode === 'blend' ? 'stable_eevee' : waterMode,
       region_map_chunk_selection: selection,
-      source: { game_root: sourcePaths.game },
+      source: { game_root: sourcePaths.game, blender_exe: sourcePaths.blender.trim() },
       output: { root: sourcePaths.output, label: outputLabel },
     }
     try {
@@ -1036,7 +1119,8 @@ export default function App() {
     firstRunValidation &&
       firstRunValidation.canonical.game_root === sourcePaths.game &&
       firstRunValidation.canonical.export_root === sourcePaths.output &&
-      firstRunValidation.canonical.cache_root === sourcePaths.cache,
+      firstRunValidation.canonical.cache_root === sourcePaths.cache &&
+      (firstRunValidation.canonical.blender_exe ?? '') === sourcePaths.blender.trim(),
   )
   const firstRunCanValidate = Boolean(
     sourcePaths.game.trim() &&
@@ -1061,7 +1145,7 @@ export default function App() {
   const firstRunPhaseNumber = firstRunStatus?.phase_index === null || firstRunStatus?.phase_index === undefined
     ? '--'
     : String(firstRunStatus.phase_index + 1).padStart(2, '0')
-  const firstRunPhaseCount = String(firstRunStatus?.phase_count ?? 13).padStart(2, '0')
+  const firstRunPhaseCount = String(firstRunStatus?.phase_count ?? 14).padStart(2, '0')
   const firstRunStateLabel = sourceReady
     ? 'DATA READY'
     : firstRunRunning
@@ -1078,13 +1162,17 @@ export default function App() {
     launchState === 'running'
       ? JOB_PHASES[activePhase][1]
       : launchState === 'completed'
-        ? '提取与审计已完成'
+        ? completedExportMode === 'blend' && (completedBlenderBuild?.status === 'partial' || (completedBlenderBuild?.pending ?? 0) > 0)
+          ? '场景已导出 · 有待处理项'
+          : completedExportMode === 'blend'
+            ? '场景导出与校验完成'
+            : '数据包导出与审计完成'
         : launchState === 'failed'
           ? '提取失败 · 检查提示'
           : launchState === 'cancelled'
             ? '任务已安全取消'
         : isReady
-          ? '开始区块提取'
+          ? exportMode === 'blend' ? '构建 Blender 场景' : '开始导出数据包'
           : '等待设置完成'
 
   return (
@@ -1115,6 +1203,7 @@ export default function App() {
                 <button
                   key={id}
                   type="button"
+                  data-testid={`map-tab-${id}`}
                   className={active ? 'active' : ''}
                   aria-pressed={active}
                   onClick={() => handleMapChange(id)}
@@ -1217,6 +1306,7 @@ export default function App() {
                   layers={layers}
                   chunkMode={chunkMode}
                   selection={selection}
+                  overviewRevision={overviewRevision}
                   onSelectionChange={handleSelectionChange}
                   onOverviewSourceChange={handleOverviewSourceChange}
                 />
@@ -1316,6 +1406,15 @@ export default function App() {
                 busy={choosingPath === 'cache'}
                 onChoose={() => void choosePath('cache')}
               />
+              <PathField
+                id="blender-exe"
+                label="Blender 程序 / 可选"
+                value={sourcePaths.blender}
+                caption="BLENDER EXECUTABLE · 场景导出需要 Blender 4.4+；仅校验路径，不执行版本探测"
+                icon={<Folder size={14} />}
+                busy={choosingPath === 'blender' || launchState === 'running'}
+                onChoose={() => void choosePath('blender')}
+              />
               <div className="first-run-boundary-note">
                 <HardDrive size={13} />
                 <span>首次准备会生成大量本机缓存；游戏安装目录保持严格只读，缓存与导出根必须位于游戏目录之外。</span>
@@ -1399,17 +1498,15 @@ export default function App() {
               <div className="first-run-capabilities" aria-label="首次准备能力边界">
                 <div><span>MAP DATASET</span><strong>{firstRunStatus?.capabilities.map_dataset ?? 'not_ready'}</strong></div>
                 <div><span>ASSET RESOLUTION</span><strong>{Object.values(firstRunStatus?.capabilities.asset_resolution ?? {}).some((value) => value === 'automatic_partial') ? 'AUTOMATIC / PARTIAL' : Object.values(firstRunStatus?.capabilities.asset_resolution ?? {}).join(' / ') || 'not_ready'}</strong></div>
-                <div><span>BLENDER BUILD</span><strong>{firstRunStatus?.capabilities.blender_build ?? 'not_ready'}</strong></div>
-                <div><span>PROFILE SCAN</span><strong>{firstRunStatus?.capabilities.profile_scan ?? 'not_ready'}</strong></div>
+                <div><span>SCENE INPUT CACHE</span><strong>{firstRunStatus?.capabilities.blender_build ?? 'not_ready'}</strong></div>
               </div>
               <p className="capability-disclaimer">AUTOMATIC_PARTIAL 仅表示自动收集的部分解析结果，不代表完整可信的 Blender 几何或材质。</p>
-
-              <p className="capability-disclaimer">当前公开版本只导出经过审计的选区数据包。BLENDER BUILD / PROFILE SCAN 为 NOT_READY，不会调用 Blender 或生成 .blend。</p>
+              <p className="capability-disclaimer">场景从本机首次准备缓存构建；未解析资源和暂未接入的组件会保留在报告中。场景导出需要 Blender 4.4 或更新版本。</p>
             </SettingSection>
 
-            <SettingSection title="预览与导出" code="04 LAYERS / 08 GROUPS">
+            <SettingSection title="预览与导出" code="04 LAYERS / 10 GROUPS">
               <div className="setting-block">
-                <span className="setting-label"><Layers3 size={12} />预览图层 · 不改变导出请求</span>
+                <span className="setting-label"><Layers3 size={12} />图层开关 · 同时影响地图预览与导出内容</span>
                 <div className="layer-grid">
                   {(Object.keys(LAYER_LABELS) as LayerId[]).map((layer) => (
                     <label key={layer}>
@@ -1422,22 +1519,49 @@ export default function App() {
                 </div>
               </div>
 
+              <label className="full-field">
+                <span>输出格式</span>
+                <div className="select-shell">
+                  <select value={exportMode} onChange={(event) => updateExportMode(event.target.value as ExportMode)} disabled={launchState === 'running'}>
+                    <option value="blend">Blender 场景 + 数据包（默认）</option>
+                    <option value="data_package">仅审计数据包</option>
+                  </select>
+                  <ChevronDown size={13} />
+                </div>
+                <small>{exportMode === 'blend'
+                  ? '从本机缓存构建并验证 .blend；未解析资源留在报告。'
+                  : '按所选范围生成审计数据包；水体选项仅作为 metadata 保存。'}</small>
+              </label>
+
               <div className="setting-block">
-                <span className="setting-label"><Box size={12} />导出分组 · 独立多选</span>
+                <span className="setting-label"><Box size={12} />导出分组 · 全部或独立多选</span>
+                <button
+                  className={`export-all-toggle ${allGroupsSelected ? 'active' : ''}`}
+                  type="button"
+                  aria-pressed={allGroupsSelected}
+                  disabled={launchState === 'running'}
+                  onClick={selectAllGroups}
+                >
+                  <span>{allGroupsSelected && <Check size={9} />}</span>
+                  <strong>全部分组</strong>
+                  <small>默认 · 含未接入项报告</small>
+                </button>
                 <div className="export-grid">
                   {EXPORT_GROUPS.map(([id, label, code]) => {
-                    const active = selectedGroups.includes(id)
+                    const active = !allGroupsSelected && selectedGroups.includes(id)
+                    const note = EXPORT_GROUP_NOTES[id]
                     return (
                       <button
                         key={id}
                         type="button"
                         className={active ? 'active' : ''}
                         aria-pressed={active}
+                        disabled={launchState === 'running'}
                         onClick={() => toggleGroup(id)}
                       >
                         <span>{active && <Check size={9} />}</span>
                         <strong>{label}</strong>
-                        <small>{code}</small>
+                        <small>{note ? `${code} · ${note}` : code}</small>
                       </button>
                     )
                   })}
@@ -1459,14 +1583,15 @@ export default function App() {
                   </div>
                 </label>
                 <label>
-                  <span><Waves size={12} />水体模式</span>
+                  <span><Waves size={12} />水体模式 · {exportMode === 'blend' ? '场景自动绑定待接入' : '仅记录 metadata'}</span>
                   <div className="select-shell">
-                    <select value={waterMode} onChange={(event) => setWaterMode(event.target.value)}>
+                    <select value={waterMode} onChange={(event) => setWaterMode(event.target.value)} disabled={exportMode === 'blend' || launchState === 'running'}>
                       <option value="stable_eevee">stable_eevee</option>
                       <option value="flowmap_fresnel">flowmap_fresnel</option>
                     </select>
                     <ChevronDown size={13} />
                   </div>
+                  {exportMode === 'blend' && <small>地图水体自动绑定尚未接入；当前会把它列入待处理报告。</small>}
                 </label>
               </div>
               <label className="full-field">
@@ -1552,7 +1677,9 @@ export default function App() {
               : launchState === 'failed'
                 ? jobError || '后端任务失败，请检查本机日志'
                 : isReady
-                  ? '当前将按所选分组导出审计数据包；Blender build 尚未开放。'
+                  ? exportMode === 'blend'
+                    ? '场景由本机首次准备缓存构建；未解析资源和待接入组件会保留在报告。'
+                    : '将按所选分组生成审计数据包；预览图层开关会影响导出内容。'
                   : sourceReady
                     ? '完成地图框选和导出设置后解锁。'
                     : '先在提取设置中完成首次运行数据准备；地图仍可浏览和框选。'}
@@ -1563,7 +1690,7 @@ export default function App() {
       <footer className="footer-strip">
         <strong>ENDFIELD / ATLAS</strong>
         <i />
-        <span>{map.title} · {sourceReady ? 'FIRST RUN READY' : firstRunRunning ? 'DATA PREPARING' : 'SETUP REQUIRED'} · SECTOR128 RESOLVED · DATA PACKAGE EXPORT</span>
+        <span>{map.title} · {sourceReady ? 'FIRST RUN READY' : firstRunRunning ? 'DATA PREPARING' : 'SETUP REQUIRED'} · SECTOR128 RESOLVED · {exportMode === 'blend' ? 'BLENDER SCENE + DATA PACKAGE' : 'DATA PACKAGE EXPORT'}</span>
       </footer>
 
       <LegalArchive />
@@ -1587,6 +1714,8 @@ export default function App() {
         mapId={mapId}
         mapName={map.chineseName}
         sectorCount={selection?.sectors.length ?? 0}
+        exportMode={completedExportMode}
+        blenderBuild={completedBlenderBuild}
         onFinished={dismissCompletion}
       />
     </div>

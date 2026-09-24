@@ -40,6 +40,8 @@ from extractor_core import (
     read_bundle_closure_names_by_map,
     write_bundle_scan_index,
 )
+from extractor_core.runtime_manifest import augment_runtime_manifest
+from extractor_core.assets import ASSET_RESOLUTION_POLICY_VERSION
 
 
 CONFIG_FORMAT = "EndfieldFirstRunConfig/1"
@@ -56,12 +58,31 @@ class FirstRunError(RuntimeError):
     pass
 
 
-def automatic_asset_upgrade_needed(meta: dict[str, Any], scan_path: Path | None) -> bool:
-    return bool(
-        scan_path is not None
-        and scan_path.is_file()
-        and meta.get("format") != "EndfieldAutomaticAssetResolutionSummary/1"
-    )
+def automatic_asset_upgrade_needed(
+    meta: dict[str, Any],
+    scan_path: Path | None,
+    scene_manifest_path: Path | None = None,
+    resource_database_path: Path | None = None,
+    instances_path: Path | None = None,
+) -> bool:
+    if scan_path is None or not scan_path.is_file():
+        return False
+    if meta.get("format") != "EndfieldAutomaticAssetResolutionSummary/1":
+        return True
+    if meta.get("asset_resolution_policy_version") != ASSET_RESOLUTION_POLICY_VERSION:
+        return True
+    inputs = {
+        "bundle_scan_sha256": scan_path,
+        "scene_probe_manifest_sha256": scene_manifest_path,
+        "resource_database_sha256": resource_database_path,
+        "instances_sha256": instances_path,
+    }
+    for key, path in inputs.items():
+        if path is None:
+            continue
+        if not path.is_file() or meta.get(key) != sha256_file(path):
+            return True
+    return False
 
 
 def utc_now() -> str:
@@ -407,6 +428,14 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--cancel-marker", type=Path)
     parser.add_argument("--events", type=Path)
     parser.add_argument("--report", type=Path)
+    parser.add_argument(
+        "--runtime-region-evidence",
+        type=Path,
+        help=(
+            "Optional extracted MapRegionTable JSONL/literal log. When present, "
+            "new H-tile levels discovered by SceneProbe are added to a run-local runtime manifest."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -482,6 +511,7 @@ def plan(paths: dict[str, Any], run_name: str) -> dict[str, Any]:
             "build_map01_instances",
             "build_map02_instances",
             "build_map01_map02_asset_resolution_tables",
+            "discover_runtime_levels_and_ownership",
             "extract_map01_full_terrain_surface",
             "extract_map02_quadrant_terrain_surfaces",
             "build_bootstrap_map_layer_dataset",
@@ -909,8 +939,20 @@ def run() -> int:
             existing_asset_outputs = (
                 state["steps"][asset_step]["outputs"] if step_done(asset_step) else {}
             )
+            scene_manifest_descriptor = (
+                (scene_discovery_result.get("maps") or {}).get(map_id, {}).get("sceneManifest")
+            )
+            scene_manifest_path = (
+                Path(scene_manifest_descriptor["path"])
+                if isinstance(scene_manifest_descriptor, dict) and scene_manifest_descriptor.get("path")
+                else None
+            )
             upgrade_asset_step = automatic_asset_upgrade_needed(
-                existing_asset_outputs.get("meta") or {}, asset_scan_path
+                existing_asset_outputs.get("meta") or {},
+                asset_scan_path,
+                scene_manifest_path,
+                resources_db,
+                instance_path,
             )
             if step_done(asset_step) and not upgrade_asset_step:
                 asset_path = Path(existing_asset_outputs["database"]["path"])
@@ -918,7 +960,8 @@ def run() -> int:
                 if asset_scan_path is not None and asset_scan_path.is_file():
                     asset_path = next_available(run_root / map_id / "assets.automatic.sqlite")
                     meta = build_asset_resolution_database(
-                        map_id, instance_path, resources_db, asset_scan_path, asset_path
+                        map_id, instance_path, resources_db, asset_scan_path, asset_path,
+                        scene_probe_manifest=scene_manifest_path,
                     )
                 else:
                     asset_path = next_available(run_root / map_id / "assets.bootstrap.sqlite")
@@ -976,6 +1019,51 @@ def run() -> int:
                 )
             terrain_surfaces["map02"].append(terrain_root)
 
+        runtime_manifest_path = RUNTIME_MANIFEST
+        if state.get("steps", {}).get("runtime_manifest", {}).get("status") == "completed":
+            runtime_manifest_path = Path(
+                state["steps"]["runtime_manifest"]["outputs"]["manifest"]["path"]
+            )
+        elif args.runtime_region_evidence is not None:
+            region_evidence = args.runtime_region_evidence.expanduser().resolve()
+            if not region_evidence.is_file():
+                raise FirstRunError(f"Runtime region evidence is missing: {region_evidence}")
+            map02_scene_descriptor = (
+                (scene_discovery_result.get("maps") or {}).get("map02", {}).get("sceneManifest")
+            )
+            scene_manifest_path = (
+                Path(map02_scene_descriptor["path"])
+                if isinstance(map02_scene_descriptor, dict) and map02_scene_descriptor.get("path")
+                else None
+            )
+            if scene_manifest_path is None or not scene_manifest_path.is_file():
+                raise FirstRunError(
+                    "Runtime region evidence was supplied, but the Map02 SceneProbe manifest is unavailable."
+                )
+            runtime_manifest_path = next_available(run_root / "runtime_manifest.generated.json")
+            generated_manifest = augment_runtime_manifest(
+                json.loads(RUNTIME_MANIFEST.read_text(encoding="utf-8")),
+                scene_manifest=scene_manifest_path,
+                region_records=region_evidence,
+                map_id="map02",
+            )
+            write_json_new(runtime_manifest_path, generated_manifest)
+            complete_step(
+                "runtime_manifest",
+                {
+                    "manifest": descriptor(runtime_manifest_path),
+                    "baseManifest": descriptor(RUNTIME_MANIFEST),
+                    "regionEvidence": descriptor(region_evidence),
+                    "sceneManifest": descriptor(scene_manifest_path),
+                },
+            )
+            emitter.emit(
+                "runtime_manifest",
+                1.0,
+                "Discovered runtime levels and ownership from extracted evidence",
+                {"manifest": str(runtime_manifest_path)},
+            )
+
         asset_database_hashes = {
             map_id: state["steps"][f"{map_id}_assets"]["outputs"]["database"]["sha256"]
             for map_id in ("map01", "map02")
@@ -994,7 +1082,7 @@ def run() -> int:
                     output_root=stage_root,
                     export_root=export_root,
                     game_root=game_root,
-                    runtime_manifest=RUNTIME_MANIFEST,
+                    runtime_manifest=runtime_manifest_path,
                     map01_instances=instance_paths["map01"],
                     map01_assets=asset_paths["map01"],
                     map02_instances=instance_paths["map02"],
@@ -1104,6 +1192,7 @@ def run() -> int:
                     "resourceDatabase": str(resources_db),
                     "bundleScanIndex": str(bundle_scan_index),
                     "sceneDiscovery": scene_discovery_result,
+                    "runtimeManifest": descriptor(runtime_manifest_path),
                     "maps": runtime_maps,
                 },
                 "helperDependencies": dependency_result,
@@ -1132,11 +1221,49 @@ def run() -> int:
                 "datasetFingerprint"
             ]
             runtime_payload["extraction"]["sceneDiscovery"] = scene_discovery_result
+            runtime_payload.setdefault("extraction", {})["runtimeManifest"] = descriptor(runtime_manifest_path)
             runtime_payload["extraction"]["maps"] = runtime_maps
             write_json_atomic(runtime_config_path, runtime_payload)
             complete_step("runtime_config", {"config": descriptor(runtime_config_path)})
 
         runtime_payload = json.loads(runtime_config_path.read_text(encoding="utf-8"))
+        portable_ready = scene_discovery_result.get("status") == "completed" and all(
+            isinstance(entry.get("sceneProbe"), dict)
+            and Path(entry["sceneProbe"]["path"]).is_file()
+            for entry in runtime_maps.values()
+        )
+        runtime_payload["paths"]["blender_exe"] = str(selected_blender) if selected_blender else None
+        runtime_payload["blenderBuild"] = {
+            "status": "ready" if portable_ready else "not_ready",
+            "contract": "EndfieldPortableScenePlan/1",
+            "reason": "Per-selection exact ECS plans; unresolved assets are reported explicitly"
+            if portable_ready else "Resume first-run preparation to generate SceneProbe geometry and material caches",
+        }
+        write_json_atomic(runtime_config_path, runtime_payload)
+        if portable_ready:
+            from endfield_map_overviews import LAYOUT_PATH, build_map_overviews
+
+            overview_sources = {
+                "datasetFingerprint": manifest["datasetFingerprint"],
+                "runtimeManifest": descriptor(runtime_manifest_path)["sha256"],
+                "previewLayout": descriptor(LAYOUT_PATH)["sha256"],
+                "sceneManifests": {map_id: entry["sceneProbe"]["sha256"] for map_id, entry in runtime_maps.items()},
+                "generator": "EndfieldMapOverviews/1",
+                "generatorSha256": descriptor(Path(__file__).with_name("endfield_map_overviews.py"))["sha256"],
+            }
+            previous_overviews = state.get("steps", {}).get("map_overviews", {}).get("outputs", {})
+            if step_done("map_overviews") and previous_overviews.get("sources") == overview_sources:
+                overview_descriptor = previous_overviews["manifest"]
+                if not Path(overview_descriptor["path"]).is_file():
+                    raise FirstRunError("Prepared overview manifest is missing; restore the cache before resuming")
+            else:
+                emitter.emit("map_overviews", 0.0, "Composing map images from extracted H tiles")
+                overview_descriptor = build_map_overviews(runtime_config_path, next_available(run_root / "map_overviews"))
+                complete_step("map_overviews", {"manifest": overview_descriptor, "sources": overview_sources})
+            runtime_payload["extraction"]["mapOverviews"] = overview_descriptor
+            write_json_atomic(runtime_config_path, runtime_payload)
+            emitter.emit("map_overviews", 1.0, "Prepared map images for the WebUI")
+        complete_step("runtime_config", {"config": descriptor(runtime_config_path)})
         activation = (
             {"status": "skipped", "reason": "--no-activate-runtime-config"}
             if args.no_activate_runtime_config
@@ -1162,6 +1289,7 @@ def run() -> int:
             "stageRoot": str(stage_root),
             "datasetFingerprint": manifest["datasetFingerprint"],
             "runtimeConfig": descriptor(runtime_config_path),
+            "runtimeManifest": descriptor(runtime_manifest_path),
             "runtimeActivation": activation,
             "audit": audit_report,
             "mapLayers": build_summary.get("maps"),
@@ -1175,11 +1303,7 @@ def run() -> int:
                 "manualHistoricalInputsRequired": False,
             },
             "deferredCapabilities": deferred_capabilities,
-            "blenderBuild": {
-                "status": "not_ready",
-                "manualPreparationRequired": False,
-                "nextAutomaticCapability": "SceneProbe/BundleScanner geometry and material closure",
-            },
+            "blenderBuild": runtime_payload["blenderBuild"],
         }
         write_json_new(report_path, report)
         emitter.emit("complete", 1.0, "First-run baseline extraction completed", status=completion_status)

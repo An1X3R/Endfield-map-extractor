@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Iterable, Mapping
 
 
-GAME_ROOT_NAME = "Endfield Game"
 EXPORT_GROUPS = (
+    "building",
+    "prop",
     "lighting",
     "particle",
     "vegetation",
@@ -18,6 +19,26 @@ EXPORT_GROUPS = (
     "effects",
     "unknown",
 )
+
+
+def selected_static_categories(layers: Mapping[str, object], groups: Iterable[str]) -> frozenset[str]:
+    """Select static ECS categories only when both their layer and group are enabled."""
+    selected_groups = frozenset(groups)
+    if any(not isinstance(value, str) for value in selected_groups):
+        raise ValueError("export_groups must contain strings")
+    assignments = {
+        "building": ("instances", "building"),
+        "prop": ("instances", "prop"),
+        "unknown": ("instances", "unknown"),
+        "road": ("roads", "road"),
+        "vegetation": ("vegetation", "vegetation"),
+        "terrain-structure": ("terrain", "terrain"),
+    }
+    for layer in {item[0] for item in assignments.values()}:
+        if layer in layers and type(layers[layer]) is not bool:
+            raise ValueError(f"layers.{layer} must be boolean")
+    return frozenset(category for category, (layer, group) in assignments.items()
+                     if layers.get(layer) is True and ("all" in selected_groups or group in selected_groups))
 
 
 def _path(value: Any, field: str) -> Path:
@@ -34,10 +55,26 @@ def validate_source_paths(source: Mapping[str, Any]) -> dict[str, Any]:
     optional future capability, not a prerequisite for a package export.
     """
     game_root = _path(source.get("game_root"), "source.game_root")
-    if game_root.name.casefold() != GAME_ROOT_NAME.casefold():
-        raise ValueError(f"source.game_root must select the '{GAME_ROOT_NAME}' directory")
     if not game_root.is_dir():
         raise ValueError(f"source.game_root is not an existing directory: {game_root}")
+    required_paths = (
+        ("Endfield.exe", game_root / "Endfield.exe", False),
+        ("Endfield_Data/globalgamemanagers", game_root / "Endfield_Data" / "globalgamemanagers", False),
+        (
+            "Endfield_Data/StreamingAssets/VFS",
+            game_root / "Endfield_Data" / "StreamingAssets" / "VFS",
+            True,
+        ),
+    )
+    missing_paths = [
+        label for label, path, is_directory in required_paths
+        if not (path.is_dir() if is_directory else path.is_file())
+    ]
+    if missing_paths:
+        raise ValueError(
+            "source.game_root is not a complete Endfield installation; missing: "
+            + ", ".join(missing_paths)
+        )
     blender_text = str(source.get("blender_exe") or "").strip()
     blender_exe = Path(blender_text).expanduser().resolve() if blender_text else None
     if blender_exe is not None:

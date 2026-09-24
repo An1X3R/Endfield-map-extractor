@@ -11,20 +11,34 @@ import json
 import os
 import re
 import tempfile
+from functools import wraps
+from threading import RLock
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Concatenate, Mapping, ParamSpec, TypeVar
 
 from webui_export_contract_v2 import make_event, new_job_record, validate_transition
 
 
 JOB_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$")
+P = ParamSpec("P")
+R = TypeVar("R")
+
+
+def synchronized(method: Callable[Concatenate["JobStore", P], R]) -> Callable[Concatenate["JobStore", P], R]:
+    """Serialize file transactions and polling on the same local job store."""
+    @wraps(method)
+    def locked(self: JobStore, *args: P.args, **kwargs: P.kwargs) -> R:
+        with self._io_lock:
+            return method(self, *args, **kwargs)
+    return locked
 
 
 class JobStore:
     def __init__(self, root: Path | str) -> None:
         self.root = Path(root).expanduser().resolve()
         self.root.mkdir(parents=True, exist_ok=True)
+        self._io_lock = RLock()
 
     def _job_dir(self, job_id: str) -> Path:
         job_id = str(job_id)
@@ -68,6 +82,7 @@ class JobStore:
             stream.write(json.dumps(event, ensure_ascii=False) + "\n")
         return event
 
+    @synchronized
     def create(self, canonical: Mapping[str, Any]) -> dict[str, Any]:
         job = new_job_record(canonical)
         job_dir = self._job_dir(str(job["job_id"]))
@@ -78,9 +93,11 @@ class JobStore:
         self._event(job, "Job queued")
         return job
 
+    @synchronized
     def get(self, job_id: str) -> dict[str, Any]:
         return self._read(job_id)
 
+    @synchronized
     def events(self, job_id: str, after_sequence: int = 0) -> list[dict[str, Any]]:
         path = self._events_path(job_id)
         if not path.is_file():
@@ -94,10 +111,12 @@ class JobStore:
                 result.append(event)
         return result
 
+    @synchronized
     def log(self, job_id: str, message: str, payload: Mapping[str, Any] | None = None) -> dict[str, Any]:
         job = self._read(job_id)
         return self._event(job, message, payload)
 
+    @synchronized
     def update_progress(
         self,
         job_id: str,
@@ -122,6 +141,7 @@ class JobStore:
         self._event(job, message, payload)
         return job
 
+    @synchronized
     def transition(self, job_id: str, next_state: str, phase: str | None = None, progress: float | None = None, message: str = "", payload: Mapping[str, Any] | None = None) -> dict[str, Any]:
         job = self._read(job_id)
         validate_transition(str(job["state"]), next_state)
@@ -137,6 +157,7 @@ class JobStore:
         self._event(job, message or f"Job {next_state}", payload)
         return job
 
+    @synchronized
     def request_cancel(self, job_id: str) -> dict[str, Any]:
         job = self._read(job_id)
         if job["state"] in {"completed", "failed", "cancelled"}:
@@ -149,9 +170,11 @@ class JobStore:
         self._event(job, "Cooperative cancellation requested")
         return job
 
+    @synchronized
     def cancel_requested(self, job_id: str) -> bool:
         return (self._job_dir(job_id) / "cancel.request").is_file()
 
+    @synchronized
     def complete(self, job_id: str, result: Mapping[str, Any]) -> dict[str, Any]:
         job = self._read(job_id)
         validate_transition(str(job["state"]), "completed")
@@ -164,6 +187,7 @@ class JobStore:
         self._event(job, "Export completed", {"result": dict(result)})
         return job
 
+    @synchronized
     def fail(self, job_id: str, error: Mapping[str, Any]) -> dict[str, Any]:
         job = self._read(job_id)
         if job["state"] in {"completed", "failed", "cancelled"}:

@@ -1,27 +1,14 @@
 // @ts-nocheck
-﻿import { createHash } from 'node:crypto'
-import { createReadStream, existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
+﻿import { existsSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import path from 'node:path'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { defineConfig, type Plugin } from 'vite'
 import react from '@vitejs/plugin-react'
 import { stage119LayerApi } from './server/stage119LayerApi.ts'
+import { mapOverviewApi } from './server/mapOverviewApi.ts'
 
 const projectRoot = path.dirname(fileURLToPath(import.meta.url))
-const runtimeManifestPath = path.join(projectRoot, 'src', 'data', 'region_map_runtime_manifest.json')
-
-type MapId = 'map01' | 'map02'
-type OverviewVariant = 'clean' | 'sectors'
-type OverviewSource = 'dev-override' | 'generated-cache'
-
-type DevOverrides = {
-  enabled?: boolean
-  serverOnly?: boolean
-  maps?: Partial<Record<MapId, Partial<Record<OverviewVariant, string>>>>
-}
-
-const isOverviewVariant = (value: string): value is OverviewVariant => value === 'clean' || value === 'sectors'
 
 const sendJson = (response: ServerResponse, status: number, body: unknown) => {
   const payload = JSON.stringify(body)
@@ -29,95 +16,6 @@ const sendJson = (response: ServerResponse, status: number, body: unknown) => {
   response.setHeader('Content-Type', 'application/json; charset=utf-8')
   response.setHeader('Cache-Control', 'no-store')
   response.end(payload)
-}
-
-const readJson = <T>(filePath: string): T | null => {
-  try {
-    return JSON.parse(readFileSync(filePath, 'utf8')) as T
-  } catch {
-    return null
-  }
-}
-
-const getOverrides = (): DevOverrides => {
-  const configuredPath = process.env.ENDFIELD_MAP_OVERRIDES_FILE?.trim()
-  if (!configuredPath) return {}
-  const overrides = readJson<DevOverrides>(configuredPath)
-  if (!overrides?.enabled || overrides.serverOnly === false) return {}
-  return overrides
-}
-
-const getCacheRoot = () =>
-  process.env.ENDFIELD_MAP_CACHE_ROOT?.trim() || process.env.VITE_MAP_CACHE_ROOT?.trim() || ''
-
-const isInside = (root: string, candidate: string) => {
-  const relative = path.relative(path.resolve(root), path.resolve(candidate))
-  return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative))
-}
-
-const hashFile = (filePath: string) => {
-  const hash = createHash('sha256')
-  hash.update(readFileSync(filePath))
-  return hash.digest('hex').toUpperCase()
-}
-
-const findGeneratedCacheFile = (mapId: MapId, variant: OverviewVariant) => {
-  const cacheRoot = getCacheRoot()
-  if (!cacheRoot || !existsSync(cacheRoot)) return null
-
-  const mapsRoot = path.join(cacheRoot, 'maps')
-  if (!existsSync(mapsRoot)) return null
-
-  const requestedFingerprint = process.env.ENDFIELD_MAP_FINGERPRINT?.trim()
-  const candidates = readdirSync(mapsRoot, { withFileTypes: true })
-    .filter((entry) => entry.isDirectory())
-    .filter((entry) => !requestedFingerprint || entry.name === requestedFingerprint)
-    .map((entry) => path.join(mapsRoot, entry.name))
-    .filter((directory) => isInside(mapsRoot, directory))
-    .sort((a, b) => statSync(b).mtimeMs - statSync(a).mtimeMs)
-
-  for (const directory of candidates) {
-    const manifest = readJson<{ status?: string }>(path.join(directory, 'cache_manifest.json'))
-    if (manifest?.status && manifest.status !== 'ready') continue
-    const candidate = path.join(directory, mapId, variant + '.png')
-    if (existsSync(candidate) && isInside(directory, candidate)) return candidate
-  }
-  return null
-}
-
-const resolveOverviewFile = (mapId: MapId, variant: OverviewVariant) => {
-  const overrides = getOverrides()
-  const overrideFile = overrides.maps?.[mapId]?.[variant]
-  if (overrideFile && existsSync(overrideFile)) {
-    return { filePath: overrideFile, source: 'dev-override' as OverviewSource }
-  }
-
-  const generatedFile = findGeneratedCacheFile(mapId, variant)
-  if (generatedFile) return { filePath: generatedFile, source: 'generated-cache' as OverviewSource }
-  return null
-}
-
-const getSafeMaps = () => {
-  const runtime = readJson<{
-    maps?: Record<MapId, { mapId: MapId; domainId: string; worldBounds: unknown; sideSectors: number }>
-  }>(runtimeManifestPath)
-  const maps = runtime?.maps ?? {}
-  return (['map01', 'map02'] as MapId[]).map((mapId) => {
-    const clean = resolveOverviewFile(mapId, 'clean')
-    const sectors = resolveOverviewFile(mapId, 'sectors')
-    return {
-      mapId,
-      domainId: maps[mapId]?.domainId ?? null,
-      worldBounds: maps[mapId]?.worldBounds ?? null,
-      sideSectors: maps[mapId]?.sideSectors ?? null,
-      overview: {
-        clean: '/api/v2/maps/' + mapId + '/overview?variant=clean',
-        sectors: '/api/v2/maps/' + mapId + '/overview?variant=sectors',
-        state: clean || sectors ? 'ready' : 'missing',
-        sources: Array.from(new Set([clean?.source, sectors?.source].filter(Boolean))),
-      },
-    }
-  })
 }
 
 const readRequestBody = (request: IncomingMessage) =>
@@ -206,60 +104,6 @@ const endfieldMapRuntimeApi = (): Plugin => ({
           error: 'export_job_bridge_failed',
           message: error instanceof Error ? error.message : String(error),
         }))
-        return
-      }
-
-      const overviewMatch = pathname.match(/^\/api\/v2\/maps\/(map01|map02)\/overview$/)
-      if ((method === 'GET' || method === 'HEAD') && overviewMatch) {
-        const mapId = overviewMatch[1] as MapId
-        const variantValue = requestUrl.searchParams.get('variant') ?? 'clean'
-        const variant = isOverviewVariant(variantValue) ? variantValue : null
-        if (!variant) {
-          sendJson(response, 400, { error: 'invalid_overview_variant', message: 'variant must be clean or sectors' })
-          return
-        }
-
-        const resolved = resolveOverviewFile(mapId, variant)
-        if (!resolved) {
-          sendJson(response, 404, {
-            error: 'map_overview_not_ready',
-            mapId,
-            variant,
-            message: 'No development override or generated cache is available for this overview.',
-          })
-          return
-        }
-
-        const etag = '"' + hashFile(resolved.filePath) + '"'
-        if (request.headers['if-none-match'] === etag) {
-          response.statusCode = 304
-          response.end()
-          return
-        }
-
-        response.statusCode = 200
-        response.setHeader('Content-Type', 'image/png')
-        response.setHeader('Content-Length', statSync(resolved.filePath).size)
-        response.setHeader('Cache-Control', 'no-store')
-        response.setHeader('ETag', etag)
-        response.setHeader('X-Endfield-Map-Source', resolved.source)
-        if (method === 'HEAD') {
-          response.end()
-          return
-        }
-        createReadStream(resolved.filePath).on('error', () => {
-          if (!response.headersSent) sendJson(response, 500, { error: 'map_overview_read_failed' })
-          else response.destroy()
-        }).pipe(response)
-        return
-      }
-
-      if (method === 'GET' && pathname === '/api/v2/maps') {
-        sendJson(response, 200, {
-          format: 'EndfieldMapCatalog/1',
-          cacheRootConfigured: Boolean(getCacheRoot()),
-          maps: getSafeMaps(),
-        })
         return
       }
 
@@ -360,7 +204,7 @@ const endfieldMapRuntimeApi = (): Plugin => ({
 })
 
 export default defineConfig({
-  plugins: [react(), endfieldMapRuntimeApi(), stage119LayerApi(projectRoot)],
+  plugins: [react(), mapOverviewApi(), endfieldMapRuntimeApi(), stage119LayerApi(projectRoot)],
   server: {
     host: '127.0.0.1',
     port: 5173,

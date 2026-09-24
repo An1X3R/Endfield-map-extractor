@@ -42,8 +42,9 @@ type Props = {
   layers: LayerState
   chunkMode: ChunkMode
   selection: ChunkSelection | null
+  overviewRevision: string
   onSelectionChange: (selection: ChunkSelection | null) => void
-  onOverviewSourceChange?: (source: 'loading' | 'dev-override' | 'generated-cache' | 'fallback') => void
+  onOverviewSourceChange?: (source: 'loading' | 'dev-override' | 'runtime-config' | 'fallback') => void
 }
 
 type AnimatedTargets = {
@@ -830,6 +831,7 @@ export function MapViewport({
   layers,
   chunkMode,
   selection,
+  overviewRevision,
   onSelectionChange,
   onOverviewSourceChange,
 }: Props) {
@@ -857,7 +859,7 @@ export function MapViewport({
   const resetCameraRef = useRef<(() => void) | null>(null)
   const [zoom, setZoom] = useState(1)
   const [isPanning, setIsPanning] = useState(false)
-  const [overviewState, setOverviewState] = useState<'loading' | 'dev-override' | 'generated-cache' | 'fallback'>('loading')
+  const [overviewState, setOverviewState] = useState<'loading' | 'dev-override' | 'runtime-config' | 'fallback'>('loading')
   const [runtimeLayerState, setRuntimeLayerState] = useState<'loading' | 'ready' | 'partial' | 'offline'>('loading')
   const overviewPhaseRef = useRef<'loading' | 'loaded' | 'fallback'>('loading')
   const overviewRevealRef = useRef(0)
@@ -878,7 +880,7 @@ export function MapViewport({
     overviewRevealRef.current = 0
     setOverviewState('loading')
     onOverviewSourceChange?.('loading')
-  }, [mapId, onOverviewSourceChange])
+  }, [mapId, overviewRevision, onOverviewSourceChange])
 
   useEffect(() => {
     layersRef.current = layers
@@ -946,7 +948,7 @@ export function MapViewport({
     overviewPhaseRef.current = 'loading'
     overviewRevealRef.current = 0
     let overviewReadyNotified = false
-    let loadedOverviewSource: 'dev-override' | 'generated-cache' = 'generated-cache'
+    let loadedOverviewSource: 'dev-override' | 'runtime-config' = 'runtime-config'
 
     const targets: AnimatedTargets = {
       scanner: null,
@@ -1405,7 +1407,8 @@ export function MapViewport({
         overviewTexture = texture
         overviewPhaseRef.current = 'loaded'
         const sourceHeader = response.headers.get('X-Endfield-Map-Source')
-        const source = sourceHeader === 'dev-override' || sourceHeader === 'generated-cache' ? sourceHeader : 'generated-cache'
+        const source = sourceHeader === 'dev-override' || sourceHeader === 'runtime-config' ? sourceHeader : null
+        if (!source) throw new Error(`Unsupported overview source header: ${sourceHeader ?? '(missing)'}`)
         loadedOverviewSource = source
         overviewRevealRef.current = 0
         overviewReadyNotified = false
@@ -1442,7 +1445,7 @@ export function MapViewport({
       zoomAtRef.current = null
       resetCameraRef.current = null
     }
-  }, [mapId, onOverviewSourceChange, onSelectionChange, runtimeMap])
+  }, [mapId, onOverviewSourceChange, onSelectionChange, overviewRevision, runtimeMap])
 
   const updateZoom = (next: number) => {
     zoomAtRef.current?.(next)
@@ -1467,11 +1470,11 @@ export function MapViewport({
           <strong>{map.chineseName} / ORTHOGRAPHIC</strong>
           <small>{map.direction}</small>
         </div>
-        <span className={`evidence-chip ${overviewState === 'dev-override' || overviewState === 'generated-cache' ? 'stable' : map.warningTone}`}>
+        <span className={`evidence-chip ${overviewState === 'dev-override' || overviewState === 'runtime-config' ? 'stable' : map.warningTone}`}>
           {overviewState === 'dev-override'
             ? 'DEV LOCAL OVERVIEW'
-            : overviewState === 'generated-cache'
-              ? 'GENERATED CACHE / READY'
+            : overviewState === 'runtime-config'
+              ? 'ACTIVE RUNTIME / READY'
               : overviewState === 'loading'
                 ? 'OVERVIEW / CONNECTING'
               : 'FALLBACK / API REQUIRED'}

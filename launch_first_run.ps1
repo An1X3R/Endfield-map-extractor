@@ -23,7 +23,7 @@ if (-not $hostPython) {
     }
 }
 if (-not $hostPython) {
-    throw 'No usable Python 3 interpreter was found. Install Python 3.10+ and retry.'
+    throw 'No usable Python 3 interpreter was found. Install Python 3.11+ and retry.'
 }
 
 if ($hostPython.Count -eq 2) {

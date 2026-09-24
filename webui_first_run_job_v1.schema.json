@@ -10,6 +10,7 @@
     "game_root": { "type": "string", "minLength": 1 },
     "export_root": { "type": "string", "minLength": 1 },
     "cache_root": { "type": "string", "minLength": 1 },
+    "blender_exe": { "type": "string", "minLength": 1 },
     "run_name": {
       "type": "string",
       "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$",

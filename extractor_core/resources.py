@@ -8,7 +8,7 @@ import sqlite3
 import struct
 import json
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, TypedDict
 
 import brotli
 
@@ -363,7 +363,28 @@ def read_bundle_closure_names_by_map(
 ) -> tuple[dict[str, list[str]], dict[str, Any]]:
     """Expand map candidate bundles through serialized-file external references."""
 
-    roots = read_bundle_candidate_names_by_map(matches)
+    return read_bundle_closure_names(read_bundle_candidate_names_by_map(matches), cab_inventory)
+
+
+class BundleClosureCounts(TypedDict):
+    rootBundleCount: int
+    closureBundleCount: int
+    unresolvedExternalCount: int
+    unresolvedExternalSample: list[str]
+
+
+class BundleClosureMetadata(TypedDict):
+    format: str
+    providerSerializedFileCount: int
+    bundleInventoryCount: int
+    maps: dict[str, BundleClosureCounts]
+
+
+def read_bundle_closure_names(
+    roots: dict[str, list[str]], cab_inventory: Path
+) -> tuple[dict[str, list[str]], BundleClosureMetadata]:
+    """Expand named root groups, including shared assets, using existing CAB evidence."""
+
     cab_path = cab_inventory.expanduser().resolve()
     if not cab_path.is_file():
         raise FileNotFoundError(f"Bundle CAB inventory is missing: {cab_path}")
@@ -405,6 +426,11 @@ def read_bundle_closure_names_by_map(
     closures: dict[str, list[str]] = {}
     unresolved_by_map: dict[str, list[str]] = {}
     for map_id, root_names in roots.items():
+        missing_roots = sorted(set(root_names) - bundle_serialized.keys())
+        if missing_roots:
+            raise BootstrapExtractionError(
+                f"Bundle roots are absent from CAB inventory: group={map_id}, roots={missing_roots}"
+            )
         selected = set(root_names)
         queue = list(root_names)
         unresolved: set[str] = set()
@@ -422,7 +448,7 @@ def read_bundle_closure_names_by_map(
         closures[map_id] = sorted(selected)
         unresolved_by_map[map_id] = sorted(unresolved)
 
-    metadata = {
+    metadata: BundleClosureMetadata = {
         "format": "EndfieldAutomaticBundleClosure/1",
         "providerSerializedFileCount": len(providers),
         "bundleInventoryCount": len(bundle_serialized),
@@ -433,7 +459,7 @@ def read_bundle_closure_names_by_map(
                 "unresolvedExternalCount": len(unresolved_by_map[map_id]),
                 "unresolvedExternalSample": unresolved_by_map[map_id][:32],
             }
-            for map_id in ("map01", "map02")
+            for map_id in roots
         },
     }
     return closures, metadata

@@ -8,6 +8,7 @@ __pycache__/
 
 # Local runtime state and secrets
 .runtime_status.json
+reconstruction.local.json
 .env
 .env.*
 !.env.example
@@ -73,6 +74,7 @@ dotnet/**/obj/
 /blender_build_map01_chunk_stage121_footprintfix_v1.py
 /blender_build_map01_fx_prototypes_20260725.py
 /blender_build_map02_chunk_*.py
+!/blender_build_map02_chunk_20260727.py
 /blender_endfield_fx_ui.py
 /blender_inspect_*.py
 /blender_integrate_map01_fx_instances_20260725.py

@@ -1,9 +1,7 @@
-"""Asynchronous Stage119 bounded-data package exporter for the local WebUI.
+"""Export audited selection records and optional portable Blender scenes.
 
-This worker exports real, selected records from the immutable Stage119 cache.
-It does not scan or modify the game installation. The public job contract ends
-after the selected package is signed and audited; Blender build remains an
-explicitly unavailable capability until portable reviewed profiles exist.
+Scene jobs reuse prepared caches and read current ECS evidence from the game.
+All writes remain in the user's external cache and output directories.
 """
 
 from __future__ import annotations
@@ -172,6 +170,14 @@ class ExportCoordinator:
 
     def validate(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         canonical = canonicalize_job(payload)
+        if canonical["export_mode"] == "blend":
+            self._validate_scene_runtime(canonical)
+            return {
+                "format": "EndfieldWebUIJobValidation/1", "status": "valid", "canonical": canonical,
+                "estimate": estimate_workload(canonical), "exportMode": "blend",
+                "capabilities": {"data_package": "ready", "blender_build": "ready"},
+                "blenderBuild": {"status": "ready", "scheduled": False},
+            }
         return {
             "format": "EndfieldWebUIJobValidation/1",
             "status": "valid",
@@ -192,6 +198,8 @@ class ExportCoordinator:
 
     def submit(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         canonical = canonicalize_job(payload)
+        if canonical["export_mode"] == "blend":
+            self._validate_scene_runtime(canonical)
         job = self.store.create(canonical)
         thread = threading.Thread(
             target=self._run,
@@ -203,6 +211,12 @@ class ExportCoordinator:
             self._threads[str(job["job_id"])] = thread
         thread.start()
         return job
+
+    def _validate_scene_runtime(self, canonical: Mapping[str, Any]) -> None:
+        from endfield_scene_export import scene_runtime
+        if self.runtime_config.path is None:
+            raise ValueError("Blender export requires a prepared runtime configuration; complete first-run preparation")
+        scene_runtime(self.runtime_config.path, Path(canonical["source"]["game_root"]), canonical["map_id"])
 
     def get(self, job_id: str) -> dict[str, Any]:
         return self.store.get(job_id)
@@ -343,9 +357,9 @@ class ExportCoordinator:
             artifacts: dict[str, Any] = {}
             warnings: list[str] = []
 
-            category_groups = {name for name in groups if name in {"vegetation", "road", "unknown"}}
-            if canonical["layers"].get("instances") and (all_groups or category_groups):
-                categories = None if all_groups else category_groups
+            from webui_source_contract import selected_static_categories
+            categories = selected_static_categories(canonical["layers"], groups)
+            if categories:
                 index = self._index(map_id, "instances", manifest)
                 artifacts["instances"] = self._write_records(
                     layer_dir / "instances.jsonl.gz",
@@ -353,7 +367,7 @@ class ExportCoordinator:
                     job_id,
                 )
 
-            if all_groups or "road" in groups:
+            if canonical["layers"].get("roads") and (all_groups or "road" in groups):
                 index = self._index(map_id, "roads", manifest)
                 artifacts["roads"] = self._write_records(
                     layer_dir / "roads.jsonl.gz",
@@ -379,7 +393,7 @@ class ExportCoordinator:
                     job_id,
                 )
 
-            if all_groups or "lighting" in groups:
+            if canonical["layers"].get("lights") and (all_groups or "lighting" in groups):
                 index = self._index(map_id, "lights", manifest)
                 artifacts["lights"] = self._write_records(
                     layer_dir / "lights.jsonl.gz",
@@ -406,6 +420,28 @@ class ExportCoordinator:
             selection_path = output_dir / "selection.json"
             selection_path.write_text(json.dumps(selection, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
+            scene_artifacts = []
+            blender_build = {
+                "status": "not_ready", "scheduled": False,
+                "reason": "Data-package export does not schedule Blender",
+            }
+            if canonical["export_mode"] == "blend":
+                from endfield_scene_export import build_scene_exports
+                scene_artifacts = build_scene_exports(
+                    self.runtime_config.path, canonical, output_dir,
+                    lambda: self._check_cancelled(job_id),
+                    lambda value, message: self.store.update_progress(
+                        job_id, phase="building", progress=0.24 + value * 0.66, message=message),
+                )
+                blender_build = {
+                    "status": "partial" if any(item["pending"] for item in scene_artifacts) else "completed",
+                    "scheduled": True, "scenes": scene_artifacts,
+                    "pending": sum(item["pending"] for item in scene_artifacts),
+                }
+                warnings = [warning for warning in warnings if "does not contain terrain mesh" not in warning]
+                if blender_build["pending"]:
+                    warnings.append(f"Scene reports retain {blender_build['pending']} unresolved resources; inspect scene_plan.json and scene_audit.json")
+
             export_manifest = {
                 "format": "EndfieldWebUIRegionExport/1",
                 "jobId": job_id,
@@ -414,22 +450,20 @@ class ExportCoordinator:
                 "selection": selection,
                 "artifacts": artifacts,
                 "warnings": warnings,
-                "exportMode": "data_package",
+                "exportMode": canonical["export_mode"],
                 "capabilities": {
                     "data_package": "ready",
-                    "blender_build": "not_ready",
+                    "blender_build": blender_build["status"] if scene_artifacts else "not_ready",
                     "profile_scan": "not_ready",
                 },
-                "blenderBuild": {
-                    "status": "not_ready",
-                    "scheduled": False,
-                    "note": "This public release exports an audited data package only; no Blender worker is started.",
-                },
+                "blenderBuild": blender_build,
             }
             manifest_path = output_dir / "export_manifest.json"
             manifest_path.write_text(json.dumps(export_manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
             audit = {
                 "status": "passed",
+                "scope": "artifact integrity and scene reopen; resource completeness is reported separately",
+                "sceneResolutionStatus": blender_build["status"],
                 "canonicalRequestSha256": sha256_file(output_dir / "canonical_request.json"),
                 "manifestSha256": sha256_file(manifest_path),
                 "selectionSha256": sha256_file(selection_path),
@@ -450,14 +484,10 @@ class ExportCoordinator:
                     **audit,
                     "status": "completed",
                     "auditStatus": audit["status"],
-                    "exportMode": "data_package",
+                    "exportMode": canonical["export_mode"],
                     "warnings": warnings,
                 },
-                "blenderBuild": {
-                    "status": "not_ready",
-                    "scheduled": False,
-                    "reason": "Portable reviewed Blender profiles are not available in this public release.",
-                },
+                "blenderBuild": blender_build,
             })
         except JobCancelled:
             current = self.store.get(job_id)

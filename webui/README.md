@@ -1,8 +1,8 @@
 ﻿# Endfield Atlas Composer WebUI 2.0
 
-本地地图提取器的 WebUI。游戏安装目录保持只读；导出任务通过 `launch_webui.py` 提供的本机桥接服务生成经过签名和审计的选区数据包，并把结果写入用户选择的输出目录。仓库不附带 Stage 数据、地图图片、游戏资产或导出结果，缺少外部输入时相关接口会明确报告不可用。
+本地地图提取器的 WebUI。游戏安装目录保持只读；导出任务通过 `launch_webui.py` 提供的本机桥接服务生成经过签名和审计的选区数据包，`blend` 模式同时生成逐批 Blender 场景，结果写入用户选择的输出目录。仓库不附带 Stage 数据、地图图片、游戏资产或导出结果，缺少外部输入时相关接口会明确报告不可用。
 
-当前公开版本不会从 WebUI 启动 Blender，也不会生成 `.blend`。首次运行能力中的 `blender_build` 与 `profile_scan` 保持 `not_ready`；地图任务完成后返回数据包结果和 `blenderBuild.status=not_ready`，不会继续调用缺少 profile 的 Blender worker。
+界面支持 Blender 场景与数据包两种输出。场景模式使用用户选择的 Blender 和首启缓存，调用仓库内可移植场景链；完成结果列出逐批 `.blend` 和待处理项。安装目录没有固定名称、盘符或历史文件要求。完整能力边界与构建入口见项目根目录 README；历史 profile worker 不参与这条链。
 
 ## Stage112 地图模块
 
@@ -89,28 +89,26 @@ npm.cmd run test:stage119
 `vite.config.ts` 内置了仅供本地开发的同源 API 适配器：
 
 - `GET /api/v2/maps`：返回不含绝对路径的安全地图目录和 overview 状态。
-- `GET /api/v2/maps/{mapId}/overview?variant=clean|sectors`：优先服务开发覆盖，其次服务外部生成缓存；缺图返回 `404 map_overview_not_ready`。
+- `GET /api/v2/maps/{mapId}/overview?variant=clean|sectors`：读取当前 runtime 声明的底图；缺图返回 `404 map_overview_missing`，并附具体原因。
 - `POST /api/v2/game-source/validate`：只读检查游戏根目录的三个必要标记。
 - `POST /api/v2/map-cache-jobs`：当前返回 `501`，提示自动生成 worker 尚未接入。
 
-P0 开发覆盖默认读取交接目录中的 `dev_map_overrides.example.json`，也可用
-`ENDFIELD_MAP_OVERRIDES_FILE` 指向另一份服务端配置。PNG 始终从服务端路径流式返回，
+首次准备从已提取的 H 瓦片生成底图，启动器通过 stage pointer 选择当前 runtime，
+底图接口读取其中的 `extraction.mapOverviews.path`。仅在没有当前 runtime 时，
+允许 `ENDFIELD_MAP_OVERRIDES_FILE` 显式指定开发覆盖。PNG 始终从服务端路径流式返回，
 不会复制到 `src`、`public` 或 `dist`。成功响应带有 SHA256 `ETag` 与
-`X-Endfield-Map-Source: dev-override|generated-cache`，界面会显示
-`DEV LOCAL OVERVIEW` 或 `GENERATED CACHE / READY`。
+`X-Endfield-Map-Source: dev-override|runtime-config`，界面会显示
+`DEV LOCAL OVERVIEW` 或 `ACTIVE RUNTIME / READY`。
 
-要接入后续外部缓存，可设置：
+可独立验证底图接口：
 
 ```powershell
-$env:ENDFIELD_MAP_CACHE_ROOT='<外部缓存目录>\webui_cache'
-$env:ENDFIELD_MAP_FINGERPRINT='optional-fingerprint'
-npm.cmd run dev
+node --experimental-strip-types tests/mapOverview.contract.test.mjs
 ```
 
-缓存目录按 `<cacheRoot>\\maps\\<fingerprint>\\map01|map02\\clean|sectors.png` 读取，
-并要求同目录 `cache_manifest.json` 的状态为 `ready`（缺少状态字段也可作为开发缓存）。
-自动 VFS 索引、tile 扫描、Texture2D 解码、level 合成和原子提交仍属于 P2 后端工作，
-本仓库不会伪装成已完成。
+外部缓存使用 `EndfieldMapOverviews/1` 清单及相对 PNG 路径，要求状态为 `ready`。
+普通瓦片保留透明度，未归属外围仅补充显示；经核验的附加区域由独立布局数据描述。
+这些规则不修改分块归属和导出坐标。首次准备完成后自动重取底图，保留当前视角与选框。
 
 ## 许可与非官方声明
 

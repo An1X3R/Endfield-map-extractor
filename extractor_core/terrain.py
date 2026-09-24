@@ -10,12 +10,13 @@ import re
 import sqlite3
 import struct
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, BinaryIO, Callable, Iterable, TypedDict
 
 from PIL import Image
 
 from .lz4 import decompress_lz4_inv
 from .resources import BootstrapExtractionError, load_group, validate_vfs_root
+from .vfs import VfsFile
 
 
 Progress = Callable[[str, float, str, dict[str, Any] | None], None]
@@ -98,6 +99,13 @@ def decode_dxt5(payload: bytes, width: int, height: int) -> bytes:
     return bytes(output)
 
 
+def _resize_rgba_channels(image: Image.Image, size: tuple[int, int]) -> Image.Image:
+    if image.mode != "RGBA":
+        raise ValueError(f"Expected RGBA terrain page, got {image.mode}")
+    channels = tuple(channel.resize(size, Image.Resampling.BILINEAR) for channel in image.split())
+    return Image.merge("RGBA", channels)
+
+
 def _read_clear_page(item: Any, group_dir: Path, handles: dict[Path, Any]) -> tuple[int, int, int, int, bytes]:
     chunk_path = group_dir / f"{item.file_chunk_md5_name}.chk"
     stream = handles.get(chunk_path)
@@ -176,6 +184,68 @@ def _save_manifest(path: Path, payload: dict[str, Any]) -> None:
         handle.write("\n")
 
 
+class TerrainDetailResource(TypedDict):
+    resource: str
+    file: str
+    width: int
+    height: int
+    mip_count: int
+    format_code: int
+    payload_bytes: int
+    payload_sha256: str
+    source_md5: str
+
+
+def _export_detail_resources(
+    map_id: str,
+    files: Iterable[VfsFile],
+    source_tiles: set[tuple[int, int, int]],
+    group_dir: Path,
+    output_dir: Path,
+    cancelled: Cancelled | None,
+) -> str:
+    """Retain exact S/T/C pages and all layer mip chains without inventing bindings."""
+    pattern = re.compile(rf"^Data/Terrain/PC/{re.escape(map_id)}/Terrain_(\d+)_(\d+)_(\d+)_([STC])\.bytes$", re.I)
+    layers = re.compile(rf"^Data/Terrain/PC/{re.escape(map_id)}/Layers/LAYER_[DNC]_\d+\.bytes$", re.I)
+    selected: list[VfsFile] = []
+    found: set[tuple[int, int, int, str]] = set()
+    for item in files:
+        match = pattern.fullmatch(item.file_name)
+        if match and tuple(int(match[index]) for index in (1, 2, 3)) in source_tiles:
+            selected.append(item)
+            found.add((int(match[1]), int(match[2]), int(match[3]), match[4].upper()))
+        elif layers.fullmatch(item.file_name):
+            selected.append(item)
+    folder = output_dir / "detail_resources"
+    folder.mkdir()
+    handles: dict[Path, BinaryIO] = {}
+    records: list[TerrainDetailResource] = []
+    try:
+        for item in sorted(selected, key=lambda row: row.file_name):
+            _check_cancelled(cancelled)
+            width, height, mips, code, payload = _read_clear_page(item, group_dir, handles)
+            target = folder / (Path(item.file_name).stem + ".tret")
+            with target.open("xb") as stream:
+                stream.write(struct.pack("<4sIHHHHI", b"TRET", 1, width, height, mips, code, len(payload)))
+                stream.write(payload)
+            records.append({"resource": item.file_name, "file": target.relative_to(output_dir).as_posix(),
+                            "width": width, "height": height, "mip_count": mips, "format_code": code,
+                            "payload_bytes": len(payload), "payload_sha256": hashlib.sha256(payload).hexdigest(),
+                            "source_md5": item.file_data_md5})
+    finally:
+        for stream in handles.values():
+            stream.close()
+    missing = sorted((*tile, kind) for tile in source_tiles for kind in "STC" if (*tile, kind) not in found)
+    name = "terrain_detail_resources.json"
+    _save_manifest(output_dir / name, {
+        "format": "EndfieldTerrainDetailResources/1", "map": map_id,
+        "source_tiles": sorted(source_tiles), "resources": records, "missing_pages": missing,
+        "status": "Lossless source preservation; shader-version-specific layer binding is not yet applied",
+        "source_page_borders_and_mips_preserved": True,
+    })
+    return name
+
+
 def _extract_map01(
     vfs_root: Path,
     output_dir: Path,
@@ -200,6 +270,8 @@ def _extract_map01(
     heights: dict[tuple[int, int, int], tuple[int, ...]] = {}
     albedo: dict[tuple[int, int, int], Image.Image] = {}
     normal: dict[tuple[int, int, int], Image.Image] = {}
+    albedo_rgba: dict[tuple[int, int, int], Image.Image] = {}
+    normal_rgba: dict[tuple[int, int, int], Image.Image] = {}
     try:
         rows = sorted(items.items())
         for index, ((level, x, z, kind), item) in enumerate(rows, start=1):
@@ -212,9 +284,13 @@ def _extract_map01(
             else:
                 if (width, height, format_code) != (PAGE_SIZE, PAGE_SIZE, 101):
                     raise BootstrapExtractionError(f"Unexpected Map01 {kind} page: {item.file_name}")
-                image = Image.frombytes("RGBA", (width, height), decode_dxt5(payload, width, height)).convert("RGB")
+                decoded = decode_dxt5(payload, width, height)
+                image_rgba = Image.frombytes("RGBA", (width, height), decoded)
+                image = image_rgba.convert("RGB")
                 core = image.crop((PAGE_BORDER, PAGE_BORDER, PAGE_BORDER + CORE_SIZE, PAGE_BORDER + CORE_SIZE))
+                core_rgba = image_rgba.crop((PAGE_BORDER, PAGE_BORDER, PAGE_BORDER + CORE_SIZE, PAGE_BORDER + CORE_SIZE))
                 (albedo if kind == "A" else normal)[(level, x, z)] = core
+                (albedo_rgba if kind == "A" else normal_rgba)[(level, x, z)] = core_rgba
             if index % 50 == 0 or index == len(rows):
                 _emit(
                     progress,
@@ -273,6 +349,8 @@ def _extract_map01(
 
     albedo_atlas = Image.new("RGB", (4096, 4096), (32, 32, 32))
     normal_atlas = Image.new("RGB", (4096, 4096), (128, 128, 255))
+    albedo_rgba_atlas = Image.new("RGBA", (4096, 4096), (32, 32, 32, 0))
+    normal_rgba_atlas = Image.new("RGBA", (4096, 4096), (128, 128, 255, 0))
     for row_index, (fine_x, fine_z, source) in enumerate(source_rows, start=1):
         level, _source_x, _source_z = source
         factor = 2 ** (5 - level)
@@ -291,6 +369,13 @@ def _extract_map01(
                     page.crop(crop).resize((CORE_SIZE, CORE_SIZE), Image.Resampling.BILINEAR),
                     (fine_x * CORE_SIZE, fine_z * CORE_SIZE),
                 )
+        for atlas, pages in ((albedo_rgba_atlas, albedo_rgba), (normal_rgba_atlas, normal_rgba)):
+            page = pages.get(source)
+            if page is not None:
+                atlas.paste(
+                    _resize_rgba_channels(page.crop(crop), (CORE_SIZE, CORE_SIZE)),
+                    (fine_x * CORE_SIZE, fine_z * CORE_SIZE),
+                )
         if row_index % 64 == 0 or row_index == len(source_rows):
             _emit(
                 progress,
@@ -301,8 +386,16 @@ def _extract_map01(
 
     albedo_name = "map01_terrain_pyramid_baked_albedo.png"
     normal_name = "map01_terrain_pyramid_baked_normal.png"
+    albedo_rgba_name = "map01_terrain_pyramid_baked_albedo_rgba.png"
+    normal_rgba_name = "map01_terrain_pyramid_baked_normal_rgba.png"
     albedo_atlas.save(output_dir / albedo_name, optimize=True)
     normal_atlas.save(output_dir / normal_name, optimize=True)
+    albedo_rgba_atlas.save(output_dir / albedo_rgba_name, optimize=True)
+    normal_rgba_atlas.save(output_dir / normal_rgba_name, optimize=True)
+    detail_resources = _export_detail_resources(
+        "map01", group.iter_files(), {source for _x, _z, source in source_rows},
+        group_dir, output_dir, cancelled,
+    )
     manifest = {
         "format": "EndfieldTerrainSurfaceAtlas/2",
         "read_only_game_input": True,
@@ -326,6 +419,9 @@ def _extract_map01(
         "atlas_row_direction": "Unity +Z maps to PNG top-to-bottom rows",
         "albedo": albedo_name,
         "normal": normal_name,
+        "albedo_rgba": albedo_rgba_name,
+        "normal_rgba": normal_rgba_name,
+        "detail_resources": detail_resources,
         "height_database": database.name,
         "active_tiles": len(selected),
         "source_tile_counts_by_level": {
@@ -388,6 +484,8 @@ def _extract_map02(
     height = (max_z - min_z + 1) * CORE_SIZE
     albedo_atlas = Image.new("RGB", (width, height), (32, 32, 32))
     normal_atlas = Image.new("RGB", (width, height), (128, 128, 255))
+    albedo_rgba_atlas = Image.new("RGBA", (width, height), (32, 32, 32, 0))
+    normal_rgba_atlas = Image.new("RGBA", (width, height), (128, 128, 255, 0))
     database = output_dir / "terrain.sqlite"
     connection = sqlite3.connect(database)
     connection.execute(
@@ -415,11 +513,17 @@ def _extract_map02(
                 )
                 if (image_width, image_height, image_format) != (PAGE_SIZE, PAGE_SIZE, 101):
                     raise BootstrapExtractionError(f"Unexpected Map02 {kind} page at {x},{z}")
-                page = Image.frombytes(
+                page_rgba = Image.frombytes(
                     "RGBA", (image_width, image_height), decode_dxt5(payload, image_width, image_height)
-                ).convert("RGB")
+                )
+                core_rgba = page_rgba.crop((PAGE_BORDER, PAGE_BORDER, PAGE_BORDER + CORE_SIZE, PAGE_BORDER + CORE_SIZE))
                 atlas.paste(
-                    page.crop((PAGE_BORDER, PAGE_BORDER, PAGE_BORDER + CORE_SIZE, PAGE_BORDER + CORE_SIZE)),
+                    core_rgba.convert("RGB"),
+                    ((x - min_x) * CORE_SIZE, (z - min_z) * CORE_SIZE),
+                )
+                rgba_atlas = albedo_rgba_atlas if kind == "A" else normal_rgba_atlas
+                rgba_atlas.paste(
+                    core_rgba,
                     ((x - min_x) * CORE_SIZE, (z - min_z) * CORE_SIZE),
                 )
             if index % 50 == 0:
@@ -438,8 +542,16 @@ def _extract_map02(
 
     albedo_name = "map02_terrain_baked_albedo.png"
     normal_name = "map02_terrain_baked_normal.png"
+    albedo_rgba_name = "map02_terrain_baked_albedo_rgba.png"
+    normal_rgba_name = "map02_terrain_baked_normal_rgba.png"
     albedo_atlas.save(output_dir / albedo_name, optimize=True)
     normal_atlas.save(output_dir / normal_name, optimize=True)
+    albedo_rgba_atlas.save(output_dir / albedo_rgba_name, optimize=True)
+    normal_rgba_atlas.save(output_dir / normal_rgba_name, optimize=True)
+    detail_resources = _export_detail_resources(
+        "map02", group.iter_files(), {(6, x, z) for x, z in active},
+        group_dir, output_dir, cancelled,
+    )
     manifest = {
         "format": "EndfieldTerrainSurfaceAtlas/1",
         "read_only_game_input": True,
@@ -467,6 +579,9 @@ def _extract_map02(
         "atlas_row_direction": "Unity +Z maps to PNG top-to-bottom rows",
         "albedo": albedo_name,
         "normal": normal_name,
+        "albedo_rgba": albedo_rgba_name,
+        "normal_rgba": normal_rgba_name,
+        "detail_resources": detail_resources,
         "height_database": database.name,
         "active_tiles": len(active),
         "missing_channels": missing_channels,
