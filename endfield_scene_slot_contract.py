@@ -133,6 +133,26 @@ def mesh_lod_index(name: str) -> int | None:
     return int(matches[0]) if matches else None
 
 
+def primary_visible_mesh(pairs: tuple[tuple[str, RuntimeDraw], ...]) -> str:
+    """Select one authored visible base mesh while excluding shadow-only draws."""
+    if not pairs:
+        raise AmbiguousSubmeshSlots("Primary mesh requires current renderer draws")
+    visible: set[str] = set()
+    for path, draw in pairs:
+        if (not isinstance(path, str) or not path or type(draw.submesh) is not int
+                or type(draw.flags) is not int or draw.submesh < 0 or not 0 <= draw.flags <= 0xFFFFFFFF):
+            raise AmbiguousSubmeshSlots(f"Invalid primary mesh draw: path={path}, draw={draw}")
+        if not draw.flags & 1024:
+            visible.add(path)
+    explicit = {path for path in visible if mesh_lod_index(asset_name(path)) == 0}
+    if len(explicit) == 1:
+        return next(iter(explicit))
+    implicit = {path for path in visible if mesh_lod_index(asset_name(path)) is None}
+    if not explicit and len(implicit) == 1:
+        return next(iter(implicit))
+    raise AmbiguousSubmeshSlots(f"No unique visible base mesh: candidates={sorted(visible)}")
+
+
 def lod_family_name(name: str) -> str:
     """Use the preserved builder's exact LOD family rule, without suffix guessing."""
     return canonical_mesh_name(re.sub(r"_lod\d+$", "", name, flags=re.I))

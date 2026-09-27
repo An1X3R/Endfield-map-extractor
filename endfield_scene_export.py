@@ -75,14 +75,14 @@ def run_scene_process(command: list[str], log: Path, environment: Mapping[str, s
                 check_cancelled()
                 time.sleep(0.2)
             if process.returncode != 0:
-                raise RuntimeError(f"Blender exited with code {process.returncode}; inspect {log}")
+                raise RuntimeError(f"Scene helper {command[0]} exited with code {process.returncode}; inspect {log}")
         finally:
             if process.poll() is None:
                 if os.name == "nt":
                     stopped = subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"],
                                              capture_output=True, text=True, check=False)
                     if stopped.returncode != 0 and process.poll() is None:
-                        raise RuntimeError(f"Cannot stop Blender process {process.pid}: {stopped.stderr}")
+                        raise RuntimeError(f"Cannot stop scene helper process {process.pid}: {stopped.stderr}")
                 else:
                     try:
                         process.terminate()
@@ -95,6 +95,8 @@ def run_scene_process(command: list[str], log: Path, environment: Mapping[str, s
 def build_scene_exports(runtime_path: Path, canonical: Mapping[str, object], output: Path,
                         check_cancelled: Callable[[], None], progress: Callable[[float, str], None]) -> list[SceneArtifact]:
     from endfield_scene_export_plan import prepare_scene_export_plan
+    from endfield_scene_resources import ensure_scene_resources
+    from prepare_terrain_detail import prepare_scene_terrain_details
 
     source = require_object(canonical.get("source"), "scene source")
     game = Path(str(source["game_root"])).resolve()
@@ -109,15 +111,24 @@ def build_scene_exports(runtime_path: Path, canonical: Mapping[str, object], out
     temporary.mkdir(parents=True, exist_ok=True)
     environment = {**os.environ, "TEMP": str(temporary), "TMP": str(temporary), "PYTHONDONTWRITEBYTECODE": "1"}
     builder = Path(__file__).resolve().parent / "blender_export_prepared_scene.py"
+    progress(0.0, "Checking exact scene resource dependencies for the complete selection")
+    preflight = prepare_scene_export_plan(runtime_path, canonical, output / "resource_preflight" / "scene_plan.json", check_cancelled)
+    resource_audit = ensure_scene_resources(runtime_path, preflight, check_cancelled,
+                                           lambda value, message: progress(value * 0.15, message))
+    (output / "resource_preflight" / "resource_audit.json").write_text(json.dumps(resource_audit, indent=2), encoding="utf-8")
     batches = scene_batches(canonical)
     results: list[SceneArtifact] = []
     for index, bounds in enumerate(batches):
         check_cancelled()
         directory = output / "scenes" / f"batch_{index + 1:04d}"
         directory.mkdir(parents=True, exist_ok=False)
-        progress(index / len(batches), f"Preparing scene batch {index + 1}/{len(batches)}")
-        request = {**canonical, "bounds": bounds}
+        progress(0.15 + 0.85 * index / len(batches), f"Preparing scene batch {index + 1}/{len(batches)}")
+        request = {**canonical, "bounds": bounds, "selection_bounds": canonical["bounds"]}
         plan = prepare_scene_export_plan(runtime_path, request, directory / "scene_plan.json", check_cancelled)
+        detail_audit = prepare_scene_terrain_details(
+            runtime_path, plan, check_cancelled,
+            lambda value, message: progress(0.15 + 0.85 * (index + value * 0.25) / len(batches), message))
+        (directory / "terrain_detail_audit.json").write_text(json.dumps(detail_audit, indent=2), encoding="utf-8")
         check_cancelled()
         blend = directory / (str(canonical["map_id"]) + ".blend")
         audit = directory / "scene_audit.json"
@@ -132,5 +143,5 @@ def build_scene_exports(runtime_path: Path, canonical: Mapping[str, object], out
         results.append({"path": str(blend.relative_to(output)), "audit": str(audit.relative_to(output)),
                         "plan": str(plan.relative_to(output)), "bytes": blend.stat().st_size, "sha256": digest,
                         "instances": int(cast(int, report["instances"])), "pending": int(cast(int, report["pending"]))})
-        progress((index + 1) / len(batches), f"Verified scene batch {index + 1}/{len(batches)}")
+        progress(0.15 + 0.85 * (index + 1) / len(batches), f"Verified scene batch {index + 1}/{len(batches)}")
     return results

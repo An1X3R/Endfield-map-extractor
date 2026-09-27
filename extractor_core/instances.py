@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 import sqlite3
 import struct
@@ -85,6 +86,7 @@ def iter_entities(data: bytes) -> Iterator[dict[str, Any]]:
             cursor += count * stride
 
         for entity_index in range(count):
+            entity_id = fb.u32(data, ids_data + entity_index * 4)
             matrix_type = 18 if 18 in columns else 27 if 27 in columns else None
             if matrix_type is None:
                 continue
@@ -94,13 +96,32 @@ def iter_entities(data: bytes) -> Iterator[dict[str, Any]]:
             matrix_address = blob_data + matrix_column + entity_index * matrix_stride
             matrix_blob = data[matrix_address : matrix_address + 64]
             matrix = struct.unpack("<16f", matrix_blob)
+            bounds_components = set(range(6)) & columns.keys()
+            world_bounds = None
+            if bounds_components:
+                if len(bounds_components) != 6:
+                    missing = sorted(set(range(6)) - bounds_components)
+                    raise ValueError(f"entity {entity_id}: missing world bounds components {missing}")
+                values = []
+                for type_id in range(6):
+                    column, stride = columns[type_id]
+                    if stride != 4:
+                        raise ValueError(f"entity {entity_id}: world bounds component {type_id} has stride {stride}, expected 4")
+                    value = struct.unpack_from("<f", data, blob_data + column + entity_index * stride)[0]
+                    if not math.isfinite(value) or (type_id >= 3 and value < 0):
+                        raise ValueError(f"entity {entity_id}: invalid world bounds component {type_id}: {value}")
+                    values.append(value)
+                cx, cy, cz, ex, ey, ez = values
+                world_bounds = (cx - ex, cx + ex, cy - ey, cy + ey, cz - ez, cz + ez)
+                if not all(math.isfinite(value) for value in world_bounds):
+                    raise ValueError(f"entity {entity_id}: world bounds exceed finite range")
             name = None
             if 21 in columns:
                 name_column, name_stride = columns[21]
                 name_address = blob_data + name_column + entity_index * name_stride
                 name = fb.parse_name(data[name_address : name_address + name_stride])
             yield {
-                "entity_id": fb.u32(data, ids_data + entity_index * 4),
+                "entity_id": entity_id,
                 "name": name,
                 "base": entity_base(name),
                 "matrix_type": matrix_type,
@@ -108,6 +129,7 @@ def iter_entities(data: bytes) -> Iterator[dict[str, Any]]:
                 "x": matrix[12],
                 "y": matrix[13],
                 "z": matrix[14],
+                "world_bounds": world_bounds,
                 "group_index": group_index,
                 "entity_index": entity_index,
             }

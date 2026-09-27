@@ -16,8 +16,11 @@ from blender_build_map02_chunk_20260727 import import_obj, join_submeshes, unity
 from blender_scene_materials import create_material
 from blender_scene_terrain import adapt_scene_terrain, adapt_scene_terrain_mesh_normals
 from blender_terrain_atlas import crop_terrain_atlases
-from endfield_scene_material_contract import load_catalog, reference_key
+from blender_terrain_detail import apply_scene_detail
+from endfield_scene_material_contract import load_catalog, reference_key, resolve_export_path
 from endfield_scene_export_plan import load_scene_export_plan, PlanInstance
+
+TERRAIN_SAMPLER_BUDGET = 24
 
 
 def undrawn_material() -> bpy.types.Material:
@@ -56,6 +59,55 @@ def scene_signature() -> dict[str, str]:
             digest.update(str(tuple(material.name if material else None for material in obj.data.materials)).encode())
         signatures[obj.name] = digest.hexdigest()
     return signatures
+
+
+def image_sampler_count(node_tree: bpy.types.NodeTree) -> int:
+    """Count unique image sampler configurations in a node tree and its groups."""
+    sampler_keys: set[tuple[int, str, str, str]] = set()
+    visited_groups: set[int] = set()
+    pending = [node_tree]
+    while pending:
+        current = pending.pop()
+        tree_pointer = current.as_pointer()
+        if tree_pointer in visited_groups:
+            continue
+        visited_groups.add(tree_pointer)
+        for node in current.nodes:
+            if node.type == "TEX_IMAGE":
+                image = node.image
+                if image is not None:
+                    sampler_keys.add((image.as_pointer(), node.interpolation, node.extension, node.projection))
+            elif node.type == "GROUP" and node.node_tree is not None:
+                pending.append(node.node_tree)
+    return len(sampler_keys)
+
+
+def audit_terrain_sampler_budget(scene: bpy.types.Scene) -> list[dict[str, int | str]]:
+    """Audit terrain-detail materials used by mesh polygons against the Eevee budget."""
+    used_materials: dict[int, bpy.types.Material] = {}
+    for obj in scene.objects:
+        if obj.type != "MESH":
+            continue
+        used_slots = {polygon.material_index for polygon in obj.data.polygons}
+        for index, slot in enumerate(obj.material_slots):
+            material = slot.material
+            if index in used_slots and material is not None:
+                used_materials[material.as_pointer()] = material
+
+    audit: list[dict[str, int | str]] = []
+    for material in used_materials.values():
+        if material.get("endfield_terrain_detail_contract") != "HGTerrainDetail/1":
+            continue
+        if not material.use_nodes or material.node_tree is None:
+            raise ValueError(f"Terrain detail material has no shader node tree: {material.name}")
+        sampler_count = image_sampler_count(material.node_tree)
+        audit.append({"material": material.name, "samplers": sampler_count, "budget": TERRAIN_SAMPLER_BUDGET})
+        if sampler_count > TERRAIN_SAMPLER_BUDGET:
+            raise RuntimeError(
+                f"TERRAIN_SAMPLER_BUDGET_EXCEEDED material={material.name} "
+                f"samplers={sampler_count} budget={TERRAIN_SAMPLER_BUDGET}"
+            )
+    return sorted(audit, key=lambda row: str(row["material"]))
 
 
 def project_decals(manifest: Path, materials: Path) -> list[dict[str, object]]:
@@ -137,17 +189,21 @@ def main() -> None:
     bpy.context.scene.collection.children.link(terrain_collection)
     bounds = tuple(plan["bounds"][key] for key in ("xmin", "xmax", "zmin", "zmax"))
     for surface in plan["terrain_surfaces"]:
-        root = Path(surface)
+        root = resolve_export_path(Path(surface))
         metadata = json.loads((root / "terrain_surface.json").read_text(encoding="utf-8-sig"))
         build_terrain(root / metadata["height_database"], terrain_collection, bounds, root, False)
     terrain_materials = adapt_scene_terrain(bpy.context.scene)
     crops = crop_terrain_atlases(bpy.context.scene)
     terrain_normals = adapt_scene_terrain_mesh_normals(bpy.context.scene)
+    terrain_details = [{"source": path, "materials": apply_scene_detail(bpy.context.scene, resolve_export_path(Path(path)))}
+                       for path in plan.get("terrain_details", [])]
     bpy.context.view_layer.update()
     decals = project_decals(Path(plan["decal_manifest"]), Path(plan["decal_materials"]))
+    terrain_sampler_audit = audit_terrain_sampler_budget(bpy.context.scene)
     for image in bpy.data.images:
         if image.source == "FILE" and image.users and not image.packed_file:
             image.pack()
+    bpy.context.view_layer.update()
     scene = bpy.context.scene
     scene.render.engine = "BLENDER_EEVEE_NEXT"
     scene["endfield_export_contract"] = "EndfieldPortableScenePlan/1"
@@ -170,8 +226,9 @@ def main() -> None:
     args.audit.write_text(json.dumps({"format": "EndfieldPortableSceneAudit/1", "reopen_verified": True,
         "instances": len(plan["instances"]), "pending": pending, "objects": len(expected),
         "terrain_materials": terrain_materials, "terrain_crops": crops, "terrain_normals": terrain_normals,
+        "terrain_details": terrain_details, "terrain_sampler_audit": terrain_sampler_audit,
         "decals": decals, "limitations": ["Particle simulation, volume lighting and fog are not reconstructed",
-        "Terrain micro-detail requires source surface metadata; base atlas and world normals are restored"]}, indent=2), encoding="utf-8")
+        "Terrain stochastic projection, POM and cliff C are not reconstructed"]}, indent=2), encoding="utf-8")
 
 
 if __name__ == "__main__":

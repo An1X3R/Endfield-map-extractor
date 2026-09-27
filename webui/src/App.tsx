@@ -2,12 +2,13 @@ import {
   startTransition,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
   ViewTransition,
 } from 'react'
-import type { CSSProperties, ReactNode } from 'react'
+import type { ComponentType, CSSProperties, ReactNode } from 'react'
 import { AnimatePresence, motion, useReducedMotion } from 'motion/react'
 import {
   Box,
@@ -30,10 +31,15 @@ import {
   X,
 } from 'lucide-react'
 import { EXPORT_GROUPS, LAYER_LABELS, MAPS } from './data/maps'
+import { AmbientContours } from './components/AmbientContours'
 import { ExtractionCompleteOverlay } from './components/ExtractionCompleteOverlay'
 import { MapViewport } from './components/MapViewport'
+import { RegionCartouche } from './components/RegionCartouche'
 import { REGION_MAP_RUNTIME_MANIFEST } from './data/regionMapRuntime'
+import { BackendRequestError, isJsonObject, postJson, requestJson } from './lib/backendClient'
 import { resolveSelection } from './lib/mapChunking'
+import { useDraggablePanel } from './hooks/useDraggablePanel'
+import './layout.css'
 import type { ChunkMode, ChunkSelection } from './lib/mapChunking'
 import type {
   FirstRunError,
@@ -127,6 +133,14 @@ const FIRST_RUN_PHASE_LABELS: Record<string, string> = {
   cancelled: '已安全取消',
 }
 
+const FIRST_RUN_HELPER_PHASE_LABELS: Record<string, string> = {
+  load_unpack: '读取与解包',
+  object_parse: '对象解析',
+  mesh_export: '网格导出',
+  texture_export: '纹理转换',
+  read: '读取数据',
+}
+
 const FIRST_RUN_ERROR_LABELS: Record<string, string> = {
   invalid_request: '目录或请求格式无效',
   first_run_paths_incomplete: '目录校验尚未通过',
@@ -190,6 +204,185 @@ type ExportJob = {
   error?: { message?: string; type?: string } | null
 }
 
+type ExportJobEventsResponse = {
+  events: Array<{ sequence?: number; message?: string }>
+}
+
+type ExportJobValidation = {
+  status: string
+  message?: string
+  error?: { message?: string }
+}
+
+const isStringRecord = (value: unknown): value is Record<string, string> =>
+  isJsonObject(value) && Object.values(value).every((item) => typeof item === 'string')
+
+const isFirstRunErrorValue = (value: unknown): value is FirstRunError =>
+  isJsonObject(value) &&
+  typeof value.code === 'string' &&
+  typeof value.message === 'string' &&
+  typeof value.retryable === 'boolean' &&
+  (value.details === undefined || isJsonObject(value.details))
+
+const isFirstRunStatus = (value: unknown): value is FirstRunStatus => {
+  if (!isJsonObject(value)) return false
+  const states = ['idle', 'queued', 'running', 'partial', 'failed', 'cancelled', 'completed']
+  const actions = value.actions
+  const capabilities = value.capabilities
+  if (
+    value.format !== 'EndfieldWebUIFirstRunStatus/1' ||
+    typeof value.state !== 'string' || !states.includes(value.state) ||
+    typeof value.phase !== 'string' || typeof value.progress !== 'number' ||
+    value.progress_scope !== 'phase' ||
+    (value.phase_index !== null && typeof value.phase_index !== 'number') ||
+    typeof value.phase_count !== 'number' || typeof value.message !== 'string' ||
+    typeof value.ready !== 'boolean' || typeof value.cancel_requested !== 'boolean' ||
+    typeof value.resume_available !== 'boolean' || !isJsonObject(actions) ||
+    typeof actions.can_validate !== 'boolean' || typeof actions.can_start !== 'boolean' ||
+    typeof actions.can_resume !== 'boolean' || typeof actions.can_cancel !== 'boolean' ||
+    !isJsonObject(value.defaults) || !isJsonObject(capabilities) ||
+    typeof capabilities.map_dataset !== 'string' ||
+    !isStringRecord(capabilities.asset_resolution) ||
+    typeof capabilities.blender_build !== 'string' ||
+    typeof capabilities.profile_scan !== 'string'
+  ) return false
+  if (value.request !== undefined && (
+    !isJsonObject(value.request) ||
+    value.request.format !== 'EndfieldWebUIFirstRunRequest/1' ||
+    typeof value.request.game_root !== 'string' ||
+    typeof value.request.export_root !== 'string' ||
+    typeof value.request.cache_root !== 'string' ||
+    typeof value.request.run_name !== 'string' ||
+    (value.request.blender_exe !== undefined && typeof value.request.blender_exe !== 'string')
+  )) return false
+  if (value.request_identity !== undefined && (
+    !isJsonObject(value.request_identity) ||
+    typeof value.request_identity.run_name !== 'string' ||
+    typeof value.request_identity.sha256 !== 'string'
+  )) return false
+  if (value.details !== undefined && !isJsonObject(value.details)) return false
+  if (value.result !== undefined && !isJsonObject(value.result)) return false
+  if (value.error !== undefined && value.error !== null && !isFirstRunErrorValue(value.error)) return false
+  if (value.disposition !== undefined && value.disposition !== 'already_ready') return false
+  return true
+}
+
+const isFirstRunValidation = (value: unknown): value is FirstRunValidation => {
+  if (!isJsonObject(value) || value.format !== 'EndfieldWebUIFirstRunValidation/1') return false
+  if (
+    (value.status !== 'valid' && value.status !== 'incomplete') ||
+    value.game_read_only !== true || !isJsonObject(value.checks) ||
+    !Object.values(value.checks).every((item) => typeof item === 'boolean') ||
+    !Array.isArray(value.missing) || !value.missing.every((item) => typeof item === 'string') ||
+    !isJsonObject(value.canonical) ||
+    value.canonical.format !== 'EndfieldWebUIFirstRunRequest/1' ||
+    typeof value.canonical.game_root !== 'string' ||
+    typeof value.canonical.export_root !== 'string' ||
+    typeof value.canonical.cache_root !== 'string' ||
+    typeof value.canonical.run_name !== 'string' ||
+    !isJsonObject(value.space) || !isJsonObject(value.prerequisites) ||
+    typeof value.space_warning !== 'boolean'
+  ) return false
+  for (const key of ['cache', 'export'] as const) {
+    const space = value.space[key]
+    if (
+      !isJsonObject(space) ||
+      (space.status !== 'baseline_estimate' && space.status !== 'unknown') ||
+      typeof space.path !== 'string' || typeof space.required_bytes !== 'number' ||
+      (space.free_bytes !== null && typeof space.free_bytes !== 'number') ||
+      typeof space.warning !== 'boolean'
+    ) return false
+  }
+  return typeof value.prerequisites.git_available === 'boolean' &&
+    typeof value.prerequisites.dotnet_available === 'boolean' &&
+    typeof value.prerequisites.network_required_for_initial_helper_checkout === 'boolean' &&
+    typeof value.prerequisites.helper_commit_is_pinned === 'boolean'
+}
+
+const isFirstRunEventsResponse = (value: unknown): value is { events?: FirstRunEvent[]; next_after?: number } =>
+  isJsonObject(value) &&
+  (value.events === undefined || Array.isArray(value.events) && value.events.every((event) =>
+    isJsonObject(event) && typeof event.sequence === 'number' && typeof event.phase === 'string' &&
+    typeof event.progress === 'number' && event.progress_scope === 'phase' &&
+    (event.phase_index === null || typeof event.phase_index === 'number') &&
+    typeof event.phase_count === 'number' &&
+    (event.message === undefined || typeof event.message === 'string')
+  )) &&
+  (value.next_after === undefined || typeof value.next_after === 'number')
+
+const isPathPickerResponse = (value: unknown): value is PathPickerResponse =>
+  isJsonObject(value) &&
+  value.format === 'EndfieldPathPickerResponse/1' &&
+  (value.status === 'selected' || value.status === 'cancelled' || value.status === 'unavailable') &&
+  (value.kind === undefined || value.kind === 'game' || value.kind === 'output' || value.kind === 'cache' || value.kind === 'blender') &&
+  (value.path === undefined || typeof value.path === 'string') &&
+  (value.valid === undefined || typeof value.valid === 'boolean') &&
+  (value.writable === undefined || typeof value.writable === 'boolean') &&
+  (value.writableParent === undefined || typeof value.writableParent === 'boolean') &&
+  (value.error === undefined || typeof value.error === 'string')
+
+const isBlenderBuildResult = (value: unknown): value is BlenderBuildResult =>
+  isJsonObject(value) && typeof value.status === 'string' &&
+  (value.scheduled === undefined || typeof value.scheduled === 'boolean') &&
+  (value.pending === undefined || typeof value.pending === 'number') &&
+  (value.scenes === undefined || Array.isArray(value.scenes) && value.scenes.every((scene) =>
+    isJsonObject(scene) && typeof scene.path === 'string' && typeof scene.audit === 'string' &&
+    typeof scene.plan === 'string' && typeof scene.bytes === 'number' &&
+    typeof scene.sha256 === 'string' && typeof scene.instances === 'number' &&
+    typeof scene.pending === 'number'
+  ))
+
+const isExportJob = (value: unknown): value is ExportJob => {
+  const states = ['queued', 'preparing', 'extracting', 'building', 'auditing', 'completed', 'failed', 'cancelled']
+  if (!isJsonObject(value) || typeof value.job_id !== 'string' || typeof value.state !== 'string' ||
+    !states.includes(value.state) || typeof value.phase !== 'string' || typeof value.progress !== 'number') return false
+  if (value.result !== undefined && value.result !== null) {
+    if (!isJsonObject(value.result)) return false
+    if (value.result.package !== undefined && value.result.package !== null) {
+      const resultPackage = value.result.package
+      if (!isJsonObject(resultPackage) ||
+        (resultPackage.output_dir !== undefined && typeof resultPackage.output_dir !== 'string') ||
+        (resultPackage.status !== undefined && typeof resultPackage.status !== 'string') ||
+        (resultPackage.exportMode !== undefined && resultPackage.exportMode !== 'blend' && resultPackage.exportMode !== 'data_package') ||
+        (resultPackage.warnings !== undefined && (!Array.isArray(resultPackage.warnings) || !resultPackage.warnings.every((item) => typeof item === 'string')))) return false
+    }
+    if (value.result.blenderBuild !== undefined && value.result.blenderBuild !== null && !isBlenderBuildResult(value.result.blenderBuild)) return false
+  }
+  if (value.error !== undefined && value.error !== null && (!isJsonObject(value.error) ||
+    (value.error.message !== undefined && typeof value.error.message !== 'string') ||
+    (value.error.type !== undefined && typeof value.error.type !== 'string'))) return false
+  return true
+}
+
+const isExportJobEventsResponse = (value: unknown): value is ExportJobEventsResponse =>
+  isJsonObject(value) && Array.isArray(value.events) && value.events.every((event) =>
+    isJsonObject(event) &&
+    (event.sequence === undefined || typeof event.sequence === 'number') &&
+    (event.message === undefined || typeof event.message === 'string')
+  )
+
+const isExportJobValidation = (value: unknown): value is ExportJobValidation =>
+  isJsonObject(value) && typeof value.status === 'string' &&
+  (value.message === undefined || typeof value.message === 'string') &&
+  (value.error === undefined || isJsonObject(value.error) &&
+    (value.error.message === undefined || typeof value.error.message === 'string'))
+
+const firstRunApiErrorFrom = (error: unknown): FirstRunApiError | null => {
+  if (!(error instanceof BackendRequestError) || error.responseBody === null) return null
+  let payload: unknown
+  try {
+    payload = JSON.parse(error.responseBody) as unknown
+  } catch {
+    return null
+  }
+  if (!isJsonObject(payload)) return null
+  const apiError: FirstRunApiError = {}
+  if (payload.format === 'EndfieldWebUIFirstRunError/1') apiError.format = payload.format
+  if (isFirstRunErrorValue(payload.error)) apiError.error = payload.error
+  if (isFirstRunStatus(payload.firstRun)) apiError.firstRun = payload.firstRun
+  return apiError.format || apiError.error || apiError.firstRun ? apiError : null
+}
+
 const CHUNK_MODE_LABELS: Record<ChunkMode, string> = {
   per_sector: '每个 128 × 128 sector 独立导出',
   cluster_4x4_sectors: '按全局坐标稳定分组为 4 × 4 sectors',
@@ -246,8 +439,8 @@ function PathField({
     <div className="path-field">
       <label htmlFor={id}>{label}</label>
       <div className="path-input">
-        <input id={id} value={value} readOnly />
-        <button type="button" onClick={onChoose} aria-label={`选择${label}`} disabled={busy}>
+        <input id={id} data-testid={`path-${id}`} value={value} readOnly />
+        <button type="button" data-testid={`path-picker-${id}`} onClick={onChoose} aria-label={`选择${label}`} disabled={busy}>
           {busy ? <RefreshCw className="path-picker-spin" size={14} /> : icon}
         </button>
       </div>
@@ -404,45 +597,6 @@ function LegalArchive() {
   )
 }
 
-function MapTransitionVeil({ mapId, direction, overviewSource }: { mapId: MapId; direction: 'forward' | 'back'; overviewSource: 'loading' | 'dev-override' | 'runtime-config' | 'fallback' }) {
-  const ready = overviewSource !== 'loading'
-  const reduceMotion = useReducedMotion()
-
-  return (
-    <AnimatePresence initial={false} mode="popLayout">
-      <motion.div
-        key={mapId}
-        className={`scene-rebuild scene-rebuild-${mapId} scene-rebuild-${direction} ${ready ? 'is-ready' : 'is-syncing'}`}
-        initial={{ opacity: 1 }}
-        animate={{ opacity: ready ? 0 : 1 }}
-        exit={{ opacity: 0 }}
-        transition={{
-          duration: ready ? (reduceMotion ? 0.01 : 0.86) : 0,
-          delay: ready && !reduceMotion ? 0.22 : 0,
-          ease: [0.4, 0, 0.2, 1],
-        }}
-        aria-hidden="true"
-      >
-        <div className="rebuild-slide-plane" />
-        <div className="wuling-color-bars">
-          <i className="wuling-bar bar-ink" />
-          <i className="wuling-bar bar-mint" />
-          <i className="wuling-bar bar-mineral" />
-          <i className="wuling-bar bar-warm" />
-        </div>
-        <div className="rebuild-plane" />
-        <div className="rebuild-trace trace-a" />
-        <div className="rebuild-trace trace-b" />
-        <div className="rebuild-blocks">
-          {Array.from({ length: 18 }, (_, index) => (
-            <i key={index} style={{ '--block-index': index } as CSSProperties} />
-          ))}
-        </div>
-      </motion.div>
-    </AnimatePresence>
-  )
-}
-
 export default function App() {
   const reduceMotion = useReducedMotion()
   const [mapId, setMapId] = useState<MapId>('map01')
@@ -465,8 +619,13 @@ export default function App() {
   const [drawerCollapsed, setDrawerCollapsed] = useState(false)
   const [launchState, setLaunchState] = useState<LaunchState>('idle')
   const [completionVisible, setCompletionVisible] = useState(false)
+  const [devCompletionPreview, setDevCompletionPreview] = useState<{
+    mapId: MapId
+    Component: ComponentType<{ mapId: MapId; onFinished: () => void }>
+  } | null>(null)
   const [completedExportMode, setCompletedExportMode] = useState<ExportMode>('blend')
   const [completedBlenderBuild, setCompletedBlenderBuild] = useState<BlenderBuildResult | null>(null)
+  const [completedOutputDirectory, setCompletedOutputDirectory] = useState<string | null>(null)
   const [progress, setProgress] = useState(0)
   const [activeJobId, setActiveJobId] = useState<string | null>(null)
   const [jobMessage, setJobMessage] = useState('')
@@ -475,12 +634,20 @@ export default function App() {
   const [toast, setToast] = useState<string | null>(null)
   const [overviewSource, setOverviewSource] = useState<'loading' | 'dev-override' | 'runtime-config' | 'fallback'>('loading')
   const [transitionDirection, setTransitionDirection] = useState<'forward' | 'back'>('forward')
+  const DevCompletionPreview = devCompletionPreview?.Component
+  const workspaceRef = useRef<HTMLElement | null>(null)
   const jobTimer = useRef<number | null>(null)
   const toastTimer = useRef<number | null>(null)
   const firstRunPollTimer = useRef<number | null>(null)
   const firstRunEventCursor = useRef(0)
+  const exportEventCursor = useRef(0)
+  const exportPollGeneration = useRef(0)
+  const exportPollRef = useRef<((jobId: string, after: number, generation: number) => void) | null>(null)
+  const exportConnectionLost = useRef(false)
   const firstRunHydrated = useRef(false)
   const previousReady = useRef(false)
+  const launchStateRef = useRef(launchState)
+  const panelDrag = useDraggablePanel(workspaceRef, launchState === 'running')
   const map = MAPS[mapId]
   const preparedRequest = firstRunStatus?.request
   const preparedPathsMatch = Boolean(
@@ -503,6 +670,10 @@ export default function App() {
       : overviewSource === 'loading'
         ? 'RUNTIME OVERVIEW / CONNECTING'
         : 'SCHEMATIC / NO GAME ASSETS'
+
+  useLayoutEffect(() => {
+    launchStateRef.current = launchState
+  }, [launchState])
 
   const handleOverviewSourceChange = useCallback((source: 'loading' | 'dev-override' | 'runtime-config' | 'fallback') => {
     setOverviewSource(source)
@@ -530,11 +701,7 @@ export default function App() {
   const loadFirstRunStatus = useCallback(async (silent = false) => {
     if (!silent) setFirstRunAction('status')
     try {
-      const response = await fetch('/api/v2/first-run', { cache: 'no-store' })
-      const payload = await response.json() as FirstRunStatus | FirstRunApiError
-      if (!response.ok || !('state' in payload)) {
-        throw new Error(firstRunErrorMessage(payload as FirstRunApiError, '无法读取首次运行状态'))
-      }
+      const payload = await requestJson('/api/v2/first-run', { method: 'GET' }, isFirstRunStatus)
       setFirstRunStatus(payload)
       hydrateFirstRunPaths(payload)
       if (payload.error?.message) setFirstRunError(payload.error.message)
@@ -549,9 +716,11 @@ export default function App() {
   }, [hydrateFirstRunPaths])
 
   const loadFirstRunEvents = useCallback(async () => {
-    const response = await fetch(`/api/v2/first-run/events?after=${firstRunEventCursor.current}&limit=100`, { cache: 'no-store' })
-    if (!response.ok) return
-    const payload = await response.json() as { events?: FirstRunEvent[]; next_after?: number }
+    const payload = await requestJson(
+      `/api/v2/first-run/events?after=${firstRunEventCursor.current}&limit=100`,
+      { method: 'GET' },
+      isFirstRunEventsResponse,
+    )
     const events = payload.events ?? []
     if (events.length) {
       setFirstRunEvents((current) => [...current, ...events].slice(-24))
@@ -560,6 +729,7 @@ export default function App() {
   }, [])
 
   const stopJob = useCallback(() => {
+    exportPollGeneration.current += 1
     if (jobTimer.current) {
       window.clearTimeout(jobTimer.current)
       jobTimer.current = null
@@ -600,7 +770,11 @@ export default function App() {
     if (!firstRunRunning) return
     let disposed = false
     const poll = async () => {
-      await Promise.all([loadFirstRunStatus(true), loadFirstRunEvents()])
+      try {
+        await Promise.all([loadFirstRunStatus(true), loadFirstRunEvents()])
+      } catch (error) {
+        setFirstRunError(error instanceof Error ? error.message : String(error))
+      }
       if (!disposed) firstRunPollTimer.current = window.setTimeout(poll, 850)
     }
     void poll()
@@ -612,11 +786,11 @@ export default function App() {
   }, [firstRunRunning, loadFirstRunEvents, loadFirstRunStatus])
 
   const handleSelectionChange = useCallback((next: ChunkSelection | null) => {
-    if (launchState === 'running') return
+    if (launchStateRef.current === 'running') return
     setSelection(next)
     setLaunchState('idle')
     setProgress(0)
-  }, [launchState])
+  }, [])
 
   const handleMapChange = (nextMap: MapId) => {
     if (nextMap === mapId) return
@@ -626,20 +800,18 @@ export default function App() {
     }
     stopJob()
     setTransitionDirection(nextMap === 'map02' ? 'forward' : 'back')
-    startTransition(() => {
-      setOverviewSource('loading')
-      setMapId(nextMap)
-      setSourcePaths((current) => ({
-        ...current,
-        blender: current.blender === DEFAULT_BLENDER_BY_MAP[mapId]
-          ? DEFAULT_BLENDER_BY_MAP[nextMap]
-          : current.blender,
-      }))
-      setSelection(null)
-      setLaunchState('idle')
-      setProgress(0)
-      setOutputLabel(nextMap === 'map01' ? 'map01_region_visual' : 'map02_region_visual')
-    })
+    setOverviewSource('loading')
+    setMapId(nextMap)
+    setSourcePaths((current) => ({
+      ...current,
+      blender: current.blender === DEFAULT_BLENDER_BY_MAP[mapId]
+        ? DEFAULT_BLENDER_BY_MAP[nextMap]
+        : current.blender,
+    }))
+    setSelection(null)
+    setLaunchState('idle')
+    setProgress(0)
+    setOutputLabel(nextMap === 'map01' ? 'map01_region_visual' : 'map02_region_visual')
   }
 
   const toggleLayer = (layer: LayerId) => {
@@ -678,13 +850,7 @@ export default function App() {
     if (choosingPath) return
     setChoosingPath(kind)
     try {
-      const response = await fetch('/api/v2/path-picker', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ kind, current: sourcePaths[kind] }),
-      })
-      const payload = await response.json() as PathPickerResponse
-      if (!response.ok) throw new Error(payload.error ?? 'path_picker_failed')
+      const payload = await postJson('/api/v2/path-picker', { kind, current: sourcePaths[kind] }, isPathPickerResponse)
       if (payload.status === 'cancelled') return
       if (payload.status !== 'selected' || !payload.path) throw new Error(payload.error ?? 'path_picker_unavailable')
       setSourcePaths((current) => ({ ...current, [kind]: payload.path as string }))
@@ -719,15 +885,7 @@ export default function App() {
     setFirstRunError('')
     setFirstRunValidation(null)
     try {
-      const response = await fetch('/api/v2/first-run/validate', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(firstRunRequest),
-      })
-      const payload = await response.json() as FirstRunValidation | FirstRunApiError
-      if (!response.ok || !('canonical' in payload)) {
-        throw new Error(firstRunErrorMessage(payload as FirstRunApiError, '首次运行校验失败'))
-      }
+      const payload = await postJson('/api/v2/first-run/validate', firstRunRequest, isFirstRunValidation)
       setFirstRunValidation(payload)
       setSourcePaths((current) => ({ ...current, cache: payload.canonical.cache_root }))
       if (payload.status !== 'valid') {
@@ -738,7 +896,11 @@ export default function App() {
       }
       notify(payload.space_warning ? '目录校验通过，但磁盘空间低于保守基线' : '目录与运行前提校验完成')
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error)
+      const apiError = firstRunApiErrorFrom(error)
+      if (apiError?.firstRun) setFirstRunStatus(apiError.firstRun)
+      const message = apiError
+        ? firstRunErrorMessage(apiError, '首次运行校验失败')
+        : error instanceof Error ? error.message : String(error)
       setFirstRunError(message)
       notify(message)
     } finally {
@@ -755,17 +917,7 @@ export default function App() {
       firstRunEventCursor.current = 0
     }
     try {
-      const response = await fetch('/api/v2/first-run', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(firstRunRequest),
-      })
-      const payload = await response.json() as FirstRunStatus | FirstRunApiError
-      if (!response.ok || !('state' in payload)) {
-        const errorPayload = payload as FirstRunApiError
-        if (errorPayload.firstRun) setFirstRunStatus(errorPayload.firstRun)
-        throw new Error(firstRunErrorMessage(errorPayload, '无法启动首次数据准备'))
-      }
+      const payload = await postJson('/api/v2/first-run', firstRunRequest, isFirstRunStatus)
       setFirstRunStatus(payload)
       if (payload.disposition === 'already_ready' || payload.ready) {
         notify('相同数据请求已经准备完成，地图导出已解锁')
@@ -773,7 +925,11 @@ export default function App() {
         notify(resume ? '继续准备请求已提交；将复用已保留的阶段结果' : '首次数据准备已排队；游戏目录始终保持只读')
       }
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error)
+      const apiError = firstRunApiErrorFrom(error)
+      if (apiError?.firstRun) setFirstRunStatus(apiError.firstRun)
+      const message = apiError
+        ? firstRunErrorMessage(apiError, '无法启动首次数据准备')
+        : error instanceof Error ? error.message : String(error)
       setFirstRunError(message)
       notify(message)
     } finally {
@@ -786,11 +942,7 @@ export default function App() {
     setFirstRunAction('cancel')
     setFirstRunError('')
     try {
-      const response = await fetch('/api/v2/first-run/cancel', { method: 'POST' })
-      const payload = await response.json() as FirstRunStatus | FirstRunApiError
-      if (!response.ok || !('state' in payload)) {
-        throw new Error(firstRunErrorMessage(payload as FirstRunApiError, '无法发送取消请求'))
-      }
+      const payload = await postJson('/api/v2/first-run/cancel', {}, isFirstRunStatus)
       setFirstRunStatus(payload)
       notify('取消请求已提交；正在终止子进程树，已生成的部分数据会保留')
     } catch (error) {
@@ -891,6 +1043,7 @@ export default function App() {
   const launchVisualTask = () => {
     if (!isReady || !selection) return
     stopJob()
+    const generation = exportPollGeneration.current
     setLaunchState('running')
     setProgress(0)
     setJobError('')
@@ -913,24 +1066,34 @@ export default function App() {
       export_groups: allGroupsSelected ? ['all'] : selectedGroups,
       effects: { selection_mode: effectsMode },
       water_mode: exportMode === 'blend' ? 'stable_eevee' : waterMode,
-      source: { game_root: sourcePaths.game, blender_exe: sourcePaths.blender.trim() },
+      source: { game_root: sourcePaths.game, ...(sourcePaths.blender.trim() ? { blender_exe: sourcePaths.blender.trim() } : {}) },
       output: { root: sourcePaths.output, label: outputLabel },
     }
 
-    const poll = (jobId: string, after = 0) => {
+    const poll = (jobId: string, after: number, pollGeneration: number) => {
+      if (pollGeneration !== exportPollGeneration.current) return
       const tick = async () => {
         try {
-          const [jobResponse, eventsResponse] = await Promise.all([
-            fetch(`/api/v2/export-jobs/${encodeURIComponent(jobId)}`),
-            fetch(`/api/v2/export-jobs/${encodeURIComponent(jobId)}/events?after=${after}`),
+          const [job, eventPayload] = await Promise.all([
+            requestJson(`/api/v2/export-jobs/${encodeURIComponent(jobId)}`, { method: 'GET' }, isExportJob),
+            requestJson(
+              `/api/v2/export-jobs/${encodeURIComponent(jobId)}/events?after=${after}`,
+              { method: 'GET' },
+              isExportJobEventsResponse,
+            ),
           ])
-          const job = await jobResponse.json() as ExportJob & { message?: string }
-          const eventPayload = await eventsResponse.json() as { events?: Array<{ sequence?: number; message?: string }> }
-          if (!jobResponse.ok) throw new Error(job.message ?? 'job_status_failed')
+          if (pollGeneration !== exportPollGeneration.current) return
           const events = eventPayload.events ?? []
           const newest = events.at(-1)
           const nextAfter = newest?.sequence ?? after
+          exportEventCursor.current = nextAfter
           if (newest?.message) setJobMessage(newest.message)
+          if (exportConnectionLost.current) {
+            exportConnectionLost.current = false
+            setJobError('')
+            setJobMessage(newest?.message ?? '任务状态连接已恢复')
+            notify('任务状态已重新连接')
+          }
           setProgress(Math.max(0, Math.min(100, job.progress * 100)))
           if (job.state === 'completed') {
             stopJob()
@@ -942,13 +1105,20 @@ export default function App() {
             const build = job.result?.blenderBuild ?? null
             setCompletedExportMode(resultMode)
             setCompletedBlenderBuild(build)
+            setCompletedOutputDirectory(job.result?.package?.output_dir ?? null)
             setLaunchState('completed')
             setActiveJobId(null)
-            const partialBuild = build?.status === 'partial' || (build?.pending ?? 0) > 0
+            exportPollRef.current = null
+            exportConnectionLost.current = false
+            const pendingCount = build?.pending ?? build?.scenes?.reduce((total, scene) => total + scene.pending, 0) ?? 0
+            const hasSceneReport = Boolean(build && Array.isArray(build.scenes))
+            const partialBuild = build?.status === 'partial' || pendingCount > 0
             notify(resultMode === 'blend'
-              ? partialBuild
-                ? `场景文件已导出；${build?.pending ?? 0} 项待处理，详见报告`
-                : `场景文件已导出：${build?.scenes?.length ?? 0} 批`
+              ? !hasSceneReport
+                ? '任务完成，但未返回场景报告/路径'
+                : partialBuild
+                  ? `场景文件已导出；${pendingCount} 项待处理，详见报告`
+                  : `场景文件已导出：${build?.scenes?.length ?? 0} 批`
               : `数据包导出完成：${job.result?.package?.status ?? 'completed'}`)
             return
           }
@@ -956,6 +1126,8 @@ export default function App() {
             stopJob()
             setLaunchState('cancelled')
             setActiveJobId(null)
+            exportPollRef.current = null
+            exportConnectionLost.current = false
             notify('任务已在阶段边界取消；已有日志和部分产物均已保留')
             return
           }
@@ -965,57 +1137,51 @@ export default function App() {
             setJobError(message)
             setLaunchState('failed')
             setActiveJobId(null)
+            exportPollRef.current = null
+            exportConnectionLost.current = false
             notify(`提取失败：${message}`)
             return
           }
-          jobTimer.current = window.setTimeout(() => void poll(jobId, nextAfter), 500)
+          jobTimer.current = window.setTimeout(() => poll(jobId, nextAfter, pollGeneration), 500)
         } catch (error) {
-          stopJob()
+          if (pollGeneration !== exportPollGeneration.current) return
           const message = error instanceof Error ? error.message : String(error)
           setJobError(message)
-          setLaunchState('failed')
-          setActiveJobId(null)
-          notify(`无法读取任务状态：${message}`)
+          setJobMessage('状态连接中断；后台状态暂不可确认，可重连或请求取消')
+          if (!exportConnectionLost.current) notify(`任务状态暂不可确认：${message}`)
+          exportConnectionLost.current = true
+          jobTimer.current = window.setTimeout(() => poll(jobId, exportEventCursor.current, pollGeneration), 1500)
         }
       }
       void tick()
     }
+    exportPollRef.current = poll
 
     void (async () => {
       try {
-        const validationResponse = await fetch('/api/v2/export-jobs/validate', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(request),
-        })
-        const validation = await validationResponse.json() as {
-          status?: string
-          message?: string
-          error?: { message?: string }
-        }
-        if (!validationResponse.ok || validation.status !== 'valid') {
+        const validation = await postJson('/api/v2/export-jobs/validate', request, isExportJobValidation)
+        if (generation !== exportPollGeneration.current) return
+        if (validation.status !== 'valid') {
           throw new Error(validation.message ?? validation.error?.message ?? 'export_request_validation_failed')
         }
-        const response = await fetch('/api/v2/export-jobs', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(request),
-        })
-        const payload = await response.json() as (ExportJob & { message?: string }) | FirstRunApiError
-        if (!response.ok || !('job_id' in payload) || !payload.job_id) {
-          const firstRunPayload = payload as FirstRunApiError
-          if (firstRunPayload.firstRun) setFirstRunStatus(firstRunPayload.firstRun)
-          if (firstRunPayload.error?.code === 'first_run_required') {
-            setDrawerCollapsed(false)
-            throw new Error('需要先完成首次运行数据准备')
-          }
-          throw new Error('message' in payload && payload.message ? payload.message : firstRunErrorMessage(firstRunPayload, 'export_job_submit_failed'))
-        }
+        const payload = await postJson('/api/v2/export-jobs', request, isExportJob)
+        if (generation !== exportPollGeneration.current) return
         setActiveJobId(payload.job_id)
+        exportEventCursor.current = 0
+        exportConnectionLost.current = false
         notify(exportMode === 'blend' ? 'Blender 场景构建任务已提交' : '数据包导出任务已提交')
-        poll(payload.job_id)
+        poll(payload.job_id, 0, generation)
       } catch (error) {
-        const message = error instanceof Error ? error.message : String(error)
+        if (generation !== exportPollGeneration.current) return
+        const apiError = firstRunApiErrorFrom(error)
+        if (apiError?.firstRun) setFirstRunStatus(apiError.firstRun)
+        if (apiError?.error?.code === 'first_run_required') {
+          setDrawerCollapsed(false)
+          setFirstRunError(firstRunErrorMessage(apiError, '需要先完成首次运行数据准备'))
+        }
+        const message = apiError?.error
+          ? firstRunErrorMessage(apiError, 'export_job_submit_failed')
+          : error instanceof Error ? error.message : String(error)
         setJobError(message)
         setLaunchState('failed')
         notify(`无法启动提取：${message}`)
@@ -1027,11 +1193,14 @@ export default function App() {
     if (launchState !== 'running' || !activeJobId) return
     try {
       const response = await fetch(`/api/v2/export-jobs/${encodeURIComponent(activeJobId)}/cancel`, { method: 'POST' })
-      if (!response.ok) throw new Error('cancel_request_failed')
+      if (!response.ok) {
+        const body = await response.text()
+        throw new Error(`POST /api/v2/export-jobs/${encodeURIComponent(activeJobId)}/cancel failed with HTTP ${response.status}: ${body || '(empty response body)'}`)
+      }
       setJobMessage('已请求协作取消；等待当前安全阶段结束')
       notify('取消请求已提交；已经写入的结果会保留')
-    } catch {
-      notify('取消请求发送失败；任务仍在运行')
+    } catch (error) {
+      notify(`取消请求失败，后台状态需重新确认：${error instanceof Error ? error.message : String(error)}`)
     }
   }
 
@@ -1052,7 +1221,7 @@ export default function App() {
       effects_mode: effectsMode,
       water_mode: exportMode === 'blend' ? 'stable_eevee' : waterMode,
       region_map_chunk_selection: selection,
-      source: { game_root: sourcePaths.game, blender_exe: sourcePaths.blender.trim() },
+      source: { game_root: sourcePaths.game, ...(sourcePaths.blender.trim() ? { blender_exe: sourcePaths.blender.trim() } : {}) },
       output: { root: sourcePaths.output, label: outputLabel },
     }
     try {
@@ -1146,6 +1315,18 @@ export default function App() {
     ? '--'
     : String(firstRunStatus.phase_index + 1).padStart(2, '0')
   const firstRunPhaseCount = String(firstRunStatus?.phase_count ?? 14).padStart(2, '0')
+  const helperProgress = firstRunStatus?.details?.helperProgress
+  const helperCountLabel = helperProgress && (helperProgress.current !== undefined || helperProgress.total !== undefined)
+    ? `${helperProgress.current ?? '—'} / ${helperProgress.total ?? '—'}`
+    : null
+  const helperMetrics = helperProgress
+    ? [
+        Number.isFinite(helperProgress.elapsedSeconds) ? `耗时 ${helperProgress.elapsedSeconds?.toFixed(1)} s` : null,
+        Number.isFinite(helperProgress.peakWorkingSetBytes) ? `峰值工作集 ${formatBytes(helperProgress.peakWorkingSetBytes ?? 0)}` : null,
+        Number.isFinite(helperProgress.readBytes) ? `逻辑读入 ${formatBytes(helperProgress.readBytes ?? 0)}` : null,
+        Number.isFinite(helperProgress.writeBytes) ? `逻辑写出 ${formatBytes(helperProgress.writeBytes ?? 0)}` : null,
+      ].filter((metric): metric is string => metric !== null)
+    : []
   const firstRunStateLabel = sourceReady
     ? 'DATA READY'
     : firstRunRunning
@@ -1178,7 +1359,7 @@ export default function App() {
   return (
     <div className={`app-shell theme-${mapId}`} data-map-theme={mapId}>
       <div className="ambient-grid" aria-hidden="true" />
-      <div className="ambient-contours" aria-hidden="true"><i /><i /></div>
+      <AmbientContours />
 
       <header
         className="topbar"
@@ -1206,6 +1387,7 @@ export default function App() {
                   data-testid={`map-tab-${id}`}
                   className={active ? 'active' : ''}
                   aria-pressed={active}
+                  disabled={launchState === 'running'}
                   onClick={() => handleMapChange(id)}
                 >
                   {active && (
@@ -1226,16 +1408,35 @@ export default function App() {
         </div>
 
           <div className="top-actions">
-            <div className={`top-status ${sourceReady ? 'ready' : ''}`}>
+          <div className={`top-status ${sourceReady ? 'ready' : ''}`}>
               <i />
               <span>{sourceReady ? 'DATA / READY' : firstRunRunning ? 'DATA / PREPARING' : 'FIRST RUN / REQUIRED'}</span>
             </div>
-          <button type="button" onClick={copyRequest}><Clipboard size={14} /><span>复制摘要</span></button>
-          <button type="button" onClick={resetPrototype}><RefreshCw size={14} /><span>复位</span></button>
+          {import.meta.env.DEV && (
+            <button
+              className="dev-review-button"
+              type="button"
+              data-testid="completion-review-entry"
+              aria-label="预览完成动画（开发者样例）"
+              title="开发者样例，不执行导出"
+              onClick={() => {
+                const selectedMap = mapId
+                void import('./components/completion/CompletionReview').then(({ CompletionPreview }) => {
+                  setDevCompletionPreview({ mapId: selectedMap, Component: CompletionPreview })
+                }).catch((error: unknown) => {
+                  notify(`完成动画预览加载失败：${error instanceof Error ? error.message : String(error)}`)
+                })
+              }}
+            >
+              <Play size={14} /><span>完成动画</span>
+            </button>
+          )}
+          <button type="button" onClick={copyRequest} aria-label="复制请求摘要"><Clipboard size={14} /><span>复制摘要</span></button>
+          <button type="button" data-testid="reset-app" onClick={resetPrototype} aria-label="复位页面"><RefreshCw size={14} /><span>复位</span></button>
         </div>
       </header>
 
-      <main className="workspace">
+      <main className="workspace" ref={workspaceRef}>
         <section
           className="map-heading"
           data-map-code={mapId === 'map01' ? 'M01 / FRONTIER' : 'M02 / XI-RANG'}
@@ -1273,34 +1474,7 @@ export default function App() {
               <i /><i /><i />
             </div>
             <div className={`map-placeholder-note ${overviewSource === 'fallback' ? 'fallback' : ''}`}><i /> {overviewLabel}</div>
-            <AnimatePresence initial={false} mode="wait">
-              <motion.div
-                key={mapId}
-                className={`map-transition-screen map-transition-${transitionDirection}`}
-                initial={{
-                  opacity: 0,
-                  x: reduceMotion ? '0%' : transitionDirection === 'forward' ? '4.2%' : '-4.2%',
-                  scale: reduceMotion ? 1 : 1.006,
-                }}
-                animate={{
-                  opacity: overviewSource === 'loading' ? 0 : 1,
-                  x: overviewSource === 'loading' && !reduceMotion ? (transitionDirection === 'forward' ? '4.2%' : '-4.2%') : '0%',
-                  scale: overviewSource === 'loading' && !reduceMotion ? 1.006 : 1,
-                  transition: {
-                    duration: overviewSource === 'loading' ? 0 : reduceMotion ? 0.01 : 0.86,
-                    ease: [0.16, 1, 0.3, 1],
-                  },
-                }}
-                exit={{
-                  opacity: 0,
-                  x: reduceMotion ? '0%' : transitionDirection === 'forward' ? '-2.8%' : '2.8%',
-                  scale: reduceMotion ? 1 : 0.994,
-                  transition: {
-                    duration: reduceMotion ? 0.01 : 0.38,
-                    ease: [0.4, 0, 1, 1],
-                  },
-                }}
-              >
+            <div className={`map-transition-screen map-transition-${transitionDirection}`}>
                 <MapViewport
                   mapId={mapId}
                   layers={layers}
@@ -1310,9 +1484,8 @@ export default function App() {
                   onSelectionChange={handleSelectionChange}
                   onOverviewSourceChange={handleOverviewSourceChange}
                 />
-              </motion.div>
-            </AnimatePresence>
-            <MapTransitionVeil mapId={mapId} direction={transitionDirection} overviewSource={overviewSource} />
+            </div>
+            <RegionCartouche mapId={mapId} />
           </div>
 
           <div className="map-data-ribbon" aria-label="选区摘要">
@@ -1342,14 +1515,29 @@ export default function App() {
         </section>
 
         <section
-          className={`settings-drawer ${drawerCollapsed ? 'collapsed' : ''}`}
+          ref={panelDrag.panelRef}
+          className={`settings-drawer ${drawerCollapsed ? 'collapsed' : ''} ${panelDrag.isDragging ? 'is-dragging' : ''}`}
           aria-label="提取设置"
           style={{ viewTransitionName: 'persistent-settings' }}
         >
-          <header>
+          <header
+            ref={panelDrag.headerRef}
+            className={`settings-drawer-heading ${panelDrag.isDragging ? 'is-dragging' : ''}`}
+            data-testid="settings-drag"
+            tabIndex={0}
+            aria-label="拖动提取设置面板；方向键移动，Home 归位"
+            onPointerDown={panelDrag.onPointerDown}
+            onPointerMove={panelDrag.onPointerMove}
+            onPointerUp={panelDrag.onPointerUp}
+            onPointerCancel={panelDrag.onPointerCancel}
+            onLostPointerCapture={panelDrag.onLostPointerCapture}
+            onKeyDown={panelDrag.onKeyDown}
+          >
             <div><small>Extraction settings</small><strong>提取设置</strong></div>
+            <button className="panel-reset" type="button" data-testid="settings-reset" onClick={panelDrag.reset} disabled={launchState === 'running'}>归位</button>
             <button
               type="button"
+              data-testid="settings-collapse"
               onClick={() => setDrawerCollapsed((value) => !value)}
               aria-expanded={!drawerCollapsed}
               aria-label={drawerCollapsed ? '展开提取设置' : '折叠提取设置'}
@@ -1376,7 +1564,18 @@ export default function App() {
                   <span>{FIRST_RUN_PHASE_LABELS[firstRunStatus?.phase ?? 'idle'] ?? firstRunStatus?.phase ?? '连接本机服务'}</span>
                   <strong>{firstRunPhaseProgress}% <small>PHASE</small></strong>
                 </div>
-                <p>{firstRunStatus?.message ?? '正在读取本机首次运行状态。首次完整准备约需 46.3 GiB，并可能持续约 1 小时 50 分钟。'}</p>
+                <p>{firstRunStatus?.message ?? (firstRunError
+                  ? '后端尚未连接，请配置服务后重新连接。'
+                  : '正在读取本机首次运行状态。首次准备的耗时与空间占用取决于包体、选项和磁盘性能，运行后可查看实际处理进度。')}</p>
+                {helperProgress && (
+                  <>
+                    <div className="first-run-phase" data-testid="first-run-helper-progress">
+                      <span>处理阶段 · {FIRST_RUN_HELPER_PHASE_LABELS[helperProgress.phase] ?? helperProgress.phase}</span>
+                      {helperCountLabel && <strong>{helperCountLabel} <small>COUNT</small></strong>}
+                    </div>
+                    {helperMetrics.length > 0 && <p data-testid="first-run-helper-metrics">{helperMetrics.join(' · ')}</p>}
+                  </>
+                )}
               </div>
 
               <PathField
@@ -1474,7 +1673,7 @@ export default function App() {
                   </button>
                 )}
                 {firstRunStatus?.actions.can_cancel && (
-                  <button className="danger" type="button" onClick={() => void cancelFirstRun()} disabled={firstRunAction === 'cancel'}>
+                  <button className="danger" type="button" data-testid="cancel-first-run" onClick={() => void cancelFirstRun()} disabled={firstRunAction === 'cancel'}>
                     <Square size={11} fill="currentColor" />
                     <span>{firstRunStatus.cancel_requested ? '正在取消' : '安全取消'}</span>
                   </button>
@@ -1522,7 +1721,7 @@ export default function App() {
               <label className="full-field">
                 <span>输出格式</span>
                 <div className="select-shell">
-                  <select value={exportMode} onChange={(event) => updateExportMode(event.target.value as ExportMode)} disabled={launchState === 'running'}>
+                  <select data-testid="export-mode" value={exportMode} onChange={(event) => updateExportMode(event.target.value as ExportMode)} disabled={launchState === 'running'}>
                     <option value="blend">Blender 场景 + 数据包（默认）</option>
                     <option value="data_package">仅审计数据包</option>
                   </select>
@@ -1574,7 +1773,7 @@ export default function App() {
                 <label>
                   <span><SquareDashedMousePointer size={12} />区块打包方式</span>
                   <div className="select-shell">
-                    <select value={chunkMode} onChange={(event) => updateChunkMode(event.target.value as ChunkMode)}>
+                    <select data-testid="batch-mode" value={chunkMode} onChange={(event) => updateChunkMode(event.target.value as ChunkMode)} disabled={launchState === 'running'}>
                       <option value="per_sector">每 sector 独立</option>
                       <option value="cluster_4x4_sectors">4 × 4 sectors 稳定分组</option>
                       <option value="merged_selection">合并选区</option>
@@ -1605,7 +1804,7 @@ export default function App() {
               </label>
               <label className="full-field">
                 <span>输出标签</span>
-                <input value={outputLabel} onChange={(event) => setOutputLabel(event.target.value)} />
+                <input data-testid="output-label" value={outputLabel} onChange={(event) => setOutputLabel(event.target.value)} />
               </label>
               <div className="strategy-note">
                 <i />
@@ -1632,7 +1831,7 @@ export default function App() {
             <strong>{launchState === 'running' ? `${Math.round(progress)}%` : isReady ? 'ARMED' : 'LOCKED'}</strong>
           </div>
 
-          <button className="launch-button" type="button" onClick={launchVisualTask} disabled={!isReady || launchState === 'running'}>
+          <button className="launch-button" type="button" data-testid="export-launch" onClick={launchVisualTask} disabled={!isReady || launchState === 'running'}>
             <span className="launch-base" />
             <span className="launch-tracer tracer-a" />
             <span className="launch-tracer tracer-b" />
@@ -1647,7 +1846,23 @@ export default function App() {
           <div className="chunk-progress" aria-label="区块导出预览">
             <div className="chunk-progress-head">
               <span>{selection ? `${selection.sectors.length} SECTORS / ${coverageSummary.unmapped} UNMAPPED` : 'SECTOR128 SELECTION / READY'}</span>
-              {launchState === 'running' && <button type="button" onClick={cancelVisualTask}>取消</button>}
+              {launchState === 'running' && activeJobId && jobError && (
+                <button
+                  type="button"
+                  data-testid="reconnect-export-job"
+                  onClick={() => {
+                    const jobId = activeJobId
+                    if (!jobId) return
+                    stopJob()
+                    setJobError('')
+                    setJobMessage('正在重新连接任务状态')
+                    exportPollRef.current?.(jobId, exportEventCursor.current, exportPollGeneration.current)
+                  }}
+                >
+                  <RefreshCw size={11} />重连
+                </button>
+              )}
+              {launchState === 'running' && <button type="button" data-testid="cancel-export-job" onClick={cancelVisualTask}>取消</button>}
             </div>
             <div className="chunk-mini-grid">
               {chunkPreview.length ? chunkPreview.map((chunk, index) => {
@@ -1716,8 +1931,12 @@ export default function App() {
         sectorCount={selection?.sectors.length ?? 0}
         exportMode={completedExportMode}
         blenderBuild={completedBlenderBuild}
+        outputDirectory={completedOutputDirectory}
         onFinished={dismissCompletion}
       />
+      {import.meta.env.DEV && DevCompletionPreview && devCompletionPreview && (
+        <DevCompletionPreview mapId={devCompletionPreview.mapId} onFinished={() => setDevCompletionPreview(null)} />
+      )}
     </div>
   )
 }

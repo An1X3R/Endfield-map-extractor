@@ -11,6 +11,7 @@
     "job_id": {"type": ["string", "null"], "maxLength": 80, "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$"},
     "map_id": {"type": "string", "enum": ["map01", "map02"]},
     "export_mode": {"type": "string", "enum": ["data_package", "blend"]},
+    "batch_mode": {"type": "string", "enum": ["per_sector", "cluster_4x4_sectors", "merged_selection"]},
     "source": {
       "type": ["object", "null"], "additionalProperties": false,
       "required": ["game_root"],

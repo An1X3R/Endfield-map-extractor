@@ -38,6 +38,17 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest().upper()
 
 
+def helper_source_identity(root: Path) -> str:
+    """Invalidate a completed helper build when its published source inputs change."""
+    files = {root / "endfield_dependency_bootstrap.py", root / "global.json"}
+    for directory in (root / "dotnet", root / "third_party"):
+        files.update(path for path in directory.rglob("*")
+                     if path.is_file() and not {"bin", "obj", ".git"}.intersection(path.relative_to(directory).parts)
+                     and path.suffix in (".cs", ".csproj", ".json", ".patch", ".props", ".targets"))
+    entries = [(path.relative_to(root).as_posix(), sha256_file(path)) for path in sorted(files)]
+    return hashlib.sha256(json.dumps(entries, separators=(",", ":")).encode()).hexdigest()
+
+
 def load_lock() -> dict[str, Any]:
     payload = json.loads(LOCK_PATH.read_text(encoding="utf-8"))
     if payload.get("format") != "EndfieldPinnedDependency/1":

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import {
   Application,
   Container,
@@ -10,7 +10,7 @@ import {
   TextStyle,
   Texture,
 } from 'pixi.js'
-import { AnimatePresence, motion } from 'motion/react'
+import { AnimatePresence, motion, useReducedMotion } from 'motion/react'
 import { Crosshair, Maximize2, Minus, Plus } from 'lucide-react'
 import { MAPS } from '../data/maps'
 import {
@@ -36,6 +36,7 @@ import type {
   ScreenViewport,
 } from '../lib/mapChunking'
 import type { LayerState, MapId } from '../types'
+import './map-handoff.css'
 
 type Props = {
   mapId: MapId
@@ -56,6 +57,14 @@ type AnimatedTargets = {
 }
 
 type RuntimeLayerData = Partial<Record<RuntimeLayerId, RuntimeLayerResponse>>
+
+type MapHandoff = {
+  id: number
+  image: string
+  target: MapId
+  direction: 'forward' | 'back'
+  ready: boolean
+}
 
 const clamp = (value: number, min: number, max: number) =>
   Math.min(max, Math.max(min, value))
@@ -836,6 +845,10 @@ export function MapViewport({
   onOverviewSourceChange,
 }: Props) {
   const hostRef = useRef<HTMLDivElement>(null)
+  const onSelectionChangeRef = useRef(onSelectionChange)
+  const onOverviewSourceChangeRef = useRef(onOverviewSourceChange)
+  onSelectionChangeRef.current = onSelectionChange
+  onOverviewSourceChangeRef.current = onOverviewSourceChange
   const appRef = useRef<Application | null>(null)
   const worldLayerRef = useRef<Container | null>(null)
   const runtimeLayerContainerRef = useRef<Container | null>(null)
@@ -861,6 +874,13 @@ export function MapViewport({
   const [isPanning, setIsPanning] = useState(false)
   const [overviewState, setOverviewState] = useState<'loading' | 'dev-override' | 'runtime-config' | 'fallback'>('loading')
   const [runtimeLayerState, setRuntimeLayerState] = useState<'loading' | 'ready' | 'partial' | 'offline'>('loading')
+  const reducedMotion = useReducedMotion() === true
+  const [handoff, setHandoff] = useState<MapHandoff | null>(null)
+  const handoffRef = useRef<MapHandoff | null>(null)
+  const previousMapIdRef = useRef(mapId)
+  const handoffSequenceRef = useRef(0)
+  const handoffOldRef = useRef<HTMLImageElement>(null)
+  const handoffScannerRef = useRef<HTMLDivElement>(null)
   const overviewPhaseRef = useRef<'loading' | 'loaded' | 'fallback'>('loading')
   const overviewRevealRef = useRef(0)
   const map = MAPS[mapId]
@@ -871,6 +891,62 @@ export function MapViewport({
   const lightScanStatus = runtimeLayerDataRef.current.lights?.meta.scanStatus ?? 'loading'
   const waterCandidateCount = runtimeLayerDataRef.current.water?.meta.bindingCounts?.candidate ?? 0
 
+  useLayoutEffect(() => {
+    const previousMapId = previousMapIdRef.current
+    if (previousMapId === mapId) return
+    previousMapIdRef.current = mapId
+    const canvas = appRef.current?.canvas
+    const image = handoffRef.current?.image ?? canvas?.toDataURL('image/png')
+    if (!image) return
+    const next: MapHandoff = {
+      id: ++handoffSequenceRef.current,
+      image,
+      target: mapId,
+      direction: mapId === 'map02' ? 'forward' : 'back',
+      ready: false,
+    }
+    handoffRef.current = next
+    setHandoff(next)
+  }, [mapId])
+
+  useEffect(() => {
+    if (!handoff?.ready) return
+    if (reducedMotion) {
+      if (handoffRef.current?.id === handoff.id) handoffRef.current = null
+      setHandoff(null)
+      return
+    }
+    const old = handoffOldRef.current
+    const scanner = handoffScannerRef.current
+    if (!old || !scanner) throw new Error('Map handoff layers are missing')
+    const forward = handoff.direction === 'forward'
+    const timing: KeyframeAnimationOptions = {
+      duration: 900,
+      easing: 'cubic-bezier(.32,.12,.2,1)',
+      fill: 'both',
+    }
+    const wipe = old.animate([
+      { clipPath: 'inset(0 0 0 0)' },
+      { clipPath: forward ? 'inset(0 0 0 100%)' : 'inset(0 100% 0 0)' },
+    ], timing)
+    const sweep = scanner.animate([
+      { transform: 'translateX(0)', opacity: 0 },
+      { opacity: 1, offset: .08 },
+      { opacity: 1, offset: .85 },
+      { transform: forward ? 'translateX(100%)' : 'translateX(-100%)', opacity: 0 },
+    ], timing)
+    wipe.onfinish = () => {
+      if (handoffRef.current?.id !== handoff.id) return
+      handoffRef.current = null
+      setHandoff(null)
+    }
+    return () => {
+      wipe.onfinish = null
+      wipe.cancel()
+      sweep.cancel()
+    }
+  }, [handoff, reducedMotion])
+
   useEffect(() => {
     const camera = cameraByMapRef.current[mapId]
     zoomRef.current = camera.zoom
@@ -879,8 +955,8 @@ export function MapViewport({
     overviewPhaseRef.current = 'loading'
     overviewRevealRef.current = 0
     setOverviewState('loading')
-    onOverviewSourceChange?.('loading')
-  }, [mapId, overviewRevision, onOverviewSourceChange])
+    onOverviewSourceChangeRef.current?.('loading')
+  }, [mapId, overviewRevision])
 
   useEffect(() => {
     layersRef.current = layers
@@ -949,6 +1025,12 @@ export function MapViewport({
     overviewRevealRef.current = 0
     let overviewReadyNotified = false
     let loadedOverviewSource: 'dev-override' | 'runtime-config' = 'runtime-config'
+
+    const markHandoffReady = () => {
+      if (handoffRef.current?.target !== mapId) return
+      setHandoff((current) => current && current.id === handoffRef.current?.id
+        ? { ...current, ready: true } : current)
+    }
 
     const targets: AnimatedTargets = {
       scanner: null,
@@ -1113,7 +1195,7 @@ export function MapViewport({
       const backdrop = new Graphics()
       backdrop
         .rect(0, 0, width, height)
-        .fill({ color: mapId === 'map01' ? 0xe8ece9 : 0xe7f0eb })
+        .fill({ color: 0x080e0c })
       app.stage.addChild(backdrop)
 
       const world = new Container()
@@ -1128,7 +1210,7 @@ export function MapViewport({
       const mapBackdrop = new Graphics()
       mapBackdrop
         .rect(0, 0, mapViewport.width, mapViewport.height)
-        .fill({ color: mapId === 'map01' ? 0xe8ece9 : 0xe7f0eb })
+        .fill({ color: 0x080e0c })
         .stroke({ color: mapId === 'map01' ? 0x66706d : 0x5d766d, width: 1, alpha: 0.28 })
       mapContent.addChild(mapBackdrop)
 
@@ -1216,6 +1298,7 @@ export function MapViewport({
         antialias: true,
         autoDensity: true,
         backgroundAlpha: 0,
+        preserveDrawingBuffer: true,
         resolution: Math.min(window.devicePixelRatio || 1, 2),
       })
       if (disposed) {
@@ -1284,7 +1367,7 @@ export function MapViewport({
           )
           selectionRef.current = resolved
           drawCanonicalSelection(resolved)
-          onSelectionChange(resolved)
+          onSelectionChangeRef.current(resolved)
         } else {
           rawSelectionRef.current?.clear()
         }
@@ -1351,7 +1434,7 @@ export function MapViewport({
           targets.overviewSprite.alpha = easedReveal
           if (revealProgress >= 1 && !overviewReadyNotified) {
             overviewReadyNotified = true
-            onOverviewSourceChange?.(loadedOverviewSource)
+            onOverviewSourceChangeRef.current?.(loadedOverviewSource)
           }
         }
         if (targets.scanner && app) {
@@ -1385,8 +1468,9 @@ export function MapViewport({
       if (!shouldRequestRuntimeOverview) {
         overviewPhaseRef.current = 'fallback'
         setOverviewState('fallback')
-        onOverviewSourceChange?.('fallback')
+        onOverviewSourceChangeRef.current?.('fallback')
         drawScene()
+        markHandoffReady()
         return
       }
       try {
@@ -1410,16 +1494,18 @@ export function MapViewport({
         const source = sourceHeader === 'dev-override' || sourceHeader === 'runtime-config' ? sourceHeader : null
         if (!source) throw new Error(`Unsupported overview source header: ${sourceHeader ?? '(missing)'}`)
         loadedOverviewSource = source
-        overviewRevealRef.current = 0
+        overviewRevealRef.current = handoffRef.current?.target === mapId ? 1 : 0
         overviewReadyNotified = false
         setOverviewState(source)
         drawScene()
+        markHandoffReady()
       } catch {
         if (disposed) return
         overviewPhaseRef.current = 'fallback'
         setOverviewState('fallback')
-        onOverviewSourceChange?.('fallback')
+        onOverviewSourceChangeRef.current?.('fallback')
         drawScene()
+        markHandoffReady()
       }
     }
 
@@ -1445,7 +1531,7 @@ export function MapViewport({
       zoomAtRef.current = null
       resetCameraRef.current = null
     }
-  }, [mapId, onOverviewSourceChange, onSelectionChange, overviewRevision, runtimeMap])
+  }, [mapId, overviewRevision, runtimeMap])
 
   const updateZoom = (next: number) => {
     zoomAtRef.current?.(next)
@@ -1454,12 +1540,24 @@ export function MapViewport({
   const clearSelection = () => {
     rawSelectionRef.current?.clear()
     canonicalSelectionRef.current?.clear()
-    onSelectionChange(null)
+    onSelectionChangeRef.current(null)
   }
 
   return (
     <div className="map-viewport" data-testid="map-viewport">
       <div ref={hostRef} className={`pixi-host ${isPanning ? 'is-panning' : ''}`} aria-label={`${map.title} 上帝视角地图`} />
+      {handoff && (
+        <div className={`map-handoff map-handoff--${handoff.target} map-handoff--${handoff.direction}`} data-testid="map-handoff" data-ready={handoff.ready} aria-hidden="true">
+          <img className="map-handoff-old" ref={handoffOldRef} src={handoff.image} alt="" />
+          {handoff.ready && <div className="map-handoff-scanner" ref={handoffScannerRef}>
+            <i className="map-handoff-wake" />
+            <i className="map-handoff-line" />
+            <i className="map-handoff-trace" />
+            <span className="map-handoff-register">MAP {handoff.target === 'map02' ? '02' : '01'} / REGISTER</span>
+            <span className="map-handoff-paths"><i /><i /><i /><i /></span>
+          </div>}
+        </div>
+      )}
       <div className="map-noise" aria-hidden="true" />
       <div className="map-register register-nw" aria-hidden="true" />
       <div className="map-register register-se" aria-hidden="true" />
@@ -1512,6 +1610,7 @@ export function MapViewport({
       <div className="zoom-stack" aria-label="地图缩放">
         <button
           type="button"
+          data-testid="map-zoom-in"
           aria-label="放大地图"
           onClick={() => updateZoom(zoom + 0.25)}
           disabled={zoom >= 5.5}
@@ -1520,6 +1619,7 @@ export function MapViewport({
         </button>
         <button
           type="button"
+          data-testid="map-zoom-out"
           aria-label="缩小地图"
           onClick={() => updateZoom(zoom - 0.25)}
           disabled={zoom <= 0.8}
@@ -1528,6 +1628,7 @@ export function MapViewport({
         </button>
         <button
           type="button"
+          data-testid="map-fit"
           aria-label="适应视口"
           onClick={() => resetCameraRef.current?.()}
         >
@@ -1535,6 +1636,7 @@ export function MapViewport({
         </button>
         <button
           type="button"
+          data-testid="map-clear-selection"
           aria-label="清除选区"
           onClick={clearSelection}
           disabled={!selection}

@@ -889,6 +889,8 @@ def main() -> int:
         runtime_environment["ENDFIELD_RUNTIME_CONFIG"] = str(runtime_config.path)
     os.environ.update(runtime_environment)
     environment = os.environ.copy()
+    environment["ENDFIELD_BACKEND_URL"] = os.environ.get("ENDFIELD_BACKEND_URL", "")
+    environment["ENDFIELD_PREVIEW_ASSET_ROOT"] = os.environ.get("ENDFIELD_PREVIEW_ASSET_ROOT", "")
     environment["VITE_ENDFIELD_GAME_ROOT"] = str(runtime_paths["game_root"] or "")
     environment["VITE_ENDFIELD_WEBUI_OUTPUT_ROOT"] = str(runtime_paths["webui_output_root"] or "")
     environment["VITE_ENDFIELD_CACHE_ROOT"] = str(runtime_paths["cache_root"] or "")

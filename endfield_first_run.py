@@ -42,6 +42,7 @@ from extractor_core import (
 )
 from extractor_core.runtime_manifest import augment_runtime_manifest
 from extractor_core.assets import ASSET_RESOLUTION_POLICY_VERSION
+from endfield_dependency_bootstrap import helper_source_identity
 
 
 CONFIG_FORMAT = "EndfieldFirstRunConfig/1"
@@ -601,12 +602,14 @@ def run() -> int:
         vfs_root = game_root / "Endfield_Data" / "StreamingAssets" / "VFS"
 
         dependency_result: dict[str, Any]
+        helper_source = helper_source_identity(SCRIPT_ROOT)
         if args.skip_helper_bootstrap:
             dependency_result = {
                 "status": "skipped",
                 "reason": "--skip-helper-bootstrap",
             }
-        elif step_done("helper_dependencies"):
+        elif (step_done("helper_dependencies") and
+              state["steps"]["helper_dependencies"]["outputs"].get("sourceIdentity") == helper_source):
             dependency_result = state["steps"]["helper_dependencies"]["outputs"]
         else:
             emitter.emit(
@@ -615,7 +618,7 @@ def run() -> int:
                 "Preparing pinned SceneProbe and BundleScanner dependencies",
             )
             dependency_workspace = run_root / "dependencies"
-            dependency_log = log_root / "dependency_bootstrap"
+            dependency_log = next_available(log_root / "dependency_bootstrap")
             command = [
                 sys.executable,
                 str(DEPENDENCY_BOOTSTRAP),
@@ -644,6 +647,7 @@ def run() -> int:
                 payload = json.loads(dependency_report.read_text(encoding="utf-8"))
                 dependency_result = {
                     "status": "passed",
+                    "sourceIdentity": helper_source,
                     "report": descriptor(dependency_report),
                     "outputs": payload.get("outputs") or {},
                 }
@@ -722,7 +726,7 @@ def run() -> int:
                 "reason": "--skip-scene-discovery",
                 "scanIndex": descriptor(bundle_scan_index),
             }
-        elif step_done("scene_discovery"):
+        elif step_done("scene_discovery") and not state["steps"]["scene_discovery"]["outputs"].get("checkpointVersion"):
             scene_discovery_result = state["steps"]["scene_discovery"]["outputs"]
         elif dependency_result.get("status") != "passed":
             scene_discovery_result = {
@@ -737,182 +741,25 @@ def run() -> int:
                 "outputs": scene_discovery_result,
             }
             save_state()
-        elif recovered_scene := recover_completed_scene_discovery(
-            run_root, log_root, bundle_scan_index
-        ):
-            scene_discovery_result = recovered_scene
-            complete_step("scene_discovery", scene_discovery_result)
-            emitter.emit(
-                "scene_discovery",
-                1.0,
-                "Recovered completed Map01/Map02 scene payloads after launcher interruption",
-            )
         else:
+            from endfield_scene_discovery import discovery
+
             helper_outputs = dict(dependency_result.get("outputs") or {})
             scanner = Path(str((helper_outputs.get("bundleScanner") or {}).get("path") or ""))
             scene_probe = Path(str((helper_outputs.get("sceneProbe") or {}).get("path") or ""))
-            if not scanner.is_file() or not scene_probe.is_file():
-                raise FirstRunError(
-                    "Dependency bootstrap passed without usable BundleScanner/SceneProbe executables."
-                )
-            discovery_root = next_available(run_root / "scene_discovery" / "map_scene_candidates")
-            discovery_root.mkdir(parents=True, exist_ok=False)
-            scan_results = discovery_root / "bundle_candidates.jsonl"
-            scan_console = next_available(log_root / "scene_discovery" / "bundle_scanner.log")
-            emitter.emit(
-                "scene_discovery",
-                0.1,
-                "Scanning read-only bundles for Map01/Map02 scene candidates",
-            )
-            scan_command = [
-                str(scanner),
-                "--input",
-                str(bundle_scan_index),
-                "--output",
-                str(scan_results),
-                "--progress-every",
-                "1000",
-                "--contains",
-                "map01",
-                "--contains",
-                "map02",
-            ]
-            return_code, tail = run_logged_process(
-                scan_command,
-                cwd=SCRIPT_ROOT,
-                log_path=scan_console,
-                cancelled=cancelled,
-            )
-            if return_code != 0 or not scan_results.is_file():
-                scene_discovery_result = {
-                    "status": "deferred",
-                    "reason": f"BundleScanner failed with exit code {return_code}: {tail.strip()}",
-                    "retryAutomatic": True,
-                    "scanIndex": descriptor(bundle_scan_index),
-                    "console": descriptor(scan_console),
-                }
-                state["steps"]["scene_discovery"] = {
-                    "status": "deferred",
-                    "updatedAt": utc_now(),
-                    "outputs": scene_discovery_result,
-                }
-                save_state()
-            else:
-                cab_results = discovery_root / "bundle_cab_inventory.jsonl"
-                cab_console = next_available(log_root / "scene_discovery" / "bundle_cab_inventory.log")
-                emitter.emit(
-                    "scene_discovery",
-                    0.35,
-                    "Building the full CAB-to-bundle dependency inventory",
-                )
-                cab_code, cab_tail = run_logged_process(
-                    [
-                        str(scanner),
-                        "--input",
-                        str(bundle_scan_index),
-                        "--output",
-                        str(cab_results),
-                        "--progress-every",
-                        "1000",
-                        "--cab-only",
-                    ],
-                    cwd=SCRIPT_ROOT,
-                    log_path=cab_console,
-                    cancelled=cancelled,
-                )
-                if cab_code == 0 and cab_results.is_file():
-                    names_by_map, closure_meta = read_bundle_closure_names_by_map(
-                        scan_results, cab_results
-                    )
-                    closure_status = "expanded_from_cab_inventory"
-                else:
-                    names_by_map = read_bundle_candidate_names_by_map(scan_results)
-                    closure_meta = {
-                        "format": "EndfieldAutomaticBundleClosure/1",
-                        "status": "candidate_roots_only",
-                        "reason": f"CAB inventory failed with exit code {cab_code}: {cab_tail.strip()}",
-                    }
-                    closure_status = "candidate_roots_only"
 
-                map_outputs: dict[str, Any] = {}
-                probe_failures = 0
-                for map_index, map_id in enumerate(("map01", "map02"), start=1):
-                    candidate_names = names_by_map[map_id]
-                    candidate_bundles = discovery_root / map_id / "bundles"
-                    bundle_meta = extract_candidate_bundles(
-                        resources_db,
-                        vfs_root,
-                        candidate_names,
-                        candidate_bundles,
-                        progress=progress,
-                        cancelled=cancelled,
-                    )
-                    scene_manifest: dict[str, Any] | None = None
-                    if candidate_names:
-                        scene_probe_output = discovery_root / map_id / "scene_probe"
-                        probe_console = next_available(
-                            log_root / "scene_discovery" / f"{map_id}_scene_probe.log"
-                        )
-                        probe_code, probe_tail = run_logged_process(
-                            [
-                                str(scene_probe),
-                                str(candidate_bundles),
-                                str(scene_probe_output),
-                                "--include-unreferenced",
-                            ],
-                            cwd=SCRIPT_ROOT,
-                            log_path=probe_console,
-                            cancelled=cancelled,
-                        )
-                        manifest_path = scene_probe_output / "scene_manifest.json"
-                        if probe_code == 0 and manifest_path.is_file():
-                            scene_manifest = descriptor(manifest_path)
-                        else:
-                            probe_failures += 1
-                            scene_manifest = {
-                                "status": "deferred",
-                                "reason": (
-                                    f"SceneProbe failed with exit code {probe_code}: "
-                                    f"{probe_tail.strip()}"
-                                ),
-                                "console": descriptor(probe_console),
-                            }
-                    else:
-                        probe_failures += 1
-                    map_outputs[map_id] = {
-                        "bundleCount": len(candidate_names),
-                        "candidateBundles": {"root": str(candidate_bundles), "meta": bundle_meta},
-                        "sceneManifest": scene_manifest,
-                    }
-                    emitter.emit(
-                        "scene_discovery",
-                        0.6 + 0.2 * map_index,
-                        f"Extracted automatic scene payload for {map_id}",
-                    )
+            def discovery_cancelled() -> None:
+                if cancelled():
+                    raise FirstRunError("First-run extraction was cancelled; verified checkpoints were preserved.")
 
-                scene_discovery_result = {
-                    "status": "completed" if probe_failures == 0 else "completed_with_deferred_probes",
-                    "coverage": "map01_map02_container_candidates_plus_cab_external_closure",
-                    "scanIndex": descriptor(bundle_scan_index),
-                    "scannerResults": descriptor(scan_results),
-                    "scannerConsole": descriptor(scan_console),
-                    "cabInventory": descriptor(cab_results) if cab_results.is_file() else None,
-                    "cabConsole": descriptor(cab_console),
-                    "closureStatus": closure_status,
-                    "closure": closure_meta,
-                    "maps": map_outputs,
-                    "limitations": [
-                        "Automatic extraction does not promote unreviewed geometry/material bindings.",
-                        "Blender profiles remain not_ready until builder-specific audits pass.",
-                    ],
-                }
-                complete_step("scene_discovery", scene_discovery_result)
-                emitter.emit(
-                    "scene_discovery",
-                    1.0,
-                    "Automatic Map01/Map02 scene payload extraction completed",
-                    status=scene_discovery_result["status"],
-                )
+            def discovery_progress(value: float, message: str, details: dict[str, object]) -> None:
+                emitter.emit("scene_discovery", value, message, details)
+
+            scene_discovery_result = discovery(
+                run_root, log_root, bundle_scan_index, resources_db, vfs_root, scanner, scene_probe,
+                discovery_cancelled, discovery_progress)
+            complete_step("scene_discovery", scene_discovery_result)
+            emitter.emit("scene_discovery", 1.0, "Verified Map01/Map02 scene preparation completed")
 
         instance_paths: dict[str, Path] = {}
         asset_paths: dict[str, Path] = {}

@@ -5,7 +5,9 @@ import json
 import math
 from pathlib import Path
 import re
-from typing import TypedDict
+from typing import NotRequired, TypedDict
+
+from endfield_scene_material_contract import resolve_export_path
 
 
 class TerrainLayer(TypedDict):
@@ -44,6 +46,7 @@ class TerrainDetail(TypedDict):
     source_metadata_sha256: str
     source_index_sha256: str
     projection: str
+    source_surface: NotRequired[str]
 
 
 def source_vector(section: str, name: str, dimensions: int) -> list[float]:
@@ -101,12 +104,13 @@ def finite_vector(value: object, size: int, label: str) -> list[float]:
 
 
 def source_file(value: object, root: Path, label: str) -> str:
-    if not isinstance(value, str) or not value or not (root / value).is_file():
+    if not isinstance(value, str) or not value or not resolve_export_path(root / value).is_file():
         raise ValueError(f"Terrain detail texture is missing: field={label}, path={value}, root={root}")
     return value
 
 
 def load_terrain_detail(path: Path) -> TerrainDetail:
+    path = resolve_export_path(path)
     raw = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(raw, dict) or raw.get("format") != "EndfieldTerrainDetail/1":
         raise ValueError(f"Unsupported terrain detail manifest: {path}")
@@ -128,9 +132,8 @@ def load_terrain_detail(path: Path) -> TerrainDetail:
     side = raw["size"] // 64
     x0, x1 = min(tile[0] for tile in tiles), max(tile[0] for tile in tiles) + 1
     z0, z1 = min(tile[1] for tile in tiles), max(tile[1] for tile in tiles) + 1
-    if (len({tuple(tile) for tile in tiles}) != len(tiles) or max(x1, z1) > side
-            or len(tiles) != (x1-x0)*(z1-z0)):
-        raise ValueError(f"Terrain detail tiles must form a distinct in-bounds rectangle: {path}")
+    if len({tuple(tile) for tile in tiles}) != len(tiles) or max(x1, z1) > side:
+        raise ValueError(f"Terrain detail tiles must be distinct and in bounds: {path}")
     expected_bounds = [position[0]+x0*64, position[0]+x1*64, position[2]+z0*64, position[2]+z1*64]
     if bounds != expected_bounds:
         raise ValueError(f"Terrain detail bounds disagree with source tiles: actual={bounds}, expected={expected_bounds}")
@@ -161,10 +164,16 @@ def load_terrain_detail(path: Path) -> TerrainDetail:
     for key in ("source_metadata_sha256", "source_index_sha256"):
         if not isinstance(raw.get(key), str) or not re.fullmatch("[a-f0-9]{64}", raw[key]):
             raise ValueError(f"Missing terrain source fingerprint: {key}")
-    return {"format": raw["format"], "map": raw["map"], "position": position,
+    result: TerrainDetail = {"format": raw["format"], "map": raw["map"], "position": position,
             "size": raw["size"], "bounds": bounds, "tiles": tiles,
             "index": source_file(raw.get("index"), path.parent, "index"),
             "control": source_file(raw.get("control"), path.parent, "control"),
             "tint": source_file(raw.get("tint"), path.parent, "tint"), "layers": layers,
             "source_metadata_sha256": raw["source_metadata_sha256"],
             "source_index_sha256": raw["source_index_sha256"], "projection": raw["projection"]}
+    if "source_surface" in raw:
+        source = raw["source_surface"]
+        if not isinstance(source, str) or not source or not resolve_export_path(Path(source)).is_file():
+            raise ValueError(f"Terrain detail source surface is missing: {source}")
+        result["source_surface"] = source
+    return result

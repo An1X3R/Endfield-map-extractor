@@ -22,6 +22,19 @@ from extractor_core.terrain import decode_dxt5
 
 
 class FirstRunPlanTests(unittest.TestCase):
+    def test_dependency_retry_preserves_previous_report_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            previous = Path(temporary) / "dependency_bootstrap"
+            previous.mkdir()
+            report = previous / "dependency_bootstrap_report.json"
+            report.write_text('{"status":"passed"}', encoding="utf-8")
+            retry = endfield_first_run.next_available(previous)
+            self.assertEqual(previous.with_name("dependency_bootstrap.retry001"), retry)
+            retry.mkdir()
+            self.assertEqual(previous.with_name("dependency_bootstrap.retry002"),
+                             endfield_first_run.next_available(previous))
+            self.assertEqual('{"status":"passed"}', report.read_text(encoding="utf-8"))
+
     def test_cli_blender_path_is_resolved_without_running_the_binary(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

@@ -12,11 +12,28 @@ import unittest
 from endfield_dependency_bootstrap import (
     DependencyBootstrapError,
     ensure_pinned_checkout,
+    helper_source_identity,
     run_logged,
 )
 
 
 class DependencyBootstrapTests(unittest.TestCase):
+    def test_helper_build_identity_tracks_shared_source_but_not_build_outputs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "global.json").write_text("{}", encoding="utf-8")
+            (root / "endfield_dependency_bootstrap.py").write_text("source", encoding="utf-8")
+            shared = root / "dotnet" / "Shared" / "HelperProgress.cs"
+            shared.parent.mkdir(parents=True)
+            shared.write_text("first", encoding="utf-8")
+            first = helper_source_identity(root)
+            binary = root / "dotnet" / "Probe" / "obj" / "generated.cs"
+            binary.parent.mkdir(parents=True)
+            binary.write_text("generated", encoding="utf-8")
+            self.assertEqual(first, helper_source_identity(root))
+            shared.write_text("second", encoding="utf-8")
+            self.assertNotEqual(first, helper_source_identity(root))
+
     @unittest.skipUnless(os.name == "nt", "Windows process-tree behavior")
     def test_timeout_terminates_child_holding_stdout_pipe(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

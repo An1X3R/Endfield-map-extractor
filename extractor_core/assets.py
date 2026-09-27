@@ -10,6 +10,8 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
+from endfield_map_layer_contract import is_hlod_name as _is_hlod_name
+
 
 class AssetResolutionError(RuntimeError):
     pass
@@ -24,11 +26,6 @@ def sha256_file(path: Path) -> str:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest().upper()
-
-
-def _is_hlod_name(value: str | None) -> bool:
-    folded = str(value or "").casefold().replace("\\", "/")
-    return bool(re.search(r"(?:^|[/_])hlod\d+(?:[/_]|$)", folded))
 
 
 def _lod_kind(value: str | None) -> str:

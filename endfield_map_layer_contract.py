@@ -26,6 +26,12 @@ VALIDATION_FORMAT = "EndfieldMapLayerValidation/1"
 GENERATOR_VERSION = "stage119-v1"
 SECTOR_SIZE = 128
 
+def is_hlod_name(value: str | None) -> bool:
+    """Identify explicit HLOD tokens in entity names and asset paths."""
+    folded = str(value or "").casefold().replace("\\", "/")
+    return bool(re.search(r"(?:^|[/_])hlod\d+(?:[/_]|$)", folded))
+
+
 DECIMAL_INTEGER_PATTERN = re.compile(r"^-?[0-9]+$")
 PATH_ID_FIELD_NAMES = frozenset(
     {

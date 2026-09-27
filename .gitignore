@@ -9,6 +9,7 @@ __pycache__/
 # Local runtime state and secrets
 .runtime_status.json
 reconstruction.local.json
+endfield.runtime.local.json
 .env
 .env.*
 !.env.example

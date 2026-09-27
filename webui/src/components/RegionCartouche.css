@@ -1,0 +1,112 @@
+.region-cartouche {
+  position: absolute;
+  z-index: 9;
+  top: 28px;
+  right: 32px;
+  width: clamp(260px, 24vw, 370px);
+  overflow: hidden;
+  padding: 0 12px 0 18px;
+  color: #a4b9ab;
+  pointer-events: none;
+  background: linear-gradient(90deg, rgb(8 14 12 / 96%), rgb(8 14 12 / 94%));
+  box-shadow: 0 12px 36px rgb(0 0 0 / 24%);
+}
+
+.cartouche-index {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 0;
+  color: #6f8979;
+  border-bottom: 1px solid #82978a55;
+}
+
+.cartouche-index > span:first-child {
+  font: 600 32px/1 var(--display);
+  letter-spacing: -0.08em;
+}
+
+.cartouche-index > span:last-child {
+  font: 10px/1.6 var(--mono);
+  letter-spacing: 0.08em;
+  text-align: right;
+}
+
+.cartouche-body {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 21px 0 25px;
+}
+
+.cartouche-rule {
+  display: block;
+  width: 45px;
+  height: 4px;
+  margin-bottom: 15px;
+  background: var(--accent);
+}
+
+.cartouche-body h2 {
+  margin: 0;
+  color: #a9c6b5;
+  font-size: clamp(30px, 2.8vw, 44px);
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  line-height: 1.2;
+  white-space: nowrap;
+}
+
+.cartouche-body p {
+  max-width: 180px;
+  margin: 14px 0 0;
+  color: #a3b9a9;
+  font-size: 12px;
+  letter-spacing: 0.06em;
+  line-height: 1.6;
+}
+
+.region-sculpture {
+  width: 100px;
+  height: 127px;
+  flex-shrink: 0;
+  opacity: 0.92;
+  stroke: none;
+}
+
+.cartouche-meta {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 12px 0;
+  color: #7c9586;
+  border-top: 2px solid #70ddb066;
+  font: 10px var(--mono);
+}
+
+.theme-map01 .cartouche-rule { background: #dedf68; }
+
+.theme-map01 .cartouche-body h2 {
+  color: #a7ac85;
+  font-size: clamp(28px, 2.6vw, 40px);
+  letter-spacing: 0.06em;
+}
+
+@media (max-width: 800px) {
+  .region-cartouche {
+    top: 152px;
+    right: 16px;
+    width: 210px;
+    padding-right: 4px;
+    padding-left: 10px;
+  }
+
+  .cartouche-body { padding-top: 12px; padding-bottom: 18px; }
+  .cartouche-rule { width: 25px; height: 3px; margin-bottom: 10px; }
+  .cartouche-index > span:first-child { font-size: 25px; }
+  .cartouche-body h2 { font-size: 29px; letter-spacing: 0.02em; white-space: nowrap; }
+  .cartouche-body p { display: none; }
+  .region-sculpture { width: 48px; height: 72px; }
+
+  .theme-map01 .cartouche-body h2 { font-size: 25px; white-space: nowrap; }
+}

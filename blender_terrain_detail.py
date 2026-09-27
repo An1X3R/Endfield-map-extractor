@@ -7,23 +7,28 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from pathlib import Path
 
 import bpy
-from mathutils import Vector as MathVector
+import numpy as np
+from numpy.typing import NDArray
 
 from blender_scene_materials import texture_image
 from blender_scene_terrain import terrain_world_normal_group
-from endfield_terrain_detail_contract import TerrainDetail, load_terrain_detail
+from endfield_scene_material_contract import resolve_export_path
+from endfield_terrain_detail_contract import DetailLayer, TerrainDetail, load_terrain_detail
 
 Scalar = bpy.types.NodeSocket | float
 Vector = bpy.types.NodeSocket | tuple[float, float, float]
 EPSILON = 2 ** -14
+MAX_LAYERS_PER_MATERIAL = 8
 
 
-def detail_identity(path: Path) -> str:
-    """Keep relative texture bindings distinct when manifests have equal contents."""
-    return hashlib.sha256(str(path.resolve()).casefold().encode() + b"\0" + path.read_bytes()).hexdigest()
+def detail_identity(path: Path, ordinals: tuple[int, ...]) -> str:
+    """Identify both source bindings and the exact shader layer subset."""
+    return hashlib.sha256(str(path.resolve()).casefold().encode() + b"\0" + path.read_bytes()
+                          + b"\0" + bytes(ordinals)).hexdigest()
 
 
 def bind(tree: bpy.types.NodeTree, value: Scalar | Vector, socket: bpy.types.NodeSocket) -> None:
@@ -87,15 +92,16 @@ def vector_total(tree: bpy.types.NodeTree, values: list[Vector]) -> Vector:
 def image_sample(tree: bpy.types.NodeTree, path: Path, colorspace: str,
                  uv: bpy.types.NodeSocket, interpolation: str, extension: str) -> bpy.types.Node:
     node = tree.nodes.new("ShaderNodeTexImage")
-    node.image = texture_image(path, colorspace, "CHANNEL_PACKED")
+    node.image = texture_image(resolve_export_path(path), colorspace, "CHANNEL_PACKED")
     node.interpolation = interpolation
     node.extension = extension
     tree.links.new(uv, node.inputs["Vector"])
     return node
 
 
-def detail_group(path: Path, detail: TerrainDetail) -> bpy.types.ShaderNodeTree:
-    digest = detail_identity(path)
+def detail_group(path: Path, detail: TerrainDetail, layers: list[DetailLayer]) -> bpy.types.ShaderNodeTree:
+    ordinals = tuple(int(layer["ordinal"]) for layer in layers)
+    digest = detail_identity(path, ordinals)
     name = "EF_Terrain_Detail_" + digest[:24]
     existing = bpy.data.node_groups.get(name)
     if existing is not None:
@@ -149,7 +155,7 @@ def detail_group(path: Path, detail: TerrainDetail) -> bpy.types.ShaderNodeTree:
     normals: list[Vector] = []
     roughness: list[Scalar] = []
     occlusion: list[Scalar] = []
-    for layer in detail["layers"]:
+    for layer in layers:
         st = layer["splat_st"]
         tiling = st[0] / detail["size"]
         uv_axes = [combine(tree, (add(mul(u, tiling), st[2]), add(mul(v, tiling), st[3]), 0.0))
@@ -174,7 +180,7 @@ def detail_group(path: Path, detail: TerrainDetail) -> bpy.types.ShaderNodeTree:
         selectors.append([math_node(tree, "COMPARE", (index_value, float(layer["ordinal"]), 0.01)) for index_value in indices])
     slot_heights = [total(tree, [mul(selectors[i][slot], heights[i]) for i in range(len(heights))]) for slot in range(4)]
     borders = [maximum(total(tree, [mul(selectors[i][slot], layer["diffuse_scale"][3])
-                                    for i, layer in enumerate(detail["layers"])]), EPSILON) for slot in range(4)]
+                                    for i, layer in enumerate(layers)]), EPSILON) for slot in range(4)]
     weighted_heights = [mul(weight, height) for weight, height in zip(initial, slot_heights)]
     peak = maximum(maximum(weighted_heights[0], weighted_heights[1]), maximum(weighted_heights[2], weighted_heights[3]))
     adjusted = [mul(weight, add(maximum(add(sub(height, peak), border), 0.0), EPSILON))
@@ -184,7 +190,7 @@ def detail_group(path: Path, detail: TerrainDetail) -> bpy.types.ShaderNodeTree:
     layer_weights = [total(tree, [mul(selector, weight) for selector, weight in zip(row, weights)]) for row in selectors]
     color = vector_total(tree, [scale(tree, value, weight) for value, weight in zip(colors, layer_weights)])
     mean = vector_total(tree, [scale(tree, tuple(layer["packed_info"][:3]), weight)
-                              for layer, weight in zip(detail["layers"], layer_weights)])
+                              for layer, weight in zip(layers, layer_weights)])
     tint_factor = math_node(tree, "POWER", (tint.outputs["Alpha"], 4.0))
     final_color = vector_node(tree, "ADD", (color, scale(tree, vector_node(tree, "SUBTRACT", (tint.outputs["Color"], mean)), tint_factor)))
     detail_normal = vector_total(tree, [scale(tree, value, weight) for value, weight in zip(normals, layer_weights)])
@@ -202,29 +208,32 @@ def detail_group(path: Path, detail: TerrainDetail) -> bpy.types.ShaderNodeTree:
     bind(tree, normal, output.inputs["World Normal"])
     tree["endfield_contract"] = "HGTerrainDetail/1"
     tree["endfield_source_sha256"] = digest
+    tree["endfield_layer_ordinals"] = list(ordinals)
     tree["endfield_projection"] = detail["projection"]
     tree["endfield_limitations"] = "Smooth triplanar and half-texel control border are adaptations; POM, cliff C, runtime stochastic projection pending; AO exposed, not multiplied into direct lighting"
     return tree
 
 
-def apply_detail_material(material: bpy.types.Material, path: Path, detail: TerrainDetail) -> str:
+def apply_detail_material(material: bpy.types.Material, path: Path, detail: TerrainDetail,
+                          layers: list[DetailLayer]) -> str:
     tree = material.node_tree
-    digest = detail_identity(path)
+    ordinals = tuple(int(layer["ordinal"]) for layer in layers)
+    digest = detail_identity(path, ordinals)
     if material.get("endfield_terrain_detail_contract") == "HGTerrainDetail/1":
         groups = [node for node in tree.nodes if node.type == "GROUP" and node.node_tree
                   and node.node_tree.get("endfield_source_sha256") == digest]
         if len(groups) != 1 or not groups[0].outputs["Base Color"].is_linked:
             raise ValueError(f"Terrain detail reapplication contract mismatch: {material.name}")
         return "already_adapted"
-    surface_path = Path(material["endfield_terrain_surface_source"])
+    surface_path = resolve_export_path(Path(material["endfield_terrain_surface_source"]))
     surface = json.loads(surface_path.read_text(encoding="utf-8"))
     if surface["map"].casefold() != detail["map"].casefold():
         raise ValueError(f"Terrain detail map mismatch: {material.name}, {surface['map']}, {detail['map']}")
     images = {}
     for role, keys in (("albedo", ("albedo", "albedo_rgba")), ("normal", ("normal", "normal_rgba"))):
-        paths = {(surface_path.parent / surface[key]).resolve() for key in keys if key in surface}
+        paths = {resolve_export_path(surface_path.parent / surface[key]) for key in keys if key in surface}
         matches = [node for node in tree.nodes if node.type == "TEX_IMAGE" and node.image and
-                   Path(node.image.get("endfield_terrain_crop_source", bpy.path.abspath(node.image.filepath))).resolve() in paths]
+                   resolve_export_path(Path(node.image.get("endfield_terrain_crop_source", bpy.path.abspath(node.image.filepath)))) in paths]
         if len(matches) != 1:
             raise ValueError(f"Terrain detail requires a unique {role} atlas: {material.name}, count={len(matches)}")
         images[role] = matches[0]
@@ -243,7 +252,7 @@ def apply_detail_material(material: bpy.types.Material, path: Path, detail: Terr
         tree.links.new(images["normal"].outputs["Color"], normal.inputs["Packed RG"])
     normal_destinations = [link.to_socket for link in normal.outputs["World Normal"].links]
     node = tree.nodes.new("ShaderNodeGroup")
-    node.node_tree = detail_group(path, detail)
+    node.node_tree = detail_group(path, detail, layers)
     node.label = "Source terrain layers and height blend"
     geometry = tree.nodes.new("ShaderNodeNewGeometry")
     tree.links.new(geometry.outputs["Position"], node.inputs["Position"])
@@ -265,18 +274,158 @@ def apply_detail_material(material: bpy.types.Material, path: Path, detail: Terr
     return "adapted"
 
 
-def apply_scene_detail(scene: bpy.types.Scene, path: Path) -> list[dict[str, str]]:
-    detail = load_terrain_detail(path)
-    terrain = [obj for obj in scene.objects if obj.type == "MESH" and "unity_tile" in obj]
-    if not terrain:
-        raise ValueError("Scene contains no terrain tiles for detail reconstruction")
+def index_ordinals(path: Path, detail: TerrainDetail) -> NDArray[np.int16]:
+    """Read source RGBA ordinals with row zero at Blender's bottom image edge."""
+    image = texture_image(resolve_export_path(path.parent / detail["index"]), "Non-Color", "CHANNEL_PACKED")
+    side = detail["size"] // 8
+    if tuple(image.size) != (side, side):
+        raise ValueError(f"Terrain index dimensions disagree with source extent: {image.name}, size={tuple(image.size)}, expected={side}")
+    pixels = np.empty(side * side * 4, dtype=np.float32)
+    image.pixels.foreach_get(pixels)
+    if not np.isfinite(pixels).all():
+        raise ValueError(f"Terrain index contains nonfinite pixels: {image.name}")
+    values = np.rint(pixels * 255).astype(np.int16)
+    if (np.max(np.abs(pixels * 255 - values)) > 0.001 or np.any(values < 0)
+            or np.any(values > 255) or np.any(values % 4)):
+        raise ValueError(f"Terrain index has invalid source ordinal encoding: {image.name}")
+    return (values // 4).reshape(side, side, 4)
+
+
+def polygon_cell_area(points: list[tuple[float, float]], left: float, right: float,
+                      bottom: float, top: float) -> float:
+    """Clip a terrain face to one index texel and ignore zero-area edge contact."""
+    clipped = points
+    for axis, sign, bound in ((0, 1.0, left), (0, -1.0, right),
+                              (1, 1.0, bottom), (1, -1.0, top)):
+        if not clipped:
+            return 0.0
+        result: list[tuple[float, float]] = []
+        previous = clipped[-1]
+        previous_distance = sign * (previous[axis] - bound)
+        for current in clipped:
+            current_distance = sign * (current[axis] - bound)
+            if (previous_distance < 0) != (current_distance < 0):
+                fraction = previous_distance / (previous_distance - current_distance)
+                result.append((previous[0] + fraction * (current[0] - previous[0]),
+                               previous[1] + fraction * (current[1] - previous[1])))
+            if current_distance >= 0:
+                result.append(current)
+            previous, previous_distance = current, current_distance
+        clipped = result
+    return abs(sum(a[0] * b[1] - b[0] * a[1] for a, b in zip(clipped, clipped[1:] + clipped[:1]))) * 0.5
+
+
+def face_layers(obj: bpy.types.Object, polygon: bpy.types.MeshPolygon, detail: TerrainDetail,
+                indices: NDArray[np.int16]) -> frozenset[int]:
+    """Collect every nearest-sampled index texel with positive face overlap."""
+    points = []
     x0, x1, z0, z1 = detail["bounds"]
-    for obj in terrain:
-        for corner in obj.bound_box:
-            point = obj.matrix_world @ MathVector(corner)
-            if not (x0-0.01 <= point.x <= x1+0.01 and z0-0.01 <= -point.y <= z1+0.01):
-                raise ValueError(f"Terrain geometry exceeds detail resource bounds: {obj.name}, {tuple(point)}")
-    materials = {material for obj in scene.objects if obj.type == "MESH"
-                 for material in obj.data.materials if material and material.get("endfield_terrain_surface_source")}
-    return [{"material": material.name, "status": apply_detail_material(material, path, detail)}
-            for material in sorted(materials, key=lambda item: item.name)]
+    for vertex in polygon.vertices:
+        world = obj.matrix_world @ obj.data.vertices[vertex].co
+        point = (float(world.x), float(-world.y))
+        if not (x0-0.01 <= point[0] <= x1+0.01 and z0-0.01 <= point[1] <= z1+0.01):
+            raise ValueError(f"Terrain face exceeds detail resource bounds: object={obj.name}, face={polygon.index}, point={point}")
+        points.append(point)
+    origin_x, origin_z = detail["position"][0], detail["position"][2]
+    width = indices.shape[1]
+    height = indices.shape[0]
+    low_x = max(0, min(width-1, math.floor((min(point[0] for point in points)-origin_x) / 8)))
+    high_x = max(0, min(width-1, math.floor((max(point[0] for point in points)-origin_x) / 8)))
+    low_z = max(0, min(height-1, math.floor((min(point[1] for point in points)-origin_z) / 8)))
+    high_z = max(0, min(height-1, math.floor((max(point[1] for point in points)-origin_z) / 8)))
+    needed: set[int] = set()
+    for row in range(low_z, high_z + 1):
+        for column in range(low_x, high_x + 1):
+            if polygon_cell_area(points, origin_x + column*8, origin_x + (column+1)*8,
+                                 origin_z + row*8, origin_z + (row+1)*8) > 1e-10:
+                needed.update(int(value) for value in indices[row, column])
+    if not needed:
+        raise ValueError(f"Terrain face has no positive index texel coverage: object={obj.name}, face={polygon.index}")
+    return frozenset(needed)
+
+
+def packed_layer_groups(faces: list[frozenset[int]]) -> list[tuple[int, ...]]:
+    """Deterministically combine face requirements under the sampler budget."""
+    groups: list[set[int]] = []
+    for required in sorted(set(faces), key=lambda values: (-len(values), tuple(sorted(values)))):
+        if len(required) > MAX_LAYERS_PER_MATERIAL:
+            raise ValueError(f"One terrain face exceeds the layer sampler budget: layers={sorted(required)}, limit={MAX_LAYERS_PER_MATERIAL}")
+        candidates = [(len(group | required), index) for index, group in enumerate(groups)
+                      if len(group | required) <= MAX_LAYERS_PER_MATERIAL]
+        if candidates:
+            groups[min(candidates)[1]].update(required)
+        else:
+            groups.append(set(required))
+    return sorted(tuple(sorted(group)) for group in groups)
+
+
+def apply_scene_detail(scene: bpy.types.Scene, path: Path) -> list[dict[str, str]]:
+    path = resolve_export_path(path)
+    detail = load_terrain_detail(path)
+    surface = resolve_export_path(Path(detail["source_surface"])) if "source_surface" in detail else None
+    index = index_ordinals(path, detail)
+    layer_lookup = {layer["ordinal"]: layer for layer in detail["layers"]}
+    pending: dict[bpy.types.Material, list[tuple[bpy.types.Object, int, frozenset[int]]]] = {}
+    adapted: dict[bpy.types.Material, tuple[int, ...]] = {}
+    for obj in sorted(scene.objects, key=lambda item: item.name):
+        if obj.type != "MESH" or "unity_tile" not in obj:
+            continue
+        mesh = obj.data
+        for polygon in mesh.polygons:
+            if polygon.material_index >= len(mesh.materials):
+                raise ValueError(f"Terrain face has an invalid material slot: object={obj.name}, face={polygon.index}")
+            material = mesh.materials[polygon.material_index]
+            if (material is None or not material.get("endfield_terrain_surface_source")
+                    or (surface is not None and resolve_export_path(Path(material["endfield_terrain_surface_source"])) != surface)):
+                continue
+            required = face_layers(obj, polygon, detail, index)
+            absent = required - layer_lookup.keys()
+            if absent:
+                raise ValueError(f"Terrain source index references unprepared layers: object={obj.name}, face={polygon.index}, ordinals={sorted(absent)}")
+            base_name = material.get("endfield_terrain_detail_base_material")
+            if base_name is None:
+                if material.get("endfield_terrain_detail_contract"):
+                    raise ValueError(f"Terrain material was adapted without sampler partition metadata: {material.name}")
+                pending.setdefault(material, []).append((obj, polygon.index, required))
+            else:
+                ordinals = tuple(int(value) for value in material["endfield_terrain_detail_layers"])
+                if (len(ordinals) > MAX_LAYERS_PER_MATERIAL or not required.issubset(ordinals)
+                        or material.get("endfield_terrain_detail_source") != str(path.resolve())
+                        or bpy.data.materials.get(base_name) is None):
+                    raise ValueError(f"Terrain partition no longer covers its source face: material={material.name}, object={obj.name}, face={polygon.index}, required={sorted(required)}")
+                adapted[material] = ordinals
+    if not pending and not adapted:
+        raise ValueError("Scene contains no terrain tiles for detail reconstruction")
+    results = {material: apply_detail_material(material, path, detail,
+               [layer_lookup[ordinal] for ordinal in ordinals]) for material, ordinals in adapted.items()}
+    for source, faces in sorted(pending.items(), key=lambda item: item[0].name):
+        groups = packed_layer_groups([required for _, _, required in faces])
+        if any(obj.data.users != 1 for obj, _, _ in faces):
+            raise ValueError(f"Terrain material partition requires an unshared mesh: material={source.name}")
+        materials: dict[tuple[int, ...], bpy.types.Material] = {}
+        for ordinals in groups:
+            identity = hashlib.sha256((source.name + detail_identity(path, ordinals)).encode()).hexdigest()[:24]
+            name = "EF_Terrain_Detail_Part_" + identity
+            material = bpy.data.materials.get(name)
+            if material is None:
+                material = source.copy()
+                material.name = name
+                material["endfield_terrain_detail_base_material"] = source.name
+                material["endfield_terrain_detail_layers"] = list(ordinals)
+            elif (material.get("endfield_terrain_detail_base_material") != source.name
+                  or tuple(material.get("endfield_terrain_detail_layers", ())) != ordinals):
+                raise ValueError(f"Terrain partition material name collision: {name}")
+            results[material] = apply_detail_material(material, path, detail,
+                                [layer_lookup[ordinal] for ordinal in ordinals])
+            materials[ordinals] = material
+        for obj, polygon_index, required in faces:
+            ordinals = min((group for group in groups if required.issubset(group)), key=lambda group: (len(group), group))
+            material = materials[ordinals]
+            slots = obj.data.materials
+            slot = next((index for index, item in enumerate(slots) if item == material), None)
+            if slot is None:
+                slots.append(material)
+                slot = len(slots) - 1
+            obj.data.polygons[polygon_index].material_index = slot
+    return [{"material": material.name, "status": status}
+            for material, status in sorted(results.items(), key=lambda item: item[0].name)]

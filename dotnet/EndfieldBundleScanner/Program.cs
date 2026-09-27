@@ -1,4 +1,5 @@
 using System.Reflection;
+using System.Diagnostics;
 using System.Collections;
 using System.Collections.Specialized;
 using System.Text;
@@ -35,37 +36,89 @@ internal static class Program
 
     private static void Run(Options options)
     {
+        var telemetry = new HelperProgress("EndfieldBundleScanner", options.PerformanceReport,
+            "read timing wraps chunk ReadExactly; load_unpack timing wraps LoadFile, including nested reads; " +
+            "object_parse timing wraps ReadAssets. Timings are exclusive measured call spans, include failed calls, " +
+            "and exclude output serialization. Failed bundles remain below phase totals.");
+        try
+        {
+            RunCore(options, telemetry);
+        }
+        catch (Exception error)
+        {
+            try
+            {
+                telemetry.Finish("failed");
+            }
+            catch (Exception reportError)
+            {
+                error.Data["PerformanceReportError"] = reportError.ToString();
+            }
+            throw;
+        }
+        telemetry.Finish("complete");
+    }
+
+    private static void RunCore(Options options, HelperProgress telemetry)
+    {
         var input = Path.GetFullPath(options.Input);
         var output = Path.GetFullPath(options.Output);
+        var cabOutput = options.CabOutput is null ? null : Path.GetFullPath(options.CabOutput);
         if (!File.Exists(input))
             throw new FileNotFoundException("Bundle index does not exist", input);
         if (File.Exists(output) || Directory.Exists(output))
             throw new IOException($"Refusing to overwrite existing output: {output}");
+        if (cabOutput is not null && (cabOutput.Equals(output, StringComparison.OrdinalIgnoreCase) ||
+                                      File.Exists(cabOutput) || Directory.Exists(cabOutput)))
+            throw new IOException($"CAB output must be a new path distinct from provider output: {cabOutput}");
+        if (options.PerformanceReport is not null &&
+            (Path.GetFullPath(options.PerformanceReport).Equals(output, StringComparison.OrdinalIgnoreCase) ||
+             Path.GetFullPath(options.PerformanceReport).Equals(cabOutput, StringComparison.OrdinalIgnoreCase)))
+            throw new IOException("Performance report must differ from provider and CAB outputs");
         Directory.CreateDirectory(Path.GetDirectoryName(output)!);
+        if (cabOutput is not null)
+            Directory.CreateDirectory(Path.GetDirectoryName(cabOutput)!);
 
         TypeFlags.SetTypes(new Dictionary<ClassIDType, (bool, bool)>());
         TypeFlags.SetType(ClassIDType.AssetBundle, true, false);
-        Logger.Default = new QuietLogger();
+        var logger = new QuietLogger();
+        Logger.Default = logger;
         Logger.Flags = LoggerEvent.Error;
 
         var game = GameManager.GetGameByType(GameType.ArknightsEndfield);
         using var outputStream = new FileStream(output, FileMode.CreateNew, FileAccess.Write, FileShare.Read);
-        using var writer = new StreamWriter(outputStream, new UTF8Encoding(false)) { AutoFlush = true };
+        using var writer = new StreamWriter(outputStream, new UTF8Encoding(false));
+        using var cabWriter = cabOutput is null ? null : new StreamWriter(
+            new FileStream(cabOutput, FileMode.CreateNew, FileAccess.Write, FileShare.Read), new UTF8Encoding(false));
         using var index = new StreamReader(input, Encoding.UTF8);
         var header = index.ReadLine();
         if (header != "logical_name\tchunk_path\toffset\tlength")
             throw new InvalidDataException("Unexpected scan-index header");
+        var rows = File.ReadLines(input).LongCount() - 1;
+        var total = options.Limit > 0 ? Math.Max(0, Math.Min(rows, options.Limit) - options.Skip)
+                                      : Math.Max(0, rows - options.Skip);
+        telemetry.Publish("read", 0, total);
+        telemetry.Publish("load_unpack", 0, total);
+        if (!options.CabOnly)
+            telemetry.Publish("object_parse", 0, total);
 
         string? currentChunk = null;
         FileStream? chunk = null;
         var scanned = 0;
         var failed = 0;
         var matches = 0;
+        var cabFailed = 0;
+        var cabMatches = 0;
+        long readCount = 0;
+        long loadedCount = 0;
+        long parsedCount = 0;
         try
         {
             string? line;
             while ((line = index.ReadLine()) != null)
             {
+                if (options.Limit > 0 && scanned >= options.Limit)
+                    break;
                 if (scanned < options.Skip)
                 {
                     scanned++;
@@ -93,32 +146,70 @@ internal static class Program
                     Silent = true,
                     SkipProcess = true,
                 };
+                var cabLoaded = false;
                 try
                 {
+                    logger.ErrorCount = 0;
                     var bytes = new byte[length];
-                    chunk.Position = offset;
-                    chunk.ReadExactly(bytes);
+                    chunk!.Position = offset;
+                    var started = Stopwatch.GetTimestamp();
+                    try
+                    {
+                        chunk.ReadExactly(bytes);
+                        readCount++;
+                    }
+                    finally
+                    {
+                        telemetry.AddPhaseDuration("read", Stopwatch.GetElapsedTime(started));
+                    }
                     var syntheticPath = Path.Combine(Path.GetDirectoryName(output)!,
                         logicalName.Replace('/', Path.DirectorySeparatorChar));
                     using var memory = new MemoryStream(bytes, writable: false);
                     var reader = new FileReader(syntheticPath, memory, leaveOpen: true).PreProcessing(game);
-                    LoadFileMethod.Invoke(manager, new object[] { reader });
+                    started = Stopwatch.GetTimestamp();
+                    try
+                    {
+                        LoadFileMethod.Invoke(manager, new object[] { reader });
+                        loadedCount++;
+                    }
+                    finally
+                    {
+                        telemetry.AddPhaseDuration("load_unpack", Stopwatch.GetElapsedTime(started));
+                    }
                     var serialized = manager.assetsFileList.Select(file => new
                     {
                         name = file.fileName,
                         externals = file.m_Externals.Select(item => item.fileName).ToArray(),
                     }).ToArray();
+                    var cabRecord = JsonSerializer.Serialize(new
+                    {
+                        kind = "cab", logical_name = logicalName, chunk_path = chunkPath,
+                        offset, length, serialized,
+                    }, JsonOptions);
+                    if (options.CabOnly || cabWriter is not null)
+                    {
+                        (cabWriter ?? writer).WriteLine(cabRecord);
+                        cabMatches++;
+                    }
+                    cabLoaded = true;
                     if (options.CabOnly)
                     {
-                        writer.WriteLine(JsonSerializer.Serialize(new
-                        {
-                            kind = "cab", logical_name = logicalName, chunk_path = chunkPath,
-                            offset, length, serialized,
-                        }, JsonOptions));
+                        matches++;
                         goto BundleFinished;
                     }
 
-                    ReadAssetsMethod.Invoke(manager, null);
+                    started = Stopwatch.GetTimestamp();
+                    try
+                    {
+                        ReadAssetsMethod.Invoke(manager, null);
+                        parsedCount++;
+                    }
+                    finally
+                    {
+                        telemetry.AddPhaseDuration("object_parse", Stopwatch.GetElapsedTime(started));
+                    }
+                    if (logger.ErrorCount != 0)
+                        throw new InvalidDataException($"AnimeStudio logged {logger.ErrorCount} object errors while parsing {logicalName}");
                     if (options.AssetBundleTails || options.StreamedScenesOnly ||
                         options.HashContainerAudit)
                     {
@@ -255,6 +346,15 @@ internal static class Program
                 catch (Exception ex)
                 {
                     failed++;
+                    if (!cabLoaded && cabWriter is not null)
+                    {
+                        cabFailed++;
+                        cabWriter.WriteLine(JsonSerializer.Serialize(new
+                        {
+                            kind = "error", logical_name = logicalName,
+                            message = Unwrap(ex).Message,
+                        }, JsonOptions));
+                    }
                     writer.WriteLine(JsonSerializer.Serialize(new
                     {
                         kind = "error", logical_name = logicalName,
@@ -274,6 +374,18 @@ internal static class Program
                         kind = "progress", scanned, failed, matches,
                         utc = DateTime.UtcNow.ToString("O"),
                     }, JsonOptions));
+                    if (cabWriter is not null)
+                        cabWriter.WriteLine(JsonSerializer.Serialize(new
+                        {
+                            kind = "progress", scanned, failed = cabFailed, matches = cabMatches,
+                            utc = DateTime.UtcNow.ToString("O"),
+                        }, JsonOptions));
+                    writer.Flush();
+                    cabWriter?.Flush();
+                    telemetry.Publish("read", readCount, total);
+                    telemetry.Publish("load_unpack", loadedCount, total);
+                    if (!options.CabOnly)
+                        telemetry.Publish("object_parse", parsedCount, total);
                     Console.WriteLine($"scanned={scanned} failed={failed} matches={matches}");
                 }
                 if (options.Limit > 0 && scanned >= options.Limit)
@@ -284,6 +396,19 @@ internal static class Program
                 kind = "complete", scanned, failed, matches,
                 utc = DateTime.UtcNow.ToString("O"),
             }, JsonOptions));
+            if (cabWriter is not null)
+                cabWriter.WriteLine(JsonSerializer.Serialize(new
+                {
+                    kind = "complete", scanned, failed = cabFailed, matches = cabMatches,
+                    utc = DateTime.UtcNow.ToString("O"),
+                }, JsonOptions));
+            writer.Flush();
+            cabWriter?.Flush();
+            telemetry.Publish("read", readCount, total);
+            telemetry.Publish("load_unpack", loadedCount, total);
+            if (!options.CabOnly)
+                telemetry.Publish("object_parse", parsedCount, total);
+            telemetry.Publish("manifest_write", 1, 1);
             Console.WriteLine($"complete scanned={scanned} failed={failed} matches={matches}");
         }
         finally
@@ -405,12 +530,17 @@ internal static class Program
 
     private sealed class QuietLogger : ILogger
     {
-        public void Log(LoggerEvent loggerEvent, string message) { }
+        public int ErrorCount { get; set; }
+        public void Log(LoggerEvent loggerEvent, string message)
+        {
+            if (loggerEvent == LoggerEvent.Error)
+                ErrorCount++;
+        }
     }
 
     private sealed record Options(string Input, string Output, int Limit, int ProgressEvery,
         int Skip, bool CabOnly, bool AssetBundleTails, bool StreamedScenesOnly,
-        bool HashContainerAudit, string[] Contains)
+        bool HashContainerAudit, string[] Contains, string? CabOutput, string? PerformanceReport)
     {
         public static Options Parse(string[] args)
         {
@@ -424,6 +554,8 @@ internal static class Program
             var streamedScenesOnly = false;
             var hashContainerAudit = false;
             var contains = new List<string>();
+            string? cabOutput = null;
+            string? performanceReport = null;
             for (var i = 0; i < args.Length; i++)
             {
                 switch (args[i])
@@ -438,6 +570,8 @@ internal static class Program
                     case "--streamed-scenes-only": streamedScenesOnly = true; break;
                     case "--hash-container-audit": hashContainerAudit = true; break;
                     case "--contains": contains.Add(args[++i]); break;
+                    case "--cab-output": cabOutput = args[++i]; break;
+                    case "--performance-report": performanceReport = args[++i]; break;
                     default: throw new ArgumentException($"Unknown option: {args[i]}");
                 }
             }
@@ -449,13 +583,13 @@ internal static class Program
                 (streamedScenesOnly ? 1 : 0) + (hashContainerAudit ? 1 : 0);
             if (cabOnly && metadataModeCount > 0)
                 throw new ArgumentException("--cab-only cannot be combined with AssetBundle metadata modes");
+            if (cabOnly && cabOutput is not null)
+                throw new ArgumentException("--cab-only writes CAB rows to --output; omit --cab-output");
             if (metadataModeCount > 1)
                 throw new ArgumentException(
                     "AssetBundle metadata modes are mutually exclusive");
             return new Options(input, output, limit, progressEvery, skip, cabOnly, assetBundleTails,
-                streamedScenesOnly, hashContainerAudit, contains.ToArray());
+                streamedScenesOnly, hashContainerAudit, contains.ToArray(), cabOutput, performanceReport);
         }
     }
 }
-
-

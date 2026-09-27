@@ -1,0 +1,510 @@
+.app-shell {
+  --map-rail: 3.5vw;
+  --panel-inset: 0px;
+  padding-right: 28px;
+  padding-left: 28px;
+}
+
+.app-shell .ambient-contours-canvas {
+  z-index: -1;
+  mix-blend-mode: multiply;
+  mask-image: linear-gradient(112deg, #000 0 34%, rgb(0 0 0 / 18%) 69%, transparent 91%);
+}
+
+.app-shell .topbar {
+  min-height: 98px;
+  gap: 24px;
+}
+
+.app-shell .brand-lockup small,
+.app-shell .map-switch-hint,
+.app-shell .map-switch-copy small,
+.app-shell .top-status,
+.app-shell .top-actions button {
+  font-size: 10px;
+}
+
+.app-shell .map-switch {
+  min-width: clamp(400px, 33vw, 580px);
+  height: 68px;
+}
+
+.app-shell .map-switch button {
+  grid-template-columns: 42px minmax(0, 1fr) 16px;
+  gap: 11px;
+  padding: 6px 13px;
+}
+
+.app-shell .map-switch-copy strong { font-size: 18px; }
+.app-shell .map-switch-copy small { margin-top: 4px; font-size: 10px; }
+.app-shell .map-thumb { width: 38px; height: 44px; }
+
+.app-shell .workspace {
+  min-height: max(780px, calc(100dvh - 132px));
+}
+
+.app-shell .map-heading {
+  top: 25px;
+  left: calc(var(--map-rail) + 26px);
+  z-index: 12;
+  width: min(700px, 49vw);
+  padding: 13px 84px 16px 18px;
+  border-left: 3px solid var(--accent);
+  background: linear-gradient(90deg, color-mix(in srgb, var(--paper) 95%, transparent) 0 62%, color-mix(in srgb, var(--paper) 60%, transparent) 78%, transparent 100%);
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 46%);
+  clip-path: polygon(0 0, 96% 0, 100% 18%, 94% 100%, 0 100%);
+}
+
+.app-shell .map-heading::before { display: none; }
+.app-shell .map-heading > span { gap: 12px; font-size: 10px; }
+.app-shell .map-title-lockup { gap: 14px; min-height: 78px; margin-top: 9px; }
+.app-shell .map-title-lockup h1 { font-size: clamp(58px, 5.2vw, 94px); }
+.app-shell .map-title-lockup > strong { margin-bottom: 4px; padding: 7px 12px; font-size: 14px; }
+.app-shell .map-heading-meta { gap: 10px; margin-top: 9px; font-size: 10px; }
+.app-shell .map-heading-meta i { width: 32px; }
+
+.app-shell .map-stage {
+  inset: 0 var(--map-rail) 0;
+  min-height: 0;
+}
+
+.app-shell .map-stage-frame {
+  inset: 0 0 62px;
+  border-top: 0;
+  border-right: 0;
+  border-bottom: 0;
+  border-left-width: 1px;
+  background: #080e0c;
+  box-shadow: none;
+}
+
+.app-shell .map-transition-screen,
+.app-shell .map-viewport {
+  background: #080e0c;
+}
+
+.app-shell .map-stage-frame::before { inset: 12px; }
+.app-shell .map-stage-frame::after { opacity: 0.14; }
+.app-shell .map-stage-signature,
+.app-shell .theme-seal { display: none; }
+
+.app-shell .map-placeholder-note {
+  top: 25px;
+  right: 26px;
+  padding: 8px 11px;
+  font-size: 10px;
+}
+
+.app-shell .map-data-ribbon {
+  min-height: 62px;
+  grid-template-columns: 2fr 0.72fr 1fr 1.35fr;
+}
+
+.app-shell .map-data-ribbon > div:not(.ribbon-pulse) { gap: 4px; padding: 8px 12px; }
+.app-shell .map-data-ribbon span,
+.app-shell .map-data-ribbon small { font-size: 9px; }
+.app-shell .map-data-ribbon strong { font-size: 12px; }
+
+.app-shell .settings-drawer {
+  --settings-top: 184px;
+  display: flex;
+  height: min(650px, calc(100% - var(--settings-top) - 44px));
+  flex-direction: column;
+  top: var(--settings-top);
+  bottom: auto;
+  left: calc(var(--map-rail) + 10px);
+  width: clamp(340px, 27vw, 520px);
+  max-height: calc(100% - var(--settings-top) - 44px);
+  overflow: hidden;
+  transition: width 420ms var(--ease-silky), box-shadow 220ms ease;
+}
+
+.app-shell .settings-drawer.is-dragging {
+  z-index: 40;
+  box-shadow: 14px 22px 40px rgb(7 21 12 / 24%);
+}
+
+.app-shell .settings-drawer > header {
+  flex: 0 0 auto;
+  min-height: 62px;
+  gap: 12px;
+  padding: 11px 16px 10px 19px;
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+}
+
+.app-shell .settings-drawer > header:focus-visible {
+  outline: 2px solid var(--ink);
+  outline-offset: -5px;
+}
+
+.app-shell .settings-drawer > header.is-dragging { cursor: grabbing; }
+.app-shell .settings-drawer header small { font-size: 10px; }
+.app-shell .settings-drawer header strong { font-size: 22px; }
+
+.app-shell .settings-drawer > header > .panel-reset {
+  width: auto;
+  min-width: 46px;
+  height: 34px;
+  margin: 0 0 0 auto;
+  padding: 0 8px;
+  border: 1px solid var(--line);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.app-shell .settings-drawer > header > button:not(.panel-reset) {
+  width: 36px;
+  height: 36px;
+  margin: 0;
+}
+
+.app-shell .settings-drawer > header > button svg { width: 18px; height: 18px; }
+.app-shell .settings-scroll {
+  width: 100%;
+  min-width: 0;
+  min-height: 0;
+  max-height: none;
+  flex: 1 1 auto;
+  gap: 9px;
+  padding: 12px 15px 16px;
+  overflow-x: hidden;
+}
+.app-shell .settings-scroll > *,
+.app-shell .setting-section,
+.app-shell .setting-section summary,
+.app-shell .setting-section-body,
+.app-shell .setting-section-body > *,
+.app-shell .setting-block,
+.app-shell .path-field,
+.app-shell .field-pair,
+.app-shell .field-pair label,
+.app-shell .full-field,
+.app-shell .select-shell,
+.app-shell .validation-space,
+.app-shell .validation-space > div,
+.app-shell .first-run-validation,
+.app-shell .first-run-console,
+.app-shell .first-run-events,
+.app-shell .first-run-capabilities,
+.app-shell .settings-state,
+.app-shell .strategy-note {
+  min-width: 0;
+  max-width: 100%;
+}
+.app-shell .setting-section summary { grid-template-columns: minmax(0, 1fr) minmax(0, auto) 13px; }
+.app-shell .setting-section summary small { max-width: 112px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.app-shell .field-pair { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.app-shell .layer-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.app-shell .export-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.app-shell .validation-space,
+.app-shell .first-run-capabilities { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.app-shell .select-shell select { min-width: 0; max-width: 100%; text-overflow: ellipsis; }
+.app-shell .first-run-error span,
+.app-shell .first-run-boundary-note span,
+.app-shell .first-run-console > p,
+.app-shell .capability-disclaimer,
+.app-shell .full-field > small,
+.app-shell .field-pair label > small,
+.app-shell .strategy-note > span { overflow-wrap: anywhere; }
+.app-shell .settings-drawer.collapsed { height: auto; }
+.app-shell .setting-section summary { min-height: 42px; gap: 10px; padding: 0 11px; }
+.app-shell .setting-section summary strong { font-size: 16px; }
+.app-shell .setting-section summary small { font-size: 10px; }
+.app-shell .setting-section-body { gap: 10px; padding: 12px 11px 13px; }
+.app-shell .path-field { gap: 5px; }
+.app-shell .path-field label,
+.app-shell .path-field small { font-size: 10px; }
+.app-shell .path-input { grid-template-columns: minmax(0, 1fr) 38px; min-height: 38px; }
+.app-shell .path-input input { font-size: 11px; }
+.app-shell .path-input button { min-height: 36px; }
+.app-shell .first-run-console { gap: 8px; padding: 11px; }
+.app-shell .first-run-heading small { font-size: 9px; }
+.app-shell .first-run-heading strong { font-size: 20px; }
+.app-shell .first-run-heading > span { font-size: 10px; }
+.app-shell .first-run-phase { font-size: 10px; }
+.app-shell .first-run-phase > strong { font-size: 12px; }
+.app-shell .first-run-phase small { font-size: 8px; }
+.app-shell .first-run-console > p,
+.app-shell .first-run-boundary-note,
+.app-shell .first-run-error,
+.app-shell .first-run-validation > p { font-size: 10px; }
+.app-shell .validation-space span,
+.app-shell .validation-space small,
+.app-shell .validation-prerequisites span { font-size: 9px; }
+.app-shell .validation-space strong { font-size: 11px; }
+.app-shell .first-run-actions button { min-height: 36px; padding: 6px 9px; font-size: 10px; }
+.app-shell .first-run-events > div { min-height: 32px; font-size: 9px; }
+.app-shell .first-run-capabilities span,
+.app-shell .first-run-capabilities strong { font-size: 9px; }
+.app-shell .source-scan { min-height: 42px; gap: 8px; padding: 0 10px; }
+.app-shell .source-scan small { font-size: 9px; }
+.app-shell .layer-grid strong,
+.app-shell .export-grid button strong { font-size: 12px; }
+.app-shell .layer-grid small,
+.app-shell .export-grid button small { font-size: 9px; }
+.app-shell .strategy-note { min-height: 36px; font-size: 9px; }
+.app-shell .strategy-note button { min-height: 28px; padding: 0 8px; font-size: 9px; }
+.app-shell .settings-state { min-height: 30px; font-size: 10px; }
+
+.app-shell .launch-pod {
+  right: calc(var(--map-rail) + 4px);
+  bottom: 25px;
+  width: clamp(370px, 31vw, 520px);
+  min-height: 250px;
+  padding: 17px;
+}
+
+.app-shell .launch-overline { gap: 8px; font-size: 10px; }
+.app-shell .launch-button { min-height: 82px; margin-top: 11px; padding: 13px 58px 12px 16px; }
+.app-shell .launch-title { font-size: 32px; }
+.app-shell .launch-subtitle { margin-top: 7px; font-size: 10px; }
+.app-shell .launch-arrow { right: 17px; bottom: 21px; width: 29px; height: 29px; }
+.app-shell .chunk-progress { gap: 8px; margin-top: 11px; font-size: 9px; }
+.app-shell .chunk-progress-head button { padding: 3px 8px; font-size: 10px; }
+.app-shell .chunk-mini-grid span { min-height: 20px; font-size: 8px; }
+.app-shell .phase-track span { font-size: 9px; }
+.app-shell .phase-track small { font-size: 8px; }
+.app-shell .launch-pod > p { margin-top: 9px; font-size: 10px; }
+.app-shell .footer-strip { min-height: 40px; gap: 15px; font-size: 9px; }
+.app-shell .footer-strip strong { font-size: 15px; }
+
+@media (max-width: 1260px) and (min-width: 921px) {
+  .app-shell { --map-rail: 28px; padding-right: 20px; padding-left: 20px; }
+  .app-shell .topbar { min-height: 88px; grid-template-columns: minmax(230px, 1fr) auto minmax(190px, 1fr); gap: 12px; }
+  .app-shell .map-switch { min-width: 370px; height: 62px; }
+  .app-shell .map-heading { width: min(610px, 51vw); }
+  .app-shell .map-title-lockup h1 { font-size: clamp(54px, 5vw, 76px); }
+  .app-shell .settings-drawer { --settings-top: 176px; width: min(390px, 34vw); }
+  .app-shell .settings-scroll { max-height: min(550px, calc(100dvh - 310px)); }
+  .app-shell .launch-pod { width: min(410px, 33vw); }
+}
+
+@media (max-width: 920px) and (min-width: 561px) {
+  .app-shell { --map-rail: 16px; padding-right: 10px; padding-left: 10px; }
+  .app-shell .workspace { min-height: max(1120px, calc(100dvh + 360px)); }
+  .app-shell .map-heading { top: 24px; left: 27px; width: min(530px, 74vw); }
+  .app-shell .map-title-lockup h1 { font-size: clamp(48px, 8vw, 70px); }
+  .app-shell .map-stage { inset: 0 var(--map-rail) 550px; min-height: 470px; }
+  .app-shell .map-stage-frame { inset: 0 0 66px; }
+  .app-shell .settings-drawer { top: auto; bottom: 44px; left: 12px; width: calc(54% - 16px); height: min(520px, calc(100% - 44px)); max-height: 520px; }
+  .app-shell .settings-scroll { max-height: none; padding: 9px 10px 12px; }
+  .app-shell .launch-pod { right: 12px; bottom: 18px; width: calc(46% - 16px); min-height: 238px; padding: 12px; }
+  .app-shell .launch-title { font-size: 24px; }
+  .app-shell .launch-subtitle { font-size: 9px; }
+  .app-shell .chunk-progress { font-size: 8px; }
+  .app-shell .map-data-ribbon { grid-template-columns: 1.5fr 0.8fr 1fr; }
+  .app-shell .manifest-state { display: none; }
+  .app-shell .region-cartouche { top: 152px; }
+}
+
+@media (max-width: 560px) {
+  .app-shell { --map-rail: 10px; padding-right: 10px; padding-left: 10px; }
+  .app-shell .topbar {
+    min-height: 0;
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-rows: auto auto;
+    grid-template-areas: "brand actions" "switch switch";
+    gap: 13px 8px;
+    padding: 8px 0 9px;
+  }
+  .app-shell .brand-lockup { grid-area: brand; gap: 8px; }
+  .app-shell .brand-mark { width: 40px; height: 42px; }
+  .app-shell .brand-lockup > div:last-child > strong { font-size: 17px; }
+  .app-shell .map-switch-zone { grid-area: switch; width: 100%; padding-top: 8px; }
+  .app-shell .map-switch { width: 100%; min-width: 0; height: 62px; }
+  .app-shell .map-switch button { grid-template-columns: 28px minmax(0, 1fr) 14px; gap: 7px; padding: 4px 8px; }
+  .app-shell .map-thumb { display: block; width: 27px; height: 34px; }
+  .app-shell .map-switch-copy strong { font-size: 14px; white-space: nowrap; }
+  .app-shell .map-switch-copy small { display: block; margin-top: 3px; font-size: 10px; white-space: nowrap; }
+  .app-shell .top-actions { grid-area: actions; display: flex; align-items: center; gap: 5px; }
+  .app-shell .top-status { display: none; }
+  .app-shell .top-actions button { display: grid; width: 36px; min-height: 36px; place-items: center; padding: 0; }
+  .app-shell .top-actions button span { display: none; }
+  .app-shell .workspace { min-height: 1510px; }
+  .app-shell .map-heading { top: 20px; left: 17px; width: min(360px, calc(100vw - 42px)); padding: 10px 45px 12px 12px; }
+  .app-shell .map-heading > span { font-size: 9px; }
+  .app-shell .map-title-lockup { display: flex; min-height: 52px; gap: 7px; margin-top: 6px; }
+  .app-shell .map-title-lockup h1 { font-size: clamp(39px, 12vw, 58px); }
+  .app-shell .map-title-lockup > strong { padding: 5px 7px; font-size: 11px; }
+  .app-shell .map-heading-meta { gap: 6px; margin-top: 6px; font-size: 8px; }
+  .app-shell .map-heading-meta > span:last-child { display: none; }
+  .app-shell .map-stage { inset: 0 10px auto; height: 488px; min-height: 0; }
+  .app-shell .map-stage-frame { inset: 0 0 68px; }
+  .app-shell .map-placeholder-note { top: 20px; right: 10px; max-width: 156px; padding: 6px; font-size: 8px; }
+  .app-shell .map-data-ribbon { grid-template-columns: 1.4fr 0.7fr 1fr; min-height: 60px; }
+  .app-shell .map-data-ribbon > div:not(.ribbon-pulse) { padding: 6px; }
+  .app-shell .map-data-ribbon span,
+  .app-shell .map-data-ribbon small { font-size: 8px; }
+  .app-shell .map-data-ribbon strong { font-size: 9px; }
+  .app-shell .region-cartouche { top: 164px; right: 16px; width: min(152px, calc(100vw - 32px)); padding: 0 5px 0 8px; }
+  .app-shell .cartouche-index { padding: 7px 0; }
+  .app-shell .cartouche-index > span:first-child { font-size: 22px; }
+  .app-shell .cartouche-index > span:last-child { font-size: 8px; }
+  .app-shell .cartouche-body { padding: 8px 0 11px; }
+  .app-shell .cartouche-rule { width: 22px; height: 3px; margin-bottom: 7px; }
+  .app-shell .cartouche-body h2,
+  .app-shell .theme-map01 .cartouche-body h2 { max-width: 96px; font-size: 18px; letter-spacing: 0; }
+  .app-shell .region-sculpture { width: 36px; height: 54px; }
+  .app-shell .cartouche-meta { padding: 7px 0; font-size: 8px; }
+  .app-shell .map-stage .zoom-stack { top: 285px; }
+  .app-shell .settings-drawer { top: 520px; bottom: auto; left: 10px; width: calc(100% - 20px); height: 620px; max-height: 620px; }
+  .app-shell .settings-scroll { max-height: none; }
+  .app-shell .launch-pod { top: 1165px; right: 10px; bottom: auto; left: 10px; width: auto; min-height: 285px; }
+  .app-shell .launch-title { font-size: 28px; }
+  .app-shell .launch-subtitle,
+  .app-shell .chunk-progress,
+  .app-shell .launch-pod > p { font-size: 9px; }
+  .app-shell .chunk-mini-grid span { min-height: 22px; font-size: 8px; }
+  .app-shell .phase-track { grid-template-columns: repeat(5, 1fr); gap: 3px; }
+  .app-shell .phase-track > div { grid-template-columns: 7px minmax(0, 1fr); }
+  .app-shell .phase-track small { display: none; }
+  .app-shell .footer-strip { grid-template-columns: auto 1fr; font-size: 8px; }
+  .app-shell .footer-strip > span { display: none; }
+}
+
+@media (max-width: 800px) {
+  .app-shell .map-stage .zoom-stack {
+    top: auto;
+    right: 12px;
+    bottom: 12px;
+    display: flex;
+    transform: none;
+  }
+  .app-shell .map-stage .zoom-stack button { width: 32px; height: 32px; }
+  .app-shell .map-stage .zoom-stack button + button { border-top: 0; border-left: 1px solid var(--line); }
+}
+
+/* Keep operational copy close to the approved demo's readable scale. */
+.app-shell .brand-lockup small { font-size: 11px; }
+.app-shell .map-switch-copy strong { font-size: 18px; }
+.app-shell .map-switch-copy small { font-size: 11px; }
+.app-shell .top-status,
+.app-shell .top-actions button { font-size: 12px; }
+.app-shell .top-actions { flex-wrap: nowrap; }
+.app-shell .top-actions button { flex: 0 0 auto; min-width: max-content; white-space: nowrap; }
+.app-shell .path-field { gap: 6px; }
+.app-shell .path-field label,
+.app-shell .setting-label,
+.app-shell .field-pair label > span,
+.app-shell .full-field > span { font-size: 13px; line-height: 1.4; }
+.app-shell .path-field small,
+.app-shell .full-field > small,
+.app-shell .field-pair label > small,
+.app-shell .first-run-console > p,
+.app-shell .first-run-boundary-note,
+.app-shell .first-run-error,
+.app-shell .first-run-validation > p,
+.app-shell .capability-disclaimer,
+.app-shell .strategy-note > span,
+.app-shell .launch-subtitle,
+.app-shell .launch-pod > p { font-size: 12px; line-height: 1.55; }
+.app-shell .path-input { min-height: 44px; grid-template-columns: minmax(0, 1fr) 42px; }
+.app-shell .path-input input,
+.app-shell .select-shell select,
+.app-shell .full-field > input { font-size: 15px; }
+.app-shell .path-input button { min-height: 42px; }
+.app-shell .select-shell,
+.app-shell .select-shell select,
+.app-shell .full-field > input { min-height: 44px; }
+.app-shell .setting-section summary small { font-size: 11px; }
+.app-shell .first-run-heading > span,
+.app-shell .first-run-phase { font-size: 12px; }
+.app-shell .first-run-phase > strong { font-size: 13px; }
+.app-shell .first-run-phase small { font-size: 10px; }
+.app-shell .first-run-console > p { line-height: 1.6; }
+.app-shell .first-run-actions button { min-height: 40px; padding: 7px 11px; font-size: 12px; }
+.app-shell .first-run-events > div { min-height: 34px; font-size: 11px; }
+.app-shell .validation-space span,
+.app-shell .validation-space small,
+.app-shell .validation-prerequisites span { font-size: 10px; }
+.app-shell .validation-space strong { font-size: 13px; }
+.app-shell .first-run-capabilities span { font-size: 11px; }
+.app-shell .first-run-capabilities strong { font-size: 12px; }
+.app-shell .source-scan small { font-size: 11px; }
+.app-shell .layer-grid strong,
+.app-shell .export-grid button strong { font-size: 13px; }
+.app-shell .layer-grid small,
+.app-shell .export-grid button small { font-size: 10px; }
+.app-shell .strategy-note { font-size: 12px; line-height: 1.5; }
+.app-shell .strategy-note button { min-height: 32px; padding: 0 10px; font-size: 12px; }
+.app-shell .settings-state { font-size: 12px; }
+.app-shell .launch-overline { font-size: 11px; }
+.app-shell .launch-subtitle { font-size: 12px; }
+.app-shell .chunk-progress { font-size: 11px; }
+.app-shell .chunk-mini-grid span { font-size: 10px; }
+.app-shell .phase-track span { font-size: 10px; }
+.app-shell .phase-track small { font-size: 9px; }
+
+@media (max-width: 1260px) and (min-width: 921px) {
+  .app-shell .top-actions {
+    display: flex;
+    align-items: center;
+    justify-self: end;
+    gap: 6px;
+  }
+  .app-shell .top-status { display: none; }
+  .app-shell .top-actions > button { width: 36px; min-height: 36px; justify-content: center; padding: 0; }
+  .app-shell .top-actions > button:not(.dev-review-button) span { display: none; }
+  .app-shell .top-actions .dev-review-button { width: auto; min-height: 36px; gap: 5px; padding: 0 8px; white-space: nowrap; font-size: 11px; }
+  .app-shell .top-actions .dev-review-button span { display: inline; }
+}
+
+@media (max-width: 1700px) and (min-width: 1261px) {
+  .app-shell .top-status { display: none; }
+}
+
+@media (max-width: 920px) and (min-width: 561px) {
+  .app-shell .topbar {
+    grid-template-areas: "brand actions" "switch switch";
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-rows: auto auto;
+    gap: 10px 14px;
+  }
+  .app-shell .brand-lockup { grid-area: brand; }
+  .app-shell .map-switch-zone { grid-area: switch; width: 100%; }
+  .app-shell .map-switch { width: min(100%, 580px); min-width: 0; }
+  .app-shell .map-switch button { grid-template-columns: 42px minmax(0, 1fr) 16px; }
+  .app-shell .map-switch-copy strong { font-size: 16px; }
+  .app-shell .map-switch-copy small { font-size: 11px; }
+  .app-shell .top-actions {
+    grid-area: actions;
+    display: flex;
+    align-items: center;
+    justify-self: end;
+    gap: 6px;
+  }
+  .app-shell .top-status { display: none; }
+  .app-shell .top-actions > button { width: 36px; min-height: 36px; justify-content: center; padding: 0; }
+  .app-shell .top-actions > button:not(.dev-review-button) span { display: none; }
+  .app-shell .top-actions .dev-review-button { width: auto; min-height: 36px; gap: 6px; padding: 0 9px; white-space: nowrap; }
+  .app-shell .top-actions .dev-review-button span { display: inline; }
+}
+
+@media (max-width: 560px) {
+  .app-shell .map-switch-copy strong { font-size: 15px; }
+  .app-shell .map-switch-copy small { font-size: 11px; }
+  .app-shell .top-actions .dev-review-button { width: 36px; min-height: 36px; }
+  .app-shell .path-field label,
+  .app-shell .setting-label,
+  .app-shell .field-pair label > span,
+  .app-shell .full-field > span { font-size: 13px; }
+  .app-shell .path-field small,
+  .app-shell .full-field > small,
+  .app-shell .field-pair label > small,
+  .app-shell .first-run-console > p,
+  .app-shell .first-run-boundary-note,
+  .app-shell .first-run-error,
+  .app-shell .first-run-validation > p,
+  .app-shell .capability-disclaimer,
+  .app-shell .strategy-note > span,
+  .app-shell .launch-subtitle,
+  .app-shell .launch-pod > p { font-size: 12px; }
+  .app-shell .path-input input,
+  .app-shell .select-shell select,
+  .app-shell .full-field > input { font-size: 15px; }
+  .app-shell .launch-subtitle,
+  .app-shell .chunk-progress { font-size: 12px; }
+  .app-shell .launch-pod > p { font-size: 12px; }
+}

@@ -9,11 +9,24 @@ import unittest
 from contextlib import closing
 from pathlib import Path
 
-from endfield_scene_export_plan import _merge_mesh_exports, load_scene_export_plan, prepare_scene_export_plan
+from endfield_scene_export_plan import _merge_mesh_exports, load_scene_export_plan, owns_static_footprint, prepare_scene_export_plan
 from webui_source_contract import selected_static_categories
 
 
 class PortableScenePlanTests(unittest.TestCase):
+    def test_crossing_geometry_has_one_partition_owner(self) -> None:
+        selection = {"xmin": 0.0, "xmax": 256.0, "zmin": 0.0, "zmax": 128.0}
+        batches = [{**selection, "xmin": 0.0, "xmax": 128.0},
+                   {**selection, "xmin": 128.0, "xmax": 256.0}]
+        cases = [((-20.0, 40.0), (-30.0, 200.0, 0.0, 20.0, 20.0, 80.0), [True, False]),
+                 ((200.0, 40.0), (50.0, 210.0, 0.0, 20.0, 20.0, 80.0), [False, True]),
+                 ((-20.0, 40.0), (-30.0, 0.0, 0.0, 20.0, 20.0, 80.0), [False, False])]
+        for origin, footprint, expected in cases:
+            with self.subTest(origin=origin, footprint=footprint):
+                actual = [owns_static_footprint(batch, selection, origin, footprint) for batch in batches]
+                self.assertEqual(actual, expected)
+                self.assertEqual(any(actual), owns_static_footprint(selection, selection, origin, footprint))
+
     def test_selected_static_categories_respect_independent_layers(self) -> None:
         layers = {"instances": True, "roads": False, "vegetation": True, "terrain": False}
         self.assertEqual(selected_static_categories(layers, ["all"]),
@@ -60,11 +73,18 @@ class PortableScenePlanTests(unittest.TestCase):
                         "matrix_col_major BLOB,source_path TEXT,group_index INTEGER,entity_index INTEGER,"
                         "x REAL,z REAL)"
                     )
+                    database.execute(
+                        "INSERT INTO instances VALUES (?,?,?,?,?,?,?,?,?)",
+                        (1, "HLOD0_3_14_Cluster_1837366762_150", 18, b"", "InitChunkData_0_0_0_0.bytes", 0, 0, 4.0, 4.0),
+                    )
             for name in ("assets.sqlite", "resources.sqlite", "bundles.sqlite", "paths.bin"):
                 (cache / name).write_bytes(b"")
             manifest = cache / "scene_manifest.json"
             manifest.write_text(json.dumps({"Format": "EndfieldSceneProbe/1", "Containers": [],
                                             "MeshExports": [], "Materials": [], "TextureExports": []}), encoding="utf-8")
+            terrain = cache / "terrain_surface"
+            terrain.mkdir()
+            (terrain / "terrain_surface.json").write_text("{}", encoding="utf-8")
             config = cache / "runtime_config.json"
             config.write_text(json.dumps({
                 "format": "EndfieldRuntimeConfig/1",
@@ -72,7 +92,8 @@ class PortableScenePlanTests(unittest.TestCase):
                 "extraction": {"resourceDatabase": "resources.sqlite",
                                "bundleScanIndex": "bundles.sqlite",
                                "maps": {"map01": {"instances": "instances.sqlite", "assets": "assets.sqlite",
-                                                  "sceneProbe": {"path": "scene_manifest.json"}, "terrainSurfaces": []}}},
+                                                  "sceneProbe": {"path": "scene_manifest.json"},
+                                                  "terrainSurfaces": ["terrain_surface"]}}},
             }), encoding="utf-8")
             (cache / "first_run_state.json").write_text(json.dumps({
                 "steps": {"bootstrap_metadata": {"outputs": {"main_paths": {"path": "paths.bin"}}}}
@@ -85,11 +106,26 @@ class PortableScenePlanTests(unittest.TestCase):
             output = selected_export / "plan.json"
             actual = load_scene_export_plan(prepare_scene_export_plan(config, canonical, output, None))
             self.assertEqual(actual["instances"], [])
+            self.assertEqual(actual["terrain_surfaces"], [])
             self.assertEqual(actual["pending"], [])
             self.assertEqual(actual["summary"]["ready_decals"], 0)
+            self.assertEqual(actual["summary"]["excluded_hlod"], 0)
             self.assertEqual(json.loads(Path(actual["decal_manifest"]).read_text())["records"], [])
             with self.assertRaisesRegex(ValueError, "Plan output must be new"):
                 prepare_scene_export_plan(config, canonical, output, None)
+            terrain_request = {**canonical, "export_groups": ["terrain"],
+                               "layers": {"instances": False, "terrain": True}}
+            terrain_plan = load_scene_export_plan(prepare_scene_export_plan(
+                config, terrain_request, selected_export / "terrain_plan.json", None))
+            self.assertEqual(terrain_plan["terrain_surfaces"], [str(terrain)])
+            disabled_request = {**canonical, "export_groups": ["all"],
+                                "layers": {"instances": True, "terrain": False}}
+            disabled_plan = load_scene_export_plan(prepare_scene_export_plan(
+                config, disabled_request, selected_export / "disabled_plan.json", None))
+            self.assertEqual(disabled_plan["terrain_surfaces"], [])
+            self.assertEqual(disabled_plan["summary"]["excluded_hlod"], 1)
+            self.assertEqual(disabled_plan["summary"]["selected_static"], 0)
+            self.assertEqual(disabled_plan["summary"]["pending"], 0)
 
     def test_loader_rejects_missing_exact_source_hash(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -116,6 +152,18 @@ class PortableScenePlanTests(unittest.TestCase):
             }), encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "source hash mismatch"):
                 load_scene_export_plan(plan)
+            original = json.loads(plan.read_text(encoding="utf-8"))
+            for field, value in (
+                ("entity_base", "HLOD1_1_7_Cluster_740179475_150"),
+                ("mesh_path", "assets/hlod_v2/pc/hlod0/mesh/proxy.fbx##proxy"),
+                ("mesh_asset", {"Source": "cab", "PathId": 1, "Name": "S_HLOD0_3_14_Cluster_1837366762"}),
+            ):
+                with self.subTest(field=field):
+                    candidate = json.loads(json.dumps(original))
+                    candidate["instances"][0][field] = value
+                    plan.write_text(json.dumps(candidate), encoding="utf-8")
+                    with self.assertRaisesRegex(ValueError, "excluded HLOD instance: entity_id=1"):
+                        load_scene_export_plan(plan)
 
 
 if __name__ == "__main__":

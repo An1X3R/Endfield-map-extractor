@@ -294,25 +294,32 @@ const handleCatalogRequest = (response: ServerResponse): void => {
 export const mapOverviewApi = (): Plugin => ({
   name: 'endfield-map-overview-api',
   configureServer(server) {
-    server.middlewares.use((request, response, next) => {
-      const method = request.method ?? 'GET'
-      const requestUrl = new URL(request.url ?? '/', 'http://127.0.0.1')
-      const overviewMatch = requestUrl.pathname.match(/^\/api\/v2\/maps\/(map01|map02)\/overview$/)
-      if ((method === 'GET' || method === 'HEAD') && overviewMatch) {
-        const mapId = overviewMatch[1]
-        const variantValue = requestUrl.searchParams.get('variant') ?? 'clean'
-        if (!isMapId(mapId) || !isOverviewVariant(variantValue)) {
-          sendJson(response, 400, { error: 'invalid_overview_variant', message: 'variant must be clean or sectors' })
-          return
-        }
-        void handleOverviewRequest(request, response, mapId, variantValue)
-        return
-      }
-      if (method === 'GET' && requestUrl.pathname === '/api/v2/maps') {
-        handleCatalogRequest(response)
-        return
-      }
-      next()
-    })
+    installMapOverviewApi(server.middlewares)
+  },
+  configurePreviewServer(server) {
+    installMapOverviewApi(server.middlewares)
   },
 })
+
+const installMapOverviewApi = (middlewares: { use: (handler: (request: IncomingMessage, response: ServerResponse, next: () => void) => void) => void }): void => {
+  middlewares.use((request, response, next) => {
+    const method = request.method ?? 'GET'
+    const requestUrl = new URL(request.url ?? '/', 'http://127.0.0.1')
+    const overviewMatch = requestUrl.pathname.match(/^\/api\/v2\/maps\/(map01|map02)\/overview$/)
+    if ((method === 'GET' || method === 'HEAD') && overviewMatch) {
+      const mapId = overviewMatch[1]
+      const variantValue = requestUrl.searchParams.get('variant') ?? 'clean'
+      if (!isMapId(mapId) || !isOverviewVariant(variantValue)) {
+        sendJson(response, 400, { error: 'invalid_overview_variant', message: 'variant must be clean or sectors' })
+        return
+      }
+      void handleOverviewRequest(request, response, mapId, variantValue)
+      return
+    }
+    if (method === 'GET' && requestUrl.pathname === '/api/v2/maps') {
+      handleCatalogRequest(response)
+      return
+    }
+    next()
+  })
+}

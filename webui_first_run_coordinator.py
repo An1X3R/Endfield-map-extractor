@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import signal
@@ -695,7 +696,40 @@ class FirstRunCoordinator:
                     message=event.get("message", status.get("message")),
                     source_status=event.get("status", "running"),
                 )
+                helper_progress = self._helper_progress(event)
+                if helper_progress is not None:
+                    status["details"] = {"helperProgress": helper_progress}
         return self._decorate_status(status)
+
+    @staticmethod
+    def _helper_progress(event: Mapping[str, Any]) -> dict[str, Any] | None:
+        details = event.get("details")
+        if not isinstance(details, Mapping):
+            return None
+        progress = details.get("helperProgress")
+        if not isinstance(progress, Mapping):
+            return None
+        if progress.get("format") != "EndfieldHelperProgress/1":
+            return None
+        phase = progress.get("phase")
+        if not isinstance(phase, str) or not phase.strip():
+            return None
+
+        normalized: dict[str, Any] = {"format": "EndfieldHelperProgress/1", "phase": phase.strip()}
+        integer_fields = ("current", "total", "peakWorkingSetBytes", "readBytes", "writeBytes")
+        for field in integer_fields:
+            value = progress.get(field)
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                normalized[field] = value
+        elapsed = progress.get("elapsedSeconds")
+        if (
+            isinstance(elapsed, (int, float))
+            and not isinstance(elapsed, bool)
+            and math.isfinite(elapsed)
+            and elapsed >= 0
+        ):
+            normalized["elapsedSeconds"] = float(elapsed)
+        return normalized
 
     def events(self, after_sequence: int = 0, limit: int = 250) -> dict[str, Any]:
         limit = max(1, min(500, int(limit)))

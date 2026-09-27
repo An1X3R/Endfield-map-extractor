@@ -9,7 +9,7 @@ from pathlib import Path
 from endfield_scene_slot_contract import load_slot_plans, load_retained_mesh_slot_plans
 from endfield_scene_slot_contract import AmbiguousSubmeshSlots, static_submesh_slots
 from endfield_scene_slot_contract import mesh_lod_index
-from endfield_scene_slot_contract import RuntimeDraw, runtime_submesh_slots
+from endfield_scene_slot_contract import RuntimeDraw, primary_visible_mesh, runtime_submesh_slots
 
 
 def write_inputs(root: Path, sequences: list[list[list[str]]], failures: list[dict[str, str]]) -> tuple[Path, Path]:
@@ -50,6 +50,22 @@ class SceneMaterialSlotTests(unittest.TestCase):
                 self.assertEqual(expected, mesh_lod_index(name))
         with self.assertRaisesRegex(ValueError, "multiple LOD tokens"):
             mesh_lod_index("tree_lod0_lod1")
+
+    def test_visible_primary_mesh_accepts_implicit_base_beside_lods(self) -> None:
+        base = "assets/tree.fbx##tree"
+        self.assertEqual(base, primary_visible_mesh(((base, RuntimeDraw(0, 256)),
+            ("assets/tree_lod1.fbx##tree_lod1", RuntimeDraw(0, 256)),
+            ("assets/tree_lod2.fbx##tree_lod2", RuntimeDraw(0, 256)),
+            ("assets/tree_shadowproxy.fbx##tree_shadowproxy", RuntimeDraw(0, 1024)))))
+        lod0 = "assets/tree_lod0.fbx##tree_lod0"
+        self.assertEqual(lod0, primary_visible_mesh(((base, RuntimeDraw(0, 256)),
+            (lod0, RuntimeDraw(0, 256)))))
+        for pairs in (((base, RuntimeDraw(0, 256)),
+                       ("assets/tree_card.fbx##tree_card", RuntimeDraw(0, 256))),
+                      (("assets/tree_lod1.fbx##tree_lod1", RuntimeDraw(0, 256)),),
+                      ((base, RuntimeDraw(0, 1024)),)):
+            with self.subTest(pairs=pairs), self.assertRaisesRegex(AmbiguousSubmeshSlots, "No unique visible base mesh"):
+                primary_visible_mesh(pairs)
 
     def test_static_repetitions_preserve_material_choices_and_reject_conflicts(self) -> None:
         for count, references, expected in (

@@ -1,4 +1,6 @@
 using System.Globalization;
+using System.Reflection;
+using System.Runtime.ExceptionServices;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -7,6 +9,12 @@ using Object = AnimeStudio.Object;
 
 internal static partial class Program
 {
+    private static readonly MethodInfo ReadAssetsMethod = typeof(AssetsManager).GetMethod(
+        "ReadAssets", BindingFlags.Instance | BindingFlags.NonPublic)
+        ?? throw new MissingMethodException("AssetsManager.ReadAssets()");
+    private static readonly MethodInfo ProcessAssetsMethod = typeof(AssetsManager).GetMethod(
+        "ProcessAssets", BindingFlags.Instance | BindingFlags.NonPublic)
+        ?? throw new MissingMethodException("AssetsManager.ProcessAssets()");
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
         WriteIndented = true,
@@ -31,8 +39,35 @@ internal static partial class Program
 
     private static void Run(Options options)
     {
+        var telemetry = new HelperProgress("EndfieldSceneProbe", options.PerformanceReport,
+            "load_unpack includes input-file reading and bundle unpacking because AssetsManager.LoadFiles " +
+            "does not expose separate timings; object_parse covers ReadAssets and ProcessAssets in original order.");
+        try
+        {
+            RunCore(options, telemetry);
+        }
+        catch (Exception error)
+        {
+            try
+            {
+                telemetry.Finish("failed");
+            }
+            catch (Exception reportError)
+            {
+                error.Data["PerformanceReportError"] = reportError.ToString();
+            }
+            throw;
+        }
+        telemetry.Finish("complete");
+    }
+
+    private static void RunCore(Options options, HelperProgress telemetry)
+    {
         var input = Path.GetFullPath(options.Input);
         var output = Path.GetFullPath(options.Output);
+        if (options.PerformanceReport is not null && Path.GetFullPath(options.PerformanceReport)
+            .Equals(Path.Combine(output, "scene_manifest.json"), StringComparison.OrdinalIgnoreCase))
+            throw new IOException("Performance report cannot overwrite the scene manifest");
         if (!File.Exists(input) && !Directory.Exists(input))
             throw new FileNotFoundException("Input does not exist.", input);
         if (Directory.Exists(output) || File.Exists(output))
@@ -70,8 +105,16 @@ internal static partial class Program
             Game = GameManager.GetGameByType(GameType.ArknightsEndfield),
             ResolveDependencies = false,
             Silent = false,
+            SkipProcess = true,
         };
+        telemetry.Publish("load_unpack", 0, files.Length);
         manager.LoadFiles(files);
+        telemetry.Publish("load_unpack", files.Length, files.Length);
+        var objectCount = manager.assetsFileList.Sum(file => file.m_Objects.Count);
+        telemetry.Publish("object_parse", 0, objectCount);
+        InvokeManagerPhase(ReadAssetsMethod, manager);
+        InvokeManagerPhase(ProcessAssetsMethod, manager);
+        telemetry.Publish("object_parse", objectCount, objectCount);
 
         var allObjects = manager.assetsFileList.SelectMany(f => f.Objects).ToList();
         var gameObjects = allObjects.OfType<GameObject>().ToList();
@@ -179,6 +222,8 @@ internal static partial class Program
         }
 
         var meshRecords = new List<ExportRecord>();
+        var meshTotal = options.ManifestOnly ? 0 : meshRefs.Count;
+        telemetry.Publish("mesh_export", 0, meshTotal);
         foreach (var mesh in options.ManifestOnly
                      ? Enumerable.Empty<Mesh>()
                      : meshRefs.OrderBy(x => x.assetsFile.fileName).ThenBy(x => x.m_PathID))
@@ -188,9 +233,14 @@ internal static partial class Program
             var ok = WriteObj(mesh, path);
             meshRecords.Add(new ExportRecord(ToRef(mesh), ok ? Path.GetRelativePath(output, path) : null,
                 ok ? null : "Mesh has no exportable triangle/vertex data"));
+            if (meshRecords.Count % 100 == 0)
+                telemetry.Publish("mesh_export", meshRecords.Count, meshTotal);
         }
+        telemetry.Publish("mesh_export", meshRecords.Count, meshTotal);
 
         var textureRecords = new List<ExportRecord>();
+        var textureTotal = options.ManifestOnly ? 0 : textureRefs.Count;
+        telemetry.Publish("texture_export", 0, textureTotal);
         foreach (var texture in options.ManifestOnly
                      ? Enumerable.Empty<Texture2D>()
                      : textureRefs.OrderBy(x => x.assetsFile.fileName).ThenBy(x => x.m_PathID))
@@ -215,7 +265,10 @@ internal static partial class Program
                 error = ex.Message;
             }
             textureRecords.Add(new ExportRecord(TextureReference(texture), error == null ? Path.GetRelativePath(output, path) : null, error));
+            if (textureRecords.Count % 100 == 0)
+                telemetry.Publish("texture_export", textureRecords.Count, textureTotal);
         }
+        telemetry.Publish("texture_export", textureRecords.Count, textureTotal);
 
         var containers = BuildContainers(allObjects);
         var report = new SceneReport
@@ -254,9 +307,24 @@ internal static partial class Program
         };
 
         var reportPath = Path.Combine(output, "scene_manifest.json");
+        telemetry.Publish("manifest_write", 0, 1);
         File.WriteAllText(reportPath, JsonSerializer.Serialize(report, JsonOptions), new UTF8Encoding(false));
+        telemetry.Publish("manifest_write", 1, 1);
         Console.WriteLine($"Scene manifest: {reportPath}");
         Console.WriteLine(string.Join(", ", report.Summary.Select(x => $"{x.Key}={x.Value}")));
+    }
+
+    private static void InvokeManagerPhase(MethodInfo method, AssetsManager manager)
+    {
+        try
+        {
+            method.Invoke(manager, null);
+        }
+        catch (TargetInvocationException error) when (error.InnerException is not null)
+        {
+            ExceptionDispatchInfo.Capture(error.InnerException).Throw();
+            throw;
+        }
     }
 
     private static List<ContainerRecord> BuildContainers(IEnumerable<Object> objects)
@@ -356,14 +424,29 @@ internal static partial class Program
         return true;
     }
 
-    private sealed record Options(string Input, string Output, bool IncludeUnreferenced, bool ManifestOnly, bool DumpMetadata)
+    private sealed record Options(string Input, string Output, bool IncludeUnreferenced, bool ManifestOnly,
+        bool DumpMetadata, string? PerformanceReport)
     {
         public static Options Parse(string[] args)
         {
             if (args.Length < 2)
-                throw new ArgumentException("Usage: EndfieldSceneProbe <input-file-or-folder> <new-output-folder> [--include-unreferenced] [--manifest-only] [--dump-metadata]");
-            var flags = args.Skip(2).ToHashSet(StringComparer.OrdinalIgnoreCase);
-            return new Options(args[0], args[1], flags.Contains("--include-unreferenced"), flags.Contains("--manifest-only"), flags.Contains("--dump-metadata"));
+                throw new ArgumentException("Usage: EndfieldSceneProbe <input-file-or-folder> <new-output-folder> [--include-unreferenced] [--manifest-only] [--dump-metadata] [--performance-report PATH]");
+            string? report = null;
+            var includeUnreferenced = false;
+            var manifestOnly = false;
+            var dumpMetadata = false;
+            for (var index = 2; index < args.Length; index++)
+            {
+                switch (args[index])
+                {
+                    case "--include-unreferenced": includeUnreferenced = true; break;
+                    case "--manifest-only": manifestOnly = true; break;
+                    case "--dump-metadata": dumpMetadata = true; break;
+                    case "--performance-report" when index + 1 < args.Length: report = args[++index]; break;
+                    default: throw new ArgumentException($"Unknown SceneProbe option: {args[index]}");
+                }
+            }
+            return new Options(args[0], args[1], includeUnreferenced, manifestOnly, dumpMetadata, report);
         }
     }
 }

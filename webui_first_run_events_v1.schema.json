@@ -20,7 +20,26 @@
           "progress_scope": {"const": "phase"},
           "phase_index": {"type": ["integer", "null"], "minimum": 0},
           "phase_count": {"type": "integer", "minimum": 1},
-          "message": {"type": "string"}
+          "message": {"type": "string"},
+          "details": {
+            "type": "object",
+            "properties": {
+              "helperProgress": {
+                "type": "object",
+                "required": ["format", "phase"],
+                "properties": {
+                  "format": {"const": "EndfieldHelperProgress/1"},
+                  "phase": {"type": "string", "minLength": 1},
+                  "current": {"type": "integer", "minimum": 0},
+                  "total": {"type": "integer", "minimum": 0},
+                  "elapsedSeconds": {"type": "number", "minimum": 0},
+                  "peakWorkingSetBytes": {"type": "integer", "minimum": 0},
+                  "readBytes": {"type": "integer", "minimum": 0},
+                  "writeBytes": {"type": "integer", "minimum": 0}
+                }
+              }
+            }
+          }
         }
       }
     },

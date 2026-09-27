@@ -246,7 +246,7 @@ class WebUIFirstRunBackendTests(unittest.TestCase):
                 "LOCALAPPDATA": str(Path(temp) / "LocalAppData"),
                 "PATH": os.environ.get("PATH", ""),
             }
-            with mock.patch.dict(os.environ, clean_environment, clear=True):
+            with mock.patch.dict(os.environ, clean_environment, clear=True), mock.patch.object(launch_webui, "ROOT", Path(temp)):
                 paths, runtime = resolve_deferred_runtime_paths(args)
             self.assertIsNone(runtime.path)
             self.assertTrue(all(value is None for value in paths.values()))
@@ -377,6 +377,81 @@ class WebUIFirstRunBackendTests(unittest.TestCase):
             )
             with self.assertRaises(jsonschema.ValidationError):
                 request_validator.validate({**base_request, "blender_exe": 17})
+
+    def test_helper_progress_details_flow_through_status_and_events(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            game = self.make_game_root(root)
+            export = root / "exports"
+            cache = root / "cache"
+            export.mkdir()
+            cache.mkdir()
+            request = canonicalize_first_run_request(
+                {
+                    "format": REQUEST_FORMAT,
+                    "game_root": str(game),
+                    "export_root": str(export),
+                    "cache_root": str(cache),
+                    "run_name": "telemetry",
+                }
+            )
+            coordinator = FirstRunCoordinator(
+                extractor_root=root,
+                interpreter_provider=lambda: Path(sys.executable),
+                initial_request=request,
+            )
+            coordinator._thread = threading.current_thread()
+            log_root = export / "log" / "first_run_telemetry"
+            log_root.mkdir(parents=True)
+            helper_progress = {
+                "format": "EndfieldHelperProgress/1",
+                "phase": "mesh_export",
+                "current": 12,
+                "total": 40,
+                "elapsedSeconds": 8.5,
+                "peakWorkingSetBytes": 2_097_152,
+                "readBytes": 4096,
+                "writeBytes": 8192,
+            }
+            event = {
+                "format": "EndfieldFirstRunEvent/1",
+                "sequence": 7,
+                "phase": "asset_bootstrap",
+                "progress": 0.3,
+                "message": "Building scene assets",
+                "details": {"helperProgress": helper_progress},
+            }
+            events_path = log_root / "events.jsonl"
+            events_path.write_text(json.dumps(event) + "\n", encoding="utf-8")
+
+            status = coordinator.status()
+            event_page = coordinator.events()
+            self.assertEqual(helper_progress, status["details"]["helperProgress"])
+            self.assertEqual(helper_progress, event_page["events"][0]["details"]["helperProgress"])
+
+            schema_root = Path(__file__).resolve().parent
+            for schema_name, payload in (
+                ("webui_first_run_status_v1.schema.json", status),
+                ("webui_first_run_events_v1.schema.json", event_page),
+            ):
+                schema = json.loads((schema_root / schema_name).read_text(encoding="utf-8"))
+                jsonschema.Draft202012Validator(schema).validate(payload)
+
+            minimal_event = {
+                **event,
+                "sequence": 8,
+                "details": {"helperProgress": {"format": "EndfieldHelperProgress/1", "phase": "read"}},
+            }
+            events_path.write_text(json.dumps(minimal_event) + "\n", encoding="utf-8")
+            status_without_optional_counters = coordinator.status()
+            self.assertEqual(
+                {"format": "EndfieldHelperProgress/1", "phase": "read"},
+                status_without_optional_counters["details"]["helperProgress"],
+            )
+            status_schema = json.loads(
+                (schema_root / "webui_first_run_status_v1.schema.json").read_text(encoding="utf-8")
+            )
+            jsonschema.Draft202012Validator(status_schema).validate(status_without_optional_counters)
 
     def test_command_passes_optional_blender_without_changing_legacy_requests(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

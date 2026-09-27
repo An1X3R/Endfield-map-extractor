@@ -285,24 +285,27 @@ def write_bundle_scan_index(database: Path, vfs_root: Path, output: Path) -> dic
     target.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(f"file:{source}?mode=ro", uri=True)
     try:
-        rows = list(
-            connection.execute(
-                "SELECT logical_name,group_hash,chunk_name,chunk_offset,byte_length "
-                "FROM bundles ORDER BY logical_name"
-            )
+        rows = connection.execute(
+            "SELECT logical_name,group_hash,chunk_name,chunk_offset,byte_length "
+            "FROM bundles ORDER BY group_hash,chunk_name,chunk_offset,logical_name"
         )
+        count = 0
+        checked_chunks: set[Path] = set()
+        with target.open("x", encoding="utf-8", newline="\n") as handle:
+            handle.write("logical_name\tchunk_path\toffset\tlength\n")
+            for logical_name, group_hash, chunk_name, offset, length in rows:
+                chunk_path = game_vfs / str(group_hash) / f"{chunk_name}.chk"
+                if chunk_path not in checked_chunks:
+                    if not chunk_path.is_file():
+                        raise BootstrapExtractionError(
+                            f"Bundle scan input references a missing VFS chunk: {chunk_path}"
+                        )
+                    checked_chunks.add(chunk_path)
+                handle.write(f"{logical_name}\t{chunk_path}\t{int(offset)}\t{int(length)}\n")
+                count += 1
     finally:
         connection.close()
-    with target.open("x", encoding="utf-8", newline="\n") as handle:
-        handle.write("logical_name\tchunk_path\toffset\tlength\n")
-        for logical_name, group_hash, chunk_name, offset, length in rows:
-            chunk_path = game_vfs / str(group_hash) / f"{chunk_name}.chk"
-            if not chunk_path.is_file():
-                raise BootstrapExtractionError(
-                    f"Bundle scan input references a missing VFS chunk: {chunk_path}"
-                )
-            handle.write(f"{logical_name}\t{chunk_path}\t{int(offset)}\t{int(length)}\n")
-    return {"format": "EndfieldBundleScanIndex/1", "bundle_count": str(len(rows))}
+    return {"format": "EndfieldBundleScanIndex/1", "bundle_count": str(count)}
 
 
 def read_bundle_candidate_names(results: Path) -> list[str]:

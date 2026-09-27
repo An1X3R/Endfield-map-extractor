@@ -62,13 +62,27 @@ export type FirstRunStatus = {
     can_resume: boolean
     can_cancel: boolean
   }
-  defaults: Partial<FirstRunCanonicalRequest>
+  defaults: { [Key in keyof FirstRunCanonicalRequest]?: FirstRunCanonicalRequest[Key] | null }
   request?: FirstRunCanonicalRequest
   request_identity?: { run_name: string; sha256: string }
   capabilities: FirstRunCapabilities
+  details?: {
+    helperProgress?: FirstRunHelperProgress
+  }
   result?: Record<string, unknown>
   error?: FirstRunError | null
   disposition?: 'already_ready'
+}
+
+export type FirstRunHelperProgress = {
+  format: 'EndfieldHelperProgress/1'
+  phase: string
+  current?: number
+  total?: number
+  elapsedSeconds?: number
+  peakWorkingSetBytes?: number
+  readBytes?: number
+  writeBytes?: number
 }
 
 export type FirstRunValidation = {
@@ -103,6 +117,9 @@ export type FirstRunEvent = {
   phase_index: number | null
   phase_count: number
   message?: string
+  details?: {
+    helperProgress?: FirstRunHelperProgress
+  }
 }
 
 export type JobPhase =

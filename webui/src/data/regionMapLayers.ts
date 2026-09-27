@@ -1,5 +1,6 @@
 import { resolveRuntimeAssetUrl } from './regionMapRuntime'
 import type { MapId } from '../types'
+import { isJsonObject, requestJson } from '../lib/backendClient'
 
 export type RuntimeLayerId = 'instances' | 'water' | 'effects' | 'lights' | 'roads'
 
@@ -92,6 +93,23 @@ const buildLayerUrl = (mapId: MapId, layer: RuntimeLayerId, sectorKeys: string[]
   return resolveRuntimeAssetUrl(`/api/v3/maps/${mapId}/layers/${layer}?${params.toString()}`)
 }
 
+const isRuntimeLayerResponse = (payload: unknown): payload is RuntimeLayerResponse => {
+  if (!isJsonObject(payload)) return false
+  return payload.format === 'EndfieldMapLayerResponse/1' &&
+    typeof payload.datasetFingerprint === 'string' &&
+    typeof payload.manifestFormat === 'string' &&
+    typeof payload.generatorVersion === 'string' &&
+    typeof payload.resolverVersion === 'string' &&
+    (payload.mapId === 'map01' || payload.mapId === 'map02') &&
+    (payload.layer === 'instances' || payload.layer === 'water' || payload.layer === 'effects' || payload.layer === 'lights' || payload.layer === 'roads') &&
+    isJsonObject(payload.meta) &&
+    isJsonObject(payload.filter) &&
+    typeof payload.returnedCount === 'number' &&
+    typeof payload.totalMatchingHint === 'number' &&
+    typeof payload.truncated === 'boolean' &&
+    Array.isArray(payload.records)
+}
+
 export async function fetchRuntimeLayer({
   mapId,
   layer,
@@ -109,13 +127,16 @@ export async function fetchRuntimeLayer({
   const cached = responseCache.get(key)
   if (cached) return cached
 
-  const response = await fetch(buildLayerUrl(mapId, layer, sectorKeys, limit), {
-    signal,
-    headers: { Accept: 'application/json' },
-    cache: 'no-store',
-  })
-  if (!response.ok) throw new Error(`Layer endpoint returned ${response.status}`)
-  const payload = (await response.json()) as RuntimeLayerResponse
+  const payload = await requestJson(
+    buildLayerUrl(mapId, layer, sectorKeys, limit),
+    {
+      method: 'GET',
+      signal,
+      headers: { Accept: 'application/json' },
+      cache: 'no-store',
+    },
+    isRuntimeLayerResponse,
+  )
   const validFingerprint = /^[0-9A-F]{64}$/.test(payload.datasetFingerprint)
   if (activeDatasetFingerprint === null && validFingerprint) {
     activeDatasetFingerprint = payload.datasetFingerprint

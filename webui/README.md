@@ -1,4 +1,4 @@
-﻿# Endfield Atlas Composer WebUI 2.0
+﻿# Endfield Atlas Composer WebUI 2.1
 
 本地地图提取器的 WebUI。游戏安装目录保持只读；导出任务通过 `launch_webui.py` 提供的本机桥接服务生成经过签名和审计的选区数据包，`blend` 模式同时生成逐批 Blender 场景，结果写入用户选择的输出目录。仓库不附带 Stage 数据、地图图片、游戏资产或导出结果，缺少外部输入时相关接口会明确报告不可用。
 
@@ -50,8 +50,12 @@ npm.cmd run dev
 - `GET /api/v2/maps/{mapId}/overview?variant=clean|sectors`
 - `POST /api/v2/maps/{mapId}/resolve-selection`
 
-生产 WebUI 默认请求同源接口。开发时若 API 运行在另一个端口，可复制
-`.env.example` 为 `.env.local` 并设置 `VITE_MAP_API_ORIGIN`。
+浏览器始终请求同源 `/api/v2` 和 `/api/v3`。启动器默认组合本机任务桥与地图/图层接口。
+若使用独立的完整 API 网关，可复制 `.env.example` 为 `.env.local` 并设置
+`ENDFIELD_BACKEND_URL`；该地址必须已提供两个 API 前缀，不能直接填写内部 Python 任务桥地址。
+开发与构建预览共用相同接口适配，未知 API 返回 JSON 错误，不会返回网页 HTML。
+`ENDFIELD_PREVIEW_ASSET_ROOT` 仅供开发时读取 `map01.png`、`map02.png`，与独立网关配置互斥；
+它不会在构建预览中启用，也不会将图片打包进发布文件。
 
 图片接口尚未启动时，地图自动回退到程序化场景，并显示
 `FALLBACK / API REQUIRED`；这不会改变正式 sector128 框选结果。
@@ -86,7 +90,7 @@ npm.cmd run test:stage119
 
 ## Stage113 地图预览运行时
 
-`vite.config.ts` 内置了仅供本地开发的同源 API 适配器：
+`vite.config.ts` 为开发服务器与构建预览提供同源 API 适配器：
 
 - `GET /api/v2/maps`：返回不含绝对路径的安全地图目录和 overview 状态。
 - `GET /api/v2/maps/{mapId}/overview?variant=clean|sectors`：读取当前 runtime 声明的底图；缺图返回 `404 map_overview_missing`，并附具体原因。

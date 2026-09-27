@@ -12,16 +12,29 @@ from contextlib import closing
 from pathlib import Path
 from typing import Callable, Mapping, TypedDict, cast
 
-from endfield_map_layer_contract import classify_entity
+from endfield_map_layer_contract import classify_entity, is_hlod_name
 from endfield_scene_material_contract import load_catalog, reference_key, resolve_export_path, supported_slots
 from endfield_scene_slot_contract import (
-    AmbiguousSubmeshSlots, RuntimeDraw, asset_name, mesh_lod_index,
+    AmbiguousSubmeshSlots, RuntimeDraw, asset_name, primary_visible_mesh,
     runtime_submesh_slots,
 )
 from webui_source_contract import selected_static_categories
 
 
 FORMAT = "EndfieldPortableScenePlan/1"
+
+
+def owns_static_footprint(bounds: Mapping[str, float], selection: Mapping[str, float],
+                          origin: tuple[float, float], footprint: tuple[float, ...]) -> bool:
+    """Assign crossing geometry once using the legacy clipped-footprint owner rule."""
+    x, z = origin
+    if selection["xmin"] <= x < selection["xmax"] and selection["zmin"] <= z < selection["zmax"]:
+        return bounds["xmin"] <= x < bounds["xmax"] and bounds["zmin"] <= z < bounds["zmax"]
+    xmin, xmax, _, _, zmin, zmax = footprint
+    if xmax <= selection["xmin"] or xmin >= selection["xmax"] or zmax <= selection["zmin"] or zmin >= selection["zmax"]:
+        return False
+    owner_x, owner_z = max(xmin, selection["xmin"]), max(zmin, selection["zmin"])
+    return bounds["xmin"] <= owner_x < bounds["xmax"] and bounds["zmin"] <= owner_z < bounds["zmax"]
 
 
 class AssetRef(TypedDict):
@@ -79,12 +92,14 @@ class SceneExportPlan(TypedDict):
     category_filter: list[str]
     scene_manifests: list[str]
     terrain_surfaces: list[str]
+    terrain_details: list[str]
     decal_manifest: str
     decal_materials: str
     instances: list[PlanInstance]
     pending: list[Pending]
     source_sha256: dict[str, str]
     summary: dict[str, int]
+    required_resource_paths: list[str]
 
 
 def _object(value: object, label: str) -> dict[str, object]:
@@ -106,7 +121,7 @@ def _list(value: object, label: str) -> list[object]:
 
 
 def _file(value: object, label: str) -> Path:
-    path = (value if isinstance(value, Path) else Path(_text(value, label))).expanduser().resolve()
+    path = resolve_export_path(value if isinstance(value, Path) else Path(_text(value, label)))
     if not path.is_file():
         raise FileNotFoundError(f"{label} is missing: {path}")
     return path
@@ -200,13 +215,7 @@ def _merge_mesh_exports(
 
 
 def _primary_mesh(pairs: list[RendererPair]) -> str:
-    names = {row["mesh_path"] for row in pairs}
-    primary = {name for name in names if mesh_lod_index(asset_name(name)) == 0}
-    if len(primary) == 1:
-        return next(iter(primary))
-    if not primary and len(names) == 1 and mesh_lod_index(asset_name(next(iter(names)))) is None:
-        return next(iter(names))
-    raise ValueError(f"No unique LOD0 or unique non-LOD mesh: candidates={sorted(names)}")
+    return primary_visible_mesh(tuple((row["mesh_path"], RuntimeDraw(row["submesh"], row["flags"])) for row in pairs))
 
 
 def _decal_materials(
@@ -276,6 +285,7 @@ def prepare_scene_export_plan(
         build_path_id_index, decode_decal, read_chunk, rect_decal_records, streaming_records,
     )
     from extractor_core.resources import load_group
+    from extractor_core.instances import iter_entities
     from prepare_scene_geometry_repairs import obj_submesh_count
 
     runtime_path = _file(runtime_config, "runtime config")
@@ -286,6 +296,10 @@ def prepare_scene_export_plan(
     if map_id not in ("map01", "map02"):
         raise ValueError(f"Unsupported map: {map_id}")
     bounds = _bounds(canonical.get("bounds"))
+    selection = _bounds(canonical.get("selection_bounds", bounds))
+    if not (selection["xmin"] <= bounds["xmin"] < bounds["xmax"] <= selection["xmax"]
+            and selection["zmin"] <= bounds["zmin"] < bounds["zmax"] <= selection["zmax"]):
+        raise ValueError("Scene batch bounds must lie inside the canonical selection")
     paths = _object(runtime.get("paths"), "runtime paths")
     game_root = _runtime_path(paths.get("game_root"), "runtime game_root", runtime_path.parent)
     cache_root = _runtime_path(paths.get("cache_root"), "runtime cache_root", runtime_path.parent)
@@ -327,6 +341,9 @@ def prepare_scene_export_plan(
         if probe is not None and _object(probe, f"sceneProbe {candidate_map}").get("path") is not None:
             manifest_paths.append(_runtime_file(_object(probe, "sceneProbe")["path"],
                                                 "SceneProbe manifest", runtime_path.parent))
+    from endfield_scene_resources import supplemental_manifests
+
+    manifest_paths.extend(supplemental_manifests(runtime_path, runtime))
     containers: dict[str, set[tuple[str, int]]] = defaultdict(set)
     mesh_exports: dict[tuple[str, int], tuple[AssetRef, Path]] = {}
     for manifest_path in manifest_paths:
@@ -335,31 +352,38 @@ def prepare_scene_export_plan(
             containers[name].update(refs)
         mesh_exports = _merge_mesh_exports(mesh_exports, found_exports)
     materials, textures = load_catalog(tuple(manifest_paths)) if manifest_paths else ({}, {})
+    groups = {_text(value, "export group") for value in _list(canonical.get("export_groups"), "export_groups")}
+    layers = _object(canonical.get("layers"), "canonical layers")
+    terrain_selected = layers.get("terrain") is True and bool(groups & {"all", "terrain"})
     terrain_surfaces = [(_runtime_file(value, "terrain_surface/terrain_surface.json", runtime_path.parent).parent
                          if str(value).casefold().endswith("terrain_surface.json") else
                          _runtime_path(value, "terrain surface", runtime_path.parent))
-                        for value in _list(map_paths.get("terrainSurfaces"), "terrainSurfaces")]
+                        for value in _list(map_paths.get("terrainSurfaces"), "terrainSurfaces")] if terrain_selected else []
     for surface in terrain_surfaces:
         _file(surface / "terrain_surface.json", "terrain surface manifest")
-    groups = {_text(value, "export group") for value in _list(canonical.get("export_groups"), "export_groups")}
-    layers = _object(canonical.get("layers"), "canonical layers")
     allowed_categories = selected_static_categories(layers, groups)
     include_decals = bool(groups & {"all", "terrain", "road", "unknown"}) and (
         layers.get("instances") is True or layers.get("terrain") is True or layers.get("roads") is True)
     with closing(sqlite3.connect(instance_db.as_uri() + "?mode=ro", uri=True)) as database:
         rows = database.execute(
-            "SELECT entity_id,entity_base,matrix_type,matrix_col_major,source_path,group_index,entity_index "
-            "FROM instances WHERE x>=? AND x<? AND z>=? AND z<? ORDER BY source_path,entity_id",
+            "SELECT entity_id,entity_base,matrix_type,matrix_col_major,source_path,group_index,entity_index,x,z "
+            "FROM instances WHERE matrix_type=18 OR (x>=? AND x<? AND z>=? AND z<?) ORDER BY source_path,entity_id",
             (bounds["xmin"], bounds["xmax"], bounds["zmin"], bounds["zmax"]),
         ).fetchall()
     selected_static = []
     selected_decals = []
-    for entity_id, base, matrix_type, matrix_blob, source_path, group_index, entity_index in rows:
+    excluded_hlod = 0
+    excluded_hlod_mesh = 0
+    for entity_id, base, matrix_type, matrix_blob, source_path, group_index, entity_index, origin_x, origin_z in rows:
         if not isinstance(base, str) or not base:
             continue
         category, _ = classify_entity(base)
         if matrix_type == 18 and category in allowed_categories:
-            selected_static.append((entity_id, base, matrix_blob, source_path, group_index, entity_index, category))
+            if is_hlod_name(base):
+                if bounds["xmin"] <= origin_x < bounds["xmax"] and bounds["zmin"] <= origin_z < bounds["zmax"]:
+                    excluded_hlod += 1
+            else:
+                selected_static.append((entity_id, base, matrix_blob, source_path, group_index, entity_index, category))
         elif matrix_type == 27 and include_decals:
             selected_decals.append((entity_id, base, matrix_blob, source_path))
     entries = ({entry.file_name: entry for entry in load_group(vfs, "C3442D43").iter_files()}
@@ -375,6 +399,9 @@ def prepare_scene_export_plan(
     source_hashes: dict[str, str] = {}
     ready: list[PlanInstance] = []
     pending: list[Pending] = []
+    required_resources: set[str] = set()
+    selected_static_count = 0
+    footprint_extras = 0
     for component, layer_name, group_names in (
         ("water", "water", {"water", "all"}),
         ("effects", "effects", {"effects", "particle", "all"}),
@@ -390,10 +417,30 @@ def prepare_scene_export_plan(
         if source not in entries:
             raise FileNotFoundError(f"Selected current ECS source is absent from VFS: {source}")
         chunk = read_chunk(vfs, entries[source])
+        selected_rows = []
+        if source in by_source:
+            spatial = {record["entity_id"]: record for record in iter_entities(chunk)}
+            for row in by_source[source]:
+                entity_id = cast(int, row[0])
+                record = spatial.get(entity_id)
+                if record is None or record["matrix_blob"] != row[2]:
+                    raise ValueError(f"Current spatial source differs from instance index: entity_id={entity_id}, source={source}")
+                footprint = record["world_bounds"]
+                if footprint is None:
+                    raise ValueError(f"Static entity has no source world bounds: entity_id={entity_id}, source={source}")
+                origin = (record["x"], record["z"])
+                if owns_static_footprint(bounds, selection, origin, footprint):
+                    selected_rows.append(row)
+                    selected_static_count += 1
+                    if not (selection["xmin"] <= origin[0] < selection["xmax"]
+                            and selection["zmin"] <= origin[1] < selection["zmax"]):
+                        footprint_extras += 1
+        if not selected_rows and source not in by_decal_source:
+            continue
         digest = hashlib.sha256(chunk).hexdigest()
         source_hashes[source] = digest
-        columns = component_columns(chunk) if source in by_source else {}
-        for entity_id, base, matrix_blob, _, group_index, entity_index, category in by_source[source]:
+        columns = component_columns(chunk) if selected_rows else {}
+        for entity_id, base, matrix_blob, _, group_index, entity_index, category in selected_rows:
             if check_cancelled is not None:
                 check_cancelled()
             try:
@@ -413,12 +460,23 @@ def prepare_scene_export_plan(
                 if not pairs:
                     raise ValueError("No current Renderer mesh/material pairs")
                 mesh_path = _primary_mesh(pairs)
+                if is_hlod_name(mesh_path):
+                    excluded_hlod += 1
+                    excluded_hlod_mesh += 1
+                    continue
+                required_resources.add(mesh_path)
+                required_resources.update(pair["material_path"] for pair in pairs
+                                          if pair["mesh_path"] == mesh_path and not pair["flags"] & 1024)
                 stem = mesh_path.split("##", 1)[0]
                 candidates = [mesh_exports[key] for key in containers.get(stem, set()) if key in mesh_exports
                               and mesh_exports[key][0]["Name"].casefold() == asset_name(mesh_path)]
                 if len({(reference_key(asset), file) for asset, file in candidates}) != 1:
                     raise ValueError(f"Primary mesh lacks a unique exact SceneProbe Container/OBJ: {mesh_path}")
                 mesh_asset, mesh_file = candidates[0]
+                if is_hlod_name(mesh_asset["Name"]):
+                    excluded_hlod += 1
+                    excluded_hlod_mesh += 1
+                    continue
                 active = [pair for pair in pairs if pair["mesh_path"] == mesh_path]
                 count = obj_submesh_count(mesh_file)
                 mapping = runtime_submesh_slots(count, tuple(pair["material_id"] for pair in active),
@@ -476,6 +534,7 @@ def prepare_scene_export_plan(
                 except (KeyError, ValueError) as error:
                     pending.append({"entity_id": cast(int, entity_id), "entity_base": cast(str, base),
                                     "component": "projected_decal", "reason": "decal_decode_failed", "detail": str(error)})
+    required_resources.update(str(row["material_path"]).replace("\\", "/").casefold() for row in decoded_decals)
     decal_rows, decal_material_rows, decal_pending = _decal_materials(decoded_decals, containers, materials, textures)
     pending.extend(decal_pending)
     decal_path = target.with_name(target.stem + "_decals.json")
@@ -487,9 +546,14 @@ def prepare_scene_export_plan(
         "format": FORMAT, "map_id": map_id, "bounds": bounds, "category_filter": sorted(groups),
         "scene_manifests": [str(path) for path in manifest_paths],
         "terrain_surfaces": [str(path) for path in terrain_surfaces],
+        "terrain_details": [],
         "decal_manifest": str(decal_path), "decal_materials": str(decal_material_path),
         "instances": ready, "pending": pending, "source_sha256": source_hashes,
-        "summary": {"selected_static": len(selected_static), "ready_static": len(ready),
+        "required_resource_paths": sorted(required_resources),
+        "summary": {"selected_static": selected_static_count - excluded_hlod_mesh,
+                    "footprint_overlap_extras": footprint_extras,
+                    "excluded_hlod": excluded_hlod,
+                    "ready_static": len(ready),
                     "selected_decals": len(selected_decals), "ready_decals": len(decal_rows), "pending": len(pending)},
     }
     decal_payload = {"format": "EndfieldProjectedDecals/1", "instances_db": str(instance_db),
@@ -518,10 +582,16 @@ def load_scene_export_plan(path: Path) -> SceneExportPlan:
     _bounds(source.get("bounds"))
     for name in ("scene_manifests", "terrain_surfaces", "instances", "pending", "category_filter"):
         _list(source.get(name), f"scene export plan.{name}")
+    details = _list(source.get("terrain_details", []), "scene export plan.terrain_details")
     for value in _list(source["scene_manifests"], "scene_manifests"):
         _file(value, "scene manifest")
     for value in _list(source["terrain_surfaces"], "terrain_surfaces"):
         _file(Path(_text(value, "terrain surface")) / "terrain_surface.json", "terrain surface manifest")
+    if details and not source["terrain_surfaces"]:
+        raise ValueError("Terrain details require selected terrain surfaces")
+    for value in details:
+        from endfield_terrain_detail_contract import load_terrain_detail
+        load_terrain_detail(_file(value, "terrain detail"))
     for value in _list(source["category_filter"], "category_filter"):
         _text(value, "category")
     _file(source.get("decal_manifest"), "decal_manifest")
@@ -538,17 +608,20 @@ def load_scene_export_plan(path: Path) -> SceneExportPlan:
         if type(entity_id) is not int or entity_id in seen:
             raise ValueError(f"Scene instance ID is invalid or repeated: {entity_id}")
         seen.add(entity_id)
-        _text(row.get("entity_base"), "scene entity_base")
+        entity_base = _text(row.get("entity_base"), "scene entity_base")
         _text(row.get("category"), "scene category")
+        mesh_path = _text(row.get("mesh_path"), "scene mesh_path")
+        mesh_asset = _asset(row.get("mesh_asset"), "scene mesh_asset")
+        if any(is_hlod_name(name) for name in (entity_base, mesh_path, mesh_asset["Name"])):
+            raise ValueError(f"Scene plan contains excluded HLOD instance: entity_id={entity_id}, "
+                             f"entity_base={entity_base}, mesh_path={mesh_path}")
         source_path = _text(row.get("source_path"), "scene source_path")
         if row.get("source_sha256") != hashes.get(source_path):
             raise ValueError(f"Scene source hash mismatch: entity_id={entity_id}, source={source_path}")
         for name in ("group_index", "entity_index"):
             if type(row.get(name)) is not int or cast(int, row[name]) < 0:
                 raise ValueError(f"Scene {name} must be nonnegative integer: entity_id={entity_id}")
-        _text(row.get("mesh_path"), "scene mesh_path")
         _file(row.get("mesh_file"), "scene mesh_file")
-        _asset(row.get("mesh_asset"), "scene mesh_asset")
         matrix = _list(row.get("matrix"), "scene matrix")
         if len(matrix) != 16 or any(type(value) not in (int, float) or not math.isfinite(float(value)) for value in matrix):
             raise ValueError(f"Scene instance has invalid 16-float matrix: entity_id={entity_id}")
@@ -587,6 +660,8 @@ def load_scene_export_plan(path: Path) -> SceneExportPlan:
     for name in ("selected_static", "ready_static", "selected_decals", "ready_decals", "pending"):
         if type(summary.get(name)) is not int or cast(int, summary[name]) < 0:
             raise ValueError(f"Invalid scene summary count: {name}")
+    if "excluded_hlod" in summary and (type(summary["excluded_hlod"]) is not int or summary["excluded_hlod"] < 0):
+        raise ValueError("Invalid scene summary count: excluded_hlod")
     if summary["ready_static"] != len(seen) or summary["pending"] != len(source["pending"]):
         raise ValueError("Scene summary differs from instance/pending rows")
     return cast(SceneExportPlan, source)

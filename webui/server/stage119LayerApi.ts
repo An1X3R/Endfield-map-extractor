@@ -493,79 +493,86 @@ const readLayerRecords = async (pkg: Stage119Package, mapId: MapId, layer: Layer
 export const stage119LayerApi = (_projectRoot: string): Plugin => ({
   name: 'endfield-stage119-layer-api',
   configureServer(server) {
-    server.middlewares.use((request, response, next) => {
-      const method = request.method ?? 'GET'
-      const requestUrl = new URL(request.url ?? '/', 'http://127.0.0.1')
-      const pathname = requestUrl.pathname
-      const catalogMatch = pathname === '/api/v3/layer-catalog'
-      const mapLayerMatch = pathname.match(/^\/api\/v3\/maps\/(map01|map02)\/layers(?:\/(instances|water|effects|lights|roads))?$/)
-      if (method !== 'GET' || (!catalogMatch && !mapLayerMatch)) {
-        next()
-        return
-      }
-
-      let pkg: Stage119Package
-      try {
-        pkg = loadStage119Package()
-      } catch {
-        setJson(response, 503, {
-          format: 'EndfieldMapLayerError/1',
-          error: 'stage119_dataset_unavailable',
-          message: 'The Stage119 layer dataset failed its server-side version gate.',
-        })
-        return
-      }
-
-      if (catalogMatch) {
-        setCachedJson(request, response, 'catalog', buildCatalog(pkg), pkg)
-        return
-      }
-
-      const mapId = mapLayerMatch?.[1] as MapId
-      const layer = (mapLayerMatch?.[2] ?? null) as LayerId | null
-      if (!layer) {
-        setCachedJson(request, response, `map:${mapId}:layers`, {
-          format: 'EndfieldMapLayerMap/1',
-          datasetFingerprint: pkg.manifest.datasetFingerprint,
-          mapId,
-          layers: Object.fromEntries(LAYERS.map((item) => [item, safeLayerMeta(pkg, mapId, item)])),
-        }, pkg)
-        return
-      }
-
-      const controller = new AbortController()
-      const onClose = () => controller.abort()
-      request.once('close', onClose)
-      void readLayerRecords(pkg, mapId, layer, requestUrl.searchParams, controller.signal)
-        .then(({ records, filter, totalMatchingHint }) => {
-          if (controller.signal.aborted || response.writableEnded) return
-          const body = {
-            format: 'EndfieldMapLayerResponse/1',
-            datasetFingerprint: pkg.manifest.datasetFingerprint,
-            manifestFormat: EXPECTED_FORMAT,
-            generatorVersion: EXPECTED_GENERATOR,
-            resolverVersion: EXPECTED_RESOLVER,
-            mapId,
-            layer,
-            meta: safeLayerMeta(pkg, mapId, layer),
-            filter,
-            returnedCount: records.length,
-            totalMatchingHint,
-            truncated: records.length >= filter.limit,
-            records,
-          }
-          setCachedJson(request, response, `records:${mapId}:${layer}:${stableJson(filter)}`, body, pkg)
-        })
-        .catch((error: unknown) => {
-          if (controller.signal.aborted || response.writableEnded) return
-          setJson(response, 500, {
-            format: 'EndfieldMapLayerError/1',
-            error: error instanceof Error && error.message === 'stage119_shard_missing' ? 'stage119_shard_missing' : 'stage119_layer_read_failed',
-            mapId,
-            layer,
-          })
-        })
-        .finally(() => request.removeListener('close', onClose))
-    })
+    installStage119LayerApi(server.middlewares)
+  },
+  configurePreviewServer(server) {
+    installStage119LayerApi(server.middlewares)
   },
 })
+
+const installStage119LayerApi = (middlewares: { use: (handler: (request: IncomingMessage, response: ServerResponse, next: () => void) => void) => void }): void => {
+  middlewares.use((request, response, next) => {
+    const method = request.method ?? 'GET'
+    const requestUrl = new URL(request.url ?? '/', 'http://127.0.0.1')
+    const pathname = requestUrl.pathname
+    const catalogMatch = pathname === '/api/v3/layer-catalog'
+    const mapLayerMatch = pathname.match(/^\/api\/v3\/maps\/(map01|map02)\/layers(?:\/(instances|water|effects|lights|roads))?$/)
+    if (method !== 'GET' || (!catalogMatch && !mapLayerMatch)) {
+      next()
+      return
+    }
+
+    let pkg: Stage119Package
+    try {
+      pkg = loadStage119Package()
+    } catch {
+      setJson(response, 503, {
+        format: 'EndfieldMapLayerError/1',
+        error: 'stage119_dataset_unavailable',
+        message: 'The Stage119 layer dataset failed its server-side version gate.',
+      })
+      return
+    }
+
+    if (catalogMatch) {
+      setCachedJson(request, response, 'catalog', buildCatalog(pkg), pkg)
+      return
+    }
+
+    const mapId = mapLayerMatch?.[1] as MapId
+    const layer = (mapLayerMatch?.[2] ?? null) as LayerId | null
+    if (!layer) {
+      setCachedJson(request, response, `map:${mapId}:layers`, {
+        format: 'EndfieldMapLayerMap/1',
+        datasetFingerprint: pkg.manifest.datasetFingerprint,
+        mapId,
+        layers: Object.fromEntries(LAYERS.map((item) => [item, safeLayerMeta(pkg, mapId, item)])),
+      }, pkg)
+      return
+    }
+
+    const controller = new AbortController()
+    const onClose = () => controller.abort()
+    request.once('close', onClose)
+    void readLayerRecords(pkg, mapId, layer, requestUrl.searchParams, controller.signal)
+      .then(({ records, filter, totalMatchingHint }) => {
+        if (controller.signal.aborted || response.writableEnded) return
+        const body = {
+          format: 'EndfieldMapLayerResponse/1',
+          datasetFingerprint: pkg.manifest.datasetFingerprint,
+          manifestFormat: EXPECTED_FORMAT,
+          generatorVersion: EXPECTED_GENERATOR,
+          resolverVersion: EXPECTED_RESOLVER,
+          mapId,
+          layer,
+          meta: safeLayerMeta(pkg, mapId, layer),
+          filter,
+          returnedCount: records.length,
+          totalMatchingHint,
+          truncated: records.length >= filter.limit,
+          records,
+        }
+        setCachedJson(request, response, `records:${mapId}:${layer}:${stableJson(filter)}`, body, pkg)
+      })
+      .catch((error: unknown) => {
+        if (controller.signal.aborted || response.writableEnded) return
+        setJson(response, 500, {
+          format: 'EndfieldMapLayerError/1',
+          error: error instanceof Error && error.message === 'stage119_shard_missing' ? 'stage119_shard_missing' : 'stage119_layer_read_failed',
+          mapId,
+          layer,
+        })
+      })
+      .finally(() => request.removeListener('close', onClose))
+  })
+}

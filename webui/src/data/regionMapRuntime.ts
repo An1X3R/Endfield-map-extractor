@@ -49,8 +49,9 @@ export const getRuntimeMap = (mapId: MapId) => manifest.maps[mapId]
 
 export const shouldRequestRuntimeOverview = true
 
-export const resolveRuntimeAssetUrl = (apiUrl: string) => {
-  const configuredOrigin = import.meta.env.VITE_MAP_API_ORIGIN?.trim()
-  if (!configuredOrigin) return apiUrl
-  return `${configuredOrigin.replace(/\/$/, '')}${apiUrl}`
+export const resolveRuntimeAssetUrl = (apiUrl: string): string => {
+  if (!/^\/api\/v[23](?:\/|$)/.test(apiUrl)) {
+    throw new Error(`Runtime API assets must use same-origin /api/v2 or /api/v3 paths: ${apiUrl}`)
+  }
+  return apiUrl
 }

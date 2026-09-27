@@ -35,6 +35,14 @@ def payload(map_id: str = "map01") -> dict:
 
 
 class ContractTests(unittest.TestCase):
+    def test_browser_batch_modes_match_schema_and_canonicalizer(self) -> None:
+        schema = json.loads(Path(__file__).with_name("webui_export_job_v2.schema.json").read_text())
+        for mode in ("per_sector", "cluster_4x4_sectors", "merged_selection"):
+            with self.subTest(mode=mode):
+                value = {**payload(), "batch_mode": mode}
+                jsonschema.validate(value, schema)
+                self.assertEqual(contract.canonicalize_job(value)["batch_mode"], mode)
+
     def test_blend_requires_current_user_blender(self) -> None:
         value = payload()
         value["export_mode"] = "blend"
