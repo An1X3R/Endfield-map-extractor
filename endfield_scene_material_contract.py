@@ -156,6 +156,7 @@ def load_catalog(paths: tuple[Path, ...]) -> tuple[
     textures: dict[tuple[str, int], tuple[Path, str]] = {}
     texture_color_spaces: dict[tuple[str, int], int] = {}
     for path in paths:
+        path = resolve_export_path(path)
         data = require_object(json.loads(path.read_text(encoding="utf-8-sig")), str(path))
         if data.get("Format") != "EndfieldSceneProbe/1":
             raise ValueError(f"Unsupported SceneProbe format: {path}")

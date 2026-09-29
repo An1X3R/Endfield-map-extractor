@@ -9,7 +9,13 @@ import unittest
 from contextlib import closing
 from pathlib import Path
 
-from endfield_scene_export_plan import _merge_mesh_exports, load_scene_export_plan, owns_static_footprint, prepare_scene_export_plan
+from endfield_scene_export_plan import (
+    _merge_mesh_exports,
+    _water_global_resource_path,
+    load_scene_export_plan,
+    owns_static_footprint,
+    prepare_scene_export_plan,
+)
 from webui_source_contract import selected_static_categories
 
 
@@ -53,6 +59,73 @@ class PortableScenePlanTests(unittest.TestCase):
             second.write_bytes(b"v 1 0 0\n")
             with self.assertRaisesRegex(ValueError, "conflicting OBJ content"):
                 _merge_mesh_exports(primary, {key: (asset, second)})
+
+    def test_water_global_path_is_map_scoped_and_unique(self) -> None:
+        map01 = "Assets/Beyond/Scenes/LunaScenes/Map01/ReleaseData/WaterData/Global_Water_Config.asset"
+        map02 = "Assets/Beyond/Scenes/LunaScenes/Map02/ReleaseData/WaterData/Global_Water_Config.asset"
+        index = {b"one": (map01,), b"two": (map02,)}
+        self.assertEqual(_water_global_resource_path(index, "map02"), map02)
+        self.assertIsNone(_water_global_resource_path({b"one": (map01,)}, "map02"))
+        with self.assertRaisesRegex(ValueError, "WATER_GLOBAL_PATH_AMBIGUOUS"):
+            _water_global_resource_path(
+                {b"one": (map02,), b"two": (map02.replace("ReleaseData", "ReleaseData/Alternate"),)},
+                "map02",
+            )
+
+    def test_legacy_plan_defaults_water_rows_to_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sidecar = root / "sidecar.json"
+            sidecar.write_text("{}", encoding="utf-8")
+            plan = root / "plan.json"
+            plan.write_text(json.dumps({
+                "format": "EndfieldPortableScenePlan/1", "map_id": "map01",
+                "bounds": {"xmin": 0, "xmax": 1, "zmin": 0, "zmax": 1},
+                "scene_manifests": [], "terrain_surfaces": [], "category_filter": [],
+                "decal_manifest": str(sidecar), "decal_materials": str(sidecar),
+                "instances": [], "pending": [], "source_sha256": {},
+                "summary": {"selected_static": 0, "ready_static": 0, "selected_decals": 0,
+                            "ready_decals": 0, "pending": 0},
+            }), encoding="utf-8")
+            loaded = load_scene_export_plan(plan)
+            self.assertEqual(loaded["water_geometry"], [])
+            self.assertEqual(loaded["water_materials"], [])
+            self.assertEqual(loaded["water_depth_surfaces"], [])
+            self.assertEqual(loaded["water_depth_instances"], [])
+            self.assertEqual(loaded["water_depth_pending"], [])
+            self.assertEqual(loaded["effect_instances"], [])
+
+    def test_bottom_dependencies_are_validated_without_counting_as_exported_instances(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sidecar = root / "sidecar.json"
+            sidecar.write_text("{}", encoding="utf-8")
+            mesh = root / "bottom.obj"
+            mesh.write_text("o bottom\nv 0 0 0\nv 1 0 0\nv 0 0 1\nf 1 2 3\n", encoding="utf-8")
+            row = {"entity_id": 7, "entity_base": "P_pool_bottom", "category": "building",
+                   "source_path": "InitChunkData_pool", "source_sha256": "0" * 64,
+                   "group_index": 0, "entity_index": 0, "mesh_path": "pool.fbx##bottom",
+                   "mesh_file": str(mesh), "mesh_asset": {"Source": "cab", "PathId": 1, "Name": "bottom"},
+                   "matrix": [1.0] * 16, "submesh_slot_indices": [0], "material_refs": [None],
+                   "undrawn_submeshes": [], "renderer_pairs": [
+                       {"material_id": "01", "material_path": "pool.mat", "mesh_id": "02",
+                        "mesh_path": "pool.fbx##bottom", "submesh": 0, "flags": 0}]}
+            payload = {"format": "EndfieldPortableScenePlan/1", "map_id": "map01",
+                       "bounds": {"xmin": 0, "xmax": 1, "zmin": 0, "zmax": 1},
+                       "scene_manifests": [], "terrain_surfaces": [], "category_filter": ["water"],
+                       "decal_manifest": str(sidecar), "decal_materials": str(sidecar),
+                       "instances": [], "water_depth_instances": [row], "pending": [],
+                       "source_sha256": {"InitChunkData_pool": "0" * 64},
+                       "summary": {"selected_static": 0, "ready_static": 0, "selected_decals": 0,
+                                   "ready_decals": 0, "pending": 0}}
+            plan = root / "plan.json"
+            plan.write_text(json.dumps(payload), encoding="utf-8")
+            loaded = load_scene_export_plan(plan)
+            self.assertEqual(loaded["instances"], [])
+            self.assertEqual(len(loaded["water_depth_instances"]), 1)
+            mesh.unlink()
+            with self.assertRaises(FileNotFoundError):
+                load_scene_export_plan(plan)
 
     def test_configured_roots_and_empty_selection(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -106,6 +179,9 @@ class PortableScenePlanTests(unittest.TestCase):
             output = selected_export / "plan.json"
             actual = load_scene_export_plan(prepare_scene_export_plan(config, canonical, output, None))
             self.assertEqual(actual["instances"], [])
+            self.assertEqual(actual["water_geometry"], [])
+            self.assertEqual(actual["water_materials"], [])
+            self.assertEqual(actual["water_depth_surfaces"], [])
             self.assertEqual(actual["terrain_surfaces"], [])
             self.assertEqual(actual["pending"], [])
             self.assertEqual(actual["summary"]["ready_decals"], 0)

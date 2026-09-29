@@ -20,12 +20,62 @@ from endfield_scene_resources import (
     supplemental_manifests,
     validate_scan,
 )
+from extractor_core.resources import BundleProviderIssue, read_bundle_provider_names_for_paths
 
 
 FINGERPRINT = "a1" * 32
 
 
 class SceneResourceIntegrationTests(unittest.TestCase):
+    def test_probed_prefab_is_ready_even_without_particle_pairs(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest = Path(temporary) / "scene_manifest.json"
+            payload = {"Format": "EndfieldSceneProbe/1", "Containers": [
+                {"Container": "Assets/Effects/P_fx.prefab",
+                 "Asset": {"Source": "CAB-root", "PathId": 7, "Type": "GameObject", "Name": "P_fx"}}],
+                "Nodes": [], "Particles": {"DataScope": "component_parameters_no_simulation",
+                                           "ModuleDataScope": "typed_modules", "Systems": [],
+                                           "Renderers": [], "Pairs": [], "Diagnostics": []},
+                "Materials": [], "TextureExports": [], "MeshExports": []}
+            manifest.write_text(json.dumps(payload), encoding="utf-8")
+            self.assertIn("assets/effects/p_fx.prefab", ready_resource_paths((manifest,)))
+            del payload["Particles"]
+            manifest.write_text(json.dumps(payload), encoding="utf-8")
+            self.assertNotIn("assets/effects/p_fx.prefab", ready_resource_paths((manifest,)))
+
+    def test_exact_fx_providers_leave_missing_and_ambiguous_paths_unselected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            scan = Path(temporary) / "providers.jsonl"
+            rows = (
+                {"kind": "match", "logical_name": "main/unique.ab",
+                 "containers": ["assets/effects/shared.prefab"]},
+                {"kind": "match", "logical_name": "main/first.ab",
+                 "containers": ["assets/effects/ambiguous.prefab"]},
+                {"kind": "match", "logical_name": "main/second.ab",
+                 "containers": ["assets/effects/ambiguous.prefab"]},
+                {"kind": "match", "logical_name": "main/similar.ab",
+                 "containers": ["assets/effects/missing_variant.prefab"]},
+                {"kind": "complete", "failed": 0},
+            )
+            scan.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+            names, issues = read_bundle_provider_names_for_paths(scan, {
+                "map01": (
+                    "Assets/Effects/Shared.prefab",
+                    "Assets/Effects/Ambiguous.prefab",
+                    "Assets/Effects/Missing.prefab",
+                ),
+                "map02": ("assets/effects/shared.prefab",),
+            })
+
+            self.assertEqual({"map01": ["main/unique.ab"], "map02": ["main/unique.ab"]}, names)
+            self.assertEqual([
+                BundleProviderIssue("Assets/Effects/Ambiguous.prefab", "ambiguous",
+                                    ("main/first.ab", "main/second.ab")),
+                BundleProviderIssue("Assets/Effects/Missing.prefab", "missing", ()),
+            ], issues["map01"])
+            self.assertEqual([], issues["map02"])
+
     def test_exact_provider_lookup_keeps_com_indie_matches_and_ambiguity(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

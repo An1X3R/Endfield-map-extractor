@@ -7,8 +7,10 @@ import re
 import sqlite3
 import struct
 import json
+from collections.abc import Collection, Mapping
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, TypedDict
+from typing import Any, Callable, Literal, TypedDict
 
 import brotli
 
@@ -359,6 +361,78 @@ def read_bundle_candidate_names_by_map(results: Path) -> dict[str, list[str]]:
                 if any(f"/{map_id}/" in value or f"{map_id}_" in value for value in containers):
                     names[map_id].add(logical_name.casefold())
     return {map_id: sorted(values) for map_id, values in names.items()}
+
+
+@dataclass(frozen=True)
+class BundleProviderIssue:
+    path: str
+    code: Literal["missing", "ambiguous"]
+    candidates: tuple[str, ...]
+
+
+def read_bundle_provider_names_for_paths(
+    results: Path, paths_by_map: Mapping[str, Collection[str]]
+) -> tuple[dict[str, list[str]], dict[str, list[BundleProviderIssue]]]:
+    """Select only unique exact providers and report missing or ambiguous paths."""
+    source = results.expanduser().resolve()
+    if not source.is_file():
+        raise FileNotFoundError(f"Bundle scanner results are missing: {source}")
+    requested: dict[str, dict[str, str]] = {}
+    providers: dict[str, set[str]] = {}
+    for map_id, paths in paths_by_map.items():
+        if not map_id:
+            raise ValueError("Bundle provider request requires nonempty map IDs")
+        normalized: dict[str, str] = {}
+        for path in paths:
+            if not isinstance(path, str) or not path:
+                raise ValueError(f"Bundle provider request has an invalid path: map={map_id}, path={path!r}")
+            key = path.replace("\\", "/").casefold()
+            normalized[key] = path
+            providers.setdefault(key, set())
+        requested[map_id] = normalized
+    names: dict[str, set[str]] = {map_id: set() for map_id in requested}
+    with source.open("r", encoding="utf-8-sig") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as error:
+                raise BootstrapExtractionError(
+                    f"Bundle scanner result is invalid JSONL at line {line_number}: {source}"
+                ) from error
+            if not isinstance(row, dict):
+                raise BootstrapExtractionError(
+                    f"Bundle scanner result must be an object at line {line_number}: {source}"
+                )
+            if row.get("kind") != "match":
+                continue
+            logical_name, containers = row.get("logical_name"), row.get("containers")
+            if not isinstance(logical_name, str) or not logical_name or not isinstance(containers, list):
+                raise BootstrapExtractionError(
+                    f"Bundle scanner match needs logical_name and containers: {source}:{line_number}"
+                )
+            for container in containers:
+                if not isinstance(container, str):
+                    raise BootstrapExtractionError(
+                        f"Bundle scanner container must be a string: {source}:{line_number}"
+                    )
+                key = container.replace("\\", "/").casefold()
+                if key in providers:
+                    providers[key].add(logical_name.casefold())
+    issues: dict[str, list[BundleProviderIssue]] = {}
+    for map_id, paths in requested.items():
+        map_issues: list[BundleProviderIssue] = []
+        for key, original in paths.items():
+            candidates = tuple(sorted(providers[key]))
+            if len(candidates) == 1:
+                names[map_id].add(candidates[0])
+            else:
+                map_issues.append(BundleProviderIssue(
+                    original, "missing" if not candidates else "ambiguous", candidates
+                ))
+        issues[map_id] = sorted(map_issues, key=lambda issue: issue.path.casefold())
+    return {map_id: sorted(values) for map_id, values in names.items()}, issues
 
 
 def read_bundle_closure_names_by_map(

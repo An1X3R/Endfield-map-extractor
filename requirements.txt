@@ -4,3 +4,4 @@ Pillow>=10.4,<12
 pycryptodome>=3.20,<4
 brotli>=1.1,<2
 jsonschema>=4.23,<5
+UnityPy==1.25.2

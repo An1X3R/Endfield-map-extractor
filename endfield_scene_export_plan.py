@@ -14,6 +14,7 @@ from typing import Callable, Mapping, TypedDict, cast
 
 from endfield_map_layer_contract import classify_entity, is_hlod_name
 from endfield_scene_material_contract import load_catalog, reference_key, resolve_export_path, supported_slots
+from endfield_scene_effects_plan import EffectInstance, build_effect_plan
 from endfield_scene_slot_contract import (
     AmbiguousSubmeshSlots, RuntimeDraw, asset_name, primary_visible_mesh,
     runtime_submesh_slots,
@@ -77,12 +78,107 @@ class PlanInstance(TypedDict):
     undrawn_submeshes: list[int]
 
 
+class WaterMeshAssetPlan(TypedDict):
+    source: str
+    path_id: int
+    name: str
+
+
+class WaterGeometryPlanRow(TypedDict):
+    entity_id: int
+    name: str
+    init_source_path: str
+    streaming_source_path: str
+    group_index: int
+    entity_index: int
+    matrix: list[float]
+    world_bounds: list[float]
+    ownership_anchor: list[float]
+    render_type_mask: int
+    runtime_mesh_id: int
+    param0: list[float]
+    param1: list[float]
+    mesh_resource_path: str
+    mesh_hash_hex: str
+    config_resource_path: str
+    config_hash_hex: str
+    mesh_file: str
+    mesh_asset: WaterMeshAssetPlan
+
+
+class WaterAssetPlan(TypedDict):
+    source: str
+    path_id: int
+    type_name: str
+
+
+class WaterTexturePlan(TypedDict):
+    asset: WaterAssetPlan
+    file: str
+
+
+class WaterNormalPlan(TypedDict):
+    asset: WaterAssetPlan
+    slice_index: int
+    file: str
+
+
+class WaterFlowPlan(TypedDict):
+    use_flow_map: bool
+    material_index: int
+    flow_direction: float
+    flow_direction_vector: list[float]
+    small_wave_normal_type: int
+    large_wave_normal_type: int
+    flow_speed: float
+    large_wave_flow_speed: float
+    normal_tilling: float
+    large_wave_normal_tilling: float
+    normal_scale: float
+    large_wave_normal_scale: float
+    water_ior: float
+
+
+class WaterSectorPlanRow(TypedDict):
+    resource_path: str
+    sector_x: int
+    sector_z: int
+    asset: WaterAssetPlan
+    texture: WaterTexturePlan
+    source_json: str
+
+
+class WaterMaterialPlanRow(TypedDict):
+    entity_id: int
+    config_resource_path: str
+    config_asset: WaterAssetPlan
+    global_resource_path: str
+    global_asset: WaterAssetPlan
+    normal_array_resource_path: str
+    flow: WaterFlowPlan
+    flow_map: WaterTexturePlan | None
+    small_wave_normal: WaterNormalPlan
+    large_wave_normal: WaterNormalPlan
+    sectors: list[WaterSectorPlanRow]
+    sector_complete: bool
+    sector_mapping_status: str
+    config_source_json: str
+    global_source_json: str
+
+
 class Pending(TypedDict):
     entity_id: int
     entity_base: str
     component: str
     reason: str
     detail: str
+
+
+class EffectPhysicsPlan(TypedDict):
+    source: str
+    source_sha256: str
+    path_id: int
+    gravity: list[float]
 
 
 class SceneExportPlan(TypedDict):
@@ -92,10 +188,17 @@ class SceneExportPlan(TypedDict):
     category_filter: list[str]
     scene_manifests: list[str]
     terrain_surfaces: list[str]
+    water_depth_surfaces: list[str]
+    water_depth_instances: list[PlanInstance]
+    water_depth_pending: list[Pending]
     terrain_details: list[str]
     decal_manifest: str
     decal_materials: str
     instances: list[PlanInstance]
+    effect_instances: list[EffectInstance]
+    effect_physics: EffectPhysicsPlan | None
+    water_geometry: list[WaterGeometryPlanRow]
+    water_materials: list[WaterMaterialPlanRow]
     pending: list[Pending]
     source_sha256: dict[str, str]
     summary: dict[str, int]
@@ -127,6 +230,37 @@ def _file(value: object, label: str) -> Path:
     return path
 
 
+def _water_global_resource_path(
+    path_index: Mapping[bytes, tuple[str, ...]], map_id: str
+) -> str | None:
+    """Find this map's unique Global_Water_Config asset path by exact scene scope."""
+    if map_id not in ("map01", "map02"):
+        raise ValueError(f"WATER_GLOBAL_PATH_MAP_UNSUPPORTED map_id={map_id}")
+    scene_prefix = f"assets/beyond/scenes/lunascenes/{map_id.capitalize()}/releasedata/".casefold()
+    suffix = "/waterdata/global_water_config.asset"
+    matches: dict[str, str] = {}
+    for paths in path_index.values():
+        for path in paths:
+            normalized = path.replace("\\", "/").casefold()
+            if normalized.startswith(scene_prefix) and normalized.endswith(suffix):
+                matches.setdefault(normalized, path)
+    if len(matches) > 1:
+        raise ValueError(
+            f"WATER_GLOBAL_PATH_AMBIGUOUS map_id={map_id} paths={sorted(matches.values())}"
+        )
+    return next(iter(matches.values()), None)
+
+
+def _finite_vector(value: object, label: str, length: int) -> list[float]:
+    numbers = _list(value, label)
+    if len(numbers) != length or any(
+        type(number) not in (int, float) or not math.isfinite(float(number))
+        for number in numbers
+    ):
+        raise ValueError(f"{label} must contain {length} finite numbers")
+    return [float(number) for number in numbers]
+
+
 def _runtime_path(value: object, label: str, config_parent: Path) -> Path:
     raw = value if isinstance(value, Path) else Path(_text(value, label))
     return (raw if raw.is_absolute() else config_parent / raw).expanduser().resolve()
@@ -151,6 +285,18 @@ def _bounds(value: object) -> Bounds:
     if result["xmin"] >= result["xmax"] or result["zmin"] >= result["zmax"]:
         raise ValueError("canonical bounds must be increasing and half-open")
     return result
+
+
+def _terrain_surface_roots(values: object, config_parent: Path) -> list[Path]:
+    roots: list[Path] = []
+    for value in _list(values, "terrainSurfaces"):
+        surface = _text(value, "terrain surface")
+        root = (_runtime_file(surface, "terrain_surface/terrain_surface.json", config_parent).parent
+                if surface.casefold().endswith("terrain_surface.json")
+                else _runtime_path(surface, "terrain surface", config_parent))
+        _file(root / "terrain_surface.json", "terrain surface manifest")
+        roots.append(root)
+    return roots
 
 
 def _asset(value: object, label: str) -> AssetRef:
@@ -278,7 +424,7 @@ def prepare_scene_export_plan(
     check_cancelled: Callable[[], None] | None,
 ) -> Path:
     """Build exact rows from current ECS and available first-run SceneProbe exports."""
-    from dataclasses import asdict
+    from dataclasses import asdict, replace
 
     from extract_scene_renderer_materials import component_columns, decode_draws, decode_pairs
     from extractor_core.projected_decals import (
@@ -355,12 +501,15 @@ def prepare_scene_export_plan(
     groups = {_text(value, "export group") for value in _list(canonical.get("export_groups"), "export_groups")}
     layers = _object(canonical.get("layers"), "canonical layers")
     terrain_selected = layers.get("terrain") is True and bool(groups & {"all", "terrain"})
-    terrain_surfaces = [(_runtime_file(value, "terrain_surface/terrain_surface.json", runtime_path.parent).parent
-                         if str(value).casefold().endswith("terrain_surface.json") else
-                         _runtime_path(value, "terrain surface", runtime_path.parent))
-                        for value in _list(map_paths.get("terrainSurfaces"), "terrainSurfaces")] if terrain_selected else []
-    for surface in terrain_surfaces:
-        _file(surface / "terrain_surface.json", "terrain surface manifest")
+    water_selected = layers.get("water") is True and bool(groups & {"water", "all"})
+    terrain_surface_values = map_paths.get("terrainSurfaces")
+    terrain_surfaces = (_terrain_surface_roots(terrain_surface_values, runtime_path.parent)
+                        if terrain_selected else [])
+    water_depth_surfaces = (
+        _terrain_surface_roots(terrain_surface_values, runtime_path.parent)
+        if water_selected and terrain_surface_values is not None else []
+    )
+    water_depth_missing = water_selected and not water_depth_surfaces
     allowed_categories = selected_static_categories(layers, groups)
     include_decals = bool(groups & {"all", "terrain", "road", "unknown"}) and (
         layers.get("instances") is True or layers.get("terrain") is True or layers.get("roads") is True)
@@ -378,7 +527,7 @@ def prepare_scene_export_plan(
         if not isinstance(base, str) or not base:
             continue
         category, _ = classify_entity(base)
-        if matrix_type == 18 and category in allowed_categories:
+        if matrix_type == 18 and (category in allowed_categories or water_selected):
             if is_hlod_name(base):
                 if bounds["xmin"] <= origin_x < bounds["xmax"] and bounds["zmin"] <= origin_z < bounds["zmax"]:
                     excluded_hlod += 1
@@ -387,8 +536,8 @@ def prepare_scene_export_plan(
         elif matrix_type == 27 and include_decals:
             selected_decals.append((entity_id, base, matrix_blob, source_path))
     entries = ({entry.file_name: entry for entry in load_group(vfs, "C3442D43").iter_files()}
-               if selected_static or selected_decals else {})
-    path_index = build_path_id_index(path_hash) if selected_static or selected_decals else {}
+               if selected_static or selected_decals or water_selected else {})
+    path_index = build_path_id_index(path_hash) if selected_static or selected_decals or water_selected else {}
     by_source: dict[str, list[tuple[object, ...]]] = defaultdict(list)
     for row in selected_static:
         by_source[cast(str, row[3])].append(row)
@@ -398,19 +547,130 @@ def prepare_scene_export_plan(
         by_decal_source[cast(str, row[3])].append(row)
     source_hashes: dict[str, str] = {}
     ready: list[PlanInstance] = []
+    water_depth_instances: list[PlanInstance] = []
+    water_depth_pending: list[Pending] = []
+    visible_static: set[int] = set()
     pending: list[Pending] = []
     required_resources: set[str] = set()
+    if water_depth_missing:
+        water_depth_pending.append({
+            "entity_id": -1,
+            "entity_base": "selection",
+            "component": "water_depth",
+            "reason": "terrain_height_source_missing",
+            "detail": "No verified terrain height source; water depth must be fully supported by opaque source assets",
+        })
     selected_static_count = 0
     footprint_extras = 0
+    effect_instances: list[EffectInstance] = []
+    effect_physics: EffectPhysicsPlan | None = None
+    selected_effects = 0
+    if layers.get("effects") is True and groups & {"effects", "particle", "all"}:
+        from extractor_core.effects import read_dynamic_scene_effects
+
+        def effect_cancelled() -> None:
+            if check_cancelled is not None:
+                check_cancelled()
+
+        inventory = read_dynamic_scene_effects(vfs, path_hash, effect_cancelled)[map_id]
+        effect_plan = build_effect_plan(inventory, bounds, tuple(manifest_paths), materials, textures)
+        effect_instances.extend(effect_plan.rows)
+        pending.extend(cast(list[Pending], list(effect_plan.pending)))
+        required_resources.update(effect_plan.required_resource_paths)
+        selected_effects = effect_plan.selected_count
+        if effect_instances:
+            from extractor_core.physics import read_physics_settings
+
+            physics = read_physics_settings(game_root / "Endfield_Data" / "globalgamemanagers")
+            effect_physics = {"source": physics.source, "source_sha256": physics.source_sha256,
+                              "path_id": physics.path_id, "gravity": list(physics.gravity)}
     for component, layer_name, group_names in (
-        ("water", "water", {"water", "all"}),
-        ("effects", "effects", {"effects", "particle", "all"}),
         ("lights", "lights", {"lighting", "all"}),
     ):
         if layers.get(layer_name) is True and groups & group_names:
             pending.append({"entity_id": -1, "entity_base": "selection", "component": component,
                             "reason": "component_plan_not_implemented",
                             "detail": f"Selected {component} requires a separate verified component plan"})
+    water_geometry_rows: list[WaterGeometryPlanRow] = []
+    water_material_rows: list[WaterMaterialPlanRow] = []
+    if water_selected:
+        from endfield_scene_water_plan import build_water_geometry_plan
+
+        global_water_path = _water_global_resource_path(path_index, map_id)
+        if global_water_path is None:
+            scene_path = f"Assets/Beyond/Scenes/LunaScenes/{map_id.capitalize()}/ReleaseData"
+            pending.append({
+                "entity_id": -1,
+                "entity_base": "selection",
+                "component": "water_materials",
+                "reason": "global_resource_path_missing",
+                "detail": f"StringPathHash has no {scene_path}/WaterData/Global_Water_Config.asset path",
+            })
+        else:
+            required_resources.add(global_water_path)
+        geometry_plan = build_water_geometry_plan(
+            vfs,
+            entries,
+            path_index,
+            map_id,
+            bounds,
+            selection,
+            tuple(manifest_paths),
+            check_cancelled,
+        )
+        required_resources.update(geometry_plan.required_resource_paths)
+        for source, digest in geometry_plan.source_sha256:
+            previous = source_hashes.get(source)
+            if previous is not None and previous != digest:
+                raise ValueError(f"Water source SHA-256 conflicts with scene source: {source}")
+            source_hashes[source] = digest
+        for row in geometry_plan.rows:
+            serialized = asdict(row)
+            for field in ("matrix", "world_bounds", "ownership_anchor", "param0", "param1"):
+                serialized[field] = list(serialized[field])
+            water_geometry_rows.append(cast(WaterGeometryPlanRow, serialized))
+        pending.extend({
+            "entity_id": row.entity_id,
+            "entity_base": row.name,
+            "component": "water_geometry",
+            "reason": row.reason,
+            "detail": row.detail,
+        } for row in geometry_plan.pending)
+        if geometry_plan.rows:
+            from endfield_scene_water_materials import build_water_material_plan
+
+            material_geometry_rows = tuple(
+                replace(
+                    row,
+                    world_bounds=(
+                        max(row.world_bounds[0], bounds["xmin"]),
+                        min(row.world_bounds[1], bounds["xmax"]),
+                        row.world_bounds[2],
+                        row.world_bounds[3],
+                        max(row.world_bounds[4], bounds["zmin"]),
+                        min(row.world_bounds[5], bounds["zmax"]),
+                    ),
+                )
+                for row in geometry_plan.rows
+            )
+            material_plan = build_water_material_plan(
+                tuple(manifest_paths), material_geometry_rows, map_id
+            )
+            required_resources.update(material_plan.required_resource_paths)
+            names_by_entity = {row.entity_id: row.name for row in geometry_plan.rows}
+            for row in material_plan.rows:
+                serialized = asdict(row)
+                flow = cast(dict[str, object], serialized["flow"])
+                flow["flow_direction_vector"] = list(flow["flow_direction_vector"])
+                serialized["sectors"] = list(serialized["sectors"])
+                water_material_rows.append(cast(WaterMaterialPlanRow, serialized))
+            pending.extend({
+                "entity_id": row.entity_id,
+                "entity_base": names_by_entity.get(row.entity_id, "selection"),
+                "component": "water_materials",
+                "reason": row.reason,
+                "detail": row.detail,
+            } for row in material_plan.pending)
     for source in sorted(set(by_source) | set(by_decal_source)):
         if check_cancelled is not None:
             check_cancelled()
@@ -429,8 +689,20 @@ def prepare_scene_export_plan(
                 if footprint is None:
                     raise ValueError(f"Static entity has no source world bounds: entity_id={entity_id}, source={source}")
                 origin = (record["x"], record["z"])
-                if owns_static_footprint(bounds, selection, origin, footprint):
+                visible = row[6] in allowed_categories and owns_static_footprint(bounds, selection, origin, footprint)
+                bottom = any(
+                    footprint[0] < min(water["world_bounds"][1], bounds["xmax"])
+                    and footprint[1] > max(water["world_bounds"][0], bounds["xmin"])
+                    and footprint[4] < min(water["world_bounds"][5], bounds["zmax"])
+                    and footprint[5] > max(water["world_bounds"][4], bounds["zmin"])
+                    and footprint[2] < water["world_bounds"][3]
+                    and footprint[3] > water["world_bounds"][2] - 150.0
+                    for water in water_geometry_rows
+                )
+                if visible or bottom:
                     selected_rows.append(row)
+                if visible:
+                    visible_static.add(entity_id)
                     selected_static_count += 1
                     if not (selection["xmin"] <= origin[0] < selection["xmax"]
                             and selection["zmin"] <= origin[1] < selection["zmax"]):
@@ -462,7 +734,7 @@ def prepare_scene_export_plan(
                 mesh_path = _primary_mesh(pairs)
                 if is_hlod_name(mesh_path):
                     excluded_hlod += 1
-                    excluded_hlod_mesh += 1
+                    excluded_hlod_mesh += int(entity_id in visible_static)
                     continue
                 required_resources.add(mesh_path)
                 required_resources.update(pair["material_path"] for pair in pairs
@@ -475,7 +747,7 @@ def prepare_scene_export_plan(
                 mesh_asset, mesh_file = candidates[0]
                 if is_hlod_name(mesh_asset["Name"]):
                     excluded_hlod += 1
-                    excluded_hlod_mesh += 1
+                    excluded_hlod_mesh += int(entity_id in visible_static)
                     continue
                 active = [pair for pair in pairs if pair["mesh_path"] == mesh_path]
                 count = obj_submesh_count(mesh_file)
@@ -504,7 +776,8 @@ def prepare_scene_export_plan(
                 matrix = list(struct.unpack("<16f", cast(bytes, matrix_blob)))
                 if not all(math.isfinite(value) for value in matrix):
                     raise ValueError("Entity matrix has non-finite components")
-                ready.append({"entity_id": cast(int, entity_id), "entity_base": cast(str, base), "category": cast(str, category),
+                destination = ready if entity_id in visible_static else water_depth_instances
+                destination.append({"entity_id": cast(int, entity_id), "entity_base": cast(str, base), "category": cast(str, category),
                               "source_path": source, "source_sha256": digest,
                               "group_index": cast(int, group_index), "entity_index": cast(int, entity_index),
                               "matrix": matrix, "mesh_path": mesh_path, "mesh_file": str(mesh_file),
@@ -512,8 +785,10 @@ def prepare_scene_export_plan(
                               "submesh_slot_indices": list(mapping.indices), "material_refs": material_refs,
                               "undrawn_submeshes": list(mapping.undrawn_submeshes)})
             except (ValueError, AmbiguousSubmeshSlots) as error:
-                pending.append({"entity_id": cast(int, entity_id), "entity_base": cast(str, base),
-                                "component": "static_mesh", "reason": "exact_source_incomplete", "detail": str(error)})
+                failures = pending if entity_id in visible_static else water_depth_pending
+                failures.append({"entity_id": cast(int, entity_id), "entity_base": cast(str, base),
+                                 "component": "static_mesh" if entity_id in visible_static else "water_depth_static",
+                                 "reason": "exact_source_incomplete", "detail": str(error)})
         if source in by_decal_source:
             partner = source.replace("InitChunkData_", "StreamingChunkData_")
             if partner not in entries:
@@ -546,14 +821,19 @@ def prepare_scene_export_plan(
         "format": FORMAT, "map_id": map_id, "bounds": bounds, "category_filter": sorted(groups),
         "scene_manifests": [str(path) for path in manifest_paths],
         "terrain_surfaces": [str(path) for path in terrain_surfaces],
+        "water_depth_surfaces": [str(path) for path in water_depth_surfaces],
+        "water_depth_instances": water_depth_instances, "water_depth_pending": water_depth_pending,
         "terrain_details": [],
         "decal_manifest": str(decal_path), "decal_materials": str(decal_material_path),
-        "instances": ready, "pending": pending, "source_sha256": source_hashes,
+        "instances": ready, "effect_instances": effect_instances, "effect_physics": effect_physics,
+        "water_geometry": water_geometry_rows,
+        "water_materials": water_material_rows, "pending": pending, "source_sha256": source_hashes,
         "required_resource_paths": sorted(required_resources),
         "summary": {"selected_static": selected_static_count - excluded_hlod_mesh,
                     "footprint_overlap_extras": footprint_extras,
                     "excluded_hlod": excluded_hlod,
                     "ready_static": len(ready),
+                    "selected_effects": selected_effects, "ready_effects": len(effect_instances),
                     "selected_decals": len(selected_decals), "ready_decals": len(decal_rows), "pending": len(pending)},
     }
     decal_payload = {"format": "EndfieldProjectedDecals/1", "instances_db": str(instance_db),
@@ -579,14 +859,23 @@ def load_scene_export_plan(path: Path) -> SceneExportPlan:
     source = _object(json.loads(_file(path, "scene export plan").read_text(encoding="utf-8-sig")), "scene export plan")
     if source.get("format") != FORMAT or source.get("map_id") not in ("map01", "map02"):
         raise ValueError("Unsupported portable scene plan format or map")
+    source.setdefault("water_geometry", [])
+    source.setdefault("water_materials", [])
+    source.setdefault("water_depth_surfaces", [])
+    source.setdefault("water_depth_instances", [])
+    source.setdefault("water_depth_pending", [])
+    source.setdefault("effect_instances", [])
+    source.setdefault("effect_physics", None)
     _bounds(source.get("bounds"))
-    for name in ("scene_manifests", "terrain_surfaces", "instances", "pending", "category_filter"):
+    for name in ("scene_manifests", "terrain_surfaces", "water_depth_surfaces", "instances", "pending", "category_filter"):
         _list(source.get(name), f"scene export plan.{name}")
     details = _list(source.get("terrain_details", []), "scene export plan.terrain_details")
     for value in _list(source["scene_manifests"], "scene_manifests"):
         _file(value, "scene manifest")
     for value in _list(source["terrain_surfaces"], "terrain_surfaces"):
         _file(Path(_text(value, "terrain surface")) / "terrain_surface.json", "terrain surface manifest")
+    for value in _list(source["water_depth_surfaces"], "water_depth_surfaces"):
+        _file(Path(_text(value, "water depth surface")) / "terrain_surface.json", "water depth surface manifest")
     if details and not source["terrain_surfaces"]:
         raise ValueError("Terrain details require selected terrain surfaces")
     for value in details:
@@ -602,7 +891,8 @@ def load_scene_export_plan(path: Path) -> SceneExportPlan:
         if not isinstance(digest, str) or len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
             raise ValueError(f"Invalid source SHA-256: source={name}")
     seen: set[int] = set()
-    for value in _list(source["instances"], "scene export instances"):
+    for value in (*_list(source["instances"], "scene export instances"),
+                  *_list(source["water_depth_instances"], "scene export water depth instances")):
         row = _object(value, "scene export instance")
         entity_id = row.get("entity_id")
         if type(entity_id) is not int or entity_id in seen:
@@ -650,7 +940,115 @@ def load_scene_export_plan(path: Path) -> SceneExportPlan:
         undrawn = _list(row.get("undrawn_submeshes"), "scene undrawn_submeshes")
         if any(type(index) is not int or index < 0 or index >= len(slots) for index in undrawn):
             raise ValueError(f"Invalid undrawn submesh: entity_id={entity_id}")
-    for value in _list(source["pending"], "scene pending"):
+    geometry_rows = _list(source["water_geometry"], "scene export water_geometry")
+    material_rows = _list(source["water_materials"], "scene export water_materials")
+    required_path_values = _list(source.get("required_resource_paths", []), "required_resource_paths")
+    required_water_paths = {
+        _text(value, "required_resource_paths item").replace("\\", "/").casefold()
+        for value in required_path_values
+    }
+    effect_rows = _list(source["effect_instances"], "scene export effect_instances")
+    if effect_rows:
+        physics = _object(source["effect_physics"], "effect_physics; regenerate legacy FX plans to capture game gravity")
+        _text(physics.get("source"), "effect_physics.source")
+        _finite_vector(physics.get("gravity"), "effect_physics.gravity", 3)
+        if type(physics.get("path_id")) is not int:
+            raise ValueError("effect_physics.path_id must identify a PhysicsManager object")
+        digest = physics.get("source_sha256")
+        if not isinstance(digest, str) or len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+            raise ValueError("effect_physics.source_sha256 must contain the source file SHA256")
+    manifest_names = {str(_file(value, "scene manifest")) for value in source["scene_manifests"]}
+    seen_effects: set[int] = set()
+    for value in effect_rows:
+        row = _object(value, "effect instance")
+        entity_id = row.get("entity_id")
+        if type(entity_id) is not int or entity_id in seen_effects or entity_id in seen:
+            raise ValueError(f"FX entity_id must be a unique integer: entity_id={entity_id}")
+        seen_effects.add(entity_id)
+        for field in ("source_key", "source_virtual_path", "prefab_path"):
+            _text(row.get(field), f"effect instance.{field}")
+        for field, length in (("source_md5", 32), ("path_hash_hex", 16)):
+            digest = row.get(field)
+            if not isinstance(digest, str) or len(digest) != length or any(c not in "0123456789abcdefABCDEF" for c in digest):
+                raise ValueError(f"FX {field} must be {length} hexadecimal characters: entity_id={entity_id}")
+        path_value = cast(str, row["prefab_path"])
+        if path_value != path_value.replace("\\", "/").casefold() or not path_value.startswith("assets/"):
+            raise ValueError(f"FX prefab_path must be a canonical assets/ path: entity_id={entity_id}, path={path_value}")
+        if path_value not in required_water_paths:
+            raise ValueError(f"FX prefab is absent from required_resource_paths: entity_id={entity_id}, path={path_value}")
+        root = _object(row.get("prefab_root"), "effect instance.prefab_root")
+        _text(root.get("Source"), "effect instance.prefab_root.Source")
+        if type(root.get("PathId")) is not int or root.get("Type") != "GameObject":
+            raise ValueError(f"FX prefab_root must be a source-qualified GameObject: entity_id={entity_id}")
+        manifest = _file(row.get("scene_manifest"), "effect instance.scene_manifest")
+        if str(manifest) not in manifest_names:
+            raise ValueError(f"FX scene_manifest is absent from scene_manifests: entity_id={entity_id}, path={manifest}")
+        _finite_vector(row.get("matrix"), "effect instance.matrix", 16)
+        if row.get("matrix_space") != "dynamic_effect_anchor":
+            raise ValueError(f"FX matrix_space must be dynamic_effect_anchor: entity_id={entity_id}")
+    seen_water: set[int] = set()
+    for value in geometry_rows:
+        row = _object(value, "water geometry row")
+        entity_id = row.get("entity_id")
+        if type(entity_id) is not int or entity_id in seen_water:
+            raise ValueError(f"Water geometry ID is invalid or repeated: {entity_id}")
+        seen_water.add(entity_id)
+        _text(row.get("name"), "water geometry name")
+        init_source = _text(row.get("init_source_path"), "water init_source_path")
+        streaming_source = _text(row.get("streaming_source_path"), "water streaming_source_path")
+        for source_path in (init_source, streaming_source):
+            if not isinstance(hashes.get(source_path), str):
+                raise ValueError(f"Water source hash is missing: entity_id={entity_id}, source={source_path}")
+        for name in ("group_index", "entity_index"):
+            if type(row.get(name)) is not int or cast(int, row[name]) < 0:
+                raise ValueError(f"Water {name} must be nonnegative integer: entity_id={entity_id}")
+        for name, length in (("matrix", 16), ("world_bounds", 6), ("ownership_anchor", 2),
+                             ("param0", 4), ("param1", 4)):
+            _finite_vector(row.get(name), f"water geometry.{name}", length)
+        for name in ("render_type_mask", "runtime_mesh_id"):
+            if type(row.get(name)) is not int:
+                raise ValueError(f"Water {name} must be integer: entity_id={entity_id}")
+        mesh_resource = _text(row.get("mesh_resource_path"), "water mesh_resource_path")
+        config_resource = _text(row.get("config_resource_path"), "water config_resource_path")
+        for name in ("mesh_hash_hex", "config_hash_hex"):
+            digest = row.get(name)
+            if not isinstance(digest, str) or len(digest) != 16 or any(char not in "0123456789abcdef" for char in digest):
+                raise ValueError(f"Water {name} must be 16 lowercase hexadecimal characters: entity_id={entity_id}")
+        for resource in (mesh_resource, config_resource):
+            if resource.replace("\\", "/").casefold() not in required_water_paths:
+                raise ValueError(f"Water resource is absent from required_resource_paths: entity_id={entity_id}, path={resource}")
+        mesh_asset = _object(row.get("mesh_asset"), "water mesh_asset")
+        _text(mesh_asset.get("source"), "water mesh_asset.source")
+        if type(mesh_asset.get("path_id")) is not int:
+            raise ValueError(f"Water mesh asset path_id must be integer: entity_id={entity_id}")
+        _text(mesh_asset.get("name"), "water mesh_asset.name")
+        _file(row.get("mesh_file"), "water mesh_file")
+    if material_rows:
+        from endfield_scene_water_materials import read_water_material_row
+
+        seen_materials: set[int] = set()
+        for value in material_rows:
+            material = read_water_material_row(value)
+            if material.entity_id not in seen_water or material.entity_id in seen_materials:
+                raise ValueError(f"Water material has no unique geometry row: entity_id={material.entity_id}")
+            seen_materials.add(material.entity_id)
+            geometry = next(
+                cast(dict[str, object], _object(row, "water geometry row"))
+                for row in geometry_rows
+                if _object(row, "water geometry row").get("entity_id") == material.entity_id
+            )
+            if material.config_resource_path != geometry.get("config_resource_path"):
+                raise ValueError(f"Water material config differs from geometry: entity_id={material.entity_id}")
+            for resource_path in (
+                material.config_resource_path,
+                material.global_resource_path,
+                material.normal_array_resource_path,
+                *(sector.resource_path for sector in material.sectors),
+            ):
+                if resource_path.replace("\\", "/").casefold() not in required_water_paths:
+                    raise ValueError(f"Water material resource is absent from required_resource_paths: entity_id={material.entity_id}, path={resource_path}")
+    for value in (*_list(source["pending"], "scene pending"),
+                  *_list(source["water_depth_pending"], "water depth pending")):
         row = _object(value, "pending row")
         if type(row.get("entity_id")) is not int:
             raise ValueError("Pending row requires integer entity_id")
@@ -662,6 +1060,11 @@ def load_scene_export_plan(path: Path) -> SceneExportPlan:
             raise ValueError(f"Invalid scene summary count: {name}")
     if "excluded_hlod" in summary and (type(summary["excluded_hlod"]) is not int or summary["excluded_hlod"] < 0):
         raise ValueError("Invalid scene summary count: excluded_hlod")
-    if summary["ready_static"] != len(seen) or summary["pending"] != len(source["pending"]):
+    if summary["ready_static"] != len(source["instances"]) or summary["pending"] != len(source["pending"]):
         raise ValueError("Scene summary differs from instance/pending rows")
+    if "selected_effects" in summary or "ready_effects" in summary or effect_rows:
+        if type(summary.get("selected_effects")) is not int or type(summary.get("ready_effects")) is not int:
+            raise ValueError("Scene summary requires integer selected_effects and ready_effects")
+        if summary["selected_effects"] < 0 or summary["ready_effects"] != len(effect_rows):
+            raise ValueError("Scene summary differs from selected/ready effect rows")
     return cast(SceneExportPlan, source)

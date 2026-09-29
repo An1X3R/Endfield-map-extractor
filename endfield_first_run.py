@@ -727,7 +727,33 @@ def run() -> int:
                 "scanIndex": descriptor(bundle_scan_index),
             }
         elif step_done("scene_discovery") and not state["steps"]["scene_discovery"]["outputs"].get("checkpointVersion"):
-            scene_discovery_result = state["steps"]["scene_discovery"]["outputs"]
+            scene_discovery_result = dict(state["steps"]["scene_discovery"]["outputs"])
+            from endfield_scene_discovery import effect_candidates
+            from endfield_scene_resources import validate_scan
+
+            provider_record = scene_discovery_result.get("scannerResults")
+            if isinstance(provider_record, dict) and provider_record.get("path"):
+                provider_path = Path(provider_record["path"])
+                validate_scan(provider_path)
+
+                def legacy_effect_cancelled() -> None:
+                    if cancelled():
+                        raise FirstRunError("Effect discovery was cancelled; legacy scene outputs were preserved.")
+
+                emitter.emit("scene_discovery", 0.4, "Auditing effect providers while preserving legacy scene outputs")
+                _effect_roots, effects = effect_candidates(
+                    run_root / "scene_discovery" / "checkpoints_v21", vfs_root,
+                    metadata["main_paths"], provider_path, legacy_effect_cancelled)
+                scene_discovery_result["dynamicEffects"] = {
+                    **effects, "preparationStatus": "deferred_legacy_cache",
+                }
+            else:
+                scene_discovery_result["dynamicEffects"] = {
+                    "status": "not_prepared", "preparationStatus": "deferred_legacy_cache",
+                    "reason": "Legacy discovery has no provider index; effect resources require new preparation.",
+                    "reconstructionStatus": "not_implemented",
+                }
+            complete_step("scene_discovery", scene_discovery_result)
         elif dependency_result.get("status") != "passed":
             scene_discovery_result = {
                 "status": "deferred",
@@ -756,7 +782,7 @@ def run() -> int:
                 emitter.emit("scene_discovery", value, message, details)
 
             scene_discovery_result = discovery(
-                run_root, log_root, bundle_scan_index, resources_db, vfs_root, scanner, scene_probe,
+                run_root, log_root, bundle_scan_index, resources_db, vfs_root, metadata["main_paths"], scanner, scene_probe,
                 discovery_cancelled, discovery_progress)
             complete_step("scene_discovery", scene_discovery_result)
             emitter.emit("scene_discovery", 1.0, "Verified Map01/Map02 scene preparation completed")

@@ -121,12 +121,17 @@ internal static partial class Program
         var allMeshes = allObjects.OfType<Mesh>().ToList();
         var allMaterials = allObjects.OfType<Material>().ToList();
         var allTextures = allObjects.OfType<Texture2D>().ToList();
+        var particleExtraction = ReadParticleRecords(allObjects, gameObjects);
+        var waterRecords = ReadWaterRecords(allObjects);
         var shaderReferences = allObjects.Where(obj => obj.type == ClassIDType.Shader)
             .ToDictionary(obj => (obj.assetsFile.fileName, obj.m_PathID), ReadShaderReference);
 
         var meshRefs = new HashSet<Mesh>();
         var materialRefs = new HashSet<Material>();
         var textureRefs = new HashSet<Texture2D>();
+        meshRefs.UnionWith(particleExtraction.Meshes);
+        materialRefs.UnionWith(particleExtraction.Materials);
+        textureRefs.UnionWith(particleExtraction.Textures);
         var nodes = new List<NodeRecord>();
 
         foreach (var go in gameObjects)
@@ -270,6 +275,24 @@ internal static partial class Program
         }
         telemetry.Publish("texture_export", textureRecords.Count, textureTotal);
 
+        var waterArrayKeys = waterRecords.GlobalConfigs
+            .Where(record => !record.NormalMapArray.IsNull)
+            .Select(record => (record.NormalMapArray.Target.Source, record.NormalMapArray.Target.PathId))
+            .ToHashSet();
+        var arrayObjects = allObjects.Where(obj => obj.type == ClassIDType.Texture2DArray &&
+            (options.IncludeUnreferenced || waterArrayKeys.Contains((obj.assetsFile.fileName, obj.m_PathID))))
+            .OrderBy(obj => obj.assetsFile.fileName).ThenBy(obj => obj.m_PathID).ToArray();
+        var arrayRecords = new List<TextureArrayExportBatch>();
+        if (!options.ManifestOnly)
+        {
+            telemetry.Publish("texture_array_export", 0, arrayObjects.Length);
+            foreach (var obj in arrayObjects)
+            {
+                arrayRecords.Add(TextureArrayExports.Export(obj, output, textureDir));
+                telemetry.Publish("texture_array_export", arrayRecords.Count, arrayObjects.Length);
+            }
+        }
+
         var containers = BuildContainers(allObjects);
         var report = new SceneReport
         {
@@ -284,10 +307,13 @@ internal static partial class Program
                 ObjectCount = f.Objects.Count,
             }).ToList(),
             Nodes = nodes,
+            Particles = particleExtraction.Records,
             DecalProjectors = projectors,
+            Water = waterRecords,
             Materials = materialRecords,
             MeshExports = meshRecords,
             TextureExports = textureRecords,
+            TextureArrayExports = arrayRecords,
             MetadataExports = options.DumpMetadata ? ExportSerializedMetadata(allObjects, output) : [],
             Containers = containers,
             Summary = new Dictionary<string, int>
@@ -303,6 +329,14 @@ internal static partial class Program
                 ["selectedTextures"] = textureRefs.Count,
                 ["containers"] = containers.Count,
                 ["decalProjectors"] = projectors.Count,
+                ["particleSystems"] = particleExtraction.Records.Systems.Length,
+                ["particleRenderers"] = particleExtraction.Records.Renderers.Length,
+                ["particlePairs"] = particleExtraction.Records.Pairs.Length,
+                ["particleDiagnostics"] = particleExtraction.Records.Diagnostics.Length,
+                ["waterConfigs"] = waterRecords.Configs.Length,
+                ["waterGlobals"] = waterRecords.GlobalConfigs.Length,
+                ["waterSectors"] = waterRecords.Sectors.Length,
+                ["textureArrays"] = arrayRecords.Count,
             },
         };
 
@@ -457,10 +491,13 @@ internal sealed class SceneReport
     public required string[] InputFiles { get; init; }
     public required List<SerializedFileRecord> SerializedFiles { get; init; }
     public required List<NodeRecord> Nodes { get; init; }
+    public required ParticleRecords Particles { get; init; }
     public required List<DecalProjectorRecord> DecalProjectors { get; init; }
+    public required WaterRecords Water { get; init; }
     public required List<MaterialRecord> Materials { get; init; }
     public required List<ExportRecord> MeshExports { get; init; }
     public required List<ExportRecord> TextureExports { get; init; }
+    public required List<TextureArrayExportBatch> TextureArrayExports { get; init; }
     public required List<ExportRecord> MetadataExports { get; init; }
     public required List<ContainerRecord> Containers { get; init; }
     public required Dictionary<string, int> Summary { get; init; }

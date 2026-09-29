@@ -14,6 +14,7 @@ from extractor_core.resources import extract_candidate_bundles, read_bundle_clos
 
 FORMAT = "EndfieldSceneResourceCache/1"
 PROVIDER_COVERAGE = "all_asset_containers"
+PACKAGE_PROVIDER_COVERAGE = "all_asset_and_package_containers"
 
 
 def read_json(path: Path) -> dict[str, object]:
@@ -92,17 +93,47 @@ def supplemental_manifests(runtime_path: Path, runtime: dict[str, object]) -> tu
 
 def ready_resource_paths(manifests: tuple[Path, ...]) -> frozenset[str]:
     """Require actual payloads independently of Blender shader support."""
+    from endfield_scene_effects_plan import observed_effect_prefabs
+
     materials, textures = load_catalog(manifests)
     mesh_keys: set[tuple[str, int]] = set()
+    water_keys: set[tuple[str, int]] = set()
+    array_keys: set[tuple[str, int]] = set()
+    water_records: list[tuple[str, dict[str, object]]] = []
     containers: list[dict[str, object]] = []
     for path in manifests:
         data = read_json(path)
+        array_keys.update(ready_texture_arrays(data, path.parent))
+        water = require_object(data.get("Water", {}), "water records")
+        for kind in ("Configs", "GlobalConfigs", "Sectors"):
+            records = water.get(kind, [])
+            if not isinstance(records, list):
+                raise ValueError(f"Water {kind} must be an array: {path}")
+            for value in records:
+                row = require_object(value, "water record")
+                water_records.append((kind, row))
         for value in cast(list[object], data["MeshExports"]):
             row = require_object(value, "mesh export")
             if row.get("File") and resolve_export_path(resolve_path(row["File"], path.parent)).is_file():
                 mesh_keys.add(reference_key(require_object(row["Asset"], "mesh asset")))
         containers.extend(require_object(value, "container") for value in cast(list[object], data["Containers"]))
-    ready = set()
+    for kind, row in water_records:
+        header = require_object(row.get("Header"), "water header")
+        key = reference_key(require_object(header.get("Asset"), "water asset"))
+        dependencies = ("FlowMap", "NormalMapArray") if kind == "GlobalConfigs" else (
+            ("WaterSectorTexture0",) if kind == "Sectors" else ())
+        complete = True
+        for field in dependencies:
+            pointer = require_object(row.get(field), f"water {field} pointer")
+            if pointer.get("IsNull") is True:
+                complete = False
+                continue
+            target = reference_key(require_object(pointer.get("Target"), f"water {field} target"))
+            if target not in (array_keys if field == "NormalMapArray" else textures):
+                complete = False
+        if complete:
+            water_keys.add(key)
+    ready = set(observed_effect_prefabs(manifests))
     for row in containers:
         if row.get("Asset") is None:
             continue
@@ -111,10 +142,50 @@ def ready_resource_paths(manifests: tuple[Path, ...]) -> frozenset[str]:
         container = str(row["Container"]).replace("\\", "/").casefold()
         if asset.get("Type") == "Mesh" and key in mesh_keys:
             ready.add(container + "##" + str(asset["Name"]).casefold())
+            if container.endswith(".asset"):
+                ready.add(container)
         elif asset.get("Type") == "Material" and key in materials:
             slots = materials[key]["Textures"]
             if all(slot["Texture"] is None or reference_key(slot["Texture"]) in textures for slot in slots):
                 ready.add(container)
+        elif asset.get("Type") == "MonoBehaviour" and key in water_keys:
+            ready.add(container)
+        elif asset.get("Type") == "Texture2D" and key in textures:
+            ready.add(container)
+        elif asset.get("Type") == "Texture2DArray" and key in array_keys:
+            ready.add(container)
+    return frozenset(ready)
+
+
+def ready_texture_arrays(manifest: dict[str, object], directory: Path) -> frozenset[tuple[str, int]]:
+    """Require every distinct array layer; a single layer is not a ready array."""
+    rows = manifest.get("TextureArrayExports", [])
+    if not isinstance(rows, list):
+        raise ValueError("TextureArrayExports must be an array")
+    ready: set[tuple[str, int]] = set()
+    for value in rows:
+        row = require_object(value, "texture array")
+        key = reference_key(require_object(row.get("Asset"), "texture array asset"))
+        depth, slices = row.get("Depth"), row.get("Slices")
+        if type(depth) is not int or depth <= 0 or not isinstance(slices, list) or len(slices) != depth:
+            raise ValueError(f"Texture array layer count is invalid: reference={key}, depth={depth}")
+        indices: set[int] = set()
+        complete = True
+        for item in slices:
+            layer = require_object(item, "texture array layer")
+            index = layer.get("SliceIndex")
+            if type(index) is not int or not 0 <= index < depth or index in indices:
+                raise ValueError(f"Texture array layer index is invalid: reference={key}, index={index}")
+            if reference_key(require_object(layer.get("Asset"), "layer asset")) != key:
+                raise ValueError(f"Texture array layer identity differs: reference={key}, index={index}")
+            indices.add(index)
+            file = layer.get("File")
+            if layer.get("Error") or file is None:
+                complete = False
+            elif not resolve_export_path(resolve_path(file, directory)).is_file():
+                complete = False
+        if complete:
+            ready.add(key)
     return frozenset(ready)
 
 
@@ -154,9 +225,11 @@ def ensure_scene_resources(runtime_path: Path, plan_path: Path,
     runtime, plan = read_json(runtime_path), read_json(plan_path)
     extraction = require_object(runtime["extraction"], "runtime extraction")
     values = plan.get("required_resource_paths")
-    if not isinstance(values, list) or any(not isinstance(v, str) or not v.startswith("assets/") for v in values):
-        raise ValueError("Scene preflight requires exact assets/ resource paths")
-    requested = frozenset(cast(list[str], values))
+    if not isinstance(values, list) or any(
+        not isinstance(v, str) or not v.replace("\\", "/").casefold().startswith(("assets/", "packages/")) for v in values
+    ):
+        raise ValueError("Scene preflight requires exact assets/ or packages/ resource paths")
+    requested = frozenset(value.replace("\\", "/").casefold() for value in cast(list[str], values))
     manifests = tuple(resolve_path(p, plan_path.parent) for p in cast(list[str], plan["scene_manifests"]))
     missing = requested - ready_resource_paths(manifests)
     if not missing:
@@ -182,12 +255,14 @@ def ensure_scene_resources(runtime_path: Path, plan_path: Path,
         environment = {**os.environ, "TEMP": str(work), "TMP": str(work), "PYTHONDONTWRITEBYTECODE": "1"}
         discovery = require_object(extraction["sceneDiscovery"], "scene discovery")
         provider = existing.get("providerIndex")
-        if provider is not None:
+        coverage = PACKAGE_PROVIDER_COVERAGE if any(path.startswith("packages/") for path in missing) else PROVIDER_COVERAGE
+        accepted_coverage = {coverage, PACKAGE_PROVIDER_COVERAGE}
+        if provider is not None and existing.get("providerCoverage", PROVIDER_COVERAGE) in accepted_coverage:
             record = require_object(provider, "provider descriptor")
             provider_path = resolve_path(record["path"], root)
             if not provider_path.is_relative_to(root) or describe_file(provider_path) != record:
                 raise ValueError(f"Provider cache failed integrity validation: {provider_path}")
-        elif discovery.get("providerCoverage") == PROVIDER_COVERAGE:
+        elif discovery.get("providerCoverage") in accepted_coverage:
             record = require_object(discovery["scannerResults"], "scanner results")
             provider_path = resolve_path(record["path"], runtime_path.parent)
             if describe_file(provider_path) != record:
@@ -196,11 +271,14 @@ def ensure_scene_resources(runtime_path: Path, plan_path: Path,
             provider_path = work / "providers.jsonl"
             scan_index = resolve_path(extraction["bundleScanIndex"], runtime_path.parent)
             progress(0.05, "Upgrading complete resource provider index once for this prepared cache")
+            filters = ["--contains", "assets/"]
+            if coverage == PACKAGE_PROVIDER_COVERAGE:
+                filters.extend(("--contains", "packages/"))
             run_scene_process([str(scanner), "--input", str(scan_index), "--output", str(provider_path),
-                               "--contains", "assets/", "--progress-every", "1000"],
+                               *filters, "--progress-every", "1000"],
                               work / "providers.log", environment, check_cancelled)
             validate_scan(provider_path)
-            existing = {**existing, "providerIndex": describe_file(provider_path)}
+            existing = {**existing, "providerIndex": describe_file(provider_path), "providerCoverage": coverage}
             write_index(index_path, existing)
         validate_scan(provider_path)
         check_cancelled()

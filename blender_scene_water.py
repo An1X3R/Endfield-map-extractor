@@ -14,6 +14,7 @@ import bpy
 import bmesh
 
 from blender_hgrp_surface import configure_scene_transmission
+from blender_scene_materials import layout_shader_node_tree
 
 
 @dataclass(frozen=True)
@@ -69,6 +70,46 @@ def _validate_settings_values(tree: bpy.types.ShaderNodeTree) -> None:
                                  scalar("Scattering Per Meter"), tuple(color_source.default_value), "settings"))
 
 
+def _mark_layout(node: bpy.types.Node, section: str, note: str) -> None:
+    node["endfield_layout_section"] = section
+    node["endfield_layout_note"] = note
+
+
+def _layout_optics_group(tree: bpy.types.ShaderNodeTree) -> None:
+    output = next(node for node in tree.nodes if node.type == "GROUP_OUTPUT" and node.is_active_output)
+    for node in tree.nodes:
+        if node.type == "GROUP_INPUT":
+            _mark_layout(node, "01 Optical Inputs", "Normal, sampled depth and settings")
+        elif node.type == "GROUP_OUTPUT":
+            _mark_layout(node, "05 Shader Outputs", "Surface, Eevee and volume")
+    for socket_name, section, note in (
+        ("Surface", "02 Shared Surface", "Blender transmission for Cycles"),
+        ("Eevee Surface", "03 Eevee Depth Attenuation", "Snell path; spectral extinction"),
+        ("Volume", "04 Bounded Volume", "Absorption and scatter in closed mesh"),
+    ):
+        pending = [link.from_node for link in output.inputs[socket_name].links]
+        visited: set[str] = set()
+        while pending:
+            node = pending.pop()
+            if node.name in visited:
+                continue
+            visited.add(node.name)
+            if node.type == "GROUP_INPUT":
+                continue
+            _mark_layout(node, section, note)
+            pending.extend(link.from_node for socket in node.inputs for link in socket.links)
+    layout_shader_node_tree(tree)
+
+
+def _layout_settings_group(tree: bpy.types.ShaderNodeTree) -> None:
+    for node in tree.nodes:
+        if node.type == "GROUP_OUTPUT":
+            _mark_layout(node, "02 Settings Outputs", "Shared by surface and volume")
+        elif node.type in {"VALUE", "RGB"}:
+            _mark_layout(node, "01 Editable Optics", "Editable Blender optical controls")
+    layout_shader_node_tree(tree)
+
+
 def water_optics_group() -> bpy.types.ShaderNodeTree:
     name = "EF_Water_Optics_v5"
     existing = bpy.data.node_groups.get(name)
@@ -86,6 +127,7 @@ def water_optics_group() -> bpy.types.ShaderNodeTree:
                                              ("Volume", "OUTPUT", "NodeSocketShader"),
                                              ("Eevee Surface", "OUTPUT", "NodeSocketShader")))
         _validate_group_outputs(existing, ("Surface", "Volume", "Eevee Surface"))
+        _layout_optics_group(existing)
         return existing
     tree = bpy.data.node_groups.new(name, "ShaderNodeTree")
     for label, kind in (("Normal", "NodeSocketVector"), ("Depth", "NodeSocketFloat"),
@@ -197,6 +239,7 @@ def water_optics_group() -> bpy.types.ShaderNodeTree:
     links.new(scatter.outputs[0], medium.inputs[1])
     links.new(medium.outputs[0], output.inputs["Volume"])
     tree["endfield_contract"] = "PortableWaterOptics/5"
+    _layout_optics_group(tree)
     return tree
 
 
@@ -216,6 +259,7 @@ def water_settings(optics: WaterOptics) -> bpy.types.ShaderNodeTree:
                                          ("Deep Color", "OUTPUT", "NodeSocketColor")))
         _validate_group_outputs(tree, ("IOR", "Roughness", "Attenuation Per Meter", "Scattering Per Meter", "Deep Color"))
         _validate_settings_values(tree)
+        _layout_settings_group(tree)
         return tree
     tree = bpy.data.node_groups.new(name, "ShaderNodeTree")
     output = tree.nodes.new("NodeGroupOutput")
@@ -233,6 +277,7 @@ def water_settings(optics: WaterOptics) -> bpy.types.ShaderNodeTree:
     color.outputs[0].default_value = optics.deep_color
     tree.links.new(color.outputs[0], output.inputs["Deep Color"])
     tree["endfield_contract"] = "EndfieldWaterSettings/1"
+    _layout_settings_group(tree)
     return tree
 
 
@@ -264,12 +309,15 @@ def adapt_water_surface(material: bpy.types.Material, normal: bpy.types.NodeSock
     depth = nodes.new("ShaderNodeAttribute")
     depth.attribute_name = optics.depth_attribute
     depth.label = "Scene-derived water depth in meters"
+    _mark_layout(depth, "08 Measured Depth", "Sampled bathymetry (meters)")
     core = nodes.new("ShaderNodeGroup")
     core.node_tree = core_tree
     core.name = "EF_Water_Shared_Core"
+    _mark_layout(core, "09 Shared Optics", "Edit settings inside linked group")
     settings = nodes.new("ShaderNodeGroup")
     settings.node_tree = settings_tree
     settings.name = "EF_Water_Shared_Settings"
+    _mark_layout(settings, "09 Shared Optics", "Edit settings inside linked group")
     for label in ("IOR", "Roughness", "Attenuation Per Meter", "Scattering Per Meter", "Deep Color"):
         links.new(settings.outputs[label], core.inputs[label])
     links.new(normal, core.inputs["Normal"])
@@ -278,14 +326,23 @@ def adapt_water_surface(material: bpy.types.Material, normal: bpy.types.NodeSock
     transparent = nodes.new("ShaderNodeBsdfTransparent")
     shadow_adapter = nodes.new("ShaderNodeMixShader")
     shadow_adapter.label = "Cycles: transmit direct light without refractive caustic dependency"
+    for node in (shadow_ray, transparent, shadow_adapter):
+        _mark_layout(node, "10 Shadow-Ray Adapter", "Pass direct light through water")
     links.new(shadow_ray.outputs["Is Shadow Ray"], shadow_adapter.inputs[0])
     links.new(core.outputs["Surface"], shadow_adapter.inputs[1])
     links.new(transparent.outputs[0], shadow_adapter.inputs[2])
+    eevee_shadow_adapter = nodes.new("ShaderNodeMixShader")
+    eevee_shadow_adapter.label = "Eevee: transmit direct light through the water boundary"
+    _mark_layout(eevee_shadow_adapter, "10 Shadow-Ray Adapter", "Pass direct light through water")
+    links.new(shadow_ray.outputs["Is Shadow Ray"], eevee_shadow_adapter.inputs[0])
+    links.new(core.outputs["Eevee Surface"], eevee_shadow_adapter.inputs[1])
+    links.new(transparent.outputs[0], eevee_shadow_adapter.inputs[2])
     for engine in ("CYCLES", "EEVEE"):
         output = nodes.new("ShaderNodeOutputMaterial")
         output.target = engine
         output.name = "EF_Water_Output_" + engine
-        links.new(shadow_adapter.outputs[0] if engine == "CYCLES" else core.outputs["Eevee Surface"], output.inputs["Surface"])
+        _mark_layout(output, "11 Engine Outputs", "Cycles and Eevee surfaces")
+        links.new(shadow_adapter.outputs[0] if engine == "CYCLES" else eevee_shadow_adapter.outputs[0], output.inputs["Surface"])
         if engine == "EEVEE":
             output.inputs["Thickness"].default_value = 0.01
     material.use_raytrace_refraction = True
@@ -296,7 +353,9 @@ def adapt_water_surface(material: bpy.types.Material, normal: bpy.types.NodeSock
     material["endfield_water_limitations"] = "Requires a validated closed absorption volume; bottom interpolates sampled geometry; underwater cameras, caustics and HGRP screen history remain unverified"
     material["endfield_optics_parameters"] = "Blender review calibration; IOR, attenuation, roughness and deep color are not claimed as decoded game coefficients"
     material["endfield_cycles_light_adapter"] = "Water surface passes shadow rays; avoids a black bottom when refractive caustics are unavailable"
+    material["endfield_eevee_light_adapter"] = "Water surface passes shadow rays; avoids an opaque shadow over the transmitted bottom"
     material["endfield_eevee_medium_adapter"] = "Spectral Beer-Lambert extinction from scene bathymetry and Snell path length; no in-scattering or refracted-volume integration claim"
+    layout_shader_node_tree(material.node_tree)
 
 
 def create_water_volume(source: bpy.types.Object, depths: tuple[float, ...],
@@ -360,7 +419,9 @@ def create_water_volume(source: bpy.types.Object, depths: tuple[float, ...],
             positions.append(source.matrix_world @ source.data.vertices[vertex].co)
             volume_depths.append(depths[vertex])
     faces = [tuple(mapping[(vertex, index)] for vertex in face) for index, face in enumerate(original_faces)]
-    vertices = [(p.x, p.y, p.z - min(0.01, depth * 0.25)) for p, depth in zip(positions, volume_depths, strict=True)] + [(p.x, p.y, p.z - depth) for p, depth in zip(positions, volume_depths, strict=True)]
+    # Extend the volume below the opaque bottom to avoid coplanar ray boundaries.
+    # Optical depth attributes remain the original measured distances.
+    vertices = [(p.x, p.y, p.z - min(0.01, depth * 0.25)) for p, depth in zip(positions, volume_depths, strict=True)] + [(p.x, p.y, p.z - depth - 0.01) for p, depth in zip(positions, volume_depths, strict=True)]
     count = len(positions)
     edges: dict[tuple[int, int], list[tuple[int, int]]] = {}
     for face in faces:
@@ -394,23 +455,30 @@ def create_water_volume(source: bpy.types.Object, depths: tuple[float, ...],
         nodes.clear()
         output = nodes.new("ShaderNodeOutputMaterial")
         output.target = "CYCLES"
+        _mark_layout(output, "03 Engine Outputs", "Cycles medium; Eevee clear shell")
         transparent = nodes.new("ShaderNodeBsdfTransparent")
+        _mark_layout(transparent, "02 Transparent Boundary", "Volume shell has no surface shade")
         links.new(transparent.outputs[0], output.inputs["Surface"])
         eevee_output = nodes.new("ShaderNodeOutputMaterial")
         eevee_output.target = "EEVEE"
+        _mark_layout(eevee_output, "03 Engine Outputs", "Cycles medium; Eevee clear shell")
         links.new(transparent.outputs[0], eevee_output.inputs["Surface"])
         core = nodes.new("ShaderNodeGroup")
         core.node_tree = core_tree
+        _mark_layout(core, "01 Shared Optical Medium", "Same core as visible water surface")
         settings = nodes.new("ShaderNodeGroup")
         settings.node_tree = settings_tree
+        _mark_layout(settings, "01 Shared Optical Medium", "Same core as visible water surface")
         for label in ("IOR", "Roughness", "Attenuation Per Meter", "Scattering Per Meter", "Deep Color"):
             links.new(settings.outputs[label], core.inputs[label])
         links.new(core.outputs["Volume"], output.inputs["Volume"])
+        layout_shader_node_tree(material.node_tree)
         material["endfield_water_volume_source"] = source.name
         mesh.materials.append(material)
         obj = bpy.data.objects.new(mesh.name, mesh)
         obj["endfield_water_volume_source"] = source.name
         obj["endfield_water_boundary_inset_meters"] = 0.01
+        obj["endfield_water_bottom_overlap_meters"] = 0.01
         obj["endfield_water_volume_shadow_adapter"] = "Camera medium retained; direct-light shadow attenuation disabled to match pre-lit scene-color approximation"
         obj.visible_shadow = False
         obj.display_type = "WIRE"

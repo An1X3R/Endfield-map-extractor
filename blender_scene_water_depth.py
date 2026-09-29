@@ -14,6 +14,10 @@ from mathutils import Vector
 from mathutils.bvhtree import BVHTree
 
 
+class WaterBottomGeometryMissing(ValueError):
+    """No proven opaque geometry is available below the selected water."""
+
+
 @dataclass(frozen=True)
 class BottomSource:
     object_name: str
@@ -105,8 +109,10 @@ def sample_water_depths(depsgraph: bpy.types.Depsgraph, waters: tuple[bpy.types.
             continue
         mesh = obj.to_mesh()
         try:
+            mesh.calc_loop_triangles()
             accepted: list[tuple[int, tuple[int, ...]]] = []
-            for face in mesh.polygons:
+            for triangle in mesh.loop_triangles:
+                face = mesh.polygons[triangle.polygon_index]
                 material = obj.material_slots[face.material_index].material if face.material_index < len(obj.material_slots) else None
                 key = material.as_pointer() if material else 0
                 if key not in material_cache:
@@ -115,7 +121,7 @@ def sample_water_depths(depsgraph: bpy.types.Depsgraph, waters: tuple[bpy.types.
                 if reason is not None:
                     reasons[reason] += 1
                     continue
-                accepted.append((face.index, tuple(face.vertices)))
+                accepted.append((face.index, tuple(triangle.vertices)))
             if not accepted:
                 continue
             start = len(vertices)
@@ -128,8 +134,8 @@ def sample_water_depths(depsgraph: bpy.types.Depsgraph, waters: tuple[bpy.types.
         finally:
             obj.to_mesh_clear()
     if not polygons:
-        raise ValueError(f"No opaque bottom geometry overlaps the selected water: exclusions={dict(reasons)}")
-    tree = BVHTree.FromPolygons(vertices, polygons)
+        raise WaterBottomGeometryMissing(f"No opaque bottom geometry overlaps the selected water: exclusions={dict(reasons)}")
+    tree = BVHTree.FromPolygons(vertices, polygons, all_triangles=True)
     rows: list[WaterDepthResult] = []
     for obj, positions in zip(waters, water_points, strict=True):
         hits: list[DepthHit | None] = []

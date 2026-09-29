@@ -112,9 +112,28 @@ def build_scene_exports(runtime_path: Path, canonical: Mapping[str, object], out
     environment = {**os.environ, "TEMP": str(temporary), "TMP": str(temporary), "PYTHONDONTWRITEBYTECODE": "1"}
     builder = Path(__file__).resolve().parent / "blender_export_prepared_scene.py"
     progress(0.0, "Checking exact scene resource dependencies for the complete selection")
-    preflight = prepare_scene_export_plan(runtime_path, canonical, output / "resource_preflight" / "scene_plan.json", check_cancelled)
-    resource_audit = ensure_scene_resources(runtime_path, preflight, check_cancelled,
-                                           lambda value, message: progress(value * 0.15, message))
+    attempted: set[str] = set()
+    passes: list[dict[str, object]] = []
+    while True:
+        check_cancelled()
+        preflight = prepare_scene_export_plan(
+            runtime_path, canonical,
+            output / "resource_preflight" / f"pass_{len(passes) + 1:02d}" / "scene_plan.json",
+            check_cancelled)
+        prepared = require_object(json.loads(preflight.read_text(encoding="utf-8")), "resource preflight")
+        requested = prepared.get("required_resource_paths")
+        if not isinstance(requested, list) or any(not isinstance(path, str) for path in requested):
+            raise ValueError("Resource preflight requires an array of exact resource paths")
+        discovered = set(cast(list[str], requested))
+        if passes and not discovered - attempted:
+            break
+        resource_audit = ensure_scene_resources(runtime_path, preflight, check_cancelled,
+                                               lambda value, message: progress(value * 0.15, message))
+        passes.append(resource_audit)
+        attempted.update(discovered)
+        if not discovered or resource_audit.get("missing") == []:
+            break
+    resource_audit = {**passes[-1], "dependencyPasses": passes}
     (output / "resource_preflight" / "resource_audit.json").write_text(json.dumps(resource_audit, indent=2), encoding="utf-8")
     batches = scene_batches(canonical)
     results: list[SceneArtifact] = []
