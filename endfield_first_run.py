@@ -603,13 +603,15 @@ def run() -> int:
 
         dependency_result: dict[str, Any]
         helper_source = helper_source_identity(SCRIPT_ROOT)
+        from endfield_scene_helpers import verified_helpers
         if args.skip_helper_bootstrap:
             dependency_result = {
                 "status": "skipped",
                 "reason": "--skip-helper-bootstrap",
             }
         elif (step_done("helper_dependencies") and
-              state["steps"]["helper_dependencies"]["outputs"].get("sourceIdentity") == helper_source):
+              verified_helpers(state["steps"]["helper_dependencies"]["outputs"],
+                               helper_source, run_root) is not None):
             dependency_result = state["steps"]["helper_dependencies"]["outputs"]
         else:
             emitter.emit(
@@ -626,6 +628,8 @@ def run() -> int:
                 str(dependency_workspace),
                 "--log-dir",
                 str(dependency_log),
+                "--output-root",
+                str(dependency_workspace / "builds" / dependency_log.name),
             ]
             if not args.skip_shader_diagnostics:
                 command.append("--include-shader-diagnostics")
@@ -645,6 +649,8 @@ def run() -> int:
             dependency_report = dependency_log / "dependency_bootstrap_report.json"
             if process.returncode == 0 and dependency_report.is_file():
                 payload = json.loads(dependency_report.read_text(encoding="utf-8"))
+                if verified_helpers(payload, helper_source, dependency_log) is None:
+                    raise FirstRunError("Compiled helpers differ from the current source; retry first-run preparation")
                 dependency_result = {
                     "status": "passed",
                     "sourceIdentity": helper_source,

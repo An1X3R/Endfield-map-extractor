@@ -10,11 +10,12 @@ import struct
 from collections import defaultdict
 from contextlib import closing
 from pathlib import Path
-from typing import Callable, Mapping, TypedDict, cast
+from typing import Callable, Mapping, NotRequired, TypedDict, cast
 
 from endfield_map_layer_contract import classify_entity, is_hlod_name
 from endfield_scene_material_contract import load_catalog, reference_key, resolve_export_path, supported_slots
 from endfield_scene_effects_plan import EffectInstance, build_effect_plan
+from endfield_scene_lights_plan import LightPlanRow, build_light_plan, validate_light_plan_rows
 from endfield_scene_slot_contract import (
     AmbiguousSubmeshSlots, RuntimeDraw, asset_name, primary_visible_mesh,
     runtime_submesh_slots,
@@ -76,6 +77,7 @@ class PlanInstance(TypedDict):
     submesh_slot_indices: list[int]
     material_refs: list[AssetRef | None]
     undrawn_submeshes: list[int]
+    serialized_draw_parameters: NotRequired[list[float] | None]
 
 
 class WaterMeshAssetPlan(TypedDict):
@@ -197,6 +199,7 @@ class SceneExportPlan(TypedDict):
     instances: list[PlanInstance]
     effect_instances: list[EffectInstance]
     effect_physics: EffectPhysicsPlan | None
+    light_instances: list[LightPlanRow]
     water_geometry: list[WaterGeometryPlanRow]
     water_materials: list[WaterMaterialPlanRow]
     pending: list[Pending]
@@ -426,7 +429,7 @@ def prepare_scene_export_plan(
     """Build exact rows from current ECS and available first-run SceneProbe exports."""
     from dataclasses import asdict, replace
 
-    from extract_scene_renderer_materials import component_columns, decode_draws, decode_pairs
+    from extract_scene_renderer_materials import component_columns, decode_draws, decode_pairs, serialized_draw_parameters
     from extractor_core.projected_decals import (
         build_path_id_index, decode_decal, read_chunk, rect_decal_records, streaming_records,
     )
@@ -584,13 +587,22 @@ def prepare_scene_export_plan(
             physics = read_physics_settings(game_root / "Endfield_Data" / "globalgamemanagers")
             effect_physics = {"source": physics.source, "source_sha256": physics.source_sha256,
                               "path_id": physics.path_id, "gravity": list(physics.gravity)}
-    for component, layer_name, group_names in (
-        ("lights", "lights", {"lighting", "all"}),
-    ):
-        if layers.get(layer_name) is True and groups & group_names:
-            pending.append({"entity_id": -1, "entity_base": "selection", "component": component,
-                            "reason": "component_plan_not_implemented",
-                            "detail": f"Selected {component} requires a separate verified component plan"})
+    light_instances: list[LightPlanRow] = []
+    selected_lights = 0
+    if layers.get("lights") is True and groups & {"lighting", "all"}:
+        from extractor_core.lights import read_native_lights_cached
+
+        light_inventory = read_native_lights_cached(vfs, path_hash, map_id,
+                                                    cache_root / "native_lights", check_cancelled)
+        light_plan = build_light_plan(light_inventory, bounds, selection)
+        light_instances.extend(light_plan.rows)
+        selected_lights = light_plan.selected_count
+        required_resources.update(light_plan.required_resource_paths)
+        for source, digest in light_plan.source_sha256:
+            previous = source_hashes.get(source)
+            if previous is not None and previous != digest:
+                raise ValueError(f"Light source SHA-256 conflicts with scene source: {source}")
+            source_hashes[source] = digest
     water_geometry_rows: list[WaterGeometryPlanRow] = []
     water_material_rows: list[WaterMaterialPlanRow] = []
     if water_selected:
@@ -783,7 +795,9 @@ def prepare_scene_export_plan(
                               "matrix": matrix, "mesh_path": mesh_path, "mesh_file": str(mesh_file),
                               "mesh_asset": mesh_asset, "renderer_pairs": active,
                               "submesh_slot_indices": list(mapping.indices), "material_refs": material_refs,
-                              "undrawn_submeshes": list(mapping.undrawn_submeshes)})
+                              "undrawn_submeshes": list(mapping.undrawn_submeshes),
+                              "serialized_draw_parameters": serialized_draw_parameters(renderer[18], cast(bytes, matrix_blob))
+                              if 18 in renderer else None})
             except (ValueError, AmbiguousSubmeshSlots) as error:
                 failures = pending if entity_id in visible_static else water_depth_pending
                 failures.append({"entity_id": cast(int, entity_id), "entity_base": cast(str, base),
@@ -826,6 +840,7 @@ def prepare_scene_export_plan(
         "terrain_details": [],
         "decal_manifest": str(decal_path), "decal_materials": str(decal_material_path),
         "instances": ready, "effect_instances": effect_instances, "effect_physics": effect_physics,
+        "light_instances": light_instances,
         "water_geometry": water_geometry_rows,
         "water_materials": water_material_rows, "pending": pending, "source_sha256": source_hashes,
         "required_resource_paths": sorted(required_resources),
@@ -834,6 +849,7 @@ def prepare_scene_export_plan(
                     "excluded_hlod": excluded_hlod,
                     "ready_static": len(ready),
                     "selected_effects": selected_effects, "ready_effects": len(effect_instances),
+                    "selected_lights": selected_lights, "ready_lights": len(light_instances),
                     "selected_decals": len(selected_decals), "ready_decals": len(decal_rows), "pending": len(pending)},
     }
     decal_payload = {"format": "EndfieldProjectedDecals/1", "instances_db": str(instance_db),
@@ -866,6 +882,7 @@ def load_scene_export_plan(path: Path) -> SceneExportPlan:
     source.setdefault("water_depth_pending", [])
     source.setdefault("effect_instances", [])
     source.setdefault("effect_physics", None)
+    source.setdefault("light_instances", [])
     _bounds(source.get("bounds"))
     for name in ("scene_manifests", "terrain_surfaces", "water_depth_surfaces", "instances", "pending", "category_filter"):
         _list(source.get(name), f"scene export plan.{name}")
@@ -891,6 +908,7 @@ def load_scene_export_plan(path: Path) -> SceneExportPlan:
         if not isinstance(digest, str) or len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
             raise ValueError(f"Invalid source SHA-256: source={name}")
     seen: set[int] = set()
+    validate_light_plan_rows(source["light_instances"], str(source["map_id"]), hashes)
     for value in (*_list(source["instances"], "scene export instances"),
                   *_list(source["water_depth_instances"], "scene export water depth instances")):
         row = _object(value, "scene export instance")
@@ -915,6 +933,11 @@ def load_scene_export_plan(path: Path) -> SceneExportPlan:
         matrix = _list(row.get("matrix"), "scene matrix")
         if len(matrix) != 16 or any(type(value) not in (int, float) or not math.isfinite(float(value)) for value in matrix):
             raise ValueError(f"Scene instance has invalid 16-float matrix: entity_id={entity_id}")
+        parameters = row.get("serialized_draw_parameters")
+        if parameters is not None:
+            parameters = _list(parameters, "serialized draw parameters")
+            if len(parameters) != 20 or any(type(value) not in (int, float) or not math.isfinite(float(value)) for value in parameters):
+                raise ValueError(f"Scene instance has invalid 20-float draw parameters: entity_id={entity_id}")
         refs = _list(row.get("material_refs"), "scene material_refs")
         slots = _list(row.get("submesh_slot_indices"), "scene submesh_slot_indices")
         if len(refs) != len(slots) or not refs:

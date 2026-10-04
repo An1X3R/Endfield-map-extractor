@@ -10,6 +10,7 @@ internal static partial class Program
     {
         var initial = ModuleField<OrderedDictionary>(fields, "InitialModule", "ParticleSystem", owner);
         var emission = ModuleField<OrderedDictionary>(fields, "EmissionModule", "ParticleSystem", owner);
+        var velocity = ModuleField<OrderedDictionary>(fields, "VelocityModule", "ParticleSystem", owner);
         var shape = ReadParticleShape(
             ModuleField<OrderedDictionary>(fields, "ShapeModule", "ParticleSystem", owner), owner);
         var size = ReadParticleSize(
@@ -23,11 +24,12 @@ internal static partial class Program
         var uv = ReadParticleUv(
             ModuleField<OrderedDictionary>(fields, "UVModule", "ParticleSystem", owner), owner);
         return (new ParticleModuleParameters(
-            4, "serialized_initial_emission_shape_size_color_trail_custom_data_uv_no_simulation",
+            5, "serialized_initial_emission_shape_size_color_trail_custom_data_uv_velocity_no_simulation",
             ReadParticleInitial(initial, owner),
             ReadParticleEmission(emission, owner),
             "serialized_parameters_no_simulation",
-            shape.Parameters, size, color, trail, customData, uv),
+            shape.Parameters, size, color, trail, customData, uv,
+            ReadParticleVelocity(velocity, owner)),
             shape.Meshes, shape.Textures);
     }
 
@@ -98,6 +100,28 @@ internal static partial class Program
                 "EmissionModule.rateOverDistance", owner),
             burstCount, bursts);
     }
+
+    private static ParticleVelocityParameters ReadParticleVelocity(OrderedDictionary module, Object owner) =>
+        new(
+            ModuleField<bool>(module, "enabled", "VelocityModule", owner),
+            ReadParticleVelocityCurve(module, "x", owner),
+            ReadParticleVelocityCurve(module, "y", owner),
+            ReadParticleVelocityCurve(module, "z", owner),
+            ReadParticleVelocityCurve(module, "orbitalX", owner),
+            ReadParticleVelocityCurve(module, "orbitalY", owner),
+            ReadParticleVelocityCurve(module, "orbitalZ", owner),
+            ReadParticleVelocityCurve(module, "orbitalOffsetX", owner),
+            ReadParticleVelocityCurve(module, "orbitalOffsetY", owner),
+            ReadParticleVelocityCurve(module, "orbitalOffsetZ", owner),
+            ReadParticleVelocityCurve(module, "radial", owner),
+            ReadParticleVelocityCurve(module, "speedModifier", owner),
+            ModuleField<bool>(module, "inWorldSpace", "VelocityModule", owner));
+
+    private static ParticleMinMaxCurve ReadParticleVelocityCurve(
+        OrderedDictionary module, string name, Object owner) =>
+        ReadParticleMinMaxCurve(
+            ModuleField<OrderedDictionary>(module, name, "VelocityModule", owner),
+            $"VelocityModule.{name}", owner);
 
     private static ParticleMinMaxCurve ReadParticleMinMaxCurve(
         OrderedDictionary fields, string context, Object owner) =>
@@ -234,7 +258,8 @@ internal sealed record ParticleModuleParameters(
     ParticleColorOverLifetimeParameters ColorOverLifetime,
     ParticleTrailParameters Trail,
     ParticleCustomDataParameters CustomData,
-    ParticleUvParameters Uv);
+    ParticleUvParameters Uv,
+    ParticleVelocityParameters VelocityOverLifetime);
 internal sealed record ParticleInitialParameters(
     ParticleMinMaxCurve StartLifetime, ParticleMinMaxCurve StartSpeed,
     ParticleMinMaxCurve StartSize, ParticleMinMaxCurve StartSizeY, ParticleMinMaxCurve StartSizeZ,
@@ -247,6 +272,13 @@ internal sealed record ParticleEmissionParameters(
     int BurstCount, ParticleEmissionBurst[] Bursts);
 internal sealed record ParticleEmissionBurst(
     float Time, ParticleMinMaxCurve CountCurve, int CycleCount, float RepeatInterval, float Probability);
+internal sealed record ParticleVelocityParameters(
+    bool Enabled,
+    ParticleMinMaxCurve X, ParticleMinMaxCurve Y, ParticleMinMaxCurve Z,
+    ParticleMinMaxCurve OrbitalX, ParticleMinMaxCurve OrbitalY, ParticleMinMaxCurve OrbitalZ,
+    ParticleMinMaxCurve OrbitalOffsetX, ParticleMinMaxCurve OrbitalOffsetY, ParticleMinMaxCurve OrbitalOffsetZ,
+    ParticleMinMaxCurve Radial, ParticleMinMaxCurve SpeedModifier,
+    bool InWorldSpace);
 internal sealed record ParticleMinMaxCurve(
     ushort MinMaxState, float Scalar, float MinScalar, ParticleCurve MaxCurve, ParticleCurve MinCurve);
 internal sealed record ParticleCurve(

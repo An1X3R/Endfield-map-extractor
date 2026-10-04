@@ -27,6 +27,54 @@ class WaterBuildRecord(TypedDict):
     missing_bottom_vertices: int
 
 
+def normalize_water_surface(obj: bpy.types.Object) -> None:
+    """Remove exact coincident face copies and collapsed faces before shore clipping."""
+    mesh = bmesh.new()
+    try:
+        mesh.from_mesh(obj.data)
+        mesh.normal_update()
+        normal_matrix = obj.matrix_world.inverted().transposed().to_3x3()
+        representatives: dict[tuple[tuple[float, float, float], ...], bmesh.types.BMFace] = {}
+        removed: list[bmesh.types.BMFace] = []
+        for face in mesh.faces:
+            if face.calc_area() == 0.0:
+                removed.append(face)
+                continue
+            ring = tuple(tuple(vertex.co) for vertex in face.verts)
+            reverse = tuple(reversed(ring))
+            key = min(sequence[index:] + sequence[:index]
+                      for sequence in (ring, reverse) for index in range(len(ring)))
+            prior = representatives.get(key)
+            if prior is None:
+                representatives[key] = face
+                continue
+            if prior.material_index != face.material_index:
+                raise ValueError(f"WATER_COINCIDENT_MATERIAL_CONFLICT object={obj.name}")
+            if prior.normal.dot(face.normal) > 0.0:
+                for layer in mesh.loops.layers.uv.values():
+                    prior_uv = {tuple(loop.vert.co): tuple(loop[layer].uv) for loop in prior.loops}
+                    face_uv = {tuple(loop.vert.co): tuple(loop[layer].uv) for loop in face.loops}
+                    if prior_uv != face_uv:
+                        raise ValueError(f"WATER_COINCIDENT_UV_CONFLICT object={obj.name}")
+            # Opposite faces of a flattened shell cover the same optical surface.
+            # Keep the existing upward side and its corner UVs, never average them.
+            if (normal_matrix @ face.normal).z > (normal_matrix @ prior.normal).z:
+                representatives[key] = face
+                removed.append(prior)
+            else:
+                removed.append(face)
+        if removed:
+            bmesh.ops.delete(mesh, geom=removed, context="FACES_ONLY")
+            loose = [vertex for vertex in mesh.verts if not vertex.link_faces]
+            if loose:
+                bmesh.ops.delete(mesh, geom=loose, context="VERTS")
+            mesh.to_mesh(obj.data)
+            obj.data.update()
+        obj["endfield_water_removed_coincident_or_collapsed_faces"] = len(removed)
+    finally:
+        mesh.free()
+
+
 def clip_water_surface(obj: bpy.types.Object, bounds: Mapping[str, float]) -> bool:
     """Clip a private mesh copy in world space; adjacent batches share boundaries."""
     obj.data.transform(obj.matrix_world)
@@ -133,6 +181,7 @@ def build_scene_water(
             prior.objects.unlink(obj)
         collection.objects.link(obj)
         obj.matrix_world = unity_matrix(struct.pack("<16f", *matrix))
+        normalize_water_surface(obj)
         if not clip_water_surface(obj, bounds):
             results.append({"entity_id": entity, "status": "outside_clipped_mesh",
                             "detail": "Source bounds intersect the selection but actual mesh faces do not",
@@ -158,13 +207,16 @@ def build_scene_water(
         bpy.context.evaluated_depsgraph_get(), tuple(obj for _, obj in objects))
     heightfields = tuple(obj for obj in bpy.context.scene.objects
                          if obj.type == "MESH" and obj.get("endfield_source_heightfield") is True)
+    from blender_scene_water_shore import WaterShoreIndex, prepare_water_shore_index, clip_water_to_prepared_heightfield
+
+    shore_index: WaterShoreIndex | None = None
     shore_changed = False
     retained: list[tuple[int, bpy.types.Object]] = []
     for (entity, obj), depth in zip(objects, depth_audit.waters, strict=True):
         if heightfields and any(hit is None for hit in depth.hits):
-            from blender_scene_water_shore import clip_water_to_heightfield
-
-            clipped = clip_water_to_heightfield(obj, heightfields, 0.02)
+            if shore_index is None:
+                shore_index = prepare_water_shore_index(heightfields)
+            clipped = clip_water_to_prepared_heightfield(obj, shore_index, 0.02)
             if clipped:
                 shore_changed = True
                 if not obj.data.polygons:

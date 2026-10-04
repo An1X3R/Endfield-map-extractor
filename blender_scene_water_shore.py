@@ -1,10 +1,11 @@
 """Clip submerged source water against verified terrain heightfield triangles."""
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 import math
 import struct
+from types import MappingProxyType
 
 import bpy
 from mathutils import Matrix, Vector
@@ -28,6 +29,12 @@ class _TerrainTriangle:
     xy: tuple[tuple[float, float], ...]
     bounds: tuple[float, float, float, float]
     plane: tuple[float, float, float]
+
+
+@dataclass(frozen=True)
+class WaterShoreIndex:
+    terrain: tuple[_TerrainTriangle, ...]
+    buckets: Mapping[tuple[int, int], tuple[int, ...]]
 
 
 def _area(polygon: tuple[_Vertex, ...]) -> float:
@@ -119,8 +126,19 @@ def _buckets(triangles: tuple[_TerrainTriangle, ...]) -> dict[tuple[int, int], t
     return {key: tuple(value) for key, value in index.items()}
 
 
+def prepare_water_shore_index(
+    terrain_objects: tuple[bpy.types.Object, ...]
+) -> WaterShoreIndex:
+    """Build immutable terrain geometry and its spatial index once for many waters."""
+    if not isinstance(terrain_objects, tuple):
+        raise ValueError("WATER_SHORE_TERRAIN_OBJECTS_MUST_BE_TUPLE")
+    terrain = _terrain_triangles(terrain_objects) if terrain_objects else ()
+    buckets = _buckets(terrain) if terrain else {}
+    return WaterShoreIndex(terrain, MappingProxyType(buckets))
+
+
 def _candidates(
-    polygon: tuple[_Vertex, ...], index: dict[tuple[int, int], tuple[int, ...]]
+    polygon: tuple[_Vertex, ...], index: Mapping[tuple[int, int], tuple[int, ...]]
 ) -> tuple[int, ...]:
     xmin, xmax, ymin, ymax = _triangle_bounds(tuple((vertex.x, vertex.y) for vertex in polygon))
     return tuple(sorted({number
@@ -168,7 +186,7 @@ def _water_triangles(obj: bpy.types.Object) -> tuple[tuple[tuple[_Vertex, ...], 
 
 def _pieces(
     polygon: tuple[_Vertex, ...], terrain: tuple[_TerrainTriangle, ...],
-    index: dict[tuple[int, int], tuple[int, ...]], clearance: float,
+    index: Mapping[tuple[int, int], tuple[int, ...]], clearance: float,
 ) -> tuple[tuple[tuple[_Vertex, ...], ...], bool]:
     uncovered = [polygon]
     kept: list[tuple[_Vertex, ...]] = []
@@ -243,29 +261,52 @@ def _replace_mesh(
         bpy.data.meshes.remove(original)
 
 
-def clip_water_to_heightfield(
-    obj: bpy.types.Object, terrain_objects: tuple[bpy.types.Object, ...], clearance: float
-) -> int:
-    """Remove only terrain-covered dry fragments; retain regions without terrain data."""
-    if obj.type != "MESH" or obj.data.users != 1 or not isinstance(terrain_objects, tuple):
+def _validate_water_clip(obj: bpy.types.Object, clearance: float) -> None:
+    if obj.type != "MESH" or obj.data.users != 1:
         raise ValueError(f"WATER_SHORE_PRIVATE_MESH_REQUIRED object={obj.name}")
     if not math.isfinite(clearance) or clearance <= 0:
         raise ValueError(f"WATER_SHORE_CLEARANCE_INVALID value={clearance}")
-    if not terrain_objects or not obj.data.polygons:
+
+
+def _clip_water_with_index(
+    obj: bpy.types.Object, shore_index: WaterShoreIndex, clearance: float
+) -> int:
+    if not obj.data.polygons:
         return 0
     if any(abs(obj.matrix_world[row][column] - Matrix.Identity(4)[row][column]) > 1e-8
            for row in range(4) for column in range(4)):
         raise ValueError(f"WATER_SHORE_WORLD_MESH_REQUIRED object={obj.name}")
-    terrain = _terrain_triangles(terrain_objects)
-    if not terrain:
+    if not shore_index.terrain:
         return 0
-    index = _buckets(terrain)
     faces: list[tuple[tuple[_Vertex, ...], int]] = []
     cut = 0
     for polygon, material_index in _water_triangles(obj):
-        fragments, dry = _pieces(polygon, terrain, index, clearance)
+        fragments, dry = _pieces(polygon, shore_index.terrain, shore_index.buckets, clearance)
         faces.extend((fragment, material_index) for fragment in fragments)
         cut += int(dry)
     if cut:
         _replace_mesh(obj, tuple(faces))
     return cut
+
+
+def clip_water_to_prepared_heightfield(
+    obj: bpy.types.Object, shore_index: WaterShoreIndex, clearance: float
+) -> int:
+    """Clip one water mesh using terrain geometry prepared for reuse."""
+    if not isinstance(shore_index, WaterShoreIndex):
+        raise ValueError("WATER_SHORE_PREPARED_INDEX_REQUIRED")
+    _validate_water_clip(obj, clearance)
+    return _clip_water_with_index(obj, shore_index, clearance)
+
+
+def clip_water_to_heightfield(
+    obj: bpy.types.Object, terrain_objects: tuple[bpy.types.Object, ...], clearance: float
+) -> int:
+    """Remove only terrain-covered dry fragments; retain regions without terrain data."""
+    if not isinstance(terrain_objects, tuple):
+        raise ValueError(f"WATER_SHORE_PRIVATE_MESH_REQUIRED object={obj.name}")
+    _validate_water_clip(obj, clearance)
+    if not terrain_objects or not obj.data.polygons:
+        return 0
+    shore_index = prepare_water_shore_index(terrain_objects)
+    return _clip_water_with_index(obj, shore_index, clearance)

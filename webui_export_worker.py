@@ -440,7 +440,7 @@ class ExportCoordinator:
                 }
                 warnings = [warning for warning in warnings if "does not contain terrain mesh" not in warning]
                 if blender_build["pending"]:
-                    warnings.append(f"Scene reports retain {blender_build['pending']} unresolved resources; inspect scene_plan.json and scene_audit.json")
+                    warnings.append(f"Scene reports retain {blender_build['pending']} pending items, including missing resources, unsupported features and partial previews; inspect scene_plan.json and scene_audit.json")
 
             export_manifest = {
                 "format": "EndfieldWebUIRegionExport/1",

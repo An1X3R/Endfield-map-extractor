@@ -182,12 +182,12 @@ const JOB_PHASES = [
   ['AUDIT', '校验输出文件', 91],
 ] as const
 
-const RECONSTRUCTABLE_BLEND_GROUPS = ['building', 'prop', 'vegetation', 'terrain', 'road', 'unknown']
+const RECONSTRUCTABLE_BLEND_GROUPS = ['building', 'prop', 'vegetation', 'terrain', 'road', 'unknown', 'water', 'effects', 'particle', 'lighting']
 const EXPORT_GROUP_NOTES: Record<string, string> = {
-  lighting: '仅数据记录',
-  particle: '仅数据记录',
-  water: '自动绑定待接入',
-  effects: '场景重建待接入',
+  lighting: '原生灯光预览 · 亮度待校准',
+  particle: '静态预览 · 部分组件支持',
+  water: '双引擎重建 · 部分效果近似',
+  effects: '静态预览 · 部分组件支持',
 }
 
 type LaunchState = 'idle' | 'running' | 'completed' | 'cancelled' | 'failed'
@@ -1005,7 +1005,7 @@ export default function App() {
     if (!allGroupsSelected && selectedGroups.length === 0) return '至少选择一个导出分组'
     if (exportMode === 'blend' && !sourcePaths.blender.trim()) return 'Blender 场景模式需要选择本机 Blender 4.4 或更新版本'
     if (exportMode === 'blend' && !allGroupsSelected && !selectedGroups.some((group) => RECONSTRUCTABLE_BLEND_GROUPS.includes(group))) {
-      return '当前分组只有待接入组件，无法生成场景；请选择建筑、道具、植被、地形、道路或未知 / 其它'
+      return '当前分组无法生成场景，请选择可重建的导出分组'
     }
     if (!outputLabel.trim()) return '请填写输出标签'
     return '所有前置条件已完成'
@@ -1728,8 +1728,8 @@ export default function App() {
                   <ChevronDown size={13} />
                 </div>
                 <small>{exportMode === 'blend'
-                  ? '从本机缓存构建并验证 .blend；未解析资源留在报告。'
-                  : '按所选范围生成审计数据包；水体选项仅作为 metadata 保存。'}</small>
+                  ? '从本机缓存构建并重开校验 .blend；待处理项包含缺失资源、未支持组件与近似预览，不等于同数量的资产缺失。'
+                  : '按所选范围生成审计数据包，不构建 Blender 场景；水体模式仅记录为导出参数。'}</small>
               </label>
 
               <div className="setting-block">
@@ -1743,12 +1743,12 @@ export default function App() {
                 >
                   <span>{allGroupsSelected && <Check size={9} />}</span>
                   <strong>全部分组</strong>
-                  <small>默认 · 含未接入项报告</small>
+                  <small>默认 · 保留限制与待处理报告</small>
                 </button>
                 <div className="export-grid">
                   {EXPORT_GROUPS.map(([id, label, code]) => {
                     const active = !allGroupsSelected && selectedGroups.includes(id)
-                    const note = EXPORT_GROUP_NOTES[id]
+                    const note = exportMode === 'blend' ? EXPORT_GROUP_NOTES[id] : undefined
                     return (
                       <button
                         key={id}
@@ -1782,15 +1782,17 @@ export default function App() {
                   </div>
                 </label>
                 <label>
-                  <span><Waves size={12} />水体模式 · {exportMode === 'blend' ? '场景自动绑定待接入' : '仅记录 metadata'}</span>
+                  <span><Waves size={12} />水体模式 · {exportMode === 'blend' ? '按源配置自动重建' : '仅记录导出参数'}</span>
                   <div className="select-shell">
-                    <select value={waterMode} onChange={(event) => setWaterMode(event.target.value)} disabled={exportMode === 'blend' || launchState === 'running'}>
-                      <option value="stable_eevee">stable_eevee</option>
-                      <option value="flowmap_fresnel">flowmap_fresnel</option>
+                    <select data-testid="water-mode" value={exportMode === 'blend' ? 'automatic' : waterMode} onChange={(event) => setWaterMode(event.target.value)} disabled={exportMode === 'blend' || launchState === 'running'}>
+                      {exportMode === 'blend' ? <option value="automatic">自动重建 · Eevee / Cycles</option> : <>
+                        <option value="stable_eevee">稳定水面（记录参数）</option>
+                        <option value="flowmap_fresnel">流动水面（记录参数）</option>
+                      </>}
                     </select>
                     <ChevronDown size={13} />
                   </div>
-                  {exportMode === 'blend' && <small>地图水体自动绑定尚未接入；当前会把它列入待处理报告。</small>}
+                  {exportMode === 'blend' && <small>选择水体分组后，按真实水面与配置构建。泡沫、焦散和交互等效果尚未完整还原。</small>}
                 </label>
               </div>
               <label className="full-field">
@@ -1802,6 +1804,11 @@ export default function App() {
                   <ChevronDown size={13} />
                 </div>
               </label>
+              {exportMode === 'blend' && <div className="full-field" data-testid="export-capability-notes">
+                <span>当前效果与限制</span>
+                <small>粒子与特效导出固定时刻的静态预览，仅支持部分组件。复杂环绕流带、烟雾等可能缺失或与游戏不同；动态特效仍属实验能力，尚未接入此界面。</small>
+                <small>灯光亮度、启停与特殊光源仍有差异；部分扫光缺少游戏运行状态。水体、灯光与材质支持 Eevee / Cycles，但不保证两引擎或游戏画面完全一致。</small>
+              </div>}
               <label className="full-field">
                 <span>输出标签</span>
                 <input data-testid="output-label" value={outputLabel} onChange={(event) => setOutputLabel(event.target.value)} />
@@ -1893,7 +1900,7 @@ export default function App() {
                 ? jobError || '后端任务失败，请检查本机日志'
                 : isReady
                   ? exportMode === 'blend'
-                    ? '场景由本机首次准备缓存构建；未解析资源和待接入组件会保留在报告。'
+                    ? '场景由本机缓存构建；未解析资源、未支持组件与近似效果会保留在报告。校验通过不代表完整游戏还原。'
                     : '将按所选分组生成审计数据包；预览图层开关会影响导出内容。'
                   : sourceReady
                     ? '完成地图框选和导出设置后解锁。'

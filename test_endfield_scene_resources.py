@@ -27,6 +27,43 @@ FINGERPRINT = "a1" * 32
 
 
 class SceneResourceIntegrationTests(unittest.TestCase):
+    def test_mapped_sweep_cache_requires_source_texture_color_space(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifest = root / "scene_manifest.json"
+            texture = {"Source": "CAB-texture", "PathId": 3}
+            material = {
+                "Source": "CAB-material", "PathId": 2, "Name": "sweep",
+                "Shader": {"Source": "cab-93483c2cb844b6b343af0950ad4630ad",
+                           "PathId": 5324015590718682574},
+                "Floats": {"_EmissiveMaskChannel": 0, "_EmissiveUVSet": 0,
+                           "_EnableEmissiveAnimSweep": 1}, "Colors": {},
+                "RenderState": {"ValidKeywords": ["_EMISSIVE_MAP", "_EMISSIVE_ANIM_SWEEP"],
+                                "DisabledShaderPasses": [], "CustomRenderQueue": -1},
+                "Textures": [{"Property": "_EmissiveMap", "Texture": texture,
+                              "Scale": [1, 1], "Offset": [0, 0]}],
+            }
+            container = "assets/materials/sweep.mat"
+            payload = {"Format": "EndfieldSceneProbe/1", "Materials": [material],
+                       "Containers": [{"Container": container, "Asset": {
+                           "Source": "CAB-material", "PathId": 2, "Type": "Material"}}],
+                       "MeshExports": [], "TextureExports": [{"Asset": texture, "File": "map.png"}]}
+            (root / "map.png").write_bytes(b"texture payload")
+            manifest.write_text(json.dumps(payload), encoding="utf-8")
+            self.assertNotIn(container, ready_resource_paths((manifest,)))
+            supplement = root / "supplement.json"
+            for color_space in (0, 1):
+                evidence = {"Format": "EndfieldSceneProbe/1", "Materials": [], "Containers": [],
+                            "MeshExports": [], "TextureExports": [{
+                                "Asset": {**texture, "ColorSpace": color_space}, "File": "map.png"}]}
+                supplement.write_text(json.dumps(evidence), encoding="utf-8")
+                self.assertIn(container, ready_resource_paths((manifest, supplement)))
+            legacy_material = {key: value for key, value in material.items() if key != "RenderState"}
+            manifest.write_text(json.dumps({**payload, "Materials": [legacy_material]}), encoding="utf-8")
+            self.assertNotIn(container, ready_resource_paths((manifest, supplement)))
+            supplement.write_text(json.dumps({**evidence, "Materials": [material]}), encoding="utf-8")
+            self.assertIn(container, ready_resource_paths((manifest, supplement)))
+
     def test_probed_prefab_is_ready_even_without_particle_pairs(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             manifest = Path(temporary) / "scene_manifest.json"

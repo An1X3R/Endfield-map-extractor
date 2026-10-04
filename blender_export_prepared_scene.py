@@ -24,6 +24,8 @@ from endfield_scene_export_plan import load_scene_export_plan, PlanInstance
 
 TERRAIN_SAMPLER_BUDGET = 24
 EFFECT_SNAPSHOT_AGE_SECONDS = 2.1
+LIGHT_PREVIEW_PUNCTUAL_WATTS_PER_SOURCE_INTENSITY = 1.0
+LIGHT_PREVIEW_SUN_WATTS_PER_SQUARE_METER_PER_SOURCE_INTENSITY = 1.0
 
 
 def undrawn_material() -> bpy.types.Material:
@@ -46,11 +48,15 @@ def mesh_identity(row: PlanInstance) -> str:
 
 
 def scene_signature() -> dict[str, str]:
-    """Record geometry, UVs, particle colors, transforms and slots before saving."""
+    """Record geometry, attributes, transforms, slots and light settings before saving."""
     signatures = {}
     for obj in bpy.context.scene.objects:
         digest = hashlib.sha256()
         digest.update(str(tuple(tuple(row) for row in obj.matrix_world)).encode())
+        if "endfield_draw_parameters_status" in obj:
+            digest.update(obj["endfield_draw_parameters_status"].encode())
+            if "endfield_serialized_draw_parameters" in obj:
+                digest.update(struct.pack("<20f", *obj["endfield_serialized_draw_parameters"]))
         if obj.type == "MESH":
             for vertex in obj.data.vertices:
                 digest.update(struct.pack("<3f", *vertex.co))
@@ -63,7 +69,34 @@ def scene_signature() -> dict[str, str]:
                 digest.update(str((attribute.name, attribute.domain, attribute.data_type)).encode())
                 for value in attribute.data:
                     digest.update(struct.pack("<4f", *value.color))
+            origin = obj.data.attributes.get("endfield_receiver_world_origin")
+            if origin is not None:
+                digest.update(str((origin.name, origin.domain, origin.data_type)).encode())
+                for value in origin.data:
+                    digest.update(struct.pack("<3f", *value.vector))
             digest.update(str(tuple(material.name if material else None for material in obj.data.materials)).encode())
+        elif obj.type == "LIGHT":
+            data = obj.data
+            values = {"type": data.type, "color": tuple(data.color), "energy": data.energy,
+                      "use_shadow": data.use_shadow, "use_nodes": data.use_nodes}
+            for name in ("use_custom_distance", "cutoff_distance", "spot_size", "spot_blend",
+                         "shadow_soft_size", "angle", "shape", "size", "size_y"):
+                if hasattr(data, name):
+                    values[name] = getattr(data, name)
+            digest.update(json.dumps(values, sort_keys=True).encode())
+            if data.use_nodes and data.node_tree is not None:
+                for node in sorted(data.node_tree.nodes, key=lambda item: item.name):
+                    if node.type == "FRAME":
+                        continue
+                    digest.update(str((node.name, node.bl_idname, getattr(node, "operation", None))).encode())
+                    for socket in node.inputs:
+                        if hasattr(socket, "default_value"):
+                            value = socket.default_value
+                            serialized = value if isinstance(value, (int, float, str, bool)) else tuple(value)
+                            digest.update(str((socket.identifier, serialized)).encode())
+                digest.update(str(sorted((link.from_node.name, link.from_socket.identifier,
+                                          link.to_node.name, link.to_socket.identifier)
+                                         for link in data.node_tree.links)).encode())
         signatures[obj.name] = digest.hexdigest()
     return signatures
 
@@ -184,6 +217,11 @@ def build_instances(
         obj["endfield_source_mesh"] = json.dumps(row["mesh_asset"])
         obj["endfield_material_refs"] = json.dumps(row["material_refs"])
         obj["endfield_category"] = row["category"]
+        parameters = row.get("serialized_draw_parameters")
+        obj["endfield_draw_parameters_status"] = (
+            "serialized_initial_not_runtime" if parameters is not None else "unavailable_in_plan")
+        if parameters is not None:
+            obj["endfield_serialized_draw_parameters"] = parameters
 
 
 def effect_preview_camera(instances: Sequence[Mapping[str, object]], scene: bpy.types.Scene) -> bpy.types.Object:
@@ -212,13 +250,20 @@ def build_effect_previews(plan: Mapping[str, object], materials: dict[tuple[str,
                           textures: dict[tuple[str, int], tuple[Path, str]]) -> list[dict[str, object]]:
     """Use source materials and report unsupported FX components separately."""
     from blender_scene_effects import build_scene_effects
-    from blender_scene_effect_materials import make_effect_material
+    from blender_scene_effect_meshes import build_scene_effect_meshes
+    from blender_scene_effect_materials import make_effect_material, make_mesh_effect_material
 
     instances = plan.get("effect_instances", [])
     if not isinstance(instances, list):
         raise ValueError("Scene effect_instances must be an array")
     if not instances:
         return []
+    for instance in instances:
+        if not isinstance(instance, dict) or instance.get("component_kind", "particle") not in (
+                "particle", "mesh_renderer", "mixed"):
+            raise ValueError(f"Scene effect has an invalid component kind: instance={instance}")
+    particle_instances = [row for row in instances if row.get("component_kind", "particle") != "mesh_renderer"]
+    mesh_instances = [row for row in instances if row.get("component_kind", "particle") != "particle"]
     age = EFFECT_SNAPSHOT_AGE_SECONDS
     scene = bpy.context.scene
     collection = bpy.data.collections.new("Endfield_Effects_Static_Preview")
@@ -235,16 +280,27 @@ def build_effect_previews(plan: Mapping[str, object], materials: dict[tuple[str,
             raise ValueError(f"Particle renderer vertex streams must be an integer array: reference={identity}")
         return make_effect_material(materials[identity], textures, age, tuple(streams))
 
+    def mesh_material_factory(reference: Mapping[str, object], node: Mapping[str, object],
+                              vertex_color_components: int) -> bpy.types.Material:
+        identity = reference_key(reference)
+        if identity not in materials:
+            raise FileNotFoundError(f"MeshRenderer FX material was not extracted: reference={identity}")
+        return make_mesh_effect_material(materials[identity], textures, age, vertex_color_components)
+
     scene["endfield_fx_snapshot_age_seconds"] = age
     scene["endfield_fx_snapshot_contract"] = "EndfieldStaticParticlePreview/1"
-    physics = plan.get("effect_physics")
-    if not isinstance(physics, dict):
-        raise ValueError("Effect previews require captured game physics; regenerate the scene plan")
-    gravity = physics.get("gravity")
-    if not isinstance(gravity, list) or len(gravity) != 3:
-        raise ValueError("Effect physics gravity must be a Unity Vector3")
-    return build_scene_effects(instances, collection, material_factory, age, camera, 2000, 100000,
-                               tuple(float(component) for component in gravity))
+    audit: list[dict[str, object]] = []
+    if particle_instances:
+        physics = plan.get("effect_physics")
+        if not isinstance(physics, dict):
+            raise ValueError("Effect previews require captured game physics; regenerate the scene plan")
+        gravity = physics.get("gravity")
+        if not isinstance(gravity, list) or len(gravity) != 3:
+            raise ValueError("Effect physics gravity must be a Unity Vector3")
+        audit.extend(build_scene_effects(particle_instances, collection, material_factory, age, camera,
+                                        2000, 100000, tuple(float(component) for component in gravity)))
+    audit.extend(build_scene_effect_meshes(mesh_instances, collection, mesh_material_factory, 2000, age, camera))
+    return audit
 
 
 def main() -> None:
@@ -322,10 +378,23 @@ def main() -> None:
         if image.users == 0:
             bpy.data.images.remove(image)
     effects = build_effect_previews(plan, materials, textures)
+    from blender_scene_lights import build_scene_lights
+
+    light_collection = bpy.data.collections.new("Endfield_Lights_Preview")
+    scene.collection.children.link(light_collection)
+    lights = build_scene_lights(plan["light_instances"], light_collection,
+                                LIGHT_PREVIEW_PUNCTUAL_WATTS_PER_SOURCE_INTENSITY,
+                                LIGHT_PREVIEW_SUN_WATTS_PER_SQUARE_METER_PER_SOURCE_INTENSITY, 4096)
+    material_pending = [{"material": material.name, "component": "emission_sweep",
+                         "reason": material["endfield_emissive_motion_reason"],
+                         "status": material["endfield_emissive_motion_status"]}
+                        for material in bpy.data.materials if material.users
+                        and material.get("endfield_emissive_motion_status") in (
+                            "unsupported_sweep_variant", "source_formula_preview_runtime_unresolved")]
     terrain_sampler_audit = audit_terrain_sampler_budget(bpy.context.scene)
     layout_trees = layout_shader_node_trees(tuple(
-        material.node_tree for material in bpy.data.materials
-        if material.use_nodes and material.users and material.node_tree is not None
+        data.node_tree for data in (*bpy.data.materials, *bpy.data.lights)
+        if data.use_nodes and data.users and data.node_tree is not None
     ))
     for image in bpy.data.images:
         if image.source == "FILE" and image.users and not image.packed_file:
@@ -341,15 +410,16 @@ def main() -> None:
                       if row["entity_id"] not in outside_water or row["component"] != "water_materials"]
     pending = (len(active_pending) + sum(row["status"] != "restored" for row in decals)
                + sum(row["status"] not in ("restored", "outside_clipped_mesh", "covered_by_terrain") for row in water)
-               + sum(row["status"] not in ("static_preview", "renderer_disabled", "no_alive_particles_at_snapshot") for row in effects))
+               + sum(row["status"] not in ("static_preview", "renderer_disabled", "game_object_inactive", "no_alive_particles_at_snapshot") for row in effects)
+               + len(lights) + len(material_pending))
     scene["endfield_unresolved_resources"] = pending
     scene["endfield_source_axis"] = "Blender (X,Y,Z) = Unity (X,-Z,Y)"
-    empty = not any(obj.type == "MESH" and obj.data.polygons for obj in scene.objects)
+    empty = not any((obj.type == "MESH" and obj.data.polygons) or obj.type == "LIGHT" for obj in scene.objects)
     if empty and (pending or set(plan["category_filter"]) != {"water"}):
         raise ValueError(
             "The selected categories have no reconstructable geometry; "
             f"plan_pending={len(plan['pending'])}; water_build={json.dumps(water)}; "
-            f"water_depth_pending={len(plan.get('water_depth_pending', []))}; effects={json.dumps(effects)}; "
+            f"water_depth_pending={len(plan.get('water_depth_pending', []))}; effects={json.dumps(effects)}; lights={json.dumps(lights)}; "
             "inspect scene_plan.json for resource details")
     scene["endfield_empty_selection"] = empty
     expected = scene_signature()
@@ -357,7 +427,7 @@ def main() -> None:
     bpy.ops.wm.save_as_mainfile(filepath=str(args.output))
     bpy.ops.wm.open_mainfile(filepath=str(args.output))
     if scene_signature() != expected:
-        raise ValueError("Saved scene geometry, transforms, UVs, particle colors or material slots changed on reopen")
+        raise ValueError("Saved scene geometry, transforms, UVs, particle colors, material slots or light settings changed on reopen")
     missing = [image.name for image in bpy.data.images if image.source == "FILE" and image.users and not image.packed_file]
     if missing:
         raise ValueError(f"Saved scene contains unpacked textures: {missing}")
@@ -366,7 +436,11 @@ def main() -> None:
         "terrain_materials": terrain_materials, "terrain_crops": crops, "terrain_normals": terrain_normals,
         "terrain_details": terrain_details, "terrain_sampler_audit": terrain_sampler_audit,
         "node_layout": {"contract": "EndfieldNodeLayout/2", "trees": layout_trees},
-        "decals": decals, "water": water, "effects": effects,
+        "decals": decals, "water": water, "effects": effects, "lights": lights,
+        "material_pending": material_pending,
+        "light_summary": {"source_instances": len(plan["light_instances"]),
+                          "preview_lights": sum(row["status"] == "source_light_preview_partial" for row in lights),
+                          "pending_includes_uncalibrated_previews": True},
         "effect_summary": {
             "source_instances": len(plan.get("effect_instances", [])),
             "component_rows": len(effects),
@@ -379,6 +453,8 @@ def main() -> None:
         "effect_physics": plan.get("effect_physics"),
         "water_depth_context_pending": plan.get("water_depth_pending", []), "limitations": ["Effects use camera-oriented static previews; Unity particle simulation, volume lighting and fog are not reconstructed",
         "Water uses calibrated Blender medium optics; source screen buffers, foam, caustics and interaction are not reproduced",
+        "Native lights preserve source transforms; intensity units and runtime activation remain uncalibrated previews",
+        "Light centers use half-open chunk ownership; off-region light contributors are excluded and directional lights belong to one selection batch",
         "Terrain stochastic projection, POM and cliff C are not reconstructed"]}, indent=2), encoding="utf-8")
 
 

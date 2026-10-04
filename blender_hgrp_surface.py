@@ -90,11 +90,17 @@ def remap_roughness(material: bpy.types.Material, source: bpy.types.NodeSocket,
 
 def apply_authored_albedo(material: bpy.types.Material, bsdf: bpy.types.Node,
                           record: MaterialRecord) -> None:
-    nodes, links = material.node_tree.nodes, material.node_tree.links
     base = bsdf.inputs["Base Color"]
     if not base.links:
         return
     incoming = base.links[0].from_socket
+    material.node_tree.links.new(authored_albedo_output(material, record, incoming), base)
+
+
+def authored_albedo_output(material: bpy.types.Material, record: MaterialRecord,
+                           incoming: bpy.types.NodeSocket) -> bpy.types.NodeSocket:
+    """Return the source brightness/cover color independently of later surface masks."""
+    nodes, links = material.node_tree.nodes, material.node_tree.links
     brightness = nodes.new("ShaderNodeMixRGB")
     brightness.label = "HGRP BaseColorBrighterScale (saturate)"
     brightness.blend_type = "MULTIPLY"
@@ -108,7 +114,7 @@ def apply_authored_albedo(material: bpy.types.Material, bsdf: bpy.types.Node,
     cover.inputs[0].default_value = record["Floats"].get("_BaseColorTintCover", 0.0)
     cover.inputs[2].default_value = record["Colors"].get("_BaseColor", [1, 1, 1, 1])
     links.new(brightness.outputs[0], cover.inputs[1])
-    links.new(cover.outputs[0], base)
+    return cover.outputs[0]
 
 
 def apply_engine_surface(material: bpy.types.Material, bsdf: bpy.types.Node,

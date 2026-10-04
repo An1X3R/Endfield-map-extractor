@@ -26,6 +26,11 @@ internal static partial class Program
         Console.OutputEncoding = Encoding.UTF8;
         try
         {
+            if (args.Length == 1 && args[0] == "--initialize-runtime")
+            {
+                HelperRuntime.Initialize();
+                return 0;
+            }
             var options = Options.Parse(args);
             Run(options);
             return 0;
@@ -122,6 +127,7 @@ internal static partial class Program
         var allMaterials = allObjects.OfType<Material>().ToList();
         var allTextures = allObjects.OfType<Texture2D>().ToList();
         var particleExtraction = ReadParticleRecords(allObjects, gameObjects);
+        var shapeMeshes = SelectShapeMeshes(particleExtraction.Records, allMeshes);
         var waterRecords = ReadWaterRecords(allObjects);
         var shaderReferences = allObjects.Where(obj => obj.type == ClassIDType.Shader)
             .ToDictionary(obj => (obj.assetsFile.fileName, obj.m_PathID), ReadShaderReference);
@@ -162,6 +168,7 @@ internal static partial class Program
                 Name = go.m_Name,
                 Source = go.assetsFile.fileName,
                 PathId = go.m_PathID,
+                GameObjectActive = SceneNodeBoolean(go, "m_IsActive"),
                 IsRoot = transform == null || transform.m_Father.IsNull,
                 TransformPathId = transform?.m_PathID,
                 Parent = transform == null ? null : ToRef(transform.m_Father, transform.assetsFile),
@@ -170,6 +177,8 @@ internal static partial class Program
                 LocalRotation = transform == null ? null : new[] { transform.m_LocalRotation.X, transform.m_LocalRotation.Y, transform.m_LocalRotation.Z, transform.m_LocalRotation.W },
                 LocalScale = transform == null ? null : new[] { transform.m_LocalScale.X, transform.m_LocalScale.Y, transform.m_LocalScale.Z },
                 RendererType = renderer?.type.ToString(),
+                RendererAsset = renderer == null ? null : ToRef(renderer),
+                RendererEnabled = renderer == null ? null : SceneNodeBoolean(renderer, "m_Enabled"),
                 Mesh = mesh == null ? null : ToRef(mesh),
                 Materials = materials.Count == 0 ? null : materials,
             });
@@ -236,8 +245,32 @@ internal static partial class Program
             var fileName = UniqueFileName(mesh, ".obj");
             var path = Path.Combine(meshDir, fileName);
             var ok = WriteObj(mesh, path);
+            string? shapeGeometryFile = null;
+            string? shapeGeometryError = null;
+            if (shapeMeshes.Contains(mesh))
+            {
+                try
+                {
+                    shapeGeometryFile = WriteShapeMeshGeometry(mesh, meshDir, output);
+                }
+                catch (InvalidDataException error)
+                {
+                    shapeGeometryError = error.Message;
+                }
+            }
             meshRecords.Add(new ExportRecord(ToRef(mesh), ok ? Path.GetRelativePath(output, path) : null,
-                ok ? null : "Mesh has no exportable triangle/vertex data"));
+                ok ? null : "Mesh has no exportable triangle/vertex data")
+            {
+                VertexCount = mesh.m_VertexCount,
+                VertexColorComponents = MeshVertexColorComponents(mesh),
+                VertexColorsFile = ok ? WriteMeshVertexColors(mesh, meshDir, output) : null,
+                Uv0Components = MeshUvComponents(mesh, mesh.m_UV0, "uv0"),
+                Uv1Components = MeshUvComponents(mesh, mesh.m_UV1, "uv1"),
+                Uv0File = ok ? WriteMeshUv(mesh, mesh.m_UV0, "uv0", meshDir, output) : null,
+                Uv1File = ok ? WriteMeshUv(mesh, mesh.m_UV1, "uv1", meshDir, output) : null,
+                ShapeGeometryFile = shapeGeometryFile,
+                ShapeGeometryError = shapeGeometryError,
+            });
             if (meshRecords.Count % 100 == 0)
                 telemetry.Publish("mesh_export", meshRecords.Count, meshTotal);
         }
@@ -323,6 +356,9 @@ internal static partial class Program
                 ["roots"] = nodes.Count(n => n.IsRoot),
                 ["allMeshes"] = allMeshes.Count,
                 ["selectedMeshes"] = meshRefs.Count,
+                ["selectedShapeMeshes"] = shapeMeshes.Count,
+                ["shapeMeshGeometries"] = meshRecords.Count(record => record.ShapeGeometryFile is not null),
+                ["shapeMeshGeometryErrors"] = meshRecords.Count(record => record.ShapeGeometryError is not null),
                 ["allMaterials"] = allMaterials.Count,
                 ["selectedMaterials"] = materialRefs.Count,
                 ["allTextures"] = allTextures.Count,
@@ -381,10 +417,15 @@ internal static partial class Program
 
     private static AssetRef TextureReference(Texture2D texture)
     {
-        var fields = texture.ToType();
-        if (fields?["m_ColorSpace"] is not int colorSpace || colorSpace is not (0 or 1))
+        var fields = texture.ToType() ?? throw new InvalidDataException(
+            $"Texture2D serialized type tree unavailable: source={texture.assetsFile.fileName}, pathId={texture.m_PathID}");
+        if (fields["m_ColorSpace"] is not int colorSpace || colorSpace is not (0 or 1))
             throw new InvalidDataException($"Texture2D requires serialized m_ColorSpace 0/1: source={texture.assetsFile.fileName}, pathId={texture.m_PathID}");
-        return ToRef(texture) with { ColorSpace = colorSpace };
+        return ToRef(texture) with
+        {
+            ColorSpace = colorSpace,
+            TextureSampler = ReadTextureSampler(texture, fields),
+        };
     }
 
     private static AssetRef ToRef<T>(PPtr<T> pointer, SerializedFile owner) where T : Object
@@ -517,6 +558,7 @@ internal sealed class NodeRecord
     public required string Name { get; init; }
     public required string Source { get; init; }
     public required long PathId { get; init; }
+    public required bool GameObjectActive { get; init; }
     public required bool IsRoot { get; init; }
     public long? TransformPathId { get; init; }
     public AssetRef? Parent { get; init; }
@@ -525,6 +567,8 @@ internal sealed class NodeRecord
     public float[]? LocalRotation { get; init; }
     public float[]? LocalScale { get; init; }
     public string? RendererType { get; init; }
+    public AssetRef? RendererAsset { get; init; }
+    public bool? RendererEnabled { get; init; }
     public AssetRef? Mesh { get; init; }
     public List<AssetRef>? Materials { get; init; }
 }
@@ -553,7 +597,20 @@ internal sealed class TextureSlotRecord
 internal sealed record AssetRef(string Source, long PathId, string Type, string? Name)
 {
     public string[]? PassNames { get; init; }
+    public ShaderTextureDefaultRecord[]? TextureDefaults { get; init; }
     public int? ColorSpace { get; init; }
+    public TextureSamplerRecord? TextureSampler { get; init; }
 }
-internal sealed record ExportRecord(AssetRef Asset, string? File, string? Error);
+internal sealed record ExportRecord(AssetRef Asset, string? File, string? Error)
+{
+    public int? VertexCount { get; init; }
+    public int? VertexColorComponents { get; init; }
+    public string? VertexColorsFile { get; init; }
+    public int? Uv0Components { get; init; }
+    public int? Uv1Components { get; init; }
+    public string? Uv0File { get; init; }
+    public string? Uv1File { get; init; }
+    public string? ShapeGeometryFile { get; init; }
+    public string? ShapeGeometryError { get; init; }
+}
 internal sealed record ContainerRecord(string Container, AssetRef Asset, string DeclaredBy);

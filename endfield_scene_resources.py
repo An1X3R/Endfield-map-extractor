@@ -10,6 +10,8 @@ from uuid import uuid4
 
 from endfield_scene_material_contract import load_catalog, reference_key, require_object, resolve_export_path
 from extractor_core.resources import extract_candidate_bundles, read_bundle_closure_names
+from endfield_scene_helpers import SceneHelpers, ensure_current_scene_helpers
+from endfield_shader_contract import surface_family
 
 
 FORMAT = "EndfieldSceneResourceCache/1"
@@ -145,8 +147,19 @@ def ready_resource_paths(manifests: tuple[Path, ...]) -> frozenset[str]:
             if container.endswith(".asset"):
                 ready.add(container)
         elif asset.get("Type") == "Material" and key in materials:
-            slots = materials[key]["Textures"]
-            if all(slot["Texture"] is None or reference_key(slot["Texture"]) in textures for slot in slots):
+            material = materials[key]
+            slots = material["Textures"]
+            has_sweep = (surface_family(material) == "lit"
+                         and material["Floats"].get("_EnableEmissiveAnimSweep", 0) > 0.5)
+            sweep_metadata_ready = not has_sweep or (
+                "RenderState" in material and (
+                    material["Floats"].get("_EmissiveMaskChannel") != 0 or all(
+                        slot["Property"] != "_EmissiveMap" or slot["Texture"] is None
+                        or "ColorSpace" in slot["Texture"] for slot in slots
+                    )
+                )
+            )
+            if sweep_metadata_ready and all(slot["Texture"] is None or reference_key(slot["Texture"]) in textures for slot in slots):
                 ready.add(container)
         elif asset.get("Type") == "MonoBehaviour" and key in water_keys:
             ready.add(container)
@@ -230,6 +243,8 @@ def ensure_scene_resources(runtime_path: Path, plan_path: Path,
     ):
         raise ValueError("Scene preflight requires exact assets/ or packages/ resource paths")
     requested = frozenset(value.replace("\\", "/").casefold() for value in cast(list[str], values))
+    if not requested:
+        return {"status": "ready", "requested": 0, "missing": []}
     manifests = tuple(resolve_path(p, plan_path.parent) for p in cast(list[str], plan["scene_manifests"]))
     missing = requested - ready_resource_paths(manifests)
     if not missing:
@@ -243,13 +258,9 @@ def ensure_scene_resources(runtime_path: Path, plan_path: Path,
         index_path = root / "index.json"
         existing = read_json(index_path) if index_path.is_file() else {
             "format": FORMAT, "datasetFingerprint": extraction["mapLayerFingerprint"], "manifests": []}
-        state = read_json(runtime_path.parent / "first_run_state.json")
-        steps = require_object(state["steps"], "first-run steps")
-        helper_step = require_object(steps["helper_dependencies"], "helper dependency step")
-        helper_result = require_object(helper_step["outputs"], "helper result")
-        helpers = require_object(helper_result["outputs"], "helpers")
-        scanner = resolve_path(require_object(helpers["bundleScanner"], "scanner")["path"], runtime_path.parent)
-        probe = resolve_path(require_object(helpers["sceneProbe"], "probe")["path"], runtime_path.parent)
+        paths = require_object(runtime["paths"], "runtime paths")
+        helper_cache = resolve_path(paths["cache_root"], runtime_path.parent)
+        helpers: SceneHelpers | None = None
         work = root / uuid4().hex
         work.mkdir()
         environment = {**os.environ, "TEMP": str(work), "TMP": str(work), "PYTHONDONTWRITEBYTECODE": "1"}
@@ -268,13 +279,14 @@ def ensure_scene_resources(runtime_path: Path, plan_path: Path,
             if describe_file(provider_path) != record:
                 raise ValueError(f"Prepared provider index changed: {provider_path}")
         else:
+            helpers = ensure_current_scene_helpers(runtime_path, helper_cache, check_cancelled, progress)
             provider_path = work / "providers.jsonl"
             scan_index = resolve_path(extraction["bundleScanIndex"], runtime_path.parent)
             progress(0.05, "Upgrading complete resource provider index once for this prepared cache")
             filters = ["--contains", "assets/"]
             if coverage == PACKAGE_PROVIDER_COVERAGE:
                 filters.extend(("--contains", "packages/"))
-            run_scene_process([str(scanner), "--input", str(scan_index), "--output", str(provider_path),
+            run_scene_process([str(helpers.scanner), "--input", str(scan_index), "--output", str(provider_path),
                                *filters, "--progress-every", "1000"],
                               work / "providers.log", environment, check_cancelled)
             validate_scan(provider_path)
@@ -288,6 +300,8 @@ def ensure_scene_resources(runtime_path: Path, plan_path: Path,
         result: dict[str, object] = {"requested": len(requested), "missingBefore": len(missing),
                                     "providerRoots": len(roots), "unresolvedProviders": unresolved}
         if roots:
+            if helpers is None:
+                helpers = ensure_current_scene_helpers(runtime_path, helper_cache, check_cancelled, progress)
             cab = resolve_path(require_object(discovery["cabInventory"], "CAB inventory")["path"], runtime_path.parent)
             closures, metadata = read_bundle_closure_names({"resources": roots}, cab)
             bundles = work / "bundles"
@@ -304,7 +318,7 @@ def ensure_scene_resources(runtime_path: Path, plan_path: Path,
                                                              progress=None, cancelled=cancelled)
             result["closure"] = metadata
             output = work / "probe"
-            run_scene_process([str(probe), str(bundles), str(output), "--include-unreferenced"],
+            run_scene_process([str(helpers.probe), str(bundles), str(output), "--include-unreferenced"],
                               work / "probe.log", environment, check_cancelled)
             manifest = output / "scene_manifest.json"
             if read_json(manifest).get("Format") != "EndfieldSceneProbe/1":

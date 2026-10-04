@@ -64,10 +64,14 @@ def component_columns(data: bytes) -> dict[int, dict[int, bytes]]:
                 if stride != expected:
                     raise ValueError(f"Runtime draw stride changed: type={kind}, actual={stride}, expected={expected}")
                 columns.append((kind, cursor, stride))
+            elif kind == 18:
+                if stride != 256:
+                    raise ValueError(f"CommonInstanceData stride changed: actual={stride}, expected=256")
+                columns.append((kind, cursor, stride))
             cursor += count * stride
         if cursor != length:
             raise ValueError(f"Renderer blob length mismatch: group={index}, actual={cursor}, expected={length}")
-        if not columns:
+        if not any(kind != 18 for kind, _, _ in columns):
             continue
         for i in range(count):
             entity_id = fb.u32(data, entity_ids + 4 * i)
@@ -78,6 +82,16 @@ def component_columns(data: bytes) -> dict[int, dict[int, bytes]]:
             result[entity_id] = {kind: data[blob + start + i * stride:blob + start + (i + 1) * stride]
                                 for kind, start, stride in columns}
     return result
+
+
+def serialized_draw_parameters(raw: bytes, matrix: bytes) -> list[float]:
+    """Preserve five initial custom vectors without claiming runtime draw state."""
+    if len(raw) != 256 or raw[:64] != matrix:
+        raise ValueError("CommonInstanceData size or matrix differs from the selected instance")
+    values = list(struct.unpack_from("<20f", raw, 176))
+    if not all(math.isfinite(value) for value in values):
+        raise ValueError("CommonInstanceData custom vectors contain non-finite values")
+    return values
 
 
 def renderer_columns(data: bytes) -> dict[int, tuple[bytes, ...]]:

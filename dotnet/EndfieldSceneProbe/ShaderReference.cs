@@ -30,6 +30,35 @@ internal static partial class Program
         return new AssetRef(shader.assetsFile.fileName, shader.m_PathID, shader.type.ToString(), name)
         {
             PassNames = passNames.ToArray(),
+            TextureDefaults = ReadShaderTextureDefaults(shader, parsed),
         };
     }
+
+    private static ShaderTextureDefaultRecord[] ReadShaderTextureDefaults(Object shader, OrderedDictionary parsed)
+    {
+        if (parsed["m_PropInfo"] is not OrderedDictionary propertyInfo ||
+            propertyInfo["m_Props"] is not List<object> properties)
+            throw new InvalidDataException(
+                $"SHADER_TEXTURE_PROPERTIES_INVALID source={shader.assetsFile.fileName} pathId={shader.m_PathID}");
+
+        var defaults = new List<ShaderTextureDefaultRecord>();
+        for (var index = 0; index < properties.Count; index++)
+        {
+            if (properties[index] is not OrderedDictionary property || property["m_Type"] is not int type)
+                throw new InvalidDataException(
+                    $"SHADER_PROPERTY_TYPE_INVALID source={shader.assetsFile.fileName} pathId={shader.m_PathID} index={index}");
+            if (type != 4)
+                continue;
+            if (property["m_Name"] is not string propertyName || string.IsNullOrWhiteSpace(propertyName) ||
+                property["m_DefTexture"] is not OrderedDictionary texture ||
+                texture["m_DefaultName"] is not string defaultName ||
+                texture["m_TexDim"] is not int dimension)
+                throw new InvalidDataException(
+                    $"SHADER_TEXTURE_DEFAULT_INVALID source={shader.assetsFile.fileName} pathId={shader.m_PathID} index={index}");
+            defaults.Add(new ShaderTextureDefaultRecord(propertyName, defaultName, dimension));
+        }
+        return defaults.ToArray();
+    }
 }
+
+internal sealed record ShaderTextureDefaultRecord(string Property, string Name, int Dimension);

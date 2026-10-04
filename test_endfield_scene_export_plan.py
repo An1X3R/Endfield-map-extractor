@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import struct
 import tempfile
 import unittest
 from contextlib import closing
@@ -20,6 +21,17 @@ from webui_source_contract import selected_static_categories
 
 
 class PortableScenePlanTests(unittest.TestCase):
+    def test_serialized_draw_parameters_validate_binary_source_identity(self) -> None:
+        from extract_scene_renderer_materials import serialized_draw_parameters
+        matrix = struct.pack("<16f", *range(16))
+        values = [index / 4 for index in range(20)]
+        raw = matrix + bytes(112) + struct.pack("<20f", *values)
+        self.assertEqual(serialized_draw_parameters(raw, matrix), values)
+        for damaged, expected_matrix in ((raw[:-4], matrix), (raw, bytes(64)),
+                                          (raw[:176] + struct.pack("<20f", float("inf"), *values[1:]), matrix)):
+            with self.assertRaises(ValueError):
+                serialized_draw_parameters(damaged, expected_matrix)
+
     def test_crossing_geometry_has_one_partition_owner(self) -> None:
         selection = {"xmin": 0.0, "xmax": 256.0, "zmin": 0.0, "zmax": 128.0}
         batches = [{**selection, "xmin": 0.0, "xmax": 128.0},
@@ -123,6 +135,19 @@ class PortableScenePlanTests(unittest.TestCase):
             loaded = load_scene_export_plan(plan)
             self.assertEqual(loaded["instances"], [])
             self.assertEqual(len(loaded["water_depth_instances"]), 1)
+            row["serialized_draw_parameters"] = [index / 4 for index in range(20)]
+            plan.write_text(json.dumps(payload), encoding="utf-8")
+            loaded = load_scene_export_plan(plan)
+            self.assertEqual(loaded["water_depth_instances"][0]["serialized_draw_parameters"],
+                             row["serialized_draw_parameters"])
+            for invalid in ([0.0] * 19, [float("nan")] * 20, [True] * 20):
+                row["serialized_draw_parameters"] = invalid
+                plan.write_text(json.dumps(payload), encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, "invalid 20-float draw parameters"):
+                    load_scene_export_plan(plan)
+            row["serialized_draw_parameters"] = None
+            plan.write_text(json.dumps(payload), encoding="utf-8")
+            self.assertIsNone(load_scene_export_plan(plan)["water_depth_instances"][0]["serialized_draw_parameters"])
             mesh.unlink()
             with self.assertRaises(FileNotFoundError):
                 load_scene_export_plan(plan)

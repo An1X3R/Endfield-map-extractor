@@ -23,6 +23,11 @@ internal static class Program
         Console.OutputEncoding = Encoding.UTF8;
         try
         {
+            if (args.Length == 1 && args[0] == "--initialize-runtime")
+            {
+                HelperRuntime.Initialize();
+                return 0;
+            }
             var options = Options.Parse(args);
             Run(options);
             return 0;

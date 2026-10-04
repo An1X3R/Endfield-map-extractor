@@ -14,12 +14,29 @@ def is_neutral_material_name(name: str) -> bool:
     return name.startswith(("Geometry_Only_Neutral", "REPAIR_NEUTRAL", "Unbound_Model_Material_Neutral"))
 
 
+class TextureSampler(TypedDict):
+    FilterMode: int
+    WrapU: int
+    WrapV: int
+    WrapW: int
+    Aniso: int
+    MipBias: float
+
+
+class ShaderTextureDefault(TypedDict):
+    Property: str
+    Name: str
+    Dimension: int
+
+
 class AssetReference(TypedDict):
     Source: str
     PathId: int
     Name: NotRequired[str]
     PassNames: NotRequired[list[str]]
     ColorSpace: NotRequired[int]
+    TextureSampler: NotRequired[TextureSampler]
+    TextureDefaults: NotRequired[list[ShaderTextureDefault]]
 
 
 class TextureSlot(TypedDict):
@@ -44,6 +61,44 @@ class MaterialRecord(TypedDict):
     Floats: dict[str, float]
     Colors: dict[str, list[float]]
     RenderState: NotRequired[MaterialRenderState]
+
+
+def validate_shader_texture_defaults(value: object, context: str) -> list[ShaderTextureDefault]:
+    """Retain explicit source defaults without inventing omitted texture properties."""
+    if not isinstance(value, list):
+        raise ValueError(f"Shader texture defaults must be an array: field={context}")
+    result: list[ShaderTextureDefault] = []
+    names: set[str] = set()
+    for item in value:
+        row = require_object(item, context)
+        prop, name, dimension = row.get("Property"), row.get("Name"), row.get("Dimension")
+        if not isinstance(prop, str) or not prop or prop in names:
+            raise ValueError(f"Invalid or duplicate shader texture default: field={context}, property={prop}")
+        if not isinstance(name, str) or type(dimension) is not int:
+            raise ValueError(f"Shader texture default requires Name/string and Dimension/int: field={context}, property={prop}")
+        names.add(prop)
+        result.append({"Property": prop, "Name": name, "Dimension": dimension})
+    return result
+
+
+def has_shader_white_texture_default(record: MaterialRecord, property_name: str) -> bool:
+    """Recognize only an explicitly declared two-dimensional white source texture."""
+    defaults = record["Shader"].get("TextureDefaults")
+    if defaults is None:
+        return False
+    return any(row["Property"] == property_name and row["Name"] == "white" and row["Dimension"] == 2
+               for row in validate_shader_texture_defaults(defaults, f"material={record['Name']}"))
+
+
+def mesh_material_requires_uv1(material: MaterialRecord) -> bool:
+    """Report source UV1 use by enabled VFXBaseV2 sample textures."""
+    floats, colors = material["Floats"], material["Colors"]
+    return any(
+        floats.get(f"_UseSampleTex{index}", 0) != 0 and
+        isinstance(weights := colors.get(f"_SampleTex{index}UVWeights"), list) and
+        len(weights) == 4 and weights[1] != 0
+        for index in range(4)
+    )
 
 
 def resolve_export_path(path: Path) -> Path:
@@ -79,11 +134,28 @@ def number_vector(value: object, size: int, context: str) -> None:
         raise ValueError(f"Expected {size} finite numbers: {context}")
 
 
+def validate_texture_sampler(value: object, context: str) -> TextureSampler:
+    """Read serialized sampler state without inventing absent axis settings."""
+    row = require_object(value, context)
+    for field, allowed in (("FilterMode", range(3)), ("WrapU", range(4)),
+                           ("WrapV", range(4)), ("WrapW", range(4)), ("Aniso", range(17))):
+        if type(row.get(field)) is not int or row[field] not in allowed:
+            raise ValueError(f"Invalid texture sampler field: context={context}, field={field}, value={row.get(field)!r}")
+    bias = row.get("MipBias")
+    if type(bias) not in (int, float) or not math.isfinite(bias):
+        raise ValueError(f"Invalid texture sampler mip bias: context={context}, value={bias!r}")
+    return cast(TextureSampler, {**{field: row[field] for field in
+                                 ("FilterMode", "WrapU", "WrapV", "WrapW", "Aniso")},
+                                "MipBias": float(bias)})
+
+
 def validate_material(value: object) -> MaterialRecord:
     row = require_object(value, "material")
     reference_key(row)
     reference_key(row.get("Shader"))
     shader = require_object(row["Shader"], "material Shader")
+    if "TextureDefaults" in shader:
+        validate_shader_texture_defaults(shader["TextureDefaults"], "material Shader.TextureDefaults")
     if "PassNames" in shader and (not isinstance(shader["PassNames"], list) or
             not all(isinstance(name, str) for name in shader["PassNames"])):
         raise ValueError("Shader PassNames must be a string array")
@@ -115,6 +187,8 @@ def validate_material(value: object) -> MaterialRecord:
             raise ValueError(f"Texture reference field missing: {name}")
         if slot["Texture"] is not None:
             reference_key(slot["Texture"])
+            if "TextureSampler" in slot["Texture"]:
+                validate_texture_sampler(slot["Texture"]["TextureSampler"], f"material={row['Name']}, property={name}")
             if "ColorSpace" in slot["Texture"] and (
                 type(slot["Texture"]["ColorSpace"]) is not int or slot["Texture"]["ColorSpace"] not in (0, 1)
             ):
@@ -138,7 +212,7 @@ def merge_material_evidence(left: MaterialRecord, right: MaterialRecord) -> Mate
 
     if signature(left) != signature(right):
         raise ValueError(f"Conflicting material records: reference={reference_key(right)}")
-    for field in ("Name", "PassNames"):
+    for field in ("Name", "PassNames", "TextureDefaults"):
         if field in left["Shader"] and field in right["Shader"] and left["Shader"][field] != right["Shader"][field]:
             raise ValueError(f"Conflicting shader metadata: reference={reference_key(right)}, field={field}")
     if "RenderState" in left and "RenderState" in right and left["RenderState"] != right["RenderState"]:
@@ -155,6 +229,7 @@ def load_catalog(paths: tuple[Path, ...]) -> tuple[
     materials: dict[tuple[str, int], MaterialRecord] = {}
     textures: dict[tuple[str, int], tuple[Path, str]] = {}
     texture_color_spaces: dict[tuple[str, int], int] = {}
+    texture_samplers: dict[tuple[str, int], TextureSampler] = {}
     for path in paths:
         path = resolve_export_path(path)
         data = require_object(json.loads(path.read_text(encoding="utf-8-sig")), str(path))
@@ -171,6 +246,11 @@ def load_catalog(paths: tuple[Path, ...]) -> tuple[
             row = require_object(value, "texture export")
             asset = require_object(row.get("Asset"), "texture export Asset")
             key = reference_key(asset)
+            if "TextureSampler" in asset:
+                sampler = validate_texture_sampler(asset["TextureSampler"], f"texture export={key}")
+                if key in texture_samplers and texture_samplers[key] != sampler:
+                    raise ValueError(f"Conflicting texture sampler: reference={key}, values={texture_samplers[key]}/{sampler}")
+                texture_samplers[key] = sampler
             color_space = asset.get("ColorSpace")
             if color_space is not None:
                 if type(color_space) is not int or color_space not in (0, 1):
@@ -199,7 +279,13 @@ def load_catalog(paths: tuple[Path, ...]) -> tuple[
             color_space = texture_color_spaces.get(ref_key)
             if color_space is not None and "ColorSpace" in ref and ref["ColorSpace"] != color_space:
                 raise ValueError(f"Material/export texture ColorSpace conflict: material={record['Name']}, property={slot['Property']}, reference={ref_key}, values={ref['ColorSpace']}/{color_space}")
-            slots.append({**slot, "Texture": {**ref, **({"ColorSpace": color_space} if color_space is not None else {})}})
+            sampler = texture_samplers.get(ref_key)
+            if (sampler is not None and "TextureSampler" in ref and
+                    validate_texture_sampler(ref["TextureSampler"], f"material texture={ref_key}") != sampler):
+                raise ValueError(f"Material/export texture sampler conflict: material={record['Name']}, property={slot['Property']}, reference={ref_key}")
+            slots.append({**slot, "Texture": {**ref,
+                **({"ColorSpace": color_space} if color_space is not None else {}),
+                **({"TextureSampler": sampler} if sampler is not None else {})}})
         enriched[key] = {**record, "Textures": slots}
     materials = enriched
     return materials, textures

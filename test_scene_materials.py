@@ -20,6 +20,27 @@ def material_record() -> dict[str, object]:
 
 
 class SceneMaterialTests(unittest.TestCase):
+    def test_alpha_sweep_requires_the_verified_two_map_clip_contract(self) -> None:
+        from endfield_shader_contract import has_verified_lit_sweep
+        record = {**material_record(),
+                  "Shader": {"Source": "CAB-93483c2cb844b6b343af0950ad4630ad", "PathId": 5324015590718682574},
+                  "Floats": {"_EnableAlphaTest": 1, "_BaseTextureMapCount": 1,
+                             "_BaseUVSet": 0, "_BasePbrMapUVSet": 0, "_EnableUVAnimation": 0,
+                             "_EnableEmissiveAnimSweep": 1, "_EmissiveMaskChannel": 5,
+                             "_EmissiveNoMapUseFresnel": 0},
+                  "RenderState": {"DisabledShaderPasses": [], "CustomRenderQueue": 2450,
+                                  "ValidKeywords": ["_ALPHATEST_ON", "_TWO_BASEMAP", "_EMISSIVE_ANIM_SWEEP", "_EMISSIVE_NOMAP"]}}
+        self.assertTrue(has_verified_lit_sweep(validate_material(record)))
+        for field, value in (("_EnableAlphaTest", 0), ("_BaseTextureMapCount", 0),
+                             ("_BaseUVSet", 1), ("_BasePbrMapUVSet", 1),
+                             ("_EnableUVAnimation", 1), ("_EmissiveNoMapUseFresnel", 1)):
+            changed = {**record, "Floats": {**record["Floats"], field: value}}
+            with self.subTest(field=field):
+                self.assertFalse(has_verified_lit_sweep(validate_material(changed)))
+        terrain = {**record, "RenderState": {**record["RenderState"],
+                   "ValidKeywords": [*record["RenderState"]["ValidKeywords"], "_TERRAIN_BLEND"]}}
+        self.assertFalse(has_verified_lit_sweep(validate_material(terrain)))
+
     def test_render_state_enrichment_preserves_source_and_rejects_conflicts(self) -> None:
         original = validate_material(material_record())
         state = {"DisabledShaderPasses": ["DepthOnly"], "ValidKeywords": [], "CustomRenderQueue": 2000}

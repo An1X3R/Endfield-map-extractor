@@ -9,9 +9,11 @@ import hashlib
 import json
 from pathlib import Path
 import bpy
-from endfield_shader_contract import surface_family, normal_layout, uses_mro, uses_normal_map, base_texture_mode, emission_source, emissive_map_type
-from blender_hgrp_surface import packed_normal_group, remap_roughness, apply_authored_albedo, apply_engine_surface
+from endfield_shader_contract import surface_family, normal_layout, uses_mro, uses_normal_map, base_texture_mode, emission_source, emissive_map_type, has_verified_lit_sweep, has_unresolved_liteffect_sweep
+from blender_hgrp_surface import packed_normal_group, remap_roughness, apply_authored_albedo, authored_albedo_output, apply_engine_surface
+from blender_hgrp_emission import apply_lit_sweep, apply_lit_map_sweep, apply_lit_mask_sweep
 from endfield_scene_material_contract import MaterialRecord, TextureSlot, AssetReference, supported_slots, has_procedural_foliage_emission
+from endfield_shader_contract import has_verified_lit_alpha_clip
 
 
 def ref_key(ref: AssetReference) -> tuple[str, int]:
@@ -356,6 +358,42 @@ def _texture_node(nodes: bpy.types.Nodes, links: bpy.types.NodeLinks,
     return texture
 
 
+def apply_lit_alpha_clip(material: bpy.types.Material, principled: bpy.types.Node,
+                         record: MaterialRecord) -> None:
+    """Reconstruct the selected raw alpha mask and strict source discard test."""
+    missing = [name for name, values in (("_AlphaClipThreshold", record["Floats"]),
+                                        ("_BaseColor", record["Colors"])) if name not in values]
+    if missing:
+        raise ValueError(f"Verified Lit alpha clipping requires serialized source fields; refresh scene resources: material={record['Name']}, fields={missing}")
+    selector = record["Floats"].get("_AlphaMaskChannel")
+    if type(selector) not in (int, float) or selector not in (0, 1):
+        raise ValueError(f"Invalid Lit alpha mask selector: material={record['Name']}, value={selector}")
+    property_name = "_BaseColorMap" if selector == 0 else "_NormalMap"
+    nodes, links = material.node_tree.nodes, material.node_tree.links
+    textures = [node for node in nodes if node.type == "TEX_IMAGE" and node.label == property_name]
+    if len(textures) != 1:
+        raise ValueError(f"Lit alpha mask requires one source texture: material={record['Name']}, property={property_name}, count={len(textures)}")
+    threshold = record["Floats"]["_AlphaClipThreshold"]
+    scale = nodes.new("ShaderNodeMath")
+    scale.operation = "MULTIPLY"
+    scale.label = "Source alpha mask times BaseColor alpha"
+    scale.inputs[1].default_value = record["Colors"]["_BaseColor"][3]
+    links.new(textures[0].outputs["Alpha"], scale.inputs[0])
+    discard = nodes.new("ShaderNodeMath")
+    discard.operation = "LESS_THAN"
+    discard.label = "Discard below source alpha threshold"
+    discard.inputs[1].default_value = threshold
+    links.new(scale.outputs[0], discard.inputs[0])
+    keep = nodes.new("ShaderNodeMath")
+    keep.operation = "SUBTRACT"
+    keep.label = "Keep alpha equal to or above threshold"
+    keep.inputs[0].default_value = 1.0
+    links.new(discard.outputs[0], keep.inputs[1])
+    links.new(keep.outputs[0], _input(principled, "Alpha"))
+    material["endfield_alpha_mask_source"] = property_name + ".a * _BaseColor.a"
+    material["endfield_alpha_clip_threshold"] = threshold
+
+
 def create_material(record: MaterialRecord, texture_files: dict[tuple[str, int], tuple[Path, str]],
                     pack_textures: bool) -> bpy.types.Material:
     family = surface_family(record)
@@ -386,6 +424,8 @@ def create_material(record: MaterialRecord, texture_files: dict[tuple[str, int],
     alpha_test = floats.get("_EnableAlphaTest", 0.0) > 0.5
     alpha_blend = floats.get("_EnableAlphaBlend", 0.0) > 0.5
     surface_alpha = alpha_test or alpha_blend
+    verified_alpha_clip = has_verified_lit_alpha_clip(record)
+    base_alpha_mode = "STRAIGHT" if surface_alpha and not verified_alpha_clip else "CHANNEL_PACKED"
     tri_channel_mask = floats.get("_EnableTriChannelMask", 0.0) > 0.5
     emission_selector = (emission_source(record) if family in ("lit", "trunk", "transparent") and
                          (floats.get("_EnableEmissiveMap", 0.0) > 0.5 or floats.get("_EnableBakedEmissive", 0.0) > 0.5)
@@ -416,6 +456,9 @@ def create_material(record: MaterialRecord, texture_files: dict[tuple[str, int],
         if not image_path.is_file():
             raise FileNotFoundError(image_path)
         color_space = ref.get("ColorSpace") if ref else None
+        if (role == "emissive" and color_space is None and has_verified_lit_sweep(record)
+                and record["Floats"].get("_EmissiveMaskChannel") == 0):
+            raise ValueError(f"Mapped sweep requires source texture ColorSpace; refresh scene resources: material={record['Name']}, property={prop}, reference={ref}")
         if role == "emissive" and color_space is not None and (type(color_space) is not int or color_space not in (0, 1)):
             raise ValueError(f"Invalid emissive texture ColorSpace: material={record['Name']}, property={prop}, value={color_space}")
         colorspace = ("Non-Color" if color_space == 0 else "sRGB") if role == "emissive" else (
@@ -424,7 +467,7 @@ def create_material(record: MaterialRecord, texture_files: dict[tuple[str, int],
             result["endfield_emissive_color_space_status"] = "color_space_unverified_legacy_srgb"
         elif role == "emissive":
             result["endfield_emissive_color_space_status"] = "source_linear" if color_space == 0 else "source_srgb"
-        alpha_mode = "STRAIGHT" if role == "base" and surface_alpha else "CHANNEL_PACKED"
+        alpha_mode = base_alpha_mode if role == "base" else "CHANNEL_PACKED"
         image = texture_image(image_path, colorspace, alpha_mode)
         if pack_textures and not image.packed_file:
             image.pack()
@@ -435,7 +478,7 @@ def create_material(record: MaterialRecord, texture_files: dict[tuple[str, int],
             # opaque base-color PNGs. Blender's default straight/premultiplied
             # handling can multiply RGB by an all-zero alpha and turn the
             # surface black even when Alpha is not connected.
-            image.alpha_mode = "STRAIGHT" if surface_alpha else "CHANNEL_PACKED"
+            image.alpha_mode = base_alpha_mode
             base_texture = texture
             # Keep authored albedo connected even when an optional mask is unbound.
             # A bound tri-channel mask replaces this input later.
@@ -509,6 +552,15 @@ def create_material(record: MaterialRecord, texture_files: dict[tuple[str, int],
             _input(principled, "Emission Strength").default_value = max(
                 0.0, floats.get("_EmissiveIntensity", floats.get("_EmissiveRemap", 1.0)))
             emissive_used = True
+    layer_sweep = "_LAYERBLEND_MASK" in (record.get("RenderState") or {}).get("ValidKeywords", [])
+    if (tri_channel_mask or layer_sweep) and has_verified_lit_sweep(record):
+        source_base = _input(principled, "Base Color")
+        if not source_base.is_linked:
+            raise ValueError(f"Masked surface sweep requires source base texture: material={record['Name']}")
+        source_albedo = nodes.new("NodeReroute")
+        source_albedo.name = "EF_SweepSourceAlbedo"
+        source_albedo.label = "Sweep albedo before surface tint and layer mixing"
+        links.new(authored_albedo_output(result, record, source_base.links[0].from_socket), source_albedo.inputs[0])
     if tri_channel_mask and base_texture is not None and mask_texture is not None:
         # Endfield's common environment shader uses the mask RGB channels to
         # replace the global BaseColor tint with three authored linear colours.
@@ -563,7 +615,10 @@ def create_material(record: MaterialRecord, texture_files: dict[tuple[str, int],
     if alpha_test:
         threshold = min(1.0, max(0.0, floats.get("_AlphaClipThreshold", 0.5)))
         alpha = _input(principled, "Alpha")
-        if alpha.links:
+        if verified_alpha_clip:
+            apply_lit_alpha_clip(result, principled, record)
+            threshold = floats["_AlphaClipThreshold"]
+        elif alpha.links:
             source = alpha.links[0].from_socket
             links.remove(alpha.links[0])
             clip = nodes.new("ShaderNodeMath")
@@ -666,8 +721,16 @@ def _apply_verified_emission(material: bpy.types.Material, record: MaterialRecor
     material["endfield_emissive_source"] = source
     material["endfield_emissive_mask_channel"] = int(floats["_EmissiveMaskChannel"])
     material["endfield_emissive_mask_contract"] = "Lit/Trunk/LitTransparent serialized source selector"
+    verified_sweep = has_verified_lit_sweep(record)
+    emission_color = None
     if source == "constant":
-        emission.default_value = (*authored[:3], 1.0)
+        if verified_sweep:
+            tint = nodes.new("ShaderNodeRGB")
+            tint.label = "Endfield _EmissiveColor"
+            tint.outputs[0].default_value = (*authored[:3], 1.0)
+            emission_color = tint.outputs[0]
+        else:
+            emission.default_value = (*authored[:3], 1.0)
         material["endfield_emissive_mask_status"] = "applied_constant_no_texture"
     else:
         prop, component = {
@@ -704,10 +767,46 @@ def _apply_verified_emission(material: bpy.types.Material, record: MaterialRecor
                 links.new(result, add.inputs[1])
                 links.new(contribution, add.inputs[2])
                 result = add.outputs["Color"]
-        links.new(result, emission)
+        emission_color = result
+        if not verified_sweep:
+            links.new(result, emission)
         material["endfield_emissive_mask_status"] = "applied_source_channel_static_approximation"
-    if floats.get("_EnableEmissiveAnimSweep", 0.0) > 0.5:
-        material["endfield_emissive_motion_status"] = "authored_sweep_not_reconstructed"
+    if verified_sweep:
+        if emission_color is None:
+            raise ValueError(f"Verified Lit sweep lacks emission source: material={record['Name']}")
+        base = _input(principled, "Base Color")
+        if base.is_linked:
+            albedo = base.links[0].from_socket
+        else:
+            color = nodes.new("ShaderNodeRGB")
+            color.label = "Endfield base albedo for emission"
+            color.outputs[0].default_value = base.default_value
+            albedo = color.outputs[0]
+        source_albedo = nodes.get("EF_SweepSourceAlbedo")
+        if source_albedo is not None:
+            albedo = source_albedo.outputs[0]
+        if source == "emissive_map":
+            links.new(apply_lit_map_sweep(material, record, texture, albedo), emission)
+            material["endfield_emissive_mask_status"] = "applied_source_channels_with_per_channel_sweep"
+            material["endfield_emissive_albedo_enable_status"] = "compiled_1059_1060_identity_expression"
+            if source_albedo is not None:
+                material["endfield_emissive_albedo_status"] = "verified_1078_pre_layer_albedo"
+                material["endfield_emissive_albedo_enable_status"] = "compiled_1078_identity_expression"
+        elif source in ("base_alpha", "normal_blue", "normal_alpha"):
+            links.new(apply_lit_mask_sweep(material, record, mask, albedo), emission)
+            material["endfield_emissive_mask_status"] = "applied_packed_mask_remap_with_tint_alpha_sweep"
+            material["endfield_emissive_albedo_enable_status"] = "compiled_1062_identity_expression"
+        else:
+            links.new(apply_lit_sweep(material, record, emission_color, albedo), emission)
+            material["endfield_emissive_albedo_enable_status"] = "serialized_toggle_not_independently_mapped_in_verified_fragment"
+            if source_albedo is not None:
+                material["endfield_emissive_albedo_status"] = "verified_1065_pre_tri_mask_albedo"
+    elif floats.get("_EnableEmissiveAnimSweep", 0.0) > 0.5:
+        _input(principled, "Emission Strength").default_value = 0.0
+        material["endfield_emissive_motion_status"] = "unsupported_sweep_variant"
+        material["endfield_emissive_motion_reason"] = "compiled_fragment_or_per_draw_inputs_unverified"
+        material["endfield_emissive_motion_keywords"] = json.dumps(
+            (record.get("RenderState") or {}).get("ValidKeywords", []))
     if source == "constant" and floats.get("_EmissiveNoMapUseFresnel", 0.0) > 0.5:
         material["endfield_emissive_fresnel_status"] = "authored_fresnel_not_reconstructed"
     return material
@@ -723,6 +822,12 @@ def apply_emission_mask(material: bpy.types.Material, record: MaterialRecord) ->
     )
     if not enabled:
         return material
+    if has_unresolved_liteffect_sweep(record):
+        material["endfield_emissive_motion_status"] = "unsupported_sweep_variant"
+        material["endfield_emissive_motion_reason"] = "liteffect_draw_instance_color_pulse_and_sweep_inputs_unavailable"
+        material["endfield_emissive_motion_keywords"] = json.dumps(
+            (record.get("RenderState") or {}).get("ValidKeywords", []))
+        material["endfield_emissive_preview_status"] = "legacy_static_emission_not_runtime_sweep"
     family = surface_family(record)
     if family in ("lit", "trunk", "transparent"):
         return _apply_verified_emission(material, record)

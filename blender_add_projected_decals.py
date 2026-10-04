@@ -384,6 +384,8 @@ def projected_material(source: bpy.types.Material, spec: MaterialSpec) -> bpy.ty
     material["projected_decal_material"] = spec.container
     material["receiver_material"] = source.name
     preserve_receiver_alpha(material, source)
+    from blender_hgrp_emission import preserve_projected_sweep_origin
+    preserve_projected_sweep_origin(material)
     from blender_hgrp_surface import refresh_surface_adapters
     refresh_surface_adapters(material)
     return material
@@ -401,6 +403,7 @@ def project_decal(decal: ProjectedDecal, spec: MaterialSpec, receivers: list[Rec
     high = tuple(max(v[i] for v in corners) for i in range(3))
     candidates = sorted({i for cell in grid_cells(low, high) for i in grid.get(cell, ())})
     vertices, faces, uv_surface, uv_decal, normals, material_ids = [], [], [], [], [], []
+    receiver_origins: list[tuple[float, float, float]] = []
     used_materials: list[bpy.types.Material] = []
     hits = 0
     for candidate in candidates:
@@ -467,6 +470,7 @@ def project_decal(decal: ProjectedDecal, spec: MaterialSpec, receivers: list[Rec
             offsets = np.repeat(face_normals[source_slots == source_slot], 3, axis=0)
             start = len(vertices)
             vertices.extend((values[:, 8:11] + offsets * bias).tolist())
+            receiver_origins.extend([tuple(receiver.matrix.translation)] * len(values))
             normals.extend(unit_normals.tolist())
             uv_surface.extend(values[:, 3:5].tolist())
             uv_decal.extend(((values[:, (0, 2)] + 0.5) * np.array(decal.uv_scale) + np.array(decal.uv_offset)).tolist())
@@ -477,6 +481,8 @@ def project_decal(decal: ProjectedDecal, spec: MaterialSpec, receivers: list[Rec
     mesh = bpy.data.meshes.new(f"ProjectedDecal_{decal.entity_id}")
     origin = world.translation
     mesh.from_pydata([tuple(Vector(point) - origin) for point in vertices], [], faces)
+    receiver_origin = mesh.attributes.new(name="endfield_receiver_world_origin", type="FLOAT_VECTOR", domain="POINT")
+    receiver_origin.data.foreach_set("vector", np.asarray(receiver_origins, dtype=np.float32).ravel())
     for material in used_materials:
         mesh.materials.append(material)
     mesh.polygons.foreach_set("material_index", material_ids)

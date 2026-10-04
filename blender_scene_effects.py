@@ -11,6 +11,7 @@ import bpy
 from mathutils import Matrix, Quaternion, Vector
 
 from blender_build_map02_chunk_20260727 import import_obj, unity_matrix
+from blender_scene_effect_vertex_offset import apply_material_vertex_offset, UnsupportedVertexOffset
 from endfield_scene_material_contract import resolve_export_path
 from extractor_core.particle_curves import UnsupportedParticleCurve
 from extractor_core.particle_snapshot import (
@@ -78,7 +79,8 @@ def _node_trs(node: Mapping[str, object]) -> Matrix:
     return Matrix.LocRotScale(Vector(position), Quaternion((w, x, y, z)), Vector(scale))
 
 
-def _owner_matrix(nodes: Mapping[tuple[str, int], Mapping[str, object]], root: tuple[str, int], owner: tuple[str, int]) -> Matrix:
+def _owner_nodes(nodes: Mapping[tuple[str, int], Mapping[str, object]], root: tuple[str, int],
+                 owner: tuple[str, int]) -> tuple[Mapping[str, object], ...]:
     chain: list[Mapping[str, object]] = []
     seen: set[tuple[str, int]] = set()
     transform_to_node: dict[tuple[str, int], tuple[str, int]] = {}
@@ -100,8 +102,21 @@ def _owner_matrix(nodes: Mapping[tuple[str, int], Mapping[str, object]], root: t
         if parent not in transform_to_node:
             raise ValueError(f"Prefab parent transform missing: owner={owner}, parent={parent}")
         current = transform_to_node[parent]
+    return tuple(reversed(chain))
+
+
+def _owner_matrix(nodes: Mapping[tuple[str, int], Mapping[str, object]], root: tuple[str, int], owner: tuple[str, int]) -> Matrix:
     matrix = Matrix.Identity(4)
-    for node in reversed(chain):
+    for node in _owner_nodes(nodes, root, owner):
+        matrix @= _node_trs(node)
+    return matrix
+
+
+def _owner_matrix_root_relative(nodes: Mapping[tuple[str, int], Mapping[str, object]],
+                                root: tuple[str, int], owner: tuple[str, int]) -> Matrix:
+    """Place a child under a DynamicStreaming anchor that replaces prefab root TRS."""
+    matrix = Matrix.Identity(4)
+    for node in _owner_nodes(nodes, root, owner)[1:]:
         matrix @= _node_trs(node)
     return matrix
 
@@ -168,27 +183,50 @@ def _gravity_local(gravity_world_unity: tuple[float, float, float], unity_world:
     return tuple(float(value) for value in local)
 
 
-def _particle_custom_attributes(mesh: bpy.types.Mesh, particles: tuple[SnapshotParticle, ...]) -> tuple[bpy.types.Attribute | None, bpy.types.Attribute | None]:
+def _particle_custom_attributes(mesh: bpy.types.Mesh, particles: tuple[SnapshotParticle, ...]) -> None:
     names = ("custom1", "custom2")
-    attributes: list[bpy.types.Attribute | None] = []
     for name in names:
         present = [getattr(particle, name) is not None for particle in particles]
         if any(present) and not all(present):
             raise ParticleSnapshotError(f"Particle custom stream varies across particles: stream={name}")
-        attributes.append(mesh.color_attributes.new(name=f"EF_FX_{name.upper()}", type="FLOAT_COLOR", domain="CORNER")
-                          if any(present) else None)
-    return attributes[0], attributes[1]
+        if any(present):
+            mesh.color_attributes.new(name=f"EF_FX_{name.upper()}", type="FLOAT_COLOR", domain="CORNER")
+
+
+def _write_color_stream(mesh: bpy.types.Mesh, name: str,
+                         values: Sequence[tuple[float, float, float, float] | None]) -> None:
+    attribute = mesh.color_attributes.get(name)
+    if attribute is None:
+        if any(value is not None for value in values):
+            raise ParticleSnapshotError(f"Color stream attribute missing: mesh={mesh.name}, stream={name}")
+        return
+    if len(values) != len(mesh.loops) or any(value is None for value in values):
+        raise ParticleSnapshotError(f"Color stream corner count or values invalid: mesh={mesh.name}, stream={name}")
+    # Bulk writes preserve signed shader data; the RNA color setter clamps negatives.
+    packed = [component for value in values for component in value]
+    attribute.data.foreach_set("color", packed)
 
 
 def _particle_mesh(name: str, particles: tuple[SnapshotParticle, ...], matrix: Matrix,
                    camera: bpy.types.Object, render_mode: int, velocity_scale: float,
                    length_scale: float) -> bpy.types.Mesh:
+    return _particle_mesh_aligned(name, particles, matrix, camera, render_mode, 0,
+                                  velocity_scale, length_scale)
+
+
+def _particle_mesh_aligned(name: str, particles: tuple[SnapshotParticle, ...], matrix: Matrix,
+                           camera: bpy.types.Object, render_mode: int, render_alignment: int,
+                           velocity_scale: float, length_scale: float) -> bpy.types.Mesh:
+    if render_alignment not in (0, 2) or (render_alignment == 2 and render_mode != 0):
+        raise UnsupportedParticleSnapshot(
+            f"Particle billboard alignment is unsupported: mode={render_mode}, alignment={render_alignment}")
     vertices: list[tuple[float, float, float]] = []
     faces: list[tuple[int, int, int, int]] = []
     for particle in particles:
         center = _vector(particle.position)
         velocity = _vector(particle.velocity)
-        right, up = _quad_axes(center, velocity, matrix, camera, render_mode)
+        right, up = (_quad_axes(center, velocity, matrix, camera, render_mode)
+                     if render_alignment == 0 else (Vector((1.0, 0.0, 0.0)), Vector((0.0, 0.0, 1.0))))
         width = particle.size[0]
         height = particle.size[1]
         if render_mode == 1:
@@ -209,7 +247,9 @@ def _particle_mesh(name: str, particles: tuple[SnapshotParticle, ...], matrix: M
     mesh.update()
     uv = mesh.uv_layers.new(name="UVMap")
     colors = mesh.color_attributes.new(name="EF_FX_COLOR", type="FLOAT_COLOR", domain="CORNER")
-    custom1, custom2 = _particle_custom_attributes(mesh, particles)
+    _particle_custom_attributes(mesh, particles)
+    uv = mesh.uv_layers["UVMap"]
+    colors = mesh.color_attributes["EF_FX_COLOR"]
     coordinates = ((0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0))
     for index, polygon in enumerate(mesh.polygons):
         u0, v0, u1, v1 = particles[index].uv_rect
@@ -217,11 +257,9 @@ def _particle_mesh(name: str, particles: tuple[SnapshotParticle, ...], matrix: M
             source_u, source_v = coordinates[corner]
             uv.data[loop_index].uv = (u0 + (u1 - u0) * source_u,
                                       v0 + (v1 - v0) * source_v)
-            colors.data[loop_index].color = particles[index].color
-            if custom1 is not None:
-                custom1.data[loop_index].color = particles[index].custom1
-            if custom2 is not None:
-                custom2.data[loop_index].color = particles[index].custom2
+    _write_color_stream(mesh, "EF_FX_COLOR", [particle.color for particle in particles for _ in range(4)])
+    _write_color_stream(mesh, "EF_FX_CUSTOM1", [particle.custom1 for particle in particles for _ in range(4)])
+    _write_color_stream(mesh, "EF_FX_CUSTOM2", [particle.custom2 for particle in particles for _ in range(4)])
     return mesh
 
 
@@ -264,10 +302,11 @@ def _trail_mesh(name: str, particles: tuple[SnapshotParticle, ...], matrix: Matr
     mesh.update()
     uv = mesh.uv_layers.new(name="UVMap")
     colors = mesh.color_attributes.new(name="EF_FX_COLOR", type="FLOAT_COLOR", domain="CORNER")
+    uv = mesh.uv_layers["UVMap"]
     for index, polygon in enumerate(mesh.polygons):
         for corner, loop_index in enumerate(polygon.loop_indices):
             uv.data[loop_index].uv = face_uvs[index][corner]
-            colors.data[loop_index].color = face_colors[index][corner]
+    _write_color_stream(mesh, "EF_FX_COLOR", [color for face in face_colors for color in face])
     return mesh
 
 
@@ -328,7 +367,7 @@ def _particle_mesh_instances(name: str, particles: tuple[SnapshotParticle, ...],
             raise ParticleSnapshotError(f"Negative mesh particle size: size={particle.size}")
         center = _vector(particle.position)
         rotation = Quaternion(Vector((0.0, -1.0, 0.0)), particle.rotation_radians)
-        for template in templates[index % len(templates)]:
+        for template in templates[particle.particle_id % len(templates)]:
             offset = len(vertices)
             for vertex in template.vertices:
                 scaled = Vector((vertex.co.x * particle.size[0],
@@ -352,18 +391,20 @@ def _particle_mesh_instances(name: str, particles: tuple[SnapshotParticle, ...],
     mesh.update()
     uv = mesh.uv_layers.new(name="UVMap")
     colors = mesh.color_attributes.new(name="EF_FX_COLOR", type="FLOAT_COLOR", domain="CORNER")
-    custom1, custom2 = _particle_custom_attributes(mesh, particles)
+    _particle_custom_attributes(mesh, particles)
+    uv = mesh.uv_layers["UVMap"]
+    colors = mesh.color_attributes["EF_FX_COLOR"]
     for index, polygon in enumerate(mesh.polygons):
         u0, v0, u1, v1 = face_rects[index]
         for corner, loop_index in enumerate(polygon.loop_indices):
             source_u, source_v = face_uvs[index][corner]
             uv.data[loop_index].uv = (u0 + (u1 - u0) * source_u,
                                       v0 + (v1 - v0) * source_v)
-            colors.data[loop_index].color = face_colors[index][corner]
-            if custom1 is not None:
-                custom1.data[loop_index].color = face_custom1[index]
-            if custom2 is not None:
-                custom2.data[loop_index].color = face_custom2[index]
+    _write_color_stream(mesh, "EF_FX_COLOR", [color for face in face_colors for color in face])
+    _write_color_stream(mesh, "EF_FX_CUSTOM1", [value for polygon, value in zip(mesh.polygons, face_custom1)
+                                               for _ in polygon.loop_indices])
+    _write_color_stream(mesh, "EF_FX_CUSTOM2", [value for polygon, value in zip(mesh.polygons, face_custom2)
+                                               for _ in polygon.loop_indices])
     return mesh
 
 
@@ -488,10 +529,12 @@ def build_scene_effects(effect_instances: Sequence[Mapping[str, object]], collec
             if render_mode not in (0, 1, 4):
                 audit.append(row | {"status": "unsupported_renderer_mode", "render_mode": render_mode})
                 continue
+            render_alignment = _integer(_field(renderer, "RenderAlignment", "Renderer"), "Renderer.RenderAlignment")
+            row["render_alignment"] = render_alignment
             if remaining == 0:
                 audit.append(row | {"status": "truncated_particle_limit", "limit": max_particle_objects})
                 continue
-            if _integer(_field(renderer, "RenderAlignment", "Renderer"), "Renderer.RenderAlignment") != 0:
+            if render_alignment not in (0, 2) or (render_alignment == 2 and render_mode == 1):
                 audit.append(row | {"status": "unsupported_renderer_alignment"})
                 continue
             if _finite(_field(renderer, "CameraVelocityScale", "Renderer"), "Renderer.CameraVelocityScale") != 0.0:
@@ -499,7 +542,7 @@ def build_scene_effects(effect_instances: Sequence[Mapping[str, object]], collec
                 continue
             try:
                 unity_world = _particle_world_matrix(
-                    anchor @ _owner_matrix(nodes, root, owner), nodes[owner],
+                    anchor @ _owner_matrix_root_relative(nodes, root, owner), nodes[owner],
                     _integer(_field(system, "ScalingMode", "System"), "System.ScalingMode"))
                 world = _blender_matrix(unity_world)
                 local_gravity = _gravity_local(gravity_world_unity, unity_world)
@@ -554,10 +597,20 @@ def build_scene_effects(effect_instances: Sequence[Mapping[str, object]], collec
                 mesh = _particle_mesh_instances(f"EF_FX_{entity_id}_{system_key[1]}",
                                                 snapshot.particles, templates)
             else:
-                mesh = _particle_mesh(f"EF_FX_{entity_id}_{system_key[1]}", snapshot.particles, world,
-                                      snapshot_camera, render_mode,
-                                      _finite(_field(renderer, "VelocityScale", "Renderer"), "Renderer.VelocityScale"),
-                                      _finite(_field(renderer, "LengthScale", "Renderer"), "Renderer.LengthScale"))
+                mesh = _particle_mesh_aligned(f"EF_FX_{entity_id}_{system_key[1]}", snapshot.particles, world,
+                                              snapshot_camera, render_mode, render_alignment,
+                                              _finite(_field(renderer, "VelocityScale", "Renderer"), "Renderer.VelocityScale"),
+                                              _finite(_field(renderer, "LengthScale", "Renderer"), "Renderer.LengthScale"))
+            try:
+                displaced = apply_material_vertex_offset(
+                    material, mesh, world, snapshot_camera.matrix_world.translation, snapshot_age_seconds)
+            except UnsupportedVertexOffset as error:
+                bpy.data.meshes.remove(mesh)
+                audit.append(row | {"status": "unsupported_vertex_offset", "reason": str(error)})
+                continue
+            if displaced is not mesh:
+                bpy.data.meshes.remove(mesh)
+                mesh = displaced
             mesh.materials.append(material)
             obj = bpy.data.objects.new(mesh.name, mesh)
             collection.objects.link(obj)
@@ -567,6 +620,8 @@ def build_scene_effects(effect_instances: Sequence[Mapping[str, object]], collec
             obj["endfield_fx_system_source"] = system_key[0]
             obj["endfield_fx_system_path_id"] = str(system_key[1])
             obj["endfield_fx_entity_id"] = str(entity_id)
+            if "endfield_fx_vertex_offset_scope" in mesh:
+                obj["endfield_fx_vertex_offset_scope"] = mesh["endfield_fx_vertex_offset_scope"]
             has_trail_points = any(len(particle.trail) >= 2 for particle in snapshot.particles)
             trail_status = "no_trail_at_snapshot"
             trail_reason: str | None = None
@@ -590,7 +645,7 @@ def build_scene_effects(effect_instances: Sequence[Mapping[str, object]], collec
                 trail_object_name = trail_obj.name
                 trail_status = "static_trail_preview"
             remaining -= len(snapshot.particles)
-            audit.append(row | {"status": "static_preview_partial" if snapshot.unsupported_modules or material_limitations or render_mode in (1, 4) or trail_status == "unsupported_trail_custom_vertex_stream" else "static_preview",
+            audit.append(row | {"status": "static_preview_partial" if snapshot.truncated > 0 or snapshot.unsupported_modules or material_limitations or render_mode in (1, 4) or trail_status == "unsupported_trail_custom_vertex_stream" else "static_preview",
                                 "object": obj.name, "particles": len(snapshot.particles),
                                 "trail_object": trail_object_name,
                                 "trail_status": trail_status,
@@ -599,8 +654,11 @@ def build_scene_effects(effect_instances: Sequence[Mapping[str, object]], collec
                                 "truncated_particles": snapshot.truncated,
                                 "unsupported_modules": list(snapshot.unsupported_modules),
                                 "material_limitations": material_limitations,
+                                "vertex_offset_scope": mesh.get("endfield_fx_vertex_offset_scope"),
                                 "render_mode": render_mode,
-                                "render_approximation": {0: "camera_facing_static_quad",
-                                                         1: "camera_facing_stretched_static_quad",
-                                                         4: "deterministic_mesh_slot_static_geometry"}[render_mode]})
+                                "render_approximation": ("local_transform_static_quad" if render_alignment == 2 and render_mode == 0
+                                                         else "local_transform_mesh_slot_static_geometry" if render_alignment == 2
+                                                         else {0: "camera_facing_static_quad",
+                                                               1: "camera_facing_stretched_static_quad",
+                                                               4: "deterministic_mesh_slot_static_geometry"}[render_mode])})
     return audit

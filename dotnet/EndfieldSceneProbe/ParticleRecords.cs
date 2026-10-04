@@ -72,7 +72,7 @@ internal static partial class Program
         }
 
         return (new ParticleRecords(
-                "component_parameters_no_simulation", "initial_emission_shape_size_color_trail_custom_data_uv_parameters_other_modules_enabled_only",
+                "component_parameters_no_simulation", "initial_emission_shape_size_color_trail_custom_data_uv_velocity_parameters_other_modules_enabled_only",
                 systems, renderers, pairs.ToArray(), diagnostics.ToArray()),
             systemExtractions.SelectMany(value => value.Meshes)
                 .Concat(rendererExtractions.SelectMany(value => value.Meshes)).Distinct().ToArray(),

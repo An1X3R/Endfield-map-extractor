@@ -260,6 +260,7 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--workspace", type=Path, required=True)
     parser.add_argument("--log-dir", type=Path, required=True)
     parser.add_argument("--plan-only", action="store_true")
+    parser.add_argument("--output-root", type=Path)
     parser.add_argument("--include-shader-diagnostics", action="store_true")
     return parser.parse_args()
 
@@ -289,6 +290,11 @@ def main() -> int:
         )
         return 0
 
+    environment = {**os.environ,
+                   "DOTNET_CLI_HOME": str(workspace / "dotnet_home"),
+                   "NUGET_PACKAGES": str(workspace / "nuget_packages"),
+                   "NUGET_HTTP_CACHE_PATH": str(workspace / "nuget_http_cache"),
+                   "DOTNET_SKIP_FIRST_TIME_EXPERIENCE": "1"}
     git = require_tool(
         "git.exe",
         "GIT_NOT_FOUND: install Git for Windows, then rerun first-run dependency bootstrap.",
@@ -302,6 +308,7 @@ def main() -> int:
         cwd=ROOT,
         log_path=log_dir / "dotnet_sdks.log",
         error_code="DOTNET_SDK_QUERY_FAILED",
+        environment=environment,
     )
     if not any(line.startswith(str(lock["sdk"]) + " ") for line in sdk_output.splitlines()):
         raise DependencyBootstrapError(
@@ -349,25 +356,48 @@ def main() -> int:
             cwd=ROOT,
             log_path=log_dir / f"{index:02d}_{name}_restore.log",
             error_code="NUGET_RESTORE_FAILED",
+            environment=environment,
         )
+        output_directory = (args.output_root.resolve() / name if args.output_root is not None
+                            else project.parent / "bin" / "Release" / "net9.0-windows")
         run_logged(
-            [dotnet, "build", str(project), "-c", "Release", "-f", "net9.0-windows", "--no-restore", *common],
+            [dotnet, "build", str(project), "-c", "Release", "-f", "net9.0-windows", "--no-restore",
+             "--output", str(output_directory), *common],
             cwd=ROOT,
             log_path=log_dir / f"{index:02d}_{name}_build.log",
             error_code="ANIMESTUDIO_BUILD_FAILED",
+            environment=environment,
         )
-        executable = project.parent / "bin" / "Release" / "net9.0-windows" / f"{project.stem}.exe"
+        executable = output_directory / f"{project.stem}.exe"
         if not executable.is_file():
             raise DependencyBootstrapError(f"ANIMESTUDIO_BUILD_OUTPUT_MISSING: {executable}")
+        run_logged(
+            [str(executable), "--initialize-runtime"],
+            cwd=ROOT,
+            log_path=log_dir / f"{index:02d}_{name}_initialize.log",
+            error_code="ANIMESTUDIO_RUNTIME_INITIALIZATION_FAILED",
+            environment=environment,
+        )
         outputs[name] = {
             "path": str(executable.resolve()),
             "bytes": executable.stat().st_size,
             "sha256": sha256_file(executable),
+            "assembly": {
+                "path": str(executable.with_suffix(".dll")),
+                "bytes": executable.with_suffix(".dll").stat().st_size,
+                "sha256": sha256_file(executable.with_suffix(".dll")),
+            },
+            "runtimeFiles": [
+                {"path": str(path.relative_to(output_directory)), "bytes": path.stat().st_size,
+                 "sha256": sha256_file(path)}
+                for path in sorted(output_directory.rglob("*")) if path.is_file()
+            ],
         }
 
     report = {
         "format": "EndfieldDependencyBootstrapReport/1",
         "status": "passed",
+        "sourceIdentity": helper_source_identity(ROOT),
         "completedAt": utc_now(),
         "workspace": str(workspace),
         "commit": head,

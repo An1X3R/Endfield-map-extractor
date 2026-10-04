@@ -74,3 +74,59 @@ def emissive_map_type(record: MaterialRecord) -> int:
     if value not in (0, 1):
         raise ValueError(f"Invalid emissive map type: material={record['Name']}, value={value}")
     return int(value)
+
+
+def has_verified_lit_alpha_clip(record: MaterialRecord) -> bool:
+    """Match the UV0 two-map alpha contract decoded from Lit DepthOnly 799."""
+    floats = record["Floats"]
+    return (surface_family(record) == "lit"
+            and floats.get("_EnableAlphaTest", 0.0) > 0.5
+            and floats.get("_BaseTextureMapCount") == 1
+            and floats.get("_BaseUVSet") == 0
+            and floats.get("_BasePbrMapUVSet") == 0
+            and floats.get("_EnableUVAnimation") == 0)
+
+
+def has_verified_lit_sweep(record: MaterialRecord) -> bool:
+    """Match a reconstructed sweep core, not main-pass runtime parity."""
+    state = record.get("RenderState")
+    keywords = set(state["ValidKeywords"]) if state is not None else set()
+    floats = record["Floats"]
+    mapped = (floats.get("_EmissiveMaskChannel") == 0 and floats.get("_EmissiveUVSet") == 0
+              and floats.get("_EmissiveNoMapUseFresnel", 0) == 0
+              and keywords in ({"_EMISSIVE_ANIM_SWEEP", "_EMISSIVE_MAP"},
+                               {"_EMISSIVE_ANIM_SWEEP", "_EMISSIVE_MAP", "_TWO_BASEMAP"},
+                               {"_EMISSIVE_ANIM_SWEEP", "_EMISSIVE_MAP", "_LAYERBLEND_MASK"}))
+    constant = (floats.get("_EmissiveMaskChannel") == 5
+                and floats.get("_EmissiveNoMapUseFresnel", 0) == 0
+                and keywords in ({"_EMISSIVE_ANIM_SWEEP", "_EMISSIVE_NOMAP"},
+                                 {"_EMISSIVE_ANIM_SWEEP", "_EMISSIVE_NOMAP", "_TWO_BASEMAP"},
+                                 {"_EMISSIVE_ANIM_SWEEP", "_EMISSIVE_NOMAP", "_TWO_BASEMAP", "_ALPHATEST_ON"})
+                and ("_ALPHATEST_ON" not in keywords or has_verified_lit_alpha_clip(record)))
+    tri_constant = (floats.get("_EmissiveMaskChannel") == 5
+                    and floats.get("_BaseUVSet") == 0 and floats.get("_BasePbrMapUVSet") == 0
+                    and floats.get("_EnableUVAnimation") == 0
+                    and floats.get("_EmissiveNoMapUseFresnel", 0) == 0
+                    and keywords == {"_EMISSIVE_ANIM_SWEEP", "_EMISSIVE_NOMAP",
+                                     "_TRI_CHANNEL_MASK", "_TWO_BASEMAP"})
+    masked = (floats.get("_EmissiveMaskChannel") in (1, 2, 3)
+              and floats.get("_BaseUVSet") == 0 and floats.get("_BasePbrMapUVSet") == 0
+              and floats.get("_EnableUVAnimation") == 0
+              and floats.get("_EmissiveNoMapUseFresnel", 0) == 0
+              and keywords == {"_EMISSIVE_ANIM_SWEEP", "_EMISSIVE_MASK", "_TWO_BASEMAP"})
+    return (surface_family(record) == "lit"
+            and floats.get("_BaseUVSet") == 0 and floats.get("_BasePbrMapUVSet") == 0
+            and floats.get("_EnableUVAnimation") == 0
+            and record["Floats"].get("_EnableEmissiveAnimSweep", 0.0) > 0.5
+            and (mapped or constant or masked or tri_constant))
+
+
+def has_unresolved_liteffect_sweep(record: MaterialRecord) -> bool:
+    """Identify compiled LitEffect sweeps whose draw/instance inputs are unavailable."""
+    shader = record["Shader"]
+    state = record.get("RenderState")
+    keywords = state["ValidKeywords"] if state is not None else []
+    return (shader["Source"].casefold() == "cab-2c811ef28608ab220ecdb5c4e0629d2d"
+            and shader["PathId"] == 6428594484694422749
+            and (record["Floats"].get("_EnableEmissiveAnimSweep", 0.0) > 0.5
+                 or "_EMISSIVE_ANIM_SWEEP" in keywords))

@@ -11,13 +11,13 @@ import math
 import random
 from collections.abc import Mapping
 
-from extractor_core.particle_curves import evaluate_minmax_curve, parse_minmax_curve
+from extractor_core.particle_curves import ParticleMinMaxCurve, evaluate_minmax_curve, parse_minmax_curve
 
 
-PARTICLE_PARAMETER_SCHEMA_VERSION = 4
+PARTICLE_PARAMETER_SCHEMA_VERSION = 5
 PARTICLE_PARAMETER_MODULE_FIELDS = (
     "Initial", "Emission", "Shape", "SizeOverLifetime", "ColorOverLifetime",
-    "Trail", "CustomData", "Uv",
+    "Trail", "CustomData", "Uv", "VelocityOverLifetime",
 )
 
 
@@ -31,6 +31,8 @@ class UnsupportedParticleSnapshot(ParticleSnapshotError):
 
 @dataclass(frozen=True)
 class SnapshotParticle:
+    particle_id: int
+    birth_time: float
     position: tuple[float, float, float]
     velocity: tuple[float, float, float]
     size: tuple[float, float, float]
@@ -247,9 +249,12 @@ def _birth_times(system: Mapping[str, object], emission: Mapping[str, object], a
     delay = evaluate_minmax_curve(parse_minmax_curve(_field(system, "StartDelay", "System"), "System.StartDelay"), 0.0, _unit(rng))
     if delay < 0:
         raise ParticleSnapshotError(f"Negative start delay: delay={delay}")
+    if age < delay:
+        return ()
     elapsed = max(0.0, age - delay)
     looping = _boolean(_field(system, "Looping", "System"), "System.Looping")
     emission_end = elapsed if looping else min(elapsed, length)
+    absolute_end = age if looping else min(age, delay + length)
     rate = parse_minmax_curve(_field(emission, "RateOverTime", "Emission"), "Emission.RateOverTime")
     distance_rate = parse_minmax_curve(_field(emission, "RateOverDistance", "Emission"), "Emission.RateOverDistance")
     if distance_rate.mode != 0 or distance_rate.scalar != 0:
@@ -258,19 +263,26 @@ def _birth_times(system: Mapping[str, object], emission: Mapping[str, object], a
     if emission_end / step > 100000:
         raise ParticleSnapshotError(f"Snapshot emission interval exceeds bounded work: age={age}, step={step}")
     births: list[float] = []
+    rate_rng = random.Random(rng.getrandbits(64))
+    burst_seed = rng.getrandbits(64)
     carry = 0.0
     index = 0
     while index * step < emission_end:
         start = index * step
-        end = min((index + 1) * step, emission_end)
+        # Integrate complete fixed ticks so earlier births never move with age.
+        end = (index + 1) * step
         normalized = ((start + end) * 0.5 % length) / length
-        hz = evaluate_minmax_curve(rate, normalized, _unit(rng))
+        hz = evaluate_minmax_curve(rate, normalized, _unit(rate_rng))
         if hz < 0:
             raise ParticleSnapshotError(f"Negative emission rate: rate={hz}")
+        previous_carry = carry
         carry += hz * (end - start)
         count = math.floor(carry)
         carry -= count
-        births.extend(delay + start + (end - start) * (item + 0.5) / count for item in range(count))
+        for item in range(count):
+            time = start + (item + 1 - previous_carry) / hz
+            if delay + time <= absolute_end:
+                births.append(delay + time)
         if len(births) > limit:
             raise ParticleSnapshotError(f"Emission event limit exceeded: limit={limit}")
         index += 1
@@ -278,7 +290,8 @@ def _birth_times(system: Mapping[str, object], emission: Mapping[str, object], a
     bursts = _sequence(_field(emission, "Bursts", "Emission"), "Emission.Bursts")
     if burst_count > len(bursts):
         raise ParticleSnapshotError("Burst count exceeds serialized rows")
-    cycles = math.ceil(emission_end / length) if looping else 1
+    # Check one extra cycle using absolute time to avoid delay-subtraction drift.
+    cycles = math.floor(emission_end / length) + 2 if looping else 1
     for cycle in range(cycles):
         for burst_index, value in enumerate(bursts[:burst_count]):
             burst = _record(value, f"Emission.Bursts[{burst_index}]")
@@ -290,14 +303,19 @@ def _birth_times(system: Mapping[str, object], emission: Mapping[str, object], a
                 raise UnsupportedParticleSnapshot(
                     f"Burst cycle count semantics are unverified: burst={burst_index}, cycleCount={repeats}")
             interval = _number(_field(burst, "RepeatInterval", "Burst"), "Burst.RepeatInterval")
+            burst_time = _number(_field(burst, "Time", "Burst"), "Burst.Time")
+            if interval < 0 or burst_time < 0:
+                raise ParticleSnapshotError(
+                    f"Negative burst timing: burst={burst_index}, time={burst_time}, interval={interval}")
             for repeat in range(repeats):
-                time = cycle * length + _number(_field(burst, "Time", "Burst"), "Burst.Time") + repeat * interval
-                if time > emission_end:
+                time = cycle * length + burst_time + repeat * interval
+                if delay + time > absolute_end:
                     continue
-                if _unit(rng) >= probability:
+                burst_rng = random.Random(_seed(f"{cycle}:{burst_index}:{repeat}", burst_seed))
+                if _unit(burst_rng) >= probability:
                     continue
                 count_curve = parse_minmax_curve(_field(burst, "CountCurve", "Burst"), "Burst.CountCurve")
-                count = evaluate_minmax_curve(count_curve, (time % length) / length, _unit(rng))
+                count = evaluate_minmax_curve(count_curve, (time % length) / length, _unit(burst_rng))
                 if count < 0:
                     raise ParticleSnapshotError(f"Negative burst count: burst={burst_index}, count={count}")
                 births.extend(delay + time for _ in range(math.floor(count)))
@@ -379,6 +397,38 @@ def _trajectory(birth: tuple[float, float, float], speed: tuple[float, float, fl
                  for point, velocity, acceleration in zip(birth, speed, gravity))  # type: ignore[return-value]
 
 
+def _constant_velocity_curves(value: object, enabled: bool) -> tuple[
+        tuple[ParticleMinMaxCurve, ...], tuple[str, ...]]:
+    """Select the exact local, constant linear subset; retain explicit partial flags."""
+    context = "VelocityOverLifetime"
+    row = _record(value, context)
+    if _boolean(_field(row, "Enabled", context), f"{context}.Enabled") != enabled:
+        raise ParticleSnapshotError("Velocity module state disagrees with typed parameters")
+    world_space = _boolean(_field(row, "InWorldSpace", context), f"{context}.InWorldSpace")
+    fields = ("X", "Y", "Z", "OrbitalX", "OrbitalY", "OrbitalZ",
+              "OrbitalOffsetX", "OrbitalOffsetY", "OrbitalOffsetZ", "Radial", "SpeedModifier")
+    curves = {key: parse_minmax_curve(_field(row, key, context), f"{context}.{key}")
+              for key in fields}
+    if not enabled:
+        return (), ()
+    issues: list[str] = []
+    if world_space:
+        issues.append("VelocityModule.WorldSpace_requires_transform")
+    for key in ("X", "Y", "Z"):
+        if curves[key].mode not in (0, 3):
+            issues.append(f"VelocityModule.{key}_requires_curve_integration")
+    for key in fields[3:]:
+        curve = curves[key]
+        expected = 1.0 if key == "SpeedModifier" else 0.0
+        constant = (curve.mode == 0 and curve.scalar == expected or
+                    curve.mode == 3 and curve.scalar == curve.min_scalar == expected)
+        if not constant:
+            issues.append(f"VelocityModule.{key}_requires_motion_integration")
+    if issues:
+        return (), ("VelocityModule", *issues)
+    return tuple(curves[key] for key in ("X", "Y", "Z")), ()
+
+
 def _trail(value: object, birth: tuple[float, float, float], speed: tuple[float, float, float],
            gravity: tuple[float, float, float], elapsed: float, fraction: float,
            color: tuple[float, float, float, float], rng: random.Random) -> tuple[SnapshotTrailPoint, ...]:
@@ -416,15 +466,17 @@ def _trail(value: object, birth: tuple[float, float, float], speed: tuple[float,
         raise UnsupportedParticleSnapshot(f"Trail requires more than 64 preview segments: segments={segments}")
     inherit = _boolean(_field(trail, "InheritParticleColor", "Trail"), "Trail.InheritParticleColor")
     points: list[SnapshotTrailPoint] = []
+    point_seed = rng.getrandbits(64)
     for index in range(segments + 1):
+        point_rng = random.Random(point_seed)
         u = index / segments
         seconds = start * (1.0 - u) + elapsed * u
-        width = _curve(trail, "WidthOverTrail", u, rng, "Trail")
+        width = _curve(trail, "WidthOverTrail", u, point_rng, "Trail")
         if width < 0:
             raise ParticleSnapshotError(f"Negative trail width: width={width}")
-        over_life = _color(_field(trail, "ColorOverLifetime", "Trail"), fraction, rng,
+        over_life = _color(_field(trail, "ColorOverLifetime", "Trail"), fraction, point_rng,
                            "Trail.ColorOverLifetime")
-        over_trail = _color(_field(trail, "ColorOverTrail", "Trail"), u, rng,
+        over_trail = _color(_field(trail, "ColorOverTrail", "Trail"), u, point_rng,
                             "Trail.ColorOverTrail")
         base = color if inherit else (1.0, 1.0, 1.0, 1.0)
         rgba = tuple(a * b * c for a, b, c in zip(base, over_life, over_trail))
@@ -464,9 +516,10 @@ def generate_particle_snapshot(system_value: object, snapshot_age: float, identi
     trail = _record(_field(parameters, "Trail", "Parameters"), "Trail")
     custom = _record(_field(parameters, "CustomData", "Parameters"), "CustomData")
     uv = _record(_field(parameters, "Uv", "Parameters"), "Uv")
+    velocity_parameters = _field(parameters, "VelocityOverLifetime", "Parameters")
     states = _sequence(_field(system, "ModuleStates", "System"), "System.ModuleStates")
     modeled = {"InitialModule", "EmissionModule", "ShapeModule", "SizeModule", "ColorModule",
-               "TrailModule", "CustomDataModule", "UVModule"}
+               "TrailModule", "CustomDataModule", "UVModule", "VelocityModule"}
     enabled: dict[str, bool] = {}
     for item in states:
         row = _record(item, "ModuleState")
@@ -480,6 +533,9 @@ def generate_particle_snapshot(system_value: object, snapshot_age: float, identi
     if not enabled["InitialModule"]:
         raise UnsupportedParticleSnapshot("InitialModule disabled; lifetime and speed semantics are unavailable")
     unsupported = [name for name, active in enabled.items() if active and name not in modeled]
+    velocity_curves, velocity_issues = _constant_velocity_curves(
+        velocity_parameters, enabled["VelocityModule"])
+    unsupported.extend(velocity_issues)
     rotation_3d = _boolean(_field(initial, "Rotation3D", "Initial"), "Initial.Rotation3D")
     if rotation_3d:
         unsupported.append("InitialModule.Rotation3D")
@@ -527,6 +583,11 @@ def generate_particle_snapshot(system_value: object, snapshot_age: float, identi
         position, direction = _shape(shape, rng)
         start_speed = _curve(initial, "StartSpeed", emitter_time, rng, "Initial")
         initial_velocity = tuple(component * start_speed for component in direction)
+        if velocity_curves:
+            velocity_rng = random.Random(_seed(f"{identity}:{index}:velocity", system_seed))
+            initial_velocity = tuple(
+                component + evaluate_minmax_curve(curve, 0.0, _unit(velocity_rng))
+                for component, curve in zip(initial_velocity, velocity_curves))
         gravity_modifier = _curve(initial, "GravityModifier", emitter_time, rng, "Initial")
         acceleration = tuple(component * gravity_modifier for component in gravity)
         birth_position = position
@@ -557,14 +618,14 @@ def generate_particle_snapshot(system_value: object, snapshot_age: float, identi
         lifetime_color = _color(_field(color, "Gradient", "ColorOverLifetime"), fraction, rng, "ColorOverLifetime.Gradient") if _boolean(_field(color, "Enabled", "ColorOverLifetime"), "ColorOverLifetime.Enabled") else (1.0, 1.0, 1.0, 1.0)
         rgba = tuple(a * b for a, b in zip(initial_color, lifetime_color))
         trail_points = _trail(trail, birth_position, initial_velocity, acceleration, elapsed,
-                              fraction, rgba, rng) if enabled["TrailModule"] else ()
+                              fraction, rgba, random.Random(_seed(f"{identity}:{index}:trail", system_seed))) if enabled["TrailModule"] else ()
         streams = _sequence(_field(custom, "Streams", "CustomData"), "CustomData.Streams")
         if len(streams) != 2:
             raise ParticleSnapshotError(f"CustomData stream count invalid: count={len(streams)}")
         custom_values = tuple(_custom_stream(stream, fraction, rng, f"CustomData.Streams[{stream_index}]")
                               for stream_index, stream in enumerate(streams)) if enabled["CustomDataModule"] else (None, None)
         tile = _uv_rect(uv, fraction, rng) if enabled["UVModule"] else (0.0, 0.0, 1.0, 1.0)
-        alive.append(SnapshotParticle(position, velocity,
+        alive.append(SnapshotParticle(index, birth, position, velocity,
                                       (start_size * x_scale, initial_y * y_scale, initial_z * z_scale),
                                       rgba, fraction, rotation, trail_points,
                                       custom_values[0], custom_values[1], tile))

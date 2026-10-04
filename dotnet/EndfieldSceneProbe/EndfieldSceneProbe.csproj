@@ -15,5 +15,6 @@
   <ItemGroup>
     <ProjectReference Include="$(AnimeStudioRoot)\AnimeStudio\AnimeStudio.csproj" />
     <Compile Include="..\Shared\HelperProgress.cs" Link="HelperProgress.cs" />
+    <Compile Include="..\Shared\HelperRuntime.cs" Link="HelperRuntime.cs" />
   </ItemGroup>
 </Project>
