@@ -27,7 +27,7 @@ from webui_job_store import JobStore
 
 
 EXPECTED_MANIFEST_FORMAT = "EndfieldRegionMapLayerManifest/1"
-BLENDER_PROFILES = Path(__file__).resolve().with_name("endfield_blender_worker_profiles_v1.json")
+BLENDER_PROFILES = Path(__file__).resolve().parent.parent / "endfield_blender_worker_profiles_v1.json"
 
 
 class JobCancelled(RuntimeError):
@@ -41,7 +41,7 @@ def resolve_runtime_paths(
 ) -> tuple[dict[str, Path | None], RuntimeConfig]:
     """Resolve worker defaults without opening cache records or Blender."""
 
-    config = load_runtime_config(runtime_config, root=Path(__file__).resolve().parent)
+    config = load_runtime_config(runtime_config, root=Path(__file__).resolve().parent.parent)
     config_dir = config.directory
     return {
         "stage119_root": configured_path(

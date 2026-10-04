@@ -74,7 +74,7 @@ def ensure_current_scene_helpers(runtime_path: Path, cache_root: Path,
     from endfield_scene_export import run_scene_process
 
     source_root = Path(__file__).resolve().parent
-    identity = helper_source_identity(source_root)
+    identity = helper_source_identity(source_root.parent)
     state_path = runtime_path.parent / "first_run_state.json"
     state = require_object(json.loads(state_path.read_text(encoding="utf-8-sig")), str(state_path))
     steps = require_object(state.get("steps"), "first-run steps")

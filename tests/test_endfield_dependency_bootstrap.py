@@ -22,7 +22,9 @@ class DependencyBootstrapTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             (root / "global.json").write_text("{}", encoding="utf-8")
-            (root / "endfield_dependency_bootstrap.py").write_text("source", encoding="utf-8")
+            source_root = root / "src"
+            source_root.mkdir()
+            (source_root / "endfield_dependency_bootstrap.py").write_text("source", encoding="utf-8")
             shared = root / "dotnet" / "Shared" / "HelperProgress.cs"
             shared.parent.mkdir(parents=True)
             shared.write_text("first", encoding="utf-8")

@@ -45,7 +45,7 @@ def user_runtime_config_path() -> Path:
     local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
     if local_app_data:
         return Path(local_app_data).expanduser().resolve() / "EndfieldExtractor" / LOCAL_CONFIG_NAME
-    return Path(__file__).resolve().parent / LOCAL_CONFIG_NAME
+    return Path(__file__).resolve().parent.parent / LOCAL_CONFIG_NAME
 
 
 def expand_tokens(value: Any, variables: Mapping[str, str] | None = None) -> Any:
@@ -89,7 +89,7 @@ def load_json_config(
         payload,
         {
             "ENDFIELD_CONFIG_DIR": str(resolved.parent),
-            "ENDFIELD_EXTRACTOR_ROOT": str(Path(__file__).resolve().parent),
+            "ENDFIELD_EXTRACTOR_ROOT": str(Path(__file__).resolve().parent.parent),
             **dict(variables or {}),
         },
     )
@@ -124,9 +124,9 @@ def load_runtime_config(
         candidate = Path(os.environ[env_name]).expanduser()
         explicit = True
     else:
-        base_root = (root or Path(__file__).resolve().parent).resolve()
+        base_root = (root or Path(__file__).resolve().parent.parent).resolve()
         candidates = [base_root / local_name]
-        if base_root == Path(__file__).resolve().parent:
+        if base_root == Path(__file__).resolve().parent.parent:
             user_candidate = user_runtime_config_path()
             if user_candidate not in candidates:
                 candidates.append(user_candidate)

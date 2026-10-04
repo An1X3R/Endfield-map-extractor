@@ -14,7 +14,7 @@ import sys
 from typing import Any, Mapping
 
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parent.parent
 LOCK_PATH = ROOT / "third_party" / "animestudio.lock.json"
 PROJECTS = {
     "sceneProbe": ROOT / "dotnet" / "EndfieldSceneProbe" / "EndfieldSceneProbe.csproj",
@@ -40,7 +40,7 @@ def sha256_file(path: Path) -> str:
 
 def helper_source_identity(root: Path) -> str:
     """Invalidate a completed helper build when its published source inputs change."""
-    files = {root / "endfield_dependency_bootstrap.py", root / "global.json"}
+    files = {root / "src" / "endfield_dependency_bootstrap.py", root / "global.json"}
     for directory in (root / "dotnet", root / "third_party"):
         files.update(path for path in directory.rglob("*")
                      if path.is_file() and not {"bin", "obj", ".git"}.intersection(path.relative_to(directory).parts)

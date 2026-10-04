@@ -16,6 +16,7 @@ from urllib.request import Request, urlopen
 
 import jsonschema
 import launch_webui
+from tests import SCHEMA_ROOT
 
 from launch_webui import (
     PathPickerHandler,
@@ -356,7 +357,7 @@ class WebUIFirstRunBackendTests(unittest.TestCase):
                     error_response("first_run_required", "Prepare data", retryable=True),
                 ),
             )
-            schema_root = Path(__file__).resolve().parent
+            schema_root = SCHEMA_ROOT
             for schema_name, payload in fixtures:
                 schema = json.loads(
                     (schema_root / schema_name).read_text(encoding="utf-8")
@@ -429,7 +430,7 @@ class WebUIFirstRunBackendTests(unittest.TestCase):
             self.assertEqual(helper_progress, status["details"]["helperProgress"])
             self.assertEqual(helper_progress, event_page["events"][0]["details"]["helperProgress"])
 
-            schema_root = Path(__file__).resolve().parent
+            schema_root = SCHEMA_ROOT
             for schema_name, payload in (
                 ("webui_first_run_status_v1.schema.json", status),
                 ("webui_first_run_events_v1.schema.json", event_page),
@@ -463,7 +464,7 @@ class WebUIFirstRunBackendTests(unittest.TestCase):
                 "run_name": "bootstrap_v1",
             }
             python = root / "python.exe"
-            script = root / "endfield_first_run.py"
+            script = root / "src" / "endfield_first_run.py"
             cancel_marker = root / "cancel.marker"
             legacy_command = build_first_run_command(
                 python, script, base_request, cancel_marker=cancel_marker, resume=False

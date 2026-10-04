@@ -37,7 +37,7 @@ MANIFEST_FORMAT = "EndfieldBlenderSelectionBuild/1"
 EVENT_FORMAT = "EndfieldBlenderWorkerEvent/1"
 AXIS_CONTRACT = "(X,Y,Z)=(Unity X,-Unity Z,Unity Y)"
 SECTOR_SIZE = 128.0
-PROFILE_PATH = Path(__file__).with_name("endfield_blender_worker_profiles_v1.json")
+PROFILE_PATH = Path(__file__).resolve().parent.parent / "endfield_blender_worker_profiles_v1.json"
 AUDITOR_PATH = Path(__file__).with_name("blender_audit_endfield_selection_worker_v1.py")
 MERGER_PATH = Path(__file__).with_name("blender_merge_endfield_selection_worker_v1.py")
 MAP_BOUNDS = {
@@ -63,7 +63,7 @@ def resolve_runtime_paths(args: argparse.Namespace) -> tuple[dict[str, Path | No
     responsible for checking game, cache, profile, and Blender prerequisites.
     """
 
-    config = load_runtime_config(args.runtime_config, root=Path(__file__).resolve().parent)
+    config = load_runtime_config(args.runtime_config, root=Path(__file__).resolve().parent.parent)
     config_dir = config.directory
     paths = {
         "game_root": configured_path(

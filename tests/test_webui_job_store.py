@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 
-from test_webui_export_contract_v2 import payload
+from tests.test_webui_export_contract_v2 import payload
 from webui_export_contract_v2 import canonicalize_job
 from webui_job_store import JobStore
 

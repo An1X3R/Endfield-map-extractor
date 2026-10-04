@@ -553,7 +553,7 @@ class FirstRunCoordinator:
                 raise FirstRunCancelled("First-run data preparation was cancelled")
             command = build_first_run_command(
                 interpreter,
-                self.extractor_root / "endfield_first_run.py",
+                self.extractor_root / "src" / "endfield_first_run.py",
                 request,
                 cancel_marker=cancel_marker,
                 resume=resume,

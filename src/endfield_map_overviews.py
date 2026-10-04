@@ -14,7 +14,7 @@ from generate_runtime_overview import TILE_RE, choose_tile_candidates, container
 
 
 FORMAT = "EndfieldMapOverviews/1"
-LAYOUT_PATH = Path(__file__).resolve().parent / "webui" / "src" / "data" / "region_map_overview_layout.json"
+LAYOUT_PATH = Path(__file__).resolve().parent.parent / "webui" / "src" / "data" / "region_map_overview_layout.json"
 
 
 def read_object(path: Path) -> dict[str, object]:

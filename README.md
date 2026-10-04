@@ -15,12 +15,12 @@
 - 修复部分普通资产把动态扫光当成持续自发光导致的发白。已核对的变体按相机空间与场景时间重建；缺少逐实例输入的变体保留普通表面，并将未还原的发光分支记入待处理。
 - 旧缓存导出时按源码身份更新提取工具并校验完整运行依赖，无需删除地图缓存；部分特效缓存缺材质或贴图时会重新补齐依赖。WebUI 解锁水、粒子、特效与灯光的场景分类导出。
 - 增加独立的实验性特效动画导出入口，支持已验证组件的短片段及同目录 Alembic 缓存；修正扫光和特效的连续子帧时钟。WebUI 默认仍导出静态特效，不提供完整游戏粒子模拟。
-- 整理历史本地实验脚本与首次准备说明，保留正式入口和兼容依赖；WebUI 明确显示能力限制及待处理项含义。
+- 归整发布目录：Python 运行模块与研究 CLI 放入 `src/`，测试和 JSON Schema 分置 `tests/`、`schemas/`，根目录保留启动入口；历史 Stage 脚本归入 `archive/local_legacy/`，首次准备说明归入 `docs/`。WebUI 明确显示能力限制及待处理项含义。
 
 ### 当前限制
 
 - WebUI 特效是固定时刻预览，仅支持部分组件。武陵阵列的环绕流动效果与游戏仍明显不符，本阶段冻结深入研究；已有诊断动画不作为完整还原成果。
-- 实验性动画需通过 `blender_export_effect_animation.py` 显式调用，交付时 `.blend` 与同目录 `.abc` 必须一起保留。动态视角、噪声、旋转、限速和其他运行时模块仍有未支持项。
+- 实验性动画需通过 `src/blender_export_effect_animation.py` 显式调用，交付时 `.blend` 与同目录 `.abc` 必须一起保留。动态视角、噪声、旋转、限速和其他运行时模块仍有未支持项。
 - 水体的泡沫、焦散、交互及波面位移尚未完整还原；灯光强度、运行时启停、Cookie、特殊光源及烘焙信息仍有限制，色温与衰减采用有标记的 Blender 预览近似。
 - 部分扫光缺少最终逐实例参数和交互状态，游戏雾、深度、曝光与调色也未完整恢复。双引擎兼容不代表与游戏或彼此逐像素一致。
 - `partial` 或待处理项可能表示已生成的近似预览、未支持组件或缺失资源，不能直接换算为资产缺失率。重开校验通过只证明产物可读及相应完整性检查通过。
@@ -79,22 +79,24 @@ v2.1 发布时，水面自动绑定、灯光与特效场景重建未接通，报
 ## 主要入口
 
 - `launch_webui.py`：首选入口。启动本机 WebUI、路径选择桥、首次运行 API 和地图导出任务服务。
-- `launch_first_run.ps1` / `endfield_first_run.py`：从只读游戏目录自动生成首次运行所需数据、审计后的 Stage 缓存和本机 runtime 配置。
-- `webui_first_run_contract_v1.py` / `webui_first_run_coordinator.py`：本机首启数据准备契约与异步后端门禁；目录和完整数据未就绪时拒绝地图导出任务。
-- `webui_export_contract_v2.py` / `webui_export_job_v2.schema.json`：Map01/Map02 的规范化异步导出请求契约。
-- `webui_source_contract.py`：按安装结构校验用户游戏目录、外部输出边界与 Blender 路径，不要求固定盘符或安装文件夹名称。
-- `webui_job_store.py`：在用户选择的外部输出根中保存任务状态、事件与协作式取消标记。
-- `endfield_blender_selection_worker_v1.py`：开发研究用的版本化 Blender worker；当前公开 WebUI 不会调用它。
-- `endfield_scene_export.py` / `endfield_scene_export_plan.py` / `blender_export_prepared_scene.py`：WebUI 的可移植场景编排、当前 ECS 精确计划与 Blender 构建入口；复用已有几何、材质和贴花实现。
-- `build_endfield_map_layers.py` / `audit_endfield_map_layers.py`：构建并审计供 WebUI 使用的地图分层缓存。
-- `extractor_core/`：只读 VFS、资源、实例、资产解析和 terrain 提取实现。
+- `launch_first_run.ps1` / `src/endfield_first_run.py`：从只读游戏目录自动生成首次运行所需数据、审计后的 Stage 缓存和本机 runtime 配置。
+- `src/webui_first_run_contract_v1.py` / `src/webui_first_run_coordinator.py`：本机首启数据准备契约与异步后端门禁；目录和完整数据未就绪时拒绝地图导出任务。
+- `src/webui_export_contract_v2.py` / `schemas/webui_export_job_v2.schema.json`：Map01/Map02 的规范化异步导出请求契约。
+- `src/webui_source_contract.py`：按安装结构校验用户游戏目录、外部输出边界与 Blender 路径，不要求固定盘符或安装文件夹名称。
+- `src/webui_job_store.py`：在用户选择的外部输出根中保存任务状态、事件与协作式取消标记。
+- `src/endfield_blender_selection_worker_v1.py`：开发研究用的版本化 Blender worker；当前公开 WebUI 不会调用它。
+- `src/endfield_scene_export.py` / `src/endfield_scene_export_plan.py` / `src/blender_export_prepared_scene.py`：WebUI 的可移植场景编排、当前 ECS 精确计划与 Blender 构建入口；复用已有几何、材质和贴花实现。
+- `src/build_endfield_map_layers.py` / `src/audit_endfield_map_layers.py`：构建并审计供 WebUI 使用的地图分层缓存。
+- `src/extractor_core/`：只读 VFS、资源、实例、资产解析和 terrain 提取实现。
 - `dotnet/`：SceneProbe 与 BundleScanner 的源码、项目文件和依赖锁；`bin/obj` 不发布。
 
 ## 目录导航
 
-- 根目录：启动入口、共享提取与 Blender 构建模块、接口 Schema 和现有测试。脚本从仓库根目录运行。
+- 根目录：公开启动器、环境引导、依赖清单和本机配置模板；启动器从仓库根目录运行。
+- `src/`：运行时模块、首启与导出协调器、Blender CLI，以及 `src/extractor_core/` 共享实现。
+- `tests/`：Python 回归测试。运行 `python -B -m unittest discover -s tests -t .`。
+- `schemas/`：仓库维护的 JSON Schema；运行时构建会把所需 schema 复制到数据包的 `schemas/`。
 - `webui/`：前端界面、本机接口适配与前端测试。
-- `extractor_core/`：资源解析、粒子采样、灯光等共享逻辑。
 - `dotnet/`：包扫描与场景探针源码及依赖锁定文件。
 - `docs/`：[首次准备契约](docs/FIRST_RUN_BOOTSTRAP.md)。
 - `fixtures/`、`patches/`、`third_party/`：测试输入、依赖补丁与第三方说明。
@@ -148,7 +150,7 @@ py .\launch_webui.py --stage119-root '<外部 Stage 缓存目录>'
 
 当前数据消费边界：water 仍显示为 `candidate`；首次运行未完成有效灯光闭包时，lights 保持 `not_started` 或 `partial`；roads 是点/密度视图而非道路网格。WebUI 启动器会在 Stage 缺失时调用只读首启提取链，但不会修改游戏目录。
 
-WebUI 默认采用“先选目录、再准备数据、最后解锁地图导出”流程。token-protected 本机 bridge 提供 `/first-run`、`/first-run/validate`、`/first-run/events`、`/first-run/cancel`；请求 schema 为 `webui_first_run_job_v1.schema.json`。该接口固定运行完整 helper 与 SceneProbe 链，只有首启状态为 `completed` 时才返回 `ready: true` 并放行地图 `/jobs`。`--defer-first-run-to-webui` 仍可显式指定同一行为；仅开发者需要旧式启动前准备时使用 `--prepare-before-webui`。
+WebUI 默认采用“先选目录、再准备数据、最后解锁地图导出”流程。token-protected 本机 bridge 提供 `/first-run`、`/first-run/validate`、`/first-run/events`、`/first-run/cancel`；请求 schema 为 `schemas/webui_first_run_job_v1.schema.json`。该接口固定运行完整 helper 与 SceneProbe 链，只有首启状态为 `completed` 时才返回 `ready: true` 并放行地图 `/jobs`。`--defer-first-run-to-webui` 仍可显式指定同一行为；仅开发者需要旧式启动前准备时使用 `--prepare-before-webui`。
 
 地图 `/jobs` 按选区和分组写出 gzip JSONL、`selection.json`、`export_manifest.json` 与 `audit.json`。场景模式在 `scenes/batch_XXXX/` 下额外生成 `.blend`、精确构建计划、Blender 日志与重开审计；任务完成结果列出每份场景及待处理项。数据包成功不代表场景成功，Blender 非零退出或重开核验失败会使任务失败，部分产物保留供排查。
 
@@ -197,7 +199,7 @@ Blender 工具通过 `blender --background --factory-startup --python-exit-code 
 
 ## Stage119 地图分层离线数据链
 
-正常首次运行无需手工调用本节命令：`launch_webui.py` 会先打开页面，用户在“首次运行准备”中点击“提取必要文件”后，后端才调用 `endfield_first_run.py`，从只读游戏目录生成 Map01/Map02 实例、资产解析、地形、场景探针数据，再构建并审计 Stage。`build_endfield_map_layers.py` 是面向开发者的底层重建入口，只把已提取输入转换成可供 WebUI/API 复用的只读缓存；它本身不扫描游戏目录、不启动 Blender，并拒绝复用已有输出目录。
+正常首次运行无需手工调用本节命令：`launch_webui.py` 会先打开页面，用户在“首次运行准备”中点击“提取必要文件”后，后端才调用 `src/endfield_first_run.py`，从只读游戏目录生成 Map01/Map02 实例、资产解析、地形、场景探针数据，再构建并审计 Stage。`src/build_endfield_map_layers.py` 是面向开发者的底层重建入口，只把已提取输入转换成可供 WebUI/API 复用的只读缓存；它本身不扫描游戏目录、不启动 Blender，并拒绝复用已有输出目录。
 
 正式输入默认包含：
 
@@ -210,7 +212,7 @@ Blender 工具通过 `blender --background --factory-startup --python-exit-code 
 
 ```powershell
 Set-Location '<仓库目录>'
-& '.\.venv\Scripts\python.exe' '.\build_endfield_map_layers.py' `
+& '.\.venv\Scripts\python.exe' '.\src\build_endfield_map_layers.py' `
   --output-root '<外部输出目录>\stage119_standardized_map_layers_<new-id>' `
   --generated-at '2026-07-31T23:59:00+00:00'
 ```
@@ -244,7 +246,7 @@ Stage119 index 有两种必须区分的寻址形态：
 全量或迁移后的缓存可用独立审计器复核。`--verify-source-hashes` 会重新读取并哈希所有外部证据；`--report` 必须指向一个不存在的新文件：
 
 ```powershell
-& '.\.venv\Scripts\python.exe' '.\audit_endfield_map_layers.py' `
+& '.\.venv\Scripts\python.exe' '.\src\audit_endfield_map_layers.py' `
   '<外部输出目录>\stage119_standardized_map_layers_<id>' `
   --verify-source-hashes `
   --report '<外部输出目录>\stage119_standardized_map_layers_<id>\full_audit.json'

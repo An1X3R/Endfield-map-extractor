@@ -50,8 +50,9 @@ STATE_FORMAT = "EndfieldFirstRunState/1"
 REPORT_FORMAT = "EndfieldFirstRunReport/1"
 EVENT_FORMAT = "EndfieldFirstRunEvent/1"
 SCRIPT_ROOT = Path(__file__).resolve().parent
-DEFAULT_CONFIG = SCRIPT_ROOT / "endfield.runtime.example.json"
-RUNTIME_MANIFEST = SCRIPT_ROOT / "webui" / "src" / "data" / "region_map_runtime_manifest.json"
+REPOSITORY_ROOT = SCRIPT_ROOT.parent
+DEFAULT_CONFIG = REPOSITORY_ROOT / "endfield.runtime.example.json"
+RUNTIME_MANIFEST = REPOSITORY_ROOT / "webui" / "src" / "data" / "region_map_runtime_manifest.json"
 DEPENDENCY_BOOTSTRAP = SCRIPT_ROOT / "endfield_dependency_bootstrap.py"
 
 
@@ -368,7 +369,7 @@ def read_config(path: Path | None) -> tuple[dict[str, Any], Path | None]:
             )
         return payload, resolved
     for name in ("endfield.runtime.local.json", "endfield.local.json"):
-        local = SCRIPT_ROOT / name
+        local = REPOSITORY_ROOT / name
         if local.is_file():
             payload = load_json_config(local)
             if payload.get("format") not in {CONFIG_FORMAT, "EndfieldRuntimeConfig/1"}:
@@ -602,7 +603,7 @@ def run() -> int:
         vfs_root = game_root / "Endfield_Data" / "StreamingAssets" / "VFS"
 
         dependency_result: dict[str, Any]
-        helper_source = helper_source_identity(SCRIPT_ROOT)
+        helper_source = helper_source_identity(REPOSITORY_ROOT)
         from endfield_scene_helpers import verified_helpers
         if args.skip_helper_bootstrap:
             dependency_result = {
@@ -635,7 +636,7 @@ def run() -> int:
                 command.append("--include-shader-diagnostics")
             process = subprocess.run(
                 command,
-                cwd=str(SCRIPT_ROOT),
+                cwd=str(REPOSITORY_ROOT),
                 text=True,
                 encoding="utf-8",
                 errors="replace",

@@ -9,6 +9,7 @@ from pathlib import Path
 import jsonschema
 
 import webui_export_contract_v2 as contract
+from tests import SCHEMA_ROOT
 
 
 def create_game_install(root: Path) -> Path:
@@ -36,7 +37,7 @@ def payload(map_id: str = "map01") -> dict:
 
 class ContractTests(unittest.TestCase):
     def test_browser_batch_modes_match_schema_and_canonicalizer(self) -> None:
-        schema = json.loads(Path(__file__).with_name("webui_export_job_v2.schema.json").read_text())
+        schema = json.loads((SCHEMA_ROOT / "webui_export_job_v2.schema.json").read_text())
         for mode in ("per_sector", "cluster_4x4_sectors", "merged_selection"):
             with self.subTest(mode=mode):
                 value = {**payload(), "batch_mode": mode}
@@ -63,7 +64,7 @@ class ContractTests(unittest.TestCase):
             self.assertEqual(result["export_mode"], "blend")
             self.assertEqual(result["source"]["blender_exe"], str(blender.resolve()))
             self.assertEqual(result["export_groups"], ["building", "prop"])
-            schema = json.loads(Path(__file__).with_name("webui_export_job_v2.schema.json").read_text())
+            schema = json.loads((SCHEMA_ROOT / "webui_export_job_v2.schema.json").read_text())
             jsonschema.validate(value, schema)
 
     def test_unknown_export_mode_fails(self) -> None:
@@ -151,7 +152,7 @@ class ContractTests(unittest.TestCase):
         value["source"] = {"game_root": r"X:\Games\Endfield Game"}
         value["layers"].update({"roads": True, "vegetation": True, "lights": True})
         schema = json.loads(
-            Path(__file__).with_name("webui_export_job_v2.schema.json").read_text(encoding="utf-8")
+            (SCHEMA_ROOT / "webui_export_job_v2.schema.json").read_text(encoding="utf-8")
         )
         jsonschema.Draft202012Validator(schema).validate(value)
 

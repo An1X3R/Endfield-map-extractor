@@ -2,7 +2,7 @@ param()
 
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $bootstrap = Join-Path $root 'bootstrap_environment.py'
-$coordinator = Join-Path $root 'endfield_first_run.py'
+$coordinator = Join-Path $root 'src\endfield_first_run.py'
 $venvPython = Join-Path $root '.venv\Scripts\python.exe'
 
 $hostPython = $null

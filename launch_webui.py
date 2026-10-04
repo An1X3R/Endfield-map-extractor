@@ -26,6 +26,9 @@ from urllib.request import urlopen
 from urllib.parse import parse_qs, urlparse
 import webbrowser
 
+ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(ROOT / "src"))
+
 from endfield_runtime_config import (
     ConfigurationError,
     RuntimeConfig,
@@ -46,9 +49,8 @@ from webui_first_run_contract_v1 import (
 from webui_first_run_coordinator import FirstRunCoordinator, FirstRunCoordinatorError
 
 
-ROOT = Path(__file__).resolve().parent
 WEBUI_ROOT = ROOT / "webui"
-FIRST_RUN_SCRIPT = ROOT / "endfield_first_run.py"
+FIRST_RUN_SCRIPT = ROOT / "src" / "endfield_first_run.py"
 PYTHON_REQUIREMENTS = ROOT / "requirements.txt"
 PICKER_LOCK = threading.Lock()
 

@@ -12,10 +12,11 @@ import jsonschema
 
 import blender_audit_endfield_selection_worker_v1 as reopen_audit
 import endfield_blender_selection_worker_v1 as worker
+from tests import REPO_ROOT, SCHEMA_ROOT
 
 
-SCHEMA_PATH = Path(__file__).with_name("endfield_blender_selection_worker_v1.schema.json")
-REGISTRY_PATH = Path(__file__).with_name("endfield_blender_worker_profiles_v1.json")
+SCHEMA_PATH = SCHEMA_ROOT / "endfield_blender_selection_worker_v1.schema.json"
+REGISTRY_PATH = REPO_ROOT / "endfield_blender_worker_profiles_v1.json"
 TEST_DATASET_FINGERPRINT = "A" * 64
 
 

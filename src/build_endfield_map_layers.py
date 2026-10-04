@@ -48,7 +48,7 @@ from endfield_map_layer_contract import (
 
 
 SCRIPT_ROOT = Path(__file__).resolve().parent
-DEFAULT_RUNTIME_MANIFEST = SCRIPT_ROOT / "webui" / "src" / "data" / "region_map_runtime_manifest.json"
+DEFAULT_RUNTIME_MANIFEST = SCRIPT_ROOT.parent / "webui" / "src" / "data" / "region_map_runtime_manifest.json"
 
 
 @dataclass(frozen=True)
@@ -2098,7 +2098,7 @@ def build_all(config: BuildConfig) -> dict[str, Any]:
         "endfield_map_layer_dataset.schema.json",
         "endfield_map_layer_record.schema.json",
     ):
-        source_schema = SCRIPT_ROOT / schema_name
+        source_schema = SCRIPT_ROOT.parent / "schemas" / schema_name
         if not source_schema.is_file():
             raise FileNotFoundError(source_schema)
         target_schema = output_root / "schemas" / schema_name

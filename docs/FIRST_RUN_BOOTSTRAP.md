@@ -7,7 +7,7 @@ The public source tree does not contain extracted game data. A user supplies onl
 - an optional external cache root;
 - a local Blender 4.4 or newer executable for scene export (optional for data packages).
 
-`launch_webui.py` now starts the WebUI first by default. When these values are not configured, choose them in the WebUI setup panel, validate them, and click the required-files extraction action. The launcher does not run `endfield_first_run.py` before the page opens. The same process remains available as a standalone CLI and through the legacy `--prepare-before-webui` developer mode.
+`launch_webui.py` now starts the WebUI first by default. When these values are not configured, choose them in the WebUI setup panel, validate them, and click the required-files extraction action. The launcher does not run `src/endfield_first_run.py` before the page opens. The same process remains available as a standalone CLI and through the legacy `--prepare-before-webui` developer mode.
 
 ```powershell
 .\launch_first_run.ps1 `
@@ -46,7 +46,7 @@ The local bridge exposes:
 - `GET /first-run/events?after=<sequence>&limit=<1..500>` for paged monotonic progress;
 - `POST /first-run/cancel` for cooperative cancellation with partial-output preservation.
 
-The request schema is `webui_first_run_job_v1.schema.json`. The backend does not expose helper/SceneProbe skip switches, always passes `--no-activate-runtime-config`, and rejects map `/jobs` with `first_run_required` until status is `ready: true`. On success it hot-swaps the local export coordinator to the generated Stage/runtime config, and the WebUI reloads the active overview.
+The request schema is `schemas/webui_first_run_job_v1.schema.json`. The backend does not expose helper/SceneProbe skip switches, always passes `--no-activate-runtime-config`, and rejects map `/jobs` with `first_run_required` until status is `ready: true`. On success it hot-swaps the local export coordinator to the generated Stage/runtime config, and the WebUI reloads the active overview.
 
 The baseline WebUI dataset is usable after its full audit passes. Terrain, instance, asset-resolution and scene-probe inputs are extracted during the same first run. The historical Blender profile registry remains separate from the portable scene path; users do not need historical research files. Preparation readiness does not guarantee that every selected asset or material is present in the cache.
 
