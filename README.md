@@ -15,7 +15,7 @@
 
 ## 开始使用
 
-在 [Releases](https://github.com/An1X3R/Endfield-map-extractor/releases/latest) 下载 **Endfield-Extractor-v2.4-windows-x64.zip**，解压后按 [安装与升级说明](docs/INSTALL.md) 完成一次环境准备。
+在 [Releases](https://github.com/An1X3R/Endfield-map-extractor/releases/latest) 下载 **Endfield-Extractor-v3-windows-x64.zip**，解压后按 [安装与升级说明](docs/INSTALL.md) 完成一次环境准备。
 
 | 依赖 | 要求 |
 |---|---|

@@ -1,4 +1,4 @@
-# Endfield Atlas Composer WebUI 2.4
+# Endfield Atlas Composer WebUI 3.0
 
 本地地图提取器的 WebUI。游戏安装目录保持只读；导出任务通过 `launch_webui.py` 提供的本机桥接服务生成经过签名和审计的选区数据包，`blend` 模式同时生成逐批 Blender 场景，结果写入用户选择的输出目录。仓库不附带 Stage 数据、地图图片、游戏资产或导出结果，缺少外部输入时相关接口会明确报告不可用。
 
