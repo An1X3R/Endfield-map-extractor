@@ -612,6 +612,10 @@ def create_material(record: MaterialRecord, texture_files: dict[tuple[str, int],
         if family in ("leaf", "card") and not normal_used:
             _input(principled, "Roughness").default_value = (floats.get("_RoughnessMin", 0.0) + floats.get("_RoughnessMax", 1.0)) * 0.5
         apply_authored_albedo(result, principled, record)
+    from endfield_shader_contract import has_verified_lit_top_layer
+    if has_verified_lit_top_layer(record):
+        from blender_hgrp_top_layer import apply_top_layer
+        apply_top_layer(result, principled, record, texture_files, pack_textures)
     if alpha_test:
         threshold = min(1.0, max(0.0, floats.get("_AlphaClipThreshold", 0.5)))
         alpha = _input(principled, "Alpha")
@@ -644,6 +648,8 @@ def create_material(record: MaterialRecord, texture_files: dict[tuple[str, int],
     result["endfield_render_pipeline_status"] = "source_metadata_retained_pipeline_not_reconstructed"
     if family != "unverified":
         apply_engine_surface(result, principled, record)
+    if result.get("endfield_top_layer_contract"):
+        result["endfield_surface_fidelity"] = "source_top_layer_partial_runtime_uv_and_terrain_unresolved"
     layout_shader_node_trees((result.node_tree,))
     result["endfield_node_layout"] = (
         "EndfieldNodeLayout/2: connected lanes with semantic frames and notes"

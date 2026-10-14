@@ -6,6 +6,8 @@ from dataclasses import asdict, dataclass
 import math
 from typing import Mapping, TypedDict, cast
 
+from extractor_core.scene_identity import validate_scene_id
+
 from extractor_core.lights import NativeLight, NativeLightInventory
 
 
@@ -77,6 +79,24 @@ def _selection_scope(light: NativeLight, xmin: float, xmax: float,
     return None
 
 
+def _serialize_light_plan_row(light: NativeLight, selection_scope: str) -> LightPlanRow:
+    row = asdict(light)
+    row["position"] = list(light.position)
+    row["euler_zxy"] = list(light.euler_zxy)
+    row["scale"] = list(light.scale)
+    row["color"] = list(light.color)
+    row["source_init_paths"] = list(light.source_init_paths)
+    row["source_streaming_paths"] = list(light.source_streaming_paths)
+    row["light_properties"] = [asdict(prop) for prop in light.light_properties]
+    row["additional_properties"] = [asdict(prop) for prop in light.additional_properties]
+    row["source_scope"] = "native_init_baseline_with_streaming_cookie"
+    row["runtime_activation"] = "unverified"
+    row["intensity_unit"] = "unverified_source_scalar"
+    row["color_space"] = "unverified_source_rgba"
+    row["selection_scope"] = selection_scope
+    return cast(LightPlanRow, row)
+
+
 def build_light_plan(inventory: NativeLightInventory, bounds: Mapping[str, object],
                      selection: Mapping[str, object]) -> LightPlan:
     """Use Init world-space centers and preserve unsupported source behavior in the plan."""
@@ -96,21 +116,7 @@ def build_light_plan(inventory: NativeLightInventory, bounds: Mapping[str, objec
             continue
         if light.light_type not in (0, 1, 2, 3):
             raise ValueError(f"Native Light type unsupported by source schema: map={light.map_id}, entity={light.entity_id}, type={light.light_type}")
-        row = asdict(light)
-        row["position"] = list(light.position)
-        row["euler_zxy"] = list(light.euler_zxy)
-        row["scale"] = list(light.scale)
-        row["color"] = list(light.color)
-        row["source_init_paths"] = list(light.source_init_paths)
-        row["source_streaming_paths"] = list(light.source_streaming_paths)
-        row["light_properties"] = [asdict(prop) for prop in light.light_properties]
-        row["additional_properties"] = [asdict(prop) for prop in light.additional_properties]
-        row["source_scope"] = "native_init_baseline_with_streaming_cookie"
-        row["runtime_activation"] = "unverified"
-        row["intensity_unit"] = "unverified_source_scalar"
-        row["color_space"] = "unverified_source_rgba"
-        row["selection_scope"] = selection_scope
-        rows.append(cast(LightPlanRow, row))
+        rows.append(_serialize_light_plan_row(light, selection_scope))
         selected_sources.update(light.source_init_paths)
         selected_sources.update(light.source_streaming_paths)
     source_map = dict(inventory.source_sha256)
@@ -120,13 +126,36 @@ def build_light_plan(inventory: NativeLightInventory, bounds: Mapping[str, objec
                      tuple((path, source_map[path]) for path in sorted(selected_sources)), len(rows))
 
 
+def build_water_transport_directional_dependency(inventory: NativeLightInventory,
+                                                 map_id: str, entity_id: int) -> LightPlan:
+    """Carry the request's exact directional Sun into a water batch when spatial selection omitted it."""
+    validate_scene_id(map_id)
+    if inventory.map_id != map_id:
+        raise ValueError(f"Water transport light inventory map differs: expected={map_id}, actual={inventory.map_id}")
+    if type(entity_id) is not int:
+        raise ValueError("Water transport directional light entity_id must be an integer")
+    matches = [light for light in inventory.rows
+               if light.map_id == map_id and light.entity_id == entity_id]
+    if len(matches) != 1:
+        raise ValueError(f"Water transport directional light must identify exactly one source row: map={map_id}, entity={entity_id}, matches={len(matches)}")
+    light = matches[0]
+    if light.light_type != 1:
+        raise ValueError(f"Water transport light must be a directional Sun: map={map_id}, entity={entity_id}, type={light.light_type}")
+    selected_sources = set(light.source_init_paths) | set(light.source_streaming_paths)
+    source_map = dict(inventory.source_sha256)
+    missing = sorted(source for source in selected_sources if source not in source_map)
+    if missing:
+        raise ValueError(f"Water transport Sun source fingerprint missing: map={map_id}, entity={entity_id}, sources={missing}")
+    row = _serialize_light_plan_row(light, "water_transport_dependency")
+    return LightPlan((row,), (), (), tuple((path, source_map[path]) for path in sorted(selected_sources)), 1)
+
+
 def validate_light_plan_rows(value: object, map_id: str,
                              source_hashes: Mapping[str, str]) -> tuple[LightPlanRow, ...]:
     """Validate portable Light identities and the source files that anchor every row."""
     if not isinstance(value, list):
         raise ValueError("Light plan rows must be an array")
-    if map_id not in ("map01", "map02"):
-        raise ValueError(f"Light plan map invalid: {map_id}")
+    validate_scene_id(map_id)
     seen: set[int] = set()
     rows: list[LightPlanRow] = []
     for index, item in enumerate(value):
@@ -182,7 +211,7 @@ def validate_light_plan_rows(value: object, map_id: str,
                 required("color_space") != "unverified_source_rgba"):
             raise ValueError(f"Light plan source scope invalid: {context}")
         selection = required("selection_scope")
-        expected_scopes = (("directional_global",) if light_type == 1 else
+        expected_scopes = (("directional_global", "water_transport_dependency") if light_type == 1 else
                            ("center_half_open",))
         if selection not in expected_scopes:
             raise ValueError(f"Light plan selection scope invalid: {context}")

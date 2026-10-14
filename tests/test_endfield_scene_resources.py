@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import tempfile
 import unittest
@@ -16,10 +17,12 @@ from endfield_scene_resources import (
     ensure_scene_resources,
     exact_providers,
     ready_resource_paths,
+    ready_requested_resource_paths,
     resource_cache_root,
     supplemental_manifests,
     validate_scan,
 )
+from endfield_scene_io import scene_io_session
 from extractor_core.resources import BundleProviderIssue, read_bundle_provider_names_for_paths
 
 
@@ -27,6 +30,37 @@ FINGERPRINT = "a1" * 32
 
 
 class SceneResourceIntegrationTests(unittest.TestCase):
+    def test_selected_readiness_matches_full_catalog_as_payloads_change(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            texture = {"Source": "CAB", "PathId": 8}
+            material = {"Source": "CAB", "PathId": 1, "Name": "selected",
+                        "Shader": {"Source": "CAB", "PathId": 2}, "Floats": {}, "Colors": {},
+                        "Textures": [{"Property": "_BaseMap", "Texture": texture,
+                                      "Scale": [1, 1], "Offset": [0, 0]}]}
+            mesh = {"Source": "CAB", "PathId": 3, "Type": "Mesh", "Name": "mesh"}
+            material_path, mesh_path = "assets/mat.mat", "assets/mesh.fbx"
+            manifest = root / "manifest.json"
+            manifest.write_text(json.dumps({"Format": "EndfieldSceneProbe/1", "Materials": [material],
+                "Containers": [{"Container": material_path, "Asset": {**material, "Type": "Material"}},
+                               {"Container": mesh_path, "Asset": mesh}],
+                "MeshExports": [{"Asset": mesh, "File": "mesh.obj"}],
+                "TextureExports": [{"Asset": texture, "File": "texture.png"}]}), encoding="utf-8")
+            requested = frozenset({material_path, mesh_path + "##mesh", "assets/absent.mat"})
+            for mesh_ready, texture_ready in ((True, True), (False, True), (True, False), (True, True)):
+                for name, present in (("mesh.obj", mesh_ready), ("texture.png", texture_ready)):
+                    path = root / name
+                    if present:
+                        path.write_bytes(b"payload")
+                    else:
+                        path.unlink(missing_ok=True)
+                with scene_io_session():
+                    full = ready_resource_paths((manifest,))
+                    selected = ready_requested_resource_paths((manifest,), requested, root / "cache")
+                self.assertEqual(full & requested, selected & requested)
+                self.assertEqual(material_path in selected, texture_ready)
+                self.assertEqual(mesh_path + "##mesh" in selected, mesh_ready)
+
     def test_mapped_sweep_cache_requires_source_texture_color_space(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -76,6 +110,10 @@ class SceneResourceIntegrationTests(unittest.TestCase):
                 "Materials": [], "TextureExports": [], "MeshExports": []}
             manifest.write_text(json.dumps(payload), encoding="utf-8")
             self.assertIn("assets/effects/p_fx.prefab", ready_resource_paths((manifest,)))
+            self.assertIn("assets/effects/p_fx.prefab", ready_requested_resource_paths(
+                (manifest,), frozenset({"assets/effects/p_fx.prefab"}), Path(temporary) / "cache"))
+            self.assertNotIn("assets/effects/p_fx.prefab", ready_requested_resource_paths(
+                (manifest,), frozenset({"assets/effects/other.prefab"}), Path(temporary) / "cache"))
             del payload["Particles"]
             manifest.write_text(json.dumps(payload), encoding="utf-8")
             self.assertNotIn("assets/effects/p_fx.prefab", ready_resource_paths((manifest,)))
@@ -144,6 +182,39 @@ class SceneResourceIntegrationTests(unittest.TestCase):
                 providers["assets/com/indie/mesh/ambiguous.prefab"],
             )
             self.assertEqual((), providers["assets/com/indie/mesh/cedar.prefab"])
+
+    def test_provider_index_is_shared_and_same_size_source_changes_invalidate_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            scan = Path(temporary) / "providers.jsonl"
+            requested = frozenset({"assets/com/indie/mesh/cedar.fbx"})
+            extended = frozenset({"assets/com/indie/mesh/cedar.fbx", "assets/com/indie/mesh/missing.fbx"})
+
+            def write_provider(name: str) -> None:
+                scan.write_text("".join(json.dumps(row) + "\n" for row in (
+                    {"kind": "match", "logical_name": name,
+                     "containers": ["Assets/COM/Indie/Mesh/Cedar.fbx"]},
+                    {"kind": "complete", "failed": 0},
+                )), encoding="utf-8")
+
+            write_provider("main/provider_a.ab")
+            with scene_io_session() as session:
+                validate_scan(scan)
+                first = exact_providers(scan, requested)
+                self.assertEqual({"assets/com/indie/mesh/cedar.fbx": ("main/provider_a.ab",)}, first)
+                self.assertEqual(first, exact_providers(scan, requested))
+                self.assertEqual({
+                    "assets/com/indie/mesh/cedar.fbx": ("main/provider_a.ab",),
+                    "assets/com/indie/mesh/missing.fbx": (),
+                }, exact_providers(scan, extended))
+                self.assertEqual(2, session.statistics()["source_cache_hits"])
+                self.assertEqual(1, session.statistics()["source_cache_misses"])
+
+                stamp = scan.stat()
+                write_provider("main/provider_b.ab")
+                os.utime(scan, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+                changed = exact_providers(scan, requested)
+                self.assertEqual({"assets/com/indie/mesh/cedar.fbx": ("main/provider_b.ab",)}, changed)
+                self.assertEqual(2, session.statistics()["source_cache_misses"])
 
     def test_ambiguous_provider_is_reported_without_automatic_selection(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

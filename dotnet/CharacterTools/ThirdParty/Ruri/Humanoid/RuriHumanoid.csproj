@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><AssemblyName>Endfield.RuriHumanoid</AssemblyName></PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="$(AnimeStudioRoot)/AnimeStudio/AnimeStudio.csproj" />
+    <ProjectReference Include="../../../CharacterModel/CharacterModel.csproj" />
+    <InternalsVisibleTo Include="CharacterAnimationReader" />
+    <InternalsVisibleTo Include="NpcAnimationReader" />
+    <Compile Include="$(RuriRoot)/Source/Ruri.RipperHook/Utils/Humanoid/AvatarMuscleReferential.cs" Link="AvatarMuscleReferential.cs" />
+    <Compile Include="$(RuriRoot)/Source/Ruri.RipperHook/Utils/Humanoid/AvatarRigInput.cs" Link="AvatarRigInput.cs" />
+    <Compile Include="$(RuriRoot)/Source/Ruri.RipperHook/Utils/Humanoid/MuscleBone.cs" Link="MuscleBone.cs" />
+    <Compile Include="$(RuriRoot)/Source/Ruri.RipperHook/Utils/Humanoid/RootChannelPlan.cs" Link="RootChannelPlan.cs" />
+  </ItemGroup>
+  <Target Name="ValidateRuriRoot" BeforeTargets="Restore;PrepareForBuild">
+    <Error Condition="'$(RuriRoot)' == '' Or !Exists('$(RuriRoot)/Source/Ruri.RipperHook/Utils/Humanoid/AvatarRigInput.cs')" Text="CHARACTER_RURI_ROOT_MISSING: supply the pinned patched Ruri source checkout via -p:RuriRoot." />
+  </Target>
+</Project>

@@ -8,7 +8,7 @@ import struct
 from types import MappingProxyType
 
 import bpy
-from mathutils import Matrix, Vector
+from mathutils import Matrix
 
 
 _EPS = 1e-9
@@ -37,10 +37,66 @@ class WaterShoreIndex:
     buckets: Mapping[tuple[int, int], tuple[int, ...]]
 
 
+@dataclass(frozen=True)
+class _WaterTriangles:
+    triangles: tuple[tuple[tuple[_Vertex, ...], int], ...]
+    removed_degenerate_triangles: int
+
+
+def _float32_ulp(value: float) -> float:
+    """Return coordinate storage resolution, including zero and subnormal values."""
+    if not math.isfinite(value):
+        raise ValueError(f"WATER_SHORE_COORDINATE_NONFINITE value={value}")
+    _, exponent = math.frexp(abs(value))
+    return math.ldexp(1.0, max(-149, exponent - 24)) if value else math.ldexp(1.0, -149)
+
+
+def _roundoff_collinear(points: tuple[_Vertex, ...]) -> bool:
+    """Prove collinearity within half-ULP errors of stored float32 coordinates."""
+    if len(points) != 3:
+        raise ValueError(f"WATER_SHORE_TRIANGLE_VERTEX_COUNT count={len(points)}")
+    coordinates = tuple((point.x, point.y, point.z) for point in points)
+    a, b, p = max(((coordinates[i], coordinates[j], coordinates[k]) for i, j, k in ((0, 1, 2), (0, 2, 1), (1, 2, 0))),
+                  key=lambda row: math.dist(row[0], row[1]))
+    edge = tuple(b[axis] - a[axis] for axis in range(3))
+    squared = sum(value * value for value in edge)
+    if squared == 0:
+        return True
+    t = sum((p[axis] - a[axis]) * edge[axis] for axis in range(3)) / squared
+    if not 0 <= t <= 1:
+        return False
+    return all(abs(p[axis] - (a[axis] + t * edge[axis])) <=
+               0.5 * (_float32_ulp(p[axis]) + (1 - t) * _float32_ulp(a[axis]) + t * _float32_ulp(b[axis]))
+               for axis in range(3))
+
+
 def _area(polygon: tuple[_Vertex, ...]) -> float:
     if len(polygon) < 3:
         return 0.0
     return abs(sum(a.x * b.y - b.x * a.y for a, b in zip(polygon, (*polygon[1:], polygon[0])))) * 0.5
+
+
+def _triangle_area_3d(points: tuple[_Vertex, ...]) -> float:
+    if len(points) != 3:
+        raise ValueError(f"WATER_SHORE_TRIANGLE_VERTEX_COUNT count={len(points)}")
+    a, b, c = points
+    ab = (b.x - a.x, b.y - a.y, b.z - a.z)
+    ac = (c.x - a.x, c.y - a.y, c.z - a.z)
+    cross = (ab[1] * ac[2] - ab[2] * ac[1],
+             ab[2] * ac[0] - ab[0] * ac[2],
+             ab[0] * ac[1] - ab[1] * ac[0])
+    return math.sqrt(sum(value * value for value in cross)) * 0.5
+
+
+def _triangle_float32_area_resolution(points: tuple[_Vertex, ...]) -> float:
+    if len(points) != 3:
+        raise ValueError(f"WATER_SHORE_TRIANGLE_VERTEX_COUNT count={len(points)}")
+    coordinates = tuple((point.x, point.y, point.z) for point in points)
+    longest_edge = max(math.dist(a, b) for a, b in ((coordinates[0], coordinates[1]),
+                                                   (coordinates[0], coordinates[2]),
+                                                   (coordinates[1], coordinates[2])))
+    coordinate_resolution = max(_float32_ulp(value) for point in coordinates for value in point)
+    return longest_edge * coordinate_resolution
 
 
 def _clean(vertices: list[_Vertex]) -> tuple[_Vertex, ...]:
@@ -164,11 +220,12 @@ def _partition(
     return covered, tuple(uncovered)
 
 
-def _water_triangles(obj: bpy.types.Object) -> tuple[tuple[tuple[_Vertex, ...], int], ...]:
+def _water_triangles(obj: bpy.types.Object) -> _WaterTriangles:
     mesh = obj.data
     mesh.calc_loop_triangles()
     uv_layers = tuple(mesh.uv_layers)
     result: list[tuple[tuple[_Vertex, ...], int]] = []
+    removed = 0
     for triangle in mesh.loop_triangles:
         points = tuple(
             _Vertex(mesh.vertices[index].co.x, mesh.vertices[index].co.y, mesh.vertices[index].co.z,
@@ -176,12 +233,12 @@ def _water_triangles(obj: bpy.types.Object) -> tuple[tuple[tuple[_Vertex, ...], 
             for index, loop in zip(triangle.vertices, triangle.loops, strict=True)
         )
         if _area(points) <= _EPS:
-            a, b, c = (Vector((point.x, point.y, point.z)) for point in points)
-            if ((b - a).cross(c - a)).length * 0.5 <= _EPS:
+            if _triangle_area_3d(points) <= _EPS or _roundoff_collinear(points):
+                removed += 1
                 continue
             raise ValueError(f"WATER_SHORE_SURFACE_TRIANGLE_DEGENERATE object={obj.name} face={triangle.polygon_index}")
         result.append((points, mesh.polygons[triangle.polygon_index].material_index))
-    return tuple(result)
+    return _WaterTriangles(tuple(result), removed)
 
 
 def _pieces(
@@ -218,7 +275,7 @@ def _pieces(
 
 def _replace_mesh(
     obj: bpy.types.Object, faces: tuple[tuple[tuple[_Vertex, ...], int], ...]
-) -> None:
+) -> int:
     original = obj.data
     uv_names = tuple(layer.name for layer in original.uv_layers)
     material_slots = tuple(original.materials)
@@ -227,11 +284,22 @@ def _replace_mesh(
     loop_uvs: list[tuple[tuple[float, float], ...]] = []
     material_indices: list[int] = []
     welded: dict[tuple[int, int, int], int] = {}
+    removed_degenerate_triangles = 0
     for polygon, material_index in faces:
         for middle in range(1, len(polygon) - 1):
             corners = (polygon[0], polygon[middle], polygon[middle + 1])
-            if _area(corners) <= _EPS:
+            area = _area(corners)
+            if _triangle_area_3d(corners) <= _EPS or _roundoff_collinear(corners):
+                removed_degenerate_triangles += 1
                 continue
+            if area <= _EPS:
+                if _triangle_area_3d(corners) <= _triangle_float32_area_resolution(corners):
+                    removed_degenerate_triangles += 1
+                    continue
+                raise ValueError(
+                    f"WATER_SHORE_CLIP_TRIANGLE_PROJECTION_DEGENERATE object={obj.name}, "
+                    f"area_xy={area}, area_3d={_triangle_area_3d(corners)}, "
+                    f"vertices={tuple((point.x, point.y, point.z) for point in corners)}")
             indices: list[int] = []
             for vertex in corners:
                 coordinate = struct.unpack("<3f", struct.pack("<3f", vertex.x, vertex.y, vertex.z))
@@ -259,6 +327,7 @@ def _replace_mesh(
     obj.data = replacement
     if original.users == 0:
         bpy.data.meshes.remove(original)
+    return removed_degenerate_triangles
 
 
 def _validate_water_clip(obj: bpy.types.Object, clearance: float) -> None:
@@ -280,12 +349,17 @@ def _clip_water_with_index(
         return 0
     faces: list[tuple[tuple[_Vertex, ...], int]] = []
     cut = 0
-    for polygon, material_index in _water_triangles(obj):
+    source = _water_triangles(obj)
+    for polygon, material_index in source.triangles:
         fragments, dry = _pieces(polygon, shore_index.terrain, shore_index.buckets, clearance)
         faces.extend((fragment, material_index) for fragment in fragments)
         cut += int(dry)
-    if cut:
-        _replace_mesh(obj, tuple(faces))
+    if cut or source.removed_degenerate_triangles:
+        rebuilt_degenerate_triangles = _replace_mesh(obj, tuple(faces))
+    else:
+        rebuilt_degenerate_triangles = 0
+    obj["endfield_water_shore_removed_degenerate_triangles"] = (
+        source.removed_degenerate_triangles + rebuilt_degenerate_triangles)
     return cut
 
 

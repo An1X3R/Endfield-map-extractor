@@ -8,6 +8,7 @@ import unittest
 from pathlib import Path
 
 from endfield_scene_effects_plan import build_effect_plan, observed_effect_prefabs
+from endfield_scene_io import read_scene_manifest, scene_io_session
 from endfield_scene_resources import ready_resource_paths
 from extractor_core.effects import EffectRecord, EffectSource, MapEffectInventory
 from extractor_core.particle_snapshot import PARTICLE_PARAMETER_MODULE_FIELDS, PARTICLE_PARAMETER_SCHEMA_VERSION
@@ -54,6 +55,29 @@ def _manifest(version: int) -> dict[str, object]:
 
 
 class EffectPlanIntegrationTests(unittest.TestCase):
+    def test_readiness_rechecks_payloads_with_shared_manifest_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifest = root / "scene_manifest.json"
+            texture = {"Source": "CAB-texture", "PathId": 7,
+                       "Type": "Texture2D", "ColorSpace": 0}
+            payload = _manifest(PARTICLE_PARAMETER_SCHEMA_VERSION)
+            payload["Materials"][0]["Textures"] = [
+                {"Property": "_MainTex", "Texture": texture,
+                 "Scale": [1.0, 1.0], "Offset": [0.0, 0.0]}]
+            payload["TextureExports"] = [{"Asset": texture, "File": "texture.png"}]
+            manifest.write_text(json.dumps(payload), encoding="utf-8")
+            texture_file = root / "texture.png"
+            texture_file.write_bytes(b"texture fixture")
+            with scene_io_session():
+                snapshot = read_scene_manifest(manifest)
+                self.assertIn(PREFAB, ready_resource_paths((manifest,)))
+                texture_file.unlink()
+                self.assertNotIn(PREFAB, ready_resource_paths((manifest,)))
+                texture_file.write_bytes(b"restored texture fixture")
+                self.assertIn(PREFAB, ready_resource_paths((manifest,)))
+                self.assertIs(snapshot, read_scene_manifest(manifest))
+
     def test_mesh_renderer_prefab_and_mixed_particle_validation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

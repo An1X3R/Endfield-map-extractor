@@ -268,6 +268,22 @@ def _flow(
     )
     if not spec.flow.use_flow_map:
         return config_dir, 1.0
+    color, alpha = sample_water_flow_field(tree, spec, global_config, world, images)
+    channels = _node(tree, "ShaderNodeSeparateColor", "Flow_RG")
+    channels.mode = "RGB"
+    tree.links.new(color, channels.inputs["Color"])
+    x = _math(tree, "Flow_Signed_X", "MULTIPLY_ADD", channels.outputs["Red"], 2.0)
+    x.node.inputs[2].default_value = -1.0
+    y = _math(tree, "Flow_Signed_Z", "MULTIPLY_ADD", channels.outputs["Green"], -2.0)
+    y.node.inputs[2].default_value = 1.0
+    return _combine(tree, "Flow_World_XZ", x, y, 0.0), alpha
+
+
+def sample_water_flow_field(
+    tree: bpy.types.NodeTree, spec: WaterMaterialRow, global_config: dict[str, object],
+    world: bpy.types.NodeSocket, images: dict[str, bpy.types.Image],
+) -> tuple[bpy.types.NodeSocket, Scalar]:
+    """Sample source field channels independently of the wave-direction switch."""
     if spec.flow_map is None:
         raise ValueError(f"WATER_WAVE_FLOW_MAP_REQUIRED entity={spec.entity_id}")
     center = _record(global_config.get("SceneCenterOffset"), "Global.SceneCenterOffset")
@@ -291,14 +307,7 @@ def _flow(
         texture = _texture(tree, f"{name}_Flow", images[sector.texture.file], sector_uv)
         color = _mix_color(tree, f"{name}_Color", mask, color, texture.outputs["Color"])
         alpha = _mix_float(tree, f"{name}_Alpha", mask, alpha, texture.outputs["Alpha"])
-    channels = _node(tree, "ShaderNodeSeparateColor", "Flow_RG")
-    channels.mode = "RGB"
-    tree.links.new(color, channels.inputs["Color"])
-    x = _math(tree, "Flow_Signed_X", "MULTIPLY_ADD", channels.outputs["Red"], 2.0)
-    x.node.inputs[2].default_value = -1.0
-    y = _math(tree, "Flow_Signed_Z", "MULTIPLY_ADD", channels.outputs["Green"], -2.0)
-    y.node.inputs[2].default_value = 1.0
-    return _combine(tree, "Flow_World_XZ", x, y, 0.0), alpha
+    return color, alpha
 
 
 def _phase_weight(tree: bpy.types.NodeTree, name: str, phase: bpy.types.NodeSocket) -> bpy.types.NodeSocket:

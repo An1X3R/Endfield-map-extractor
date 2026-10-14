@@ -19,7 +19,8 @@ from blender_scene_effect_layers import (VfxColor, make_vfx_feature_source, make
                                          vfx_feature_issues, vfx_mesh_feature_issues, vfx_custom1_channels)
 from blender_scene_effect_vertex_offset import OffsetSamplerContract, validate_vertex_offset_source
 from endfield_scene_material_contract import (AssetReference, MaterialRecord, reference_key, resolve_export_path,
-                                              has_shader_white_texture_default)
+                                              has_shader_white_texture_default, validate_material,
+                                              mesh_material_requires_uv1)
 
 
 def _link(links: bpy.types.NodeLinks, target: bpy.types.NodeSocket,
@@ -104,13 +105,15 @@ def _make_effect_material(record: MaterialRecord,
     if shader != "HGRP/Effect/VFXBaseV2":
         raise NotImplementedError(f"FX shader family is not implemented: shader={shader}, material={record['Name']}")
     floats = record["Floats"]
-    if floats["_SurfaceType"] != 1 or floats["_SrcBlend"] != 1 or floats["_DstBlend"] != 10:
+    surface_type = floats["_SurfaceType"]
+    destination_blend = 0 if surface_type == 0 else 10
+    if surface_type not in (0, 1) or floats["_SrcBlend"] != 1 or floats["_DstBlend"] != destination_blend:
         raise NotImplementedError(f"FX blend factors are not verified: material={record['Name']}")
-    if floats.get("_AlphaSrcBlend") != 1 or floats.get("_AlphaDstBlend") != 10:
+    if floats.get("_AlphaSrcBlend") != 1 or floats.get("_AlphaDstBlend") != destination_blend:
         raise NotImplementedError(f"FX alpha blend factors are not verified: material={record['Name']}")
     if floats["_BlendMode"] not in (0, 1) or floats["_UseMainTexAsAlpha"] not in (0, 1):
         raise NotImplementedError(f"FX blend/channel mode is not verified: material={record['Name']}")
-    if floats.get("_CullMode") not in (0, 2) or any(floats.get(name) != value for name, value in (("_ZWrite", 0), ("_ZTest", 4), ("_DisableZTest", 0))):
+    if floats.get("_CullMode") not in (0, 2) or any(floats.get(name) != value for name, value in (("_ZWrite", 1 - surface_type), ("_ZTest", 4), ("_DisableZTest", 0))):
         raise NotImplementedError(f"FX culling/depth state is not verified: material={record['Name']}")
     slots = [slot for slot in record["Textures"] if slot["Property"] == "_MainTex"]
     if len(slots) != 1:
@@ -144,7 +147,7 @@ def _make_effect_material(record: MaterialRecord,
         return existing
     material = bpy.data.materials.new(name)
     material.use_nodes = True
-    material.surface_render_method = "BLENDED"
+    material.surface_render_method = "DITHERED" if surface_type == 0 else "BLENDED"
     material.use_transparency_overlap = True
     material["endfield_fx_source_material"] = record["Name"]
     material["endfield_fx_source"] = record["Source"]
@@ -153,6 +156,8 @@ def _make_effect_material(record: MaterialRecord,
     material["endfield_fx_status"] = "static_preview_subset"
     material["endfield_fx_custom1_channels"] = json.dumps(vfx_custom1_channels(record))
     limitations = ["Game exposure and grading not captured"]
+    if surface_type == 0:
+        limitations.append("Opaque VFX retains source RGB alpha premultiplication and source-overwrite depth behavior; Blender surface opacity is one, so framebuffer alpha differs from the Unity render target")
     for prop, reason in (("_UseFog", "Game fog not reconstructed"),
                          ("_UseSoftBlend", "Screen-depth soft intersection not reconstructed"),
                          ("_UseNearCameraFade", "Game near-camera fade fixed at one")):
@@ -162,7 +167,8 @@ def _make_effect_material(record: MaterialRecord,
     tree.nodes.clear()
     source = source_factory(tree)
     rgb, alpha = source.rgb, source.alpha
-    if any("Weighted VFXBaseV2 controls derived" in item for item in source.limitations):
+    if any("Weighted VFXBaseV2 controls derived" in item or "Fresnel VFXBaseV2 controls derived" in item or item.startswith(("Screen UV", "Polar UV", "MeshRenderer missing COLOR"))
+           for item in source.limitations):
         material["endfield_fx_status"] = "source_formula_preview_partial"
     material["endfield_fx_limitations"] = json.dumps([*limitations, *source.limitations])
     excess = _vector(tree, "Exposure Threshold", "SUBTRACT", rgb, (floats["_ExpThreshold"],) * 3)
@@ -175,15 +181,22 @@ def _make_effect_material(record: MaterialRecord,
                   _control(tree, "Screen and Runtime Fade - Reference 1", 1.0))
     alpha = _math(tree, "Opacity Lower Bound", "MAXIMUM", alpha, 0.0)
     alpha = _math(tree, "Opacity Upper Bound", "MINIMUM", alpha, 1.0)
-    composite = tree.nodes.new("ShaderNodeGroup")
-    composite.node_tree = _composite_group()
-    composite.label = "Source Blend and Transparent Background"
-    tree.links.new(rgb, composite.inputs["Source RGB"])
-    tree.links.new(alpha, composite.inputs["Coverage"])
-    output_alpha = _math(tree, "Source BlendMode Output Alpha", "MULTIPLY", alpha, 1 - floats["_BlendMode"])
-    tree.links.new(output_alpha, composite.inputs["Output Alpha"])
+    if surface_type == 0:
+        # Src=One, Dst=Zero overwrites with the shader's premultiplied RGB.
+        emission = tree.nodes.new("ShaderNodeEmission")
+        emission.name = emission.label = "Opaque Source RGB Overwrite"
+        tree.links.new(_scale(tree, "Opaque Source RGB Premultiply", rgb, alpha), emission.inputs["Color"])
+        surface = emission.outputs[0]
+    else:
+        composite = tree.nodes.new("ShaderNodeGroup")
+        composite.node_tree = _composite_group()
+        composite.label = "Source Blend and Transparent Background"
+        tree.links.new(rgb, composite.inputs["Source RGB"])
+        tree.links.new(alpha, composite.inputs["Coverage"])
+        output_alpha = _math(tree, "Source BlendMode Output Alpha", "MULTIPLY", alpha, 1 - floats["_BlendMode"])
+        tree.links.new(output_alpha, composite.inputs["Output Alpha"])
+        surface = composite.outputs[0]
     output = tree.nodes.new("ShaderNodeOutputMaterial")
-    surface = composite.outputs[0]
     if floats["_CullMode"] == 2:
         geometry = tree.nodes.new("ShaderNodeNewGeometry")
         transparent = tree.nodes.new("ShaderNodeBsdfTransparent")
@@ -196,6 +209,71 @@ def _make_effect_material(record: MaterialRecord,
     tree.links.new(surface, output.inputs["Surface"])
     layout_shader_node_tree(tree)
     return material
+
+
+def make_missing_mesh_uv1_reference(material: bpy.types.Material,
+                                    source_uv1_components: int) -> bpy.types.Material:
+    """Clone a supported VFX mesh material with an explicit absent-UV1 reference."""
+    if type(source_uv1_components) is not int or source_uv1_components != 0:
+        raise ValueError(f"UV1 zero reference requires a genuinely absent source channel: components={source_uv1_components}")
+    source_json = material.get("endfield_fx_source_material_json")
+    if not isinstance(source_json, str):
+        raise ValueError(f"UV1 zero reference requires source material evidence: material={material.name}")
+    record = validate_material(json.loads(source_json))
+    if (record["Shader"].get("Name") != "HGRP/Effect/VFXBaseV2"
+            or record["Floats"].get("_InParticle") != 0 or not mesh_material_requires_uv1(record)):
+        raise ValueError(f"UV1 zero reference is outside the supported VFX mesh contract: material={material.name}")
+    if not material.use_nodes or material.node_tree is None:
+        raise ValueError(f"UV1 zero reference requires a supported material node tree: material={material.name}")
+    uv_nodes = [node for node in material.node_tree.nodes
+                if node.bl_idname == "ShaderNodeUVMap" and node.uv_map == "EF_FX_UV1"]
+    if len(uv_nodes) != 1 or not uv_nodes[0].outputs[0].is_linked:
+        raise ValueError(f"UV1 zero reference requires exactly one connected source UV1 node: material={material.name}, count={len(uv_nodes)}")
+    approximation = "absent_source_uv1_constant_zero_reference/1"
+    identity = hashlib.sha256(json.dumps([material.name, source_json, approximation], sort_keys=True).encode()).hexdigest()[:24]
+    name = "EF_FX_UV1_REFERENCE_" + identity
+    existing = bpy.data.materials.get(name)
+    if existing is not None:
+        if (existing.get("endfield_fx_approximation_identity") != approximation
+                or existing.get("endfield_fx_source_material_json") != source_json
+                or existing.get("endfield_fx_source_uv1_components") != 0
+                or not existing.use_nodes or existing.node_tree is None):
+            raise ValueError(f"Cached UV1 zero reference conflicts: material={name}")
+        reference = existing.node_tree.nodes.get("MeshRenderer Missing UV1 Reference Zero")
+        if (reference is None or reference.bl_idname != "ShaderNodeCombineXYZ"
+                or any(reference.inputs[index].default_value != 0 for index in range(3))
+                or not reference.outputs[0].is_linked
+                or any(node.bl_idname == "ShaderNodeUVMap" and node.uv_map == "EF_FX_UV1"
+                       for node in existing.node_tree.nodes)):
+            raise ValueError(f"Cached UV1 zero reference node changed: material={name}")
+        return existing
+    result = material.copy()
+    result.name = name
+    tree = result.node_tree
+    source_uv = tree.nodes.get(uv_nodes[0].name)
+    if source_uv is None:
+        raise ValueError(f"Cloned source UV1 node is missing: material={name}")
+    reference = tree.nodes.new("ShaderNodeCombineXYZ")
+    reference.name = reference.label = "MeshRenderer Missing UV1 Reference Zero"
+    for index in range(3):
+        reference.inputs[index].default_value = 0.0
+    reference["endfield_layout_section"] = "Explicit Preview Conditions"
+    reference["endfield_layout_note"] = "Editable reference state"
+    targets = tuple(link.to_socket for link in source_uv.outputs[0].links)
+    for target in targets:
+        tree.links.new(reference.outputs[0], target)
+    tree.nodes.remove(source_uv)
+    limitations = json.loads(material["endfield_fx_limitations"])
+    if not isinstance(limitations, list) or any(not isinstance(item, str) for item in limitations):
+        raise ValueError(f"UV1 zero reference requires valid source limitations: material={material.name}")
+    result["endfield_fx_limitations"] = json.dumps([*limitations,
+        "Source mesh UV1 channel is absent; this preview explicitly uses constant UV1=(0,0), an unverified game-runtime reference. Source mesh streams are unchanged; UV0 is never substituted."])
+    result["endfield_fx_status"] = "source_formula_preview_partial"
+    result["endfield_fx_approximation_identity"] = approximation
+    result["endfield_fx_source_uv1_components"] = 0
+    result["endfield_fx_uv1_reference"] = [0.0, 0.0]
+    layout_shader_node_tree(tree)
+    return result
 
 
 def _vertex_offset_enabled(record: MaterialRecord) -> bool:
@@ -363,7 +441,36 @@ def make_effect_material(record: MaterialRecord,
 def make_mesh_effect_material(record: MaterialRecord,
                               textures: dict[tuple[str, int], tuple[Path, str]],
                               snapshot_time: float, vertex_color_components: int) -> bpy.types.Material:
-    """Build a VFXBaseV2 material from MeshRenderer vertex-color evidence."""
+    """Build a supported source shader from MeshRenderer stream evidence."""
+    if record["Shader"].get("Name") == "HGRP/FogSimple":
+        from blender_scene_fog_materials import make_fog_material
+
+        return make_fog_material(record, textures, snapshot_time, vertex_color_components)
+    if record["Shader"].get("Name") == "HGRP/Effect/VFXAdvance":
+        from blender_scene_vfxadvance_materials import (
+            make_vfxadvance_blend_dissolve_disturb_material,
+            make_vfxadvance_mask_material,
+        )
+        from endfield_scene_vfxadvance_contract import (
+            vfxadvance_blend_dissolve_disturb_issues,
+            vfxadvance_mask_only_issues,
+        )
+
+        mask_issues = vfxadvance_mask_only_issues(record, vertex_color_components)
+        if not mask_issues:
+            return make_vfxadvance_mask_material(record, textures, snapshot_time, vertex_color_components)
+        blend_issues = vfxadvance_blend_dissolve_disturb_issues(record, vertex_color_components)
+        if not blend_issues:
+            return make_vfxadvance_blend_dissolve_disturb_material(
+                record, textures, snapshot_time, vertex_color_components)
+        raise NotImplementedError(
+            "VFXAdvance mesh features are outside implemented source contracts: "
+            f"material={record['Name']}, mask_issues={mask_issues}, "
+            f"blend_dissolve_disturb_issues={blend_issues}")
+    if record["Shader"].get("Name") == "HGRP/Effect/VFXDitherAlpha":
+        from blender_scene_dither_materials import make_dither_mesh_material
+
+        return make_dither_mesh_material(record, textures, snapshot_time, vertex_color_components)
     offset_enabled = _vertex_offset_enabled(record)
     color_record = _color_stage_record(record) if offset_enabled else record
     unsupported = vfx_mesh_feature_issues(color_record, vertex_color_components)

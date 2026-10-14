@@ -1,4 +1,4 @@
-"""Native surface and closed-volume water using retained wave and depth evidence.
+"""Portable surface and closed-volume water using retained wave and depth evidence.
 
 Optical coefficients are explicit Blender calibration, not recovered HGRP values.
 Screen buffers, caustics, underwater camera behavior and history remain unverified.
@@ -111,12 +111,13 @@ def _layout_settings_group(tree: bpy.types.ShaderNodeTree) -> None:
 
 
 def water_optics_group() -> bpy.types.ShaderNodeTree:
-    name = "EF_Water_Optics_v5"
+    name = "EF_Water_Optics_v6"
     existing = bpy.data.node_groups.get(name)
     if existing is not None:
-        if existing.get("endfield_contract") != "PortableWaterOptics/5":
+        if existing.get("endfield_contract") != "PortableWaterOptics/6":
             raise ValueError(f"Conflicting water optics group: {name}")
         _validate_group_interface(existing, (("Normal", "INPUT", "NodeSocketVector"),
+                                             ("Transmission Normal", "INPUT", "NodeSocketVector"),
                                              ("Depth", "INPUT", "NodeSocketFloat"),
                                              ("Attenuation Per Meter", "INPUT", "NodeSocketFloat"),
                                              ("Deep Color", "INPUT", "NodeSocketColor"),
@@ -130,7 +131,8 @@ def water_optics_group() -> bpy.types.ShaderNodeTree:
         _layout_optics_group(existing)
         return existing
     tree = bpy.data.node_groups.new(name, "ShaderNodeTree")
-    for label, kind in (("Normal", "NodeSocketVector"), ("Depth", "NodeSocketFloat"),
+    for label, kind in (("Normal", "NodeSocketVector"), ("Transmission Normal", "NodeSocketVector"),
+                        ("Depth", "NodeSocketFloat"),
                         ("Attenuation Per Meter", "NodeSocketFloat"), ("Deep Color", "NodeSocketColor"),
                         ("Scattering Per Meter", "NodeSocketFloat"),
                         ("IOR", "NodeSocketFloat"), ("Roughness", "NodeSocketFloat")):
@@ -141,16 +143,14 @@ def water_optics_group() -> bpy.types.ShaderNodeTree:
     nodes, links = tree.nodes, tree.links
     entry = nodes.new("NodeGroupInput")
     output = nodes.new("NodeGroupOutput")
-    bsdf = nodes.new("ShaderNodeBsdfPrincipled")
-    bsdf.label = "Shared native water surface"
-    bsdf.inputs["Metallic"].default_value = 0
-    bsdf.inputs["Coat Weight"].default_value = 0
-    bsdf.inputs["Base Color"].default_value = (1, 1, 1, 1)
-    bsdf.inputs["Transmission Weight"].default_value = 1
-    links.new(entry.outputs["IOR"], bsdf.inputs["IOR"])
-    links.new(entry.outputs["Roughness"], bsdf.inputs["Roughness"])
-    links.new(entry.outputs["Normal"], bsdf.inputs["Normal"])
-    links.new(bsdf.outputs[0], output.inputs["Surface"])
+    reflection = nodes.new("ShaderNodeBsdfGlossy")
+    reflection.label = "Retained wave reflection"
+    reflection.inputs["Color"].default_value = (1, 1, 1, 1)
+    links.new(entry.outputs["Roughness"], reflection.inputs["Roughness"])
+    links.new(entry.outputs["Normal"], reflection.inputs["Normal"])
+    fresnel = nodes.new("ShaderNodeFresnel")
+    links.new(entry.outputs["IOR"], fresnel.inputs["IOR"])
+    links.new(entry.outputs["Normal"], fresnel.inputs["Normal"])
     # Eevee screen rays do not integrate the same refracted medium path as Cycles.
     # Apply spectral attenuation at the boundary using measured bottom depth.
     geometry = nodes.new("ShaderNodeNewGeometry")
@@ -219,13 +219,20 @@ def water_optics_group() -> bpy.types.ShaderNodeTree:
         channel.operation = "EXPONENT"
         links.new(negative_depth.outputs[0], channel.inputs[0])
         links.new(channel.outputs[0], attenuation.inputs[index])
-    eevee = nodes.new("ShaderNodeBsdfPrincipled")
-    eevee.label = "Eevee native transmission with scene-depth attenuation"
-    eevee.inputs["Transmission Weight"].default_value = 1
-    links.new(attenuation.outputs[0], eevee.inputs["Base Color"])
-    for label in ("Normal", "IOR", "Roughness"):
-        links.new(entry.outputs[label], eevee.inputs[label])
-    links.new(eevee.outputs[0], output.inputs["Eevee Surface"])
+    clear = nodes.new("ShaderNodeRGB")
+    clear.outputs[0].default_value = (1, 1, 1, 1)
+    for surface, color in (("Surface", clear.outputs[0]), ("Eevee Surface", attenuation.outputs[0])):
+        refraction = nodes.new("ShaderNodeBsdfRefraction")
+        refraction.label = surface + " independent transmission"
+        links.new(color, refraction.inputs["Color"])
+        links.new(entry.outputs["Transmission Normal"], refraction.inputs["Normal"])
+        for label in ("IOR", "Roughness"):
+            links.new(entry.outputs[label], refraction.inputs[label])
+        boundary = nodes.new("ShaderNodeMixShader")
+        links.new(fresnel.outputs[0], boundary.inputs[0])
+        links.new(refraction.outputs[0], boundary.inputs[1])
+        links.new(reflection.outputs[0], boundary.inputs[2])
+        links.new(boundary.outputs[0], output.inputs[surface])
     absorption = nodes.new("ShaderNodeVolumeAbsorption")
     absorption.label = "Native bounded water absorption"
     links.new(entry.outputs["Deep Color"], absorption.inputs["Color"])
@@ -238,7 +245,7 @@ def water_optics_group() -> bpy.types.ShaderNodeTree:
     links.new(absorption.outputs[0], medium.inputs[0])
     links.new(scatter.outputs[0], medium.inputs[1])
     links.new(medium.outputs[0], output.inputs["Volume"])
-    tree["endfield_contract"] = "PortableWaterOptics/5"
+    tree["endfield_contract"] = "PortableWaterOptics/6"
     _layout_optics_group(tree)
     return tree
 
@@ -286,7 +293,7 @@ def adapt_water_surface(material: bpy.types.Material, normal: bpy.types.NodeSock
     if not isinstance(material, bpy.types.Material) or not material.use_nodes or not isinstance(normal, bpy.types.NodeSocket) or normal.node.id_data != material.node_tree:
         raise ValueError("Water normal must belong to the material being adapted")
     _validate_optics(optics)
-    existing_core = bpy.data.node_groups.get("EF_Water_Optics_v5")
+    existing_core = bpy.data.node_groups.get("EF_Water_Optics_v6")
     core_tree = water_optics_group() if existing_core is not None else None
     settings_tree = water_settings(optics)
     if core_tree is None:
@@ -321,6 +328,7 @@ def adapt_water_surface(material: bpy.types.Material, normal: bpy.types.NodeSock
     for label in ("IOR", "Roughness", "Attenuation Per Meter", "Scattering Per Meter", "Deep Color"):
         links.new(settings.outputs[label], core.inputs[label])
     links.new(normal, core.inputs["Normal"])
+    links.new(normal, core.inputs["Transmission Normal"])
     links.new(depth.outputs["Fac"], core.inputs["Depth"])
     shadow_ray = nodes.new("ShaderNodeLightPath")
     transparent = nodes.new("ShaderNodeBsdfTransparent")
@@ -374,8 +382,8 @@ def create_water_volume(source: bpy.types.Object, depths: tuple[float, ...],
     core_node = surface.node_tree.nodes.get("EF_Water_Shared_Core")
     if core_node is None or core_node.type != "GROUP" or core_node.node_tree is None:
         raise ValueError(f"Water volume surface has no shared optics core: material={surface.name}")
-    if core_node.node_tree.name != "EF_Water_Optics_v5" or core_node.node_tree.get("endfield_contract") != "PortableWaterOptics/5":
-        raise ValueError(f"Water volume requires a v5 optics core: material={surface.name}, group={core_node.node_tree.name}")
+    if core_node.node_tree.name != "EF_Water_Optics_v6" or core_node.node_tree.get("endfield_contract") != "PortableWaterOptics/6":
+        raise ValueError(f"Water volume requires a v6 optics core: material={surface.name}, group={core_node.node_tree.name}")
     settings_tree = settings_node.node_tree
     if settings_tree.get("endfield_contract") != "EndfieldWaterSettings/1":
         raise ValueError(f"Water volume surface has incompatible settings group: material={surface.name}, group={settings_tree.name}")

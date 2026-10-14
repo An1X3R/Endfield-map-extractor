@@ -10,7 +10,8 @@ import bpy
 from blender_scene_materials import texture_image
 from endfield_scene_material_contract import (AssetReference, MaterialRecord, TextureSlot,
                                               reference_key, resolve_export_path,
-                                              validate_texture_sampler, has_shader_white_texture_default)
+                                              validate_texture_sampler, has_shader_white_texture_default,
+                                              mesh_material_requires_uv1)
 
 
 class VfxColor(NamedTuple):
@@ -166,9 +167,10 @@ def vfx_custom1_channels(record: MaterialRecord) -> tuple[str, ...]:
 
 
 def _single_weight_sample(record: MaterialRecord) -> int | None:
-    """Select the verified one-hot weight stage after source disturbance stages."""
+    """Select the verified one-hot weight stage with optional preceding disturbance."""
     floats = record["Floats"]
-    if (any(floats.get(name) != 1 for name in ("_UseWeightTex", "_UseDissolve", "_DissolveUseWeight", "_UseDisturb")) or
+    if (any(floats.get(name) != 1 for name in ("_UseWeightTex", "_UseDissolve", "_DissolveUseWeight")) or
+            floats.get("_UseDisturb") not in (0, 1) or
             floats.get("_Bi_Disturb") != 0 or floats.get("_DisturbUseWeight") not in (0, 1)):
         return None
     active = tuple(index for index in range(5) if floats.get(f"_UseSampleTex{index}") == 1)
@@ -176,13 +178,20 @@ def _single_weight_sample(record: MaterialRecord) -> int | None:
     if len(weights) != 1:
         return None
     selected = weights[0]
-    if selected not in (1, 2) or tuple(floats.get(f"_SampleTex{index}Use") for index in range(selected)) != tuple(range(selected)):
+    supported_slots = (1, 2) if floats["_UseDisturb"] == 1 else (0,)
+    if selected not in supported_slots or tuple(floats.get(f"_SampleTex{index}Use") for index in range(selected)) != tuple(range(selected)):
         return None
     if [floats.get(f"_SampleTex{selected}UseWeight{role}", 0) for role in range(6)] != [0, 0, 1, 0, 0, 0]:
         return None
     if any(floats.get(f"_SampleTex{index}UseWeight2", 0) != 0 for index in active if index != selected):
         return None
     return selected
+
+
+def _enabled_uv_names(record: MaterialRecord) -> tuple[str, ...]:
+    """Identify UV selectors consumed by the main and enabled sample textures."""
+    return ("_MainTex", *(f"_SampleTex{index}" for index in range(5)
+                          if record["Floats"].get(f"_UseSampleTex{index}", 0) != 0))
 
 
 def _material_feature_issues(record: MaterialRecord) -> tuple[str, ...]:
@@ -194,17 +203,51 @@ def _material_feature_issues(record: MaterialRecord) -> tuple[str, ...]:
         issues.append("shader_family")
     if floats.get("_InParticle") not in (0, 1):
         issues.append("particle_shader_mode")
+    if floats.get("_UseFresnel", 0) not in (0, 1):
+        issues.append("fresnel_shader_mode")
+    if floats.get("_UseFresnel") == 1:
+        for name in ("_FresnelBias", "_FresnelPower", "_FresnelFlip", "_FresnelAffectOpacity"):
+            value = floats.get(name)
+            if type(value) not in (int, float) or not math.isfinite(value):
+                issues.append(f"fresnel_control_{name}")
+        power = floats.get("_FresnelPower")
+        if type(power) not in (int, float) or not math.isfinite(power) or power <= 0:
+            issues.append("fresnel_positive_power")
+        # Both controls are interpolation coefficients in the compiled formula.
+        if any(type(value := floats.get(name)) not in (int, float) or not 0 <= value <= 1
+               for name in ("_FresnelFlip", "_FresnelAffectOpacity")):
+            issues.append("fresnel_switch_controls")
+        color = colors.get("_FresnelColor")
+        if (not isinstance(color, list) or len(color) != 4 or
+                any(type(value) not in (int, float) or not math.isfinite(value) for value in color)):
+            issues.append("fresnel_color")
     excluded = (
-        "_UseFresnel", "_UseBright", "_UseLighting", "_UseVertexOffset",
+        "_UseBright", "_UseLighting", "_UseVertexOffset",
         "_UseVATColorTex", "_EnableHoudiniVAT", "_UseVFXPortal", "_UseTrail",
-        "_UseAnimBreathing", "_UseEdgeColor", "_UseScreenUV", "_UsePolarUV",
+        "_UseAnimBreathing", "_UseEdgeColor",
         "_UsePosYAsScreenV", "_UseParticleDisturb", "_UseWaterBlend",
     )
     issues.extend(name for name in excluded if floats.get(name, 0) != 0)
-    if (floats.get("_DissolveUseWeight", 0) != 0 or floats.get("_Bi_Disturb", 0) != 0) and weight_sample is None:
+    weighted_dissolve = (floats.get("_UseDissolve", 0) != 0 and
+                         floats.get("_DissolveUseWeight", 0) != 0 and floats.get("_UseWeightTex", 0) != 0)
+    bidirectional_disturb = floats.get("_UseDisturb", 0) != 0 and floats.get("_Bi_Disturb", 0) != 0
+    if (weighted_dissolve or bidirectional_disturb) and weight_sample is None:
         issues.append("weighted_or_bidirectional_dissolve_disturb")
-    if floats.get("_DisturbTex1Normal", 0) != 0 or floats.get("_DisturbTex2Normal", 0) != 0:
-        issues.append("normal_channel_disturb")
+    for flag, channel in (("_UsePolarUV", 2), ("_UseScreenUV", 3)):
+        if floats.get(flag, 0) != 0 and any(
+            isinstance(weights := colors.get(f"{name}UVWeights"), list) and len(weights) == 4 and weights[channel] != 0
+            for name in _enabled_uv_names(record)
+        ):
+            issues.append(flag)
+    if any(colors.get(f"{name}UVWeights") == [0, 0, 0, 1] for name in _enabled_uv_names(record)):
+        if floats.get("_ScreenUVUseDepth") not in (0, 1):
+            issues.append("screen_uv_depth_control")
+        if floats.get("_LocalPivortSpace") != 0:
+            issues.append("screen_uv_local_pivot_space")
+    for stage in (1, 2):
+        active = floats.get("_UseDisturb", 0) != 0 and (stage == 1 or floats.get("_UseDisturb2", 0) != 0)
+        if active and floats.get(f"_DisturbTex{stage}Normal", 0) not in (0, 1):
+            issues.append(f"normal_channel_disturb_{stage}_control")
     if floats.get("_UseDisturb", 0) and not floats.get("_UseSampleTex0", 0):
         issues.append("disturb_without_sample_texture")
     roles = [int(floats.get(f"_SampleTex{index}Use", 0)) for index in range(5)
@@ -231,7 +274,9 @@ def _material_feature_issues(record: MaterialRecord) -> tuple[str, ...]:
     enabled_samples = [index for index in range(6) if floats.get(f"_UseSampleTex{index}", 0)]
     if enabled_samples != list(range(len(enabled_samples))):
         issues.append("noncontiguous_sample_keywords")
-    if floats.get("_MainUVSet", 0) != 0:
+    # Compiled VFXBaseV2 selects UVs with UVWeights; MainUVSet is an editor enum.
+    # A pure UV0 selector therefore needs no secondary stream or polar branch.
+    if floats.get("_MainUVSet", 0) != 0 and colors.get("_MainTexUVWeights") != [1, 0, 0, 0]:
         issues.append("main_uv_set")
     for index in range(7):
         name = "_MainTex" if index == 6 else f"_SampleTex{index}"
@@ -269,9 +314,10 @@ def _material_feature_issues(record: MaterialRecord) -> tuple[str, ...]:
             weights = [floats.get(f"{name}UseWeight{r}", 0) for r in range(6)]
             if role in (0, 1, 3, 4, 5) and weights != [int(r == role) for r in range(6)]:
                 issues.append(f"{name}_role_weights")
-            if floats.get(f"{name}UseDisturb", 0) not in (0, 1):
+            # Authored weights cannot affect the zero offset when distortion is disabled.
+            if floats.get("_UseDisturb", 0) and floats.get(f"{name}UseDisturb", 0) not in (0, 1):
                 issues.append(f"{name}_disturb_mode")
-    if floats.get("_MainTexUseDisturb", 0) not in (0, 1):
+    if floats.get("_UseDisturb", 0) and floats.get("_MainTexUseDisturb", 0) not in (0, 1):
         issues.append("main_disturb_mode")
     return tuple(issues)
 
@@ -301,6 +347,8 @@ def vfx_feature_issues(record: MaterialRecord, vertex_streams: tuple[int, ...]) 
     # Supported graph branches consume Custom1 from TEXCOORD1, never unused trailing Custom2.
     if vfx_custom1_channels(record) and (channels is None or channels.get(34) != (4, 5, 6, 7)):
         issues.append("custom1_vertex_stream_missing")
+    if record["Floats"].get("_UseFresnel") == 1 and (channels is None or 1 not in channels):
+        issues.append("fresnel_normal_vertex_stream_missing")
     return (*issues, *_material_feature_issues(record))
 
 
@@ -309,16 +357,125 @@ def vfx_mesh_feature_issues(record: MaterialRecord, vertex_color_components: int
     issues: list[str] = []
     if vertex_color_components not in (0, 4):
         issues.append("mesh_vertex_color_components")
-    if record["Floats"].get("_InParticle", 0) != 0:
+    if record["Floats"].get("_InParticle", 0) != 0 and (
+        vfx_custom1_channels(record) or any(
+            record["Colors"].get(f"{name}UVWeights") != [1, 0, 0, 0]
+            for name in _enabled_uv_names(record)
+        )
+    ):
         issues.append("particle_input_on_mesh_renderer")
-    if record["Floats"].get("_DisableVertColor", 0) == 0 and vertex_color_components == 0:
-        issues.append("mesh_vertex_color_missing")
     source_issues = list(_material_feature_issues(record))
-    if (record["Floats"].get("_InParticle", 0) == 0 and
-            record["Colors"].get("_SampleTex1UVWeights") == [0, 1, 0, 0] and
-            "_SampleTex1_custom_uv" in source_issues):
-        source_issues.remove("_SampleTex1_custom_uv")
+    if record["Floats"].get("_InParticle", 0) == 0:
+        for name in _enabled_uv_names(record):
+            weights = record["Colors"].get(f"{name}UVWeights")
+            if (weights == [0, 1, 0, 0] or
+                    (weights == [0, 0, 1, 0] and record["Floats"].get("_UsePolarUV") == 1) or
+                    (weights == [0, 0, 0, 1] and record["Floats"].get("_UseScreenUV") == 1)):
+                if f"{name}_custom_uv" in source_issues:
+                    source_issues.remove(f"{name}_custom_uv")
+                if name == "_MainTex" and "main_uv_set" in source_issues:
+                    source_issues.remove("main_uv_set")
+        for flag in ("_UsePolarUV", "_UseScreenUV"):
+            if flag in source_issues and all(
+                record["Colors"].get(f"{name}UVWeights") in ([1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1])
+                and f"{name}_custom_uv" not in source_issues for name in _enabled_uv_names(record)
+            ):
+                source_issues.remove(flag)
     return (*issues, *source_issues)
+
+
+def _polar_uv(tree: bpy.types.NodeTree, uv: bpy.types.NodeSocket) -> bpy.types.NodeSocket:
+    """Reproduce variant 1314's atan2(X, Y) polynomial and doubled radial distance."""
+    centered = _vec(tree, "Polar UV Center", "SUBTRACT", uv, (0.5, 0.5, 0.0))
+    x = _component(tree, "Polar UV X", centered, "X")
+    y = _component(tree, "Polar UV Y", centered, "Y")
+    ax = _math(tree, "Polar UV Absolute X", "ABSOLUTE", x, 0.0)
+    ay = _math(tree, "Polar UV Absolute Y", "ABSOLUTE", y, 0.0)
+    # min/max is equivalent to the compiled reciprocal branch away from its singular center.
+    ratio = _math(tree, "Polar UV Reduced Ratio", "DIVIDE",
+                  _math(tree, "Polar UV Smaller Axis", "MINIMUM", ax, ay),
+                  _math(tree, "Polar UV Larger Axis", "MAXIMUM", ax, ay))
+    square = _math(tree, "Polar UV Ratio Squared", "MULTIPLY", ratio, ratio)
+    polynomial = _math(tree, "Polar UV Polynomial Coefficient", "ADD", -0.30189499258995056,
+                       _math(tree, "Polar UV Polynomial Quartic", "MULTIPLY", square, 0.08729290217161179))
+    polynomial = _math(tree, "Polar UV Polynomial Base", "ADD", 1.0,
+                       _math(tree, "Polar UV Polynomial Cubic", "MULTIPLY", polynomial, square))
+    angle = _math(tree, "Polar UV Polynomial Angle", "MULTIPLY", polynomial, ratio)
+    large_x = _math(tree, "Polar UV X Dominates", "SUBTRACT", 1.0,
+                    _math(tree, "Polar UV Y Dominates", "LESS_THAN", ax, ay))
+    complement = _math(tree, "Polar UV Complement Difference", "SUBTRACT", 1.5707963705062866,
+                       _math(tree, "Polar UV Double Angle", "MULTIPLY", angle, 2.0))
+    angle = _math(tree, "Polar UV Acute Angle", "ADD", angle,
+                  _math(tree, "Polar UV Complement Branch", "MULTIPLY", complement, large_x))
+    negative_y = _math(tree, "Polar UV Negative Y", "LESS_THAN", y, 0.0)
+    angle = _math(tree, "Polar UV Y Quadrant", "ADD", angle,
+                  _math(tree, "Polar UV Y Quadrant Difference", "MULTIPLY", negative_y,
+                        _math(tree, "Polar UV Y Reflection", "SUBTRACT", 3.141592502593994,
+                              _math(tree, "Polar UV Double Acute Angle", "MULTIPLY", angle, 2.0))))
+    sign = _math(tree, "Polar UV X Sign", "SUBTRACT", 1.0,
+                 _math(tree, "Polar UV Negative X Sign", "MULTIPLY", 2.0,
+                       _math(tree, "Polar UV Negative X", "LESS_THAN", x, 0.0)))
+    angle = _math(tree, "Polar UV Signed Angle", "MULTIPLY", angle, sign)
+    angle = _math(tree, "Polar UV Finite Center Reference", "MULTIPLY", angle,
+                  _math(tree, "Polar UV Nonzero Radius", "GREATER_THAN",
+                        _math(tree, "Polar UV Maximum Axis", "MAXIMUM", ax, ay), 0.0))
+    angle = _math(tree, "Polar UV Normalized Angle", "MULTIPLY", 0.15915493667125702,
+                  _math(tree, "Polar UV Angle Offset", "ADD", angle, 3.1415927410125732))
+    radius = tree.nodes.new("ShaderNodeVectorMath")
+    radius.name = radius.label = "Polar UV Radius"
+    radius.operation = "LENGTH"
+    tree.links.new(centered, radius.inputs[0])
+    return _xy(tree, "Polar UV Source Coordinates", angle,
+               _math(tree, "Polar UV Doubled Radius", "MULTIPLY", radius.outputs["Value"], 2.0))
+
+
+def _screen_uv(tree: bpy.types.NodeTree, record: MaterialRecord) -> bpy.types.NodeSocket:
+    """Approximate the compiled screen-coordinate branch using Blender camera Window UV."""
+    coordinate = tree.nodes.new("ShaderNodeTexCoord")
+    coordinate.name = coordinate.label = "Screen UV Camera Window"
+    ndc = _vec(tree, "Screen UV NDC and Y Direction", "MULTIPLY", coordinate.outputs["Window"], (2.0, -2.0, 0.0))
+    ndc = _vec(tree, "Screen UV NDC Offset", "ADD", ndc, (-1.0, 1.0, 0.0))
+    scene = bpy.context.scene
+    render = scene.render
+    aspect = _value(tree, "Screen UV Camera Height / Width", render.resolution_y * render.pixel_aspect_y / (render.resolution_x * render.pixel_aspect_x))
+    driver = aspect.node.outputs[0].driver_add("default_value").driver
+    driver.type = "SCRIPTED"
+    for name in ("resolution_x", "resolution_y", "pixel_aspect_x", "pixel_aspect_y"):
+        variable = driver.variables.new()
+        variable.name = name
+        variable.type = "SINGLE_PROP"
+        variable.targets[0].id_type = "SCENE"
+        variable.targets[0].id = scene
+        variable.targets[0].data_path = f"render.{name}"
+    driver.expression = "resolution_y * pixel_aspect_y / (resolution_x * pixel_aspect_x)"
+    scale = tree.nodes.new("ShaderNodeCombineXYZ")
+    scale.name = scale.label = "Screen UV Aspect Scale"
+    scale.inputs["X"].default_value = 1.0
+    tree.links.new(aspect, scale.inputs["Y"])
+    ndc = _vec(tree, "Screen UV Source NDC", "MULTIPLY", ndc, scale.outputs[0])
+    origin = tree.nodes.new("ShaderNodeObjectInfo")
+    origin.name = origin.label = "Screen UV Source Object Origin"
+    view = tree.nodes.new("ShaderNodeVectorTransform")
+    view.name = view.label = "Screen UV Object Origin in Camera Space"
+    view.vector_type, view.convert_from, view.convert_to = "POINT", "WORLD", "CAMERA"
+    tree.links.new(origin.outputs["Location"], view.inputs[0])
+    # Blender's shading camera coordinates use positive forward Z.
+    depth = _component(tree, "Screen UV Object Axial Depth", view.outputs[0], "Z")
+    clip = tree.nodes.new("ShaderNodeValue")
+    clip.name = clip.label = "Screen UV Active Camera Near Clip"
+    driver = clip.outputs[0].driver_add("default_value").driver
+    driver.type = "SCRIPTED"
+    variable = driver.variables.new()
+    variable.name, variable.type = "near_clip", "SINGLE_PROP"
+    variable.targets[0].id_type = "SCENE"
+    variable.targets[0].id, variable.targets[0].data_path = scene, "camera.data.clip_start"
+    driver.expression = "near_clip"
+    depth = _math(tree, "Screen UV Depth Minus Near Clip", "SUBTRACT", depth, clip.outputs[0])
+    depth = _math(tree, "Screen UV Depth Minimum One", "MAXIMUM", depth, 1.0)
+    use_depth = record["Floats"]["_ScreenUVUseDepth"]
+    factor = _math(tree, "Screen UV Source Depth Weight", "ADD", 1.0 - use_depth,
+                   _math(tree, "Screen UV Source Weighted Depth", "MULTIPLY", depth, use_depth))
+    return _scale(tree, "Screen UV Object Depth Scaling", ndc, factor)
 
 
 def _uv(tree: bpy.types.NodeTree, record: MaterialRecord, name: str,
@@ -417,9 +574,59 @@ def _disturb(tree: bpy.types.NodeTree, label: str, sample: _Rgba,
                                                      (u, v, 0.0), (0.0, 0.0, 0.0)), weighted)
 
 
+def _normal_disturb(tree: bpy.types.NodeTree, label: str, sample: _Rgba,
+                    intensity: float, weight: bpy.types.NodeSocket | float) -> bpy.types.NodeSocket:
+    """Decode the source packed normal's A*R and G; both axes use U intensity."""
+    red = _component(tree, f"{label} Normal Red", sample.rgb, "X")
+    green = _component(tree, f"{label} Normal Green", sample.rgb, "Y")
+    packed_x = _math(tree, f"{label} Normal Alpha Red", "MULTIPLY", sample.alpha, red)
+    x = _math(tree, f"{label} Normal Signed X", "SUBTRACT",
+              _math(tree, f"{label} Normal Double X", "MULTIPLY", packed_x, 2.0), 1.0)
+    y = _math(tree, f"{label} Normal Signed Y", "SUBTRACT",
+              _math(tree, f"{label} Normal Double Y", "MULTIPLY", green, 2.0), 1.0)
+    factor = _math(tree, f"{label} Normal Intensity Weight", "MULTIPLY", weight, intensity)
+    return _scale(tree, f"{label} Normal UV Offset", _xy(tree, f"{label} Normal XY", x, y), factor)
+
+
+def _fresnel(tree: bpy.types.NodeTree, record: MaterialRecord, source: _Rgba) -> _Rgba:
+    """Apply the compiled VFXBaseV2 signed-facing color and opacity formulas."""
+    floats, color = record["Floats"], record["Colors"]["_FresnelColor"]
+    geometry = tree.nodes.new("ShaderNodeNewGeometry")
+    geometry.name = geometry.label = "Fresnel Surface Geometry"
+    orientation = _math(tree, "Fresnel Source Normal Orientation", "SUBTRACT", 1.0,
+                        _math(tree, "Fresnel Backface Sign", "MULTIPLY", geometry.outputs["Backfacing"], 2.0))
+    normal = _scale(tree, "Fresnel Source Normal", geometry.outputs["Normal"], orientation)
+    dot = tree.nodes.new("ShaderNodeVectorMath")
+    dot.name = dot.label = "Fresnel Signed Facing"
+    dot.operation = "DOT_PRODUCT"
+    tree.links.new(normal, dot.inputs[0])
+    tree.links.new(geometry.outputs["Incoming"], dot.inputs[1])
+    biased = _math(tree, "Fresnel Facing Bias", "ADD", dot.outputs["Value"], floats["_FresnelBias"])
+    clamped = _math(tree, "Fresnel Facing Clamp Low", "MAXIMUM", biased, 0.0)
+    clamped = _math(tree, "Fresnel Facing Clamp High", "MINIMUM", clamped, 1.0)
+    power = _math(tree, "Fresnel Facing Power", "POWER", clamped, floats["_FresnelPower"])
+    factor = _math(tree, "Fresnel Source Flip", "ADD",
+                   _math(tree, "Fresnel Unflipped", "MULTIPLY",
+                         _math(tree, "Fresnel One Minus Power", "SUBTRACT", 1.0, power),
+                         1.0 - floats["_FresnelFlip"]),
+                   _math(tree, "Fresnel Flipped", "MULTIPLY", power, floats["_FresnelFlip"]))
+    color_factor = _math(tree, "Fresnel Color Weight", "MULTIPLY", factor, color[3])
+    rgb = _vec(tree, "Fresnel Source Color Mix", "ADD",
+               _scale(tree, "Fresnel Original RGB", source.rgb,
+                      _math(tree, "Fresnel Original Color Weight", "SUBTRACT", 1.0, color_factor)),
+               _scale(tree, "Fresnel Tint RGB",
+                      _vec(tree, "Fresnel Source Color", "ADD", tuple(color[:3]), (0.0, 0.0, 0.0)),
+                      color_factor))
+    opacity = _math(tree, "Fresnel Opacity Weight", "ADD", 1.0 - floats["_FresnelAffectOpacity"],
+                    _math(tree, "Fresnel Weighted Opacity", "MULTIPLY", factor, floats["_FresnelAffectOpacity"]))
+    alpha = _math(tree, "Fresnel Input Alpha Clamp Low", "MAXIMUM", source.alpha, 0.0)
+    alpha = _math(tree, "Fresnel Input Alpha Clamp High", "MINIMUM", alpha, 1.0)
+    return _Rgba(rgb, _math(tree, "Fresnel Source Alpha", "MULTIPLY", alpha, opacity))
+
+
 def _make_vfx_feature_source(tree: bpy.types.NodeTree, record: MaterialRecord,
                              textures: dict[tuple[str, int], tuple[Path, str]],
-                             snapshot_time: float) -> VfxColor:
+                             snapshot_time: float, vertex_color_components: int) -> VfxColor:
     """Build the shader's pre-exposure RGBA from verified texture-role controls."""
     if type(snapshot_time) not in (int, float) or not math.isfinite(snapshot_time):
         raise ValueError(f"VFX snapshot time must be finite: material={record['Name']}, value={snapshot_time}")
@@ -427,9 +634,15 @@ def _make_vfx_feature_source(tree: bpy.types.NodeTree, record: MaterialRecord,
     uv = tree.nodes.new("ShaderNodeUVMap")
     uv.uv_map = "UVMap"
     uv1 = None
-    if record["Colors"].get("_SampleTex1UVWeights") == [0, 1, 0, 0] and floats.get("_InParticle", 0) == 0:
+    if mesh_material_requires_uv1(record) and floats.get("_InParticle", 0) == 0:
         uv1 = tree.nodes.new("ShaderNodeUVMap")
         uv1.uv_map = "EF_FX_UV1"
+    screen_uv = None
+    if floats.get("_InParticle", 0) == 0 and any(colors.get(f"{name}UVWeights") == [0, 0, 0, 1] for name in _enabled_uv_names(record)):
+        screen_uv = _screen_uv(tree, record)
+    polar_uv = None
+    if floats.get("_InParticle", 0) == 0 and any(colors.get(f"{name}UVWeights") == [0, 0, 1, 0] for name in _enabled_uv_names(record)):
+        polar_uv = _polar_uv(tree, uv.outputs[0])
     zero = _vec(tree, "No UV Disturbance", "ADD", (0.0, 0.0, 0.0), (0.0, 0.0, 0.0))
     channels = vfx_custom1_channels(record)
     custom = None
@@ -459,7 +672,11 @@ def _make_vfx_feature_source(tree: bpy.types.NodeTree, record: MaterialRecord,
             continue
         name = f"_SampleTex{index}"
         role = int(floats[f"{name}Use"])
-        source_uv = uv1.outputs[0] if index == 1 and uv1 is not None else uv.outputs[0]
+        source_uv = uv1.outputs[0] if colors.get(f"{name}UVWeights") == [0, 1, 0, 0] and uv1 is not None else uv.outputs[0]
+        if colors.get(f"{name}UVWeights") == [0, 0, 0, 1] and screen_uv is not None:
+            source_uv = screen_uv
+        if colors.get(f"{name}UVWeights") == [0, 0, 1, 0] and polar_uv is not None:
+            source_uv = polar_uv
         sampled_uv = _uv(tree, record, name, source_uv, snapshot_time,
                          disturbance if floats.get(f"{name}UseDisturb", 0) else zero,
                          custom_y)
@@ -468,22 +685,31 @@ def _make_vfx_feature_source(tree: bpy.types.NodeTree, record: MaterialRecord,
         sampling_limitations.extend(sample_result.limitations)
         role_samples[role].append(sampled)
         if role == 0 and floats.get("_UseDisturb", 0):
+            offset = (_normal_disturb(tree, "Disturb 1", sampled, floats["_DisturbUIntensity1"], disturb_weight)
+                      if floats.get("_DisturbTex1Normal", 0) else
+                      _disturb(tree, "Disturb 1", sampled, floats.get("_DisturbUIntensity1", 0),
+                               floats.get("_DisturbVIntensity1", 0), disturb_weight))
             disturbance = _vec(tree, "Disturb 1 Accumulation", "ADD", disturbance,
-                               _disturb(tree, "Disturb 1", sampled,
-                                        floats.get("_DisturbUIntensity1", 0),
-                                        floats.get("_DisturbVIntensity1", 0), disturb_weight))
+                               offset)
         elif role == 1 and floats.get("_UseDisturb", 0) and floats.get("_UseDisturb2", 0):
+            offset = (_normal_disturb(tree, "Disturb 2", sampled, floats["_DisturbUIntensity2"], disturb_weight)
+                      if floats.get("_DisturbTex2Normal", 0) else
+                      _disturb(tree, "Disturb 2", sampled, floats.get("_DisturbUIntensity2", 0),
+                               floats.get("_DisturbVIntensity2", 0), disturb_weight))
             disturbance = _vec(tree, "Disturb 2 Accumulation", "ADD", disturbance,
-                               _disturb(tree, "Disturb 2", sampled,
-                                        floats.get("_DisturbUIntensity2", 0),
-                                        floats.get("_DisturbVIntensity2", 0), disturb_weight))
+                               offset)
         elif role == 2:
             source_weight = _component(tree, "Source Weight Red", sampled.rgb, "X")
             amount = floats["_DisturbUseWeight"] * floats["_WeightTexIntensity"] * floats[f"{name}UseWeight2"]
             factor = _math(tree, "Weighted Disturb Factor", "ADD", 1.0 - amount,
                            _math(tree, "Weighted Disturb Red", "MULTIPLY", source_weight, amount))
             disturbance = _scale(tree, "Weighted Disturbance", disturbance, factor)
-    main_uv = _uv(tree, record, "_MainTex", uv.outputs[0], snapshot_time,
+    main_source_uv = uv1.outputs[0] if colors.get("_MainTexUVWeights") == [0, 1, 0, 0] and uv1 is not None else uv.outputs[0]
+    if colors.get("_MainTexUVWeights") == [0, 0, 0, 1] and screen_uv is not None:
+        main_source_uv = screen_uv
+    if colors.get("_MainTexUVWeights") == [0, 0, 1, 0] and polar_uv is not None:
+        main_source_uv = polar_uv
+    main_uv = _uv(tree, record, "_MainTex", main_source_uv, snapshot_time,
                   disturbance if floats.get("_MainTexUseDisturb", 0) else zero,
                   custom_x)
     main_result = _sample(tree, record, "_MainTex", textures, main_uv)
@@ -496,11 +722,21 @@ def _make_vfx_feature_source(tree: bpy.types.NodeTree, record: MaterialRecord,
     alpha = _math(tree, "Source Tint Alpha", "MULTIPLY", main.alpha,
                   tint[3] * floats["_TintColorAlpha"])
     if floats.get("_DisableVertColor", 0) == 0:
-        vertex = tree.nodes.new("ShaderNodeVertexColor")
-        vertex.name = vertex.label = "Source Vertex Color"
-        vertex.layer_name = "EF_FX_COLOR"
-        rgb = _vec(tree, "Particle Color", "MULTIPLY", rgb, vertex.outputs["Color"])
-        alpha = _math(tree, "Particle Opacity", "MULTIPLY", alpha, vertex.outputs["Alpha"])
+        if vertex_color_components == 0:
+            # Retain absent source data; the explicit reference is not an exported RGBA stream.
+            vertex = tree.nodes.new("ShaderNodeRGB")
+            vertex.name = vertex.label = "MeshRenderer Missing COLOR Reference White"
+            vertex.outputs[0].default_value = (1.0, 1.0, 1.0, 1.0)
+            vertex_rgb = vertex.outputs[0]
+            vertex_alpha = _value(tree, "MeshRenderer Missing COLOR Reference Alpha", 1.0)
+            sampling_limitations.append("MeshRenderer missing COLOR uses an explicit white RGBA reference following Unity's missing-attribute behavior; this game runtime binding is unverified and no source color stream is synthesized")
+        else:
+            vertex = tree.nodes.new("ShaderNodeVertexColor")
+            vertex.name = vertex.label = "Source Vertex Color"
+            vertex.layer_name = "EF_FX_COLOR"
+            vertex_rgb, vertex_alpha = vertex.outputs["Color"], vertex.outputs["Alpha"]
+        rgb = _vec(tree, "Particle Color", "MULTIPLY", rgb, vertex_rgb)
+        alpha = _math(tree, "Particle Opacity", "MULTIPLY", alpha, vertex_alpha)
     mask = _Rgba(_vec(tree, "Mask Base RGB", "ADD", (1.0 - floats.get("_UseMask", 0),) * 3,
                       (0.0, 0.0, 0.0)),
                  _value(tree, "Mask Base Alpha", 1.0 - floats.get("_UseMask", 0)))
@@ -522,6 +758,10 @@ def _make_vfx_feature_source(tree: bpy.types.NodeTree, record: MaterialRecord,
         rgb = _vec(tree, "Add Blend RGB", "ADD", rgb,
                    _scale(tree, "Blend RGB Contribution", blend_rgb, blend_factor))
     limitations = sampling_limitations
+    if polar_uv is not None:
+        limitations.append("Polar UV restores the compiled atan2(X,Y) polynomial and radial scale; the exact singular UV center uses Blender's finite zero-ratio reference instead of undefined source division")
+    if screen_uv is not None:
+        limitations.append("Screen UV uses Blender camera Window coordinates with NDC, Y flip, dynamic image aspect and source object-origin axial-depth scaling; original game camera projection, frame-buffer conventions and integer pixel quantization remain approximated")
     if floats.get("_UseDissolve", 0):
         if "z" in channels:
             if custom is None:
@@ -542,7 +782,9 @@ def _make_vfx_feature_source(tree: bpy.types.NodeTree, record: MaterialRecord,
         schedule = _math(tree, "Dissolve Schedule Shift", "SUBTRACT", schedule, 1.01)
         if floats.get("_DissolveUseWeight", 0):
             if source_weight is None:
-                raise ValueError(f"VFX weighted dissolve has no source weight sample: material={record['Name']}")
+                if floats.get("_UseWeightTex", 0) != 0:
+                    raise ValueError(f"VFX weighted dissolve has no source weight sample: material={record['Name']}")
+                source_weight = _value(tree, "Source Weight Base", 1.0)
             amount = floats["_WeightTexIntensity"] * floats["_DissolveUseWeight"]
             factor = _math(tree, "Weighted Dissolve Factor", "ADD", 1.0 - amount,
                            _math(tree, "Weighted Dissolve Red", "MULTIPLY", source_weight, amount))
@@ -570,6 +812,10 @@ def _make_vfx_feature_source(tree: bpy.types.NodeTree, record: MaterialRecord,
                    _scale(tree, "Dissolve Base RGB", rgb,
                           _math(tree, "One Minus Emissive Edge", "SUBTRACT", 1.0, edge)),
                    _scale(tree, "Dissolve Edge RGB", target, edge))
+    if floats.get("_UseFresnel") == 1:
+        fresnel = _fresnel(tree, record, _Rgba(rgb, alpha))
+        rgb, alpha = fresnel.rgb, fresnel.alpha
+        limitations.append("Fresnel VFXBaseV2 controls derived from compiled shader formulas; Blender normalizes interpolated shading normals while the source interpolates vertex-normalized normals")
     if source_weight is not None:
         limitations.append("Weighted VFXBaseV2 controls derived from compiled shader formulas; game exposure and depth remain uncaptured")
     return VfxColor(rgb, alpha, tuple(limitations))
@@ -581,7 +827,7 @@ def make_vfx_feature_source(tree: bpy.types.NodeTree, record: MaterialRecord,
     issues = vfx_feature_issues(record, vertex_streams)
     if issues:
         raise NotImplementedError(f"VFX source controls unsupported: material={record['Name']}, issues={issues}")
-    source = _make_vfx_feature_source(tree, record, textures, snapshot_time)
+    source = _make_vfx_feature_source(tree, record, textures, snapshot_time, 4)
     if (record["Floats"].get("_DisableVertColor", 0) == 0 and
             record["Floats"].get("_DisableParticleInstanceColor", 0) == 0):
         return VfxColor(source.rgb, source.alpha,
@@ -595,7 +841,7 @@ def make_vfx_mesh_source(tree: bpy.types.NodeTree, record: MaterialRecord,
     issues = vfx_mesh_feature_issues(record, vertex_color_components)
     if issues:
         raise NotImplementedError(f"VFX mesh source controls unsupported: material={record['Name']}, issues={issues}")
-    source = _make_vfx_feature_source(tree, record, textures, snapshot_time)
+    source = _make_vfx_feature_source(tree, record, textures, snapshot_time, vertex_color_components)
     if record["Floats"].get("_DisableVertColor", 0) == 0:
         return VfxColor(source.rgb, source.alpha,
                         (*source.limitations, "Runtime renderer vertex-color attenuation is not captured"))

@@ -17,6 +17,7 @@ internal sealed class HelperProgress
     private readonly Stopwatch timer = Stopwatch.StartNew();
     private readonly List<ProgressSample> samples = [];
     private readonly Dictionary<string, double> phaseTimingsSeconds = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, long> phaseCounters = new(StringComparer.Ordinal);
     private readonly IoCounters? startingIo;
     private bool finished;
 
@@ -70,6 +71,7 @@ internal sealed class HelperProgress
             status,
             phaseSemantics,
             phaseTimingsSeconds,
+            phaseCounters,
             events = samples,
         }, new JsonSerializerOptions { WriteIndented = true, PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
                                       DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull }));
@@ -80,6 +82,13 @@ internal sealed class HelperProgress
         if (finished || string.IsNullOrWhiteSpace(phase) || duration < TimeSpan.Zero)
             throw new ArgumentException($"Invalid helper phase duration: {phase}, {duration}");
         phaseTimingsSeconds[phase] = phaseTimingsSeconds.GetValueOrDefault(phase) + duration.TotalSeconds;
+    }
+
+    public void SetPhaseCounter(string name, long value)
+    {
+        if (finished || string.IsNullOrWhiteSpace(name) || value < 0)
+            throw new ArgumentException($"Invalid helper phase counter: {name}, {value}");
+        phaseCounters[name] = value;
     }
 
     private static IoCounters? ReadIo()

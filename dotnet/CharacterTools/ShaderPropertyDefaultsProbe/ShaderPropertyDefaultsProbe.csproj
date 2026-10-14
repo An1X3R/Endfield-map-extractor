@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <StartupObject>ShaderIdentityProgram</StartupObject>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="$(AnimeStudioRoot)/AnimeStudio/AnimeStudio.csproj" />
+    <ProjectReference Include="../CharacterModel/CharacterModel.csproj" />
+    <Compile Include="../CharacterStaticProbe/Program.cs" Link="SharedReader.cs" />
+  </ItemGroup>
+</Project>

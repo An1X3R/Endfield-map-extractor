@@ -16,6 +16,7 @@ from uuid import uuid4
 
 from endfield_scene_export import run_scene_process
 from endfield_scene_resources import describe_file, read_json, validate_scan, write_index
+from endfield_scene_scanner import run_scanner_shards, scan_index_rows, scanner_capacity
 from extractor_core.effects import GROUP_HASH as EFFECT_GROUP_HASH, read_dynamic_scene_effects
 from extractor_core.resources import (
     extract_candidate_bundles,
@@ -239,9 +240,9 @@ def discovery(run_root: Path, log_root: Path, scan_index: Path, database: Path, 
             progress(0.05 + 0.35 * (done / total if total else 0),
                      f"Scanning providers and dependencies: {done}/{total or '?'}", {"helperProgress": row})
 
-        observe_helper([str(scanner), "--input", str(scan_index), "--output", str(providers),
-                        "--cab-output", str(cab), "--contains", "assets/", "--progress-every", "1000",
-                        "--performance-report", str(performance)], log, scan_work / "temp", check_cancelled, scan_progress)
+        rows = scan_index_rows(scan_index, check_cancelled)
+        run_scanner_shards(scanner, scan_index, scan_work, log, 0, rows, scanner_capacity(rows),
+                           check_cancelled, scan_progress, observe_helper)
         validate_scan(providers)
         validate_scan(cab)
         scan = {"scannerResults": describe_file(providers), "cabInventory": describe_file(cab),

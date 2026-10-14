@@ -9,6 +9,8 @@ using Object = AnimeStudio.Object;
 
 internal static partial class Program
 {
+    private const int MaximumTextureWorkers = 4;
+    private const int MaximumTextureMemoryMiB = 128;
     private static readonly MethodInfo ReadAssetsMethod = typeof(AssetsManager).GetMethod(
         "ReadAssets", BindingFlags.Instance | BindingFlags.NonPublic)
         ?? throw new MissingMethodException("AssetsManager.ReadAssets()");
@@ -32,7 +34,21 @@ internal static partial class Program
                 return 0;
             }
             var options = Options.Parse(args);
-            Run(options);
+            using var cancellation = new CancellationTokenSource();
+            ConsoleCancelEventHandler cancel = (_, eventArgs) =>
+            {
+                eventArgs.Cancel = true;
+                cancellation.Cancel();
+            };
+            Console.CancelKeyPress += cancel;
+            try
+            {
+                Run(options, cancellation.Token);
+            }
+            finally
+            {
+                Console.CancelKeyPress -= cancel;
+            }
             return 0;
         }
         catch (Exception ex)
@@ -42,14 +58,19 @@ internal static partial class Program
         }
     }
 
-    private static void Run(Options options)
+    private static void Run(Options options, CancellationToken cancellation)
     {
         var telemetry = new HelperProgress("EndfieldSceneProbe", options.PerformanceReport,
             "load_unpack includes input-file reading and bundle unpacking because AssetsManager.LoadFiles " +
-            "does not expose separate timings; object_parse covers ReadAssets and ProcessAssets in original order.");
+            "does not expose separate timings; object_parse covers ReadAssets and ProcessAssets in original order. " +
+            "texture_prepare includes serial resource read, decode, image copy and flip. Texture PNG/file duration sums " +
+            "overlap across workers; PNG save includes stream writes and file close, so these nested sums must not be added. " +
+            "Stream-write time measures synchronous Stream calls, not physical disk service. " +
+            "Encoder owner time includes image disposal; PNG compression level1 prioritizes speed without changing pixels. " +
+            "Pixel reservations exclude decoder scratch, encoder buffers and loaded assets; oversized images run alone.");
         try
         {
-            RunCore(options, telemetry);
+            RunCore(options, telemetry, cancellation);
         }
         catch (Exception error)
         {
@@ -66,7 +87,7 @@ internal static partial class Program
         telemetry.Finish("complete");
     }
 
-    private static void RunCore(Options options, HelperProgress telemetry)
+    private static void RunCore(Options options, HelperProgress telemetry, CancellationToken cancellation)
     {
         var input = Path.GetFullPath(options.Input);
         var output = Path.GetFullPath(options.Output);
@@ -266,8 +287,10 @@ internal static partial class Program
                 VertexColorsFile = ok ? WriteMeshVertexColors(mesh, meshDir, output) : null,
                 Uv0Components = MeshUvComponents(mesh, mesh.m_UV0, "uv0"),
                 Uv1Components = MeshUvComponents(mesh, mesh.m_UV1, "uv1"),
+                Uv2Components = MeshUvComponents(mesh, mesh.m_UV2, "uv2"),
                 Uv0File = ok ? WriteMeshUv(mesh, mesh.m_UV0, "uv0", meshDir, output) : null,
                 Uv1File = ok ? WriteMeshUv(mesh, mesh.m_UV1, "uv1", meshDir, output) : null,
+                Uv2File = ok ? WriteMeshUv(mesh, mesh.m_UV2, "uv2", meshDir, output) : null,
                 ShapeGeometryFile = shapeGeometryFile,
                 ShapeGeometryError = shapeGeometryError,
             });
@@ -276,37 +299,10 @@ internal static partial class Program
         }
         telemetry.Publish("mesh_export", meshRecords.Count, meshTotal);
 
-        var textureRecords = new List<ExportRecord>();
-        var textureTotal = options.ManifestOnly ? 0 : textureRefs.Count;
-        telemetry.Publish("texture_export", 0, textureTotal);
-        foreach (var texture in options.ManifestOnly
-                     ? Enumerable.Empty<Texture2D>()
-                     : textureRefs.OrderBy(x => x.assetsFile.fileName).ThenBy(x => x.m_PathID))
-        {
-            var fileName = UniqueFileName(texture, ".png");
-            var path = Path.Combine(textureDir, fileName);
-            string? error = null;
-            try
-            {
-                using var stream = texture.ConvertToStream(ImageFormat.Png, true);
-                if (stream == null)
-                    error = "Texture decoder returned no image";
-                else
-                {
-                    stream.Position = 0;
-                    using var file = File.Create(path);
-                    stream.CopyTo(file);
-                }
-            }
-            catch (Exception ex)
-            {
-                error = ex.Message;
-            }
-            textureRecords.Add(new ExportRecord(TextureReference(texture), error == null ? Path.GetRelativePath(output, path) : null, error));
-            if (textureRecords.Count % 100 == 0)
-                telemetry.Publish("texture_export", textureRecords.Count, textureTotal);
-        }
-        telemetry.Publish("texture_export", textureRecords.Count, textureTotal);
+        var selectedTextures = options.ManifestOnly ? [] : textureRefs
+            .OrderBy(texture => texture.assetsFile.fileName).ThenBy(texture => texture.m_PathID).ToArray();
+        var textureRecords = ExportTextures(selectedTextures, output, textureDir, options.TextureWorkers,
+            options.TextureMemoryMiB * 1024L * 1024L, telemetry, cancellation);
 
         var waterArrayKeys = waterRecords.GlobalConfigs
             .Where(record => !record.NormalMapArray.IsNull)
@@ -330,6 +326,7 @@ internal static partial class Program
         var report = new SceneReport
         {
             Format = "EndfieldSceneProbe/1",
+            MeshUvStreamVersion = 2,
             InputFiles = files.Select(Path.GetFullPath).ToArray(),
             SerializedFiles = manager.assetsFileList.Select(f => new SerializedFileRecord
             {
@@ -377,6 +374,7 @@ internal static partial class Program
         };
 
         var reportPath = Path.Combine(output, "scene_manifest.json");
+        cancellation.ThrowIfCancellationRequested();
         telemetry.Publish("manifest_write", 0, 1);
         File.WriteAllText(reportPath, JsonSerializer.Serialize(report, JsonOptions), new UTF8Encoding(false));
         telemetry.Publish("manifest_write", 1, 1);
@@ -500,16 +498,18 @@ internal static partial class Program
     }
 
     private sealed record Options(string Input, string Output, bool IncludeUnreferenced, bool ManifestOnly,
-        bool DumpMetadata, string? PerformanceReport)
+        bool DumpMetadata, string? PerformanceReport, int TextureWorkers, int TextureMemoryMiB)
     {
         public static Options Parse(string[] args)
         {
             if (args.Length < 2)
-                throw new ArgumentException("Usage: EndfieldSceneProbe <input-file-or-folder> <new-output-folder> [--include-unreferenced] [--manifest-only] [--dump-metadata] [--performance-report PATH]");
+                throw new ArgumentException("Usage: EndfieldSceneProbe <input-file-or-folder> <new-output-folder> [--include-unreferenced] [--manifest-only] [--dump-metadata] [--performance-report PATH] [--texture-workers 1..4] [--texture-memory-mib 1..128]");
             string? report = null;
             var includeUnreferenced = false;
             var manifestOnly = false;
             var dumpMetadata = false;
+            var textureWorkers = Math.Min(MaximumTextureWorkers, Environment.ProcessorCount);
+            var textureMemoryMiB = MaximumTextureMemoryMiB;
             for (var index = 2; index < args.Length; index++)
             {
                 switch (args[index])
@@ -518,10 +518,19 @@ internal static partial class Program
                     case "--manifest-only": manifestOnly = true; break;
                     case "--dump-metadata": dumpMetadata = true; break;
                     case "--performance-report" when index + 1 < args.Length: report = args[++index]; break;
+                    case "--texture-workers" when index + 1 < args.Length:
+                        if (!int.TryParse(args[++index], out textureWorkers) || textureWorkers is < 1 or > MaximumTextureWorkers)
+                            throw new ArgumentException($"SceneProbe texture-workers must be between 1 and {MaximumTextureWorkers}");
+                        break;
+                    case "--texture-memory-mib" when index + 1 < args.Length:
+                        if (!int.TryParse(args[++index], out textureMemoryMiB) || textureMemoryMiB is < 1 or > MaximumTextureMemoryMiB)
+                            throw new ArgumentException($"SceneProbe texture-memory-mib must be between 1 and {MaximumTextureMemoryMiB}");
+                        break;
                     default: throw new ArgumentException($"Unknown SceneProbe option: {args[index]}");
                 }
             }
-            return new Options(args[0], args[1], includeUnreferenced, manifestOnly, dumpMetadata, report);
+            return new Options(args[0], args[1], includeUnreferenced, manifestOnly, dumpMetadata, report,
+                textureWorkers, textureMemoryMiB);
         }
     }
 }
@@ -529,6 +538,7 @@ internal static partial class Program
 internal sealed class SceneReport
 {
     public required string Format { get; init; }
+    public required int MeshUvStreamVersion { get; init; }
     public required string[] InputFiles { get; init; }
     public required List<SerializedFileRecord> SerializedFiles { get; init; }
     public required List<NodeRecord> Nodes { get; init; }
@@ -608,8 +618,10 @@ internal sealed record ExportRecord(AssetRef Asset, string? File, string? Error)
     public string? VertexColorsFile { get; init; }
     public int? Uv0Components { get; init; }
     public int? Uv1Components { get; init; }
+    public int? Uv2Components { get; init; }
     public string? Uv0File { get; init; }
     public string? Uv1File { get; init; }
+    public string? Uv2File { get; init; }
     public string? ShapeGeometryFile { get; init; }
     public string? ShapeGeometryError { get; init; }
 }

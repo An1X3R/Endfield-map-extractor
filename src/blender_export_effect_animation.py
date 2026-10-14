@@ -32,7 +32,7 @@ from blender_scene_effects import (
     _anchor_matrix,
     _blender_matrix,
     _components,
-    _gravity_local,
+    _system_gravity_local,
     _mesh_templates,
     _owner_matrix_root_relative,
     _particle_mesh_aligned,
@@ -244,7 +244,7 @@ def _build_samplers(plan: Mapping[str, object], camera: bpy.types.Object,
                 raise ValueError(f"Source FX object must have no modifiers or constraints: identity={key}, object={obj.name}")
             if trail_obj is not None and (trail_obj.modifiers or trail_obj.constraints):
                 raise ValueError(f"Source FX trail must have no modifiers or constraints: identity={key}, object={trail_obj.name}")
-            gravity_local = _gravity_local(gravity_world, unity_world)
+            gravity_local = _system_gravity_local(gravity_world, unity_world, system)
             identity = f"{entity_id}:{system_key[0]}:{system_key[1]}"
             initial_snapshot = _snapshot(system, frame_start / fps, identity, gravity_local)
             render_mode = _integer(_field(renderer, "RenderMode", "Renderer"), "Renderer.RenderMode")
@@ -291,6 +291,20 @@ def _build_samplers(plan: Mapping[str, object], camera: bpy.types.Object,
     if unmatched or unmatched_trails:
         raise ValueError(f"Source scene contains unplanned FX objects: systems={unmatched[:8]}, trails={unmatched_trails[:8]}")
     return samplers, materials, animated, skipped
+
+
+def _mesh_effect_materials(scene: bpy.types.Scene) -> dict[str, bpy.types.Material]:
+    """Collect source-qualified mesh FX materials from objects present in the scene."""
+    return {
+        material.name: material
+        for obj in scene.objects
+        if obj.type == "MESH" and ("endfield_fx_renderer_source" in obj
+            or ("endfield_fx_direct_source_json" in obj and "endfield_fx_placement_key" in obj)
+            or any(material is not None and material.get("endfield_fx_fog_simple_shader") == "HGRP/FogSimple"
+                   for material in obj.data.materials))
+        for material in obj.data.materials
+        if material is not None
+    }
 
 
 def _arguments() -> argparse.Namespace:
@@ -361,6 +375,8 @@ def main() -> None:
         raise ValueError(f"Animation system limit exceeded: selected={len(animated_rows)}, maxSystems={args.max_systems}; narrow the source scene")
 
     output.parent.mkdir(parents=True, exist_ok=True)
+    mesh_materials = _mesh_effect_materials(scene)
+    materials = {**materials, **mesh_materials}
     driven_materials: list[str] = []
     materials_without_time: list[str] = []
     for name in sorted(materials):
@@ -385,6 +401,7 @@ def main() -> None:
         "animated_systems": animated_rows,
         "skipped_components": skipped,
         "uv_time_driver_materials": driven_materials,
+        "mesh_uv_time_driver_materials": sorted(set(driven_materials) & mesh_materials.keys()),
         "materials_without_source_time_input": materials_without_time,
         "limitations": [
             "Deterministic previews do not reproduce Unity simulation or start phase",
@@ -392,6 +409,7 @@ def main() -> None:
             "The cache covers only the requested frame interval",
             "Unsupported particle modules remain unreconstructed",
             "UV drivers affect all users of selected materials",
+            "Mesh material UV animation does not resimulate mesh vertex offsets or runtime activation",
         ],
     }
     cache_created = False

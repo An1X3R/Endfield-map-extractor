@@ -10,15 +10,18 @@ from io import BytesIO
 from pathlib import Path
 from typing import Callable
 
+from endfield_scene_io import SceneInputChangedError, SceneSourceCacheSlot, cached_scene_source_value
+
 from . import flatbuffer as fb
 from . import vfs
 from .resources import iter_path_records, load_group, validate_vfs_root
+from .scene_identity import validate_scene_id
 
 
 GROUP_HASH = "23D53F5D"
 EFFECT_STRIDE = 144
 MAIN_FILE = re.compile(
-    r"^Data/DynamicStreaming/PC/Scene/(map01|map02)/(fb_main_\d+_\d+_\d+\.bytes)$",
+    r"^Data/DynamicStreaming/PC/Scene/([^/]+)/(fb_main_\d+_\d+_\d+\.bytes)$",
     re.IGNORECASE,
 )
 
@@ -56,6 +59,35 @@ class MapEffectInventory:
     sources: tuple[EffectSource, ...]
     records: tuple[EffectRecord, ...]
     prefab_paths: tuple[str, ...]
+
+
+_EFFECT_INVENTORY_CACHE = SceneSourceCacheSlot(
+    "dynamic-scene-effects", dict, 4, 64 * 1024 * 1024
+)
+
+
+def _dynamic_inventory_sources(vfs_root: Path, string_path_hash: Path) -> tuple[Path, ...]:
+    """Stamp the whole group because BLC validation includes every physical chunk."""
+    group_dir = vfs_root / GROUP_HASH
+    chunks = tuple(sorted(group_dir.glob("*.chk")))
+    return (string_path_hash, group_dir / f"{GROUP_HASH}.blc", *chunks)
+
+
+def _dynamic_inventory_qualifiers(scene_ids: tuple[str, ...], sources: tuple[Path, ...]) -> tuple[str, ...]:
+    """Keep lexical group membership even when multiple paths resolve to one target."""
+    return (*scene_ids, *(str(path) for path in sources))
+
+
+def _require_dynamic_inventory_sources(
+    vfs_root: Path, string_path_hash: Path, expected: tuple[Path, ...],
+) -> None:
+    """Reject chunk membership changes during an inventory decode."""
+    actual = _dynamic_inventory_sources(vfs_root, string_path_hash)
+    if actual != expected:
+        raise SceneInputChangedError(
+            f"Dynamic scene group membership changed during read: group={GROUP_HASH}, "
+            f"expectedSources={expected}, actualSources={actual}"
+        )
 
 
 @dataclass(frozen=True)
@@ -154,7 +186,8 @@ def _decode_file(data: bytes, virtual_path: str) -> tuple[int, tuple[_RawEffect,
 
 
 def _resolve_hashes(
-    string_path_hash: Path, wanted: frozenset[bytes], check_cancelled: Callable[[], None]
+    string_path_hash: Path, wanted: frozenset[bytes], check_cancelled: Callable[[], None],
+    path_prefixes: tuple[str, ...],
 ) -> dict[bytes, str]:
     data = string_path_hash.read_bytes()
     if len(data) < 8:
@@ -180,49 +213,71 @@ def _resolve_hashes(
         if record_index % 8192 == 0:
             check_cancelled()
         for identifier in by_offset.get(string_at, ()):
-            if value.casefold().startswith(("assets/", "data/")):
+            if value.casefold().startswith(path_prefixes):
                 found[identifier].add(value)
     unresolved = sorted(identifier.hex() for identifier, values in found.items() if not values)
     ambiguous = sorted(identifier.hex() for identifier, values in found.items() if len(values) > 1)
     if unresolved or ambiguous:
         raise EffectDecodeError(
-            f"FX prefab path resolution failed: path={string_path_hash}, "
+            f"Source path resolution failed: path={string_path_hash}, "
             f"unresolvedCount={len(unresolved)}, unresolvedSample={unresolved[:8]}, "
             f"ambiguousCount={len(ambiguous)}, ambiguousSample={ambiguous[:8]}"
         )
     return {identifier: next(iter(values)) for identifier, values in found.items()}
 
 
-def read_dynamic_scene_effects(
-    vfs_root: Path, string_path_hash: Path, check_cancelled: Callable[[], None]
+def _decode_dynamic_scene_effects(
+    vfs_root: Path,
+    string_path_hash: Path,
+    scene_ids: tuple[str, ...],
+    check_cancelled: Callable[[], None],
 ) -> dict[str, MapEffectInventory]:
-    """Return all current Map01/Map02 fb_main effect source records and paths."""
+    """Decode current fb_main effect records for each requested scene."""
     game_vfs = validate_vfs_root(vfs_root)
     source_paths = string_path_hash.expanduser().resolve()
     if not source_paths.is_file():
         raise FileNotFoundError(f"FX StringPathHash source is missing: {source_paths}")
     group = load_group(game_vfs, GROUP_HASH)
     candidates: list[tuple[str, vfs.VfsFile]] = []
+    prefixes = {
+        scene_id: f"data/dynamicstreaming/pc/scene/{scene_id}/fb_main_"
+        for scene_id in scene_ids
+    }
     for item in group.iter_files():
-        if not item.file_name.casefold().startswith(
-            ("data/dynamicstreaming/pc/scene/map01/fb_main_",
-             "data/dynamicstreaming/pc/scene/map02/fb_main_")
-        ):
+        folded_path = item.file_name.casefold()
+        scene_id = next(
+            (candidate_id for candidate_id, prefix in prefixes.items()
+             if folded_path.startswith(prefix)),
+            None,
+        )
+        if scene_id is None:
             continue
         match = MAIN_FILE.fullmatch(item.file_name)
         if match is None:
             raise EffectDecodeError(f"FX main filename differs from current layout: {item.file_name}")
-        candidates.append((match.group(1).casefold(), item))
+        matched_scene_id = validate_scene_id(match.group(1).casefold())
+        if matched_scene_id != scene_id:
+            raise EffectDecodeError(
+                f"FX main scene path differs from requested scene: path={item.file_name}, "
+                f"requestedScene={scene_id}, actualScene={matched_scene_id}"
+            )
+        candidates.append((matched_scene_id, item))
     candidates.sort(key=lambda pair: pair[1].file_name.casefold())
-    if not candidates or {map_id for map_id, _ in candidates} != {"map01", "map02"}:
+    found_scene_ids = {scene_id for scene_id, _ in candidates}
+    if found_scene_ids != set(scene_ids):
+        if scene_ids == ("map01", "map02"):
+            raise EffectDecodeError(
+                f"FX main sources for both maps are required: group={GROUP_HASH}, "
+                f"mapIds={sorted(found_scene_ids)}"
+            )
         raise EffectDecodeError(
-            f"FX main sources for both maps are required: group={GROUP_HASH}, "
-            f"mapIds={sorted({map_id for map_id, _ in candidates})}"
+            f"FX main sources for requested scenes are required: group={GROUP_HASH}, "
+            f"sceneIds={list(scene_ids)}, foundSceneIds={sorted(found_scene_ids)}"
         )
-    raw: dict[str, list[_RawEffect]] = {"map01": [], "map02": []}
-    sources: dict[str, list[EffectSource]] = {"map01": [], "map02": []}
+    raw: dict[str, list[_RawEffect]] = {scene_id: [] for scene_id in scene_ids}
+    sources: dict[str, list[EffectSource]] = {scene_id: [] for scene_id in scene_ids}
     seen_paths: set[str] = set()
-    for map_id, item in candidates:
+    for scene_id, item in candidates:
         check_cancelled()
         if item.file_name.casefold() in seen_paths:
             raise EffectDecodeError(f"Duplicate FX VFS source path: {item.file_name}")
@@ -240,21 +295,66 @@ def read_dynamic_scene_effects(
             )
         payload = output.getvalue()
         grid_count, file_records = _decode_file(payload, item.file_name)
-        raw[map_id].extend(file_records)
-        sources[map_id].append(EffectSource(
+        raw[scene_id].extend(file_records)
+        sources[scene_id].append(EffectSource(
             item.file_name, digest, len(payload), grid_count, len(file_records)
         ))
     wanted = frozenset(row.path_hash for records in raw.values() for row in records)
-    resolved = _resolve_hashes(source_paths, wanted, check_cancelled)
+    resolved = _resolve_hashes(source_paths, wanted, check_cancelled, ("assets/", "data/"))
     result: dict[str, MapEffectInventory] = {}
-    for map_id in ("map01", "map02"):
+    for scene_id in scene_ids:
         rows = tuple(EffectRecord(
             row.key, row.source_virtual_path, row.grid_index, row.effect_index,
             row.record_offset, row.path_hash.hex(), resolved[row.path_hash],
             row.position, row.rotation_euler_degrees, row.scale,
-        ) for row in raw[map_id])
-        result[map_id] = MapEffectInventory(
-            map_id, tuple(sources[map_id]), rows,
+        ) for row in raw[scene_id])
+        result[scene_id] = MapEffectInventory(
+            scene_id, tuple(sources[scene_id]), rows,
             tuple(sorted({row.prefab_path for row in rows}, key=str.casefold)),
         )
     return result
+
+
+def _read_dynamic_scene_effects(
+    vfs_root: Path, string_path_hash: Path, scene_ids: tuple[str, ...],
+    check_cancelled: Callable[[], None],
+) -> dict[str, MapEffectInventory]:
+    """Reuse immutable scene inventories while every group input remains unchanged."""
+    check_cancelled()
+    root = validate_vfs_root(vfs_root)
+    hash_path = string_path_hash.expanduser().resolve()
+    if not hash_path.is_file():
+        raise FileNotFoundError(f"FX StringPathHash source is missing: {hash_path}")
+    sources = _dynamic_inventory_sources(root, hash_path)
+
+    def decode() -> dict[str, MapEffectInventory]:
+        result = _decode_dynamic_scene_effects(root, hash_path, scene_ids, check_cancelled)
+        _require_dynamic_inventory_sources(root, hash_path, sources)
+        return result
+
+    qualifiers = _dynamic_inventory_qualifiers(scene_ids, sources)
+    result = cached_scene_source_value(_EFFECT_INVENTORY_CACHE, sources, qualifiers, decode)
+    check_cancelled()
+    return dict(result)
+
+
+def read_dynamic_scene_effects(
+    vfs_root: Path, string_path_hash: Path, check_cancelled: Callable[[], None]
+) -> dict[str, MapEffectInventory]:
+    """Return all current Map01/Map02 fb_main effect source records and paths."""
+    return _read_dynamic_scene_effects(
+        vfs_root, string_path_hash, ("map01", "map02"), check_cancelled
+    )
+
+
+def read_dynamic_scene_effects_for_scene(
+    vfs_root: Path,
+    string_path_hash: Path,
+    scene_id: str,
+    check_cancelled: Callable[[], None],
+) -> MapEffectInventory:
+    """Return the current fb_main effect records and paths for one validated scene."""
+    validated_scene_id = validate_scene_id(scene_id)
+    return _read_dynamic_scene_effects(
+        vfs_root, string_path_hash, (validated_scene_id,), check_cancelled
+    )[validated_scene_id]

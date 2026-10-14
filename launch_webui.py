@@ -21,9 +21,9 @@ import sys
 import tempfile
 import threading
 import time
-from typing import Callable
+from typing import Callable, Mapping
 from urllib.request import urlopen
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 import webbrowser
 
 ROOT = Path(__file__).resolve().parent
@@ -38,7 +38,7 @@ from endfield_runtime_config import (
     path_hint,
 )
 from webui_export_worker import ExportCoordinator
-from bootstrap_environment import ensure_virtualenv
+from bootstrap_environment import require_virtualenv, setup_command, venv_python
 from webui_first_run_contract_v1 import (
     REQUEST_FORMAT,
     FirstRunRequestError,
@@ -47,12 +47,34 @@ from webui_first_run_contract_v1 import (
     validate_first_run_paths,
 )
 from webui_first_run_coordinator import FirstRunCoordinator, FirstRunCoordinatorError
+from webui_instanced_worker import InstancedSceneCoordinator, SceneJobNotFound
+from webui_character_contract import CharacterJobNotFound, CharacterRequestConflict, CharacterRequestError
+from webui_character_worker import CharacterCoordinator
 
 
 WEBUI_ROOT = ROOT / "webui"
 FIRST_RUN_SCRIPT = ROOT / "src" / "endfield_first_run.py"
 PYTHON_REQUIREMENTS = ROOT / "requirements.txt"
 PICKER_LOCK = threading.Lock()
+
+
+def resolve_character_config(explicit: Path | None, environment: Mapping[str, str], root: Path) -> Path | None:
+    """Resolve an optional local reader pack without embedding workstation paths."""
+    configured = environment.get("ENDFIELD_CHARACTER_CONFIG", "").strip()
+    if explicit is not None:
+        selected = explicit
+    elif configured:
+        selected = Path(configured)
+    else:
+        selected = root / ".tools" / "character" / "runtime.json"
+        if not selected.exists():
+            selected = root / "endfield.character.local.json"
+        if not selected.exists():
+            return None
+    resolved = selected.expanduser().resolve()
+    if not resolved.is_file():
+        raise ConfigurationError(f"Character runtime configuration file is missing: {resolved}")
+    return resolved
 
 
 def validate_selected_path(kind: str, selected: Path) -> dict[str, object]:
@@ -159,10 +181,31 @@ class PathPickerServer(ThreadingHTTPServer):
     token: str
     coordinator: ExportCoordinator
     first_run: FirstRunCoordinator
+    instanced: InstancedSceneCoordinator
+    character: CharacterCoordinator
     require_first_run_ready: bool
+
+    def server_close(self) -> None:
+        errors: list[Exception] = []
+        try:
+            for name in ("first_run", "character", "instanced", "coordinator"):
+                if hasattr(self, name):
+                    try:
+                        getattr(self, name).shutdown()
+                    except Exception as error:
+                        error.add_note(f"Coordinator shutdown failed: {name}")
+                        errors.append(error)
+        finally:
+            super().server_close()
+        if errors:
+            raise ExceptionGroup("WebUI workers failed to shut down cleanly", errors)
 
 
 class UnavailableExportCoordinator:
+    def shutdown(self) -> None:
+        """No workers exist before the scene runtime is configured."""
+        return None
+
     def _unavailable(self) -> None:
         raise FirstRunCoordinatorError(
             "first_run_required",
@@ -250,11 +293,112 @@ class PathPickerHandler(BaseHTTPRequestHandler):
         else:
             self.send_json(500, error_response("internal_error", str(error), retryable=True))
 
+    def handle_instanced_error(self, error: Exception) -> None:
+        if isinstance(error, SceneJobNotFound):
+            self.send_json(404, error_response("instanced_job_not_found", str(error), retryable=False))
+        elif isinstance(error, FileNotFoundError):
+            self.send_json(409, error_response("instanced_source_missing", str(error), retryable=True))
+        else:
+            self.handle_error(error)
+
+    def handle_character_error(self, error: Exception) -> None:
+        if isinstance(error, CharacterJobNotFound):
+            self.send_json(404, error_response("character_job_not_found", "角色任务不存在。", retryable=False))
+        elif isinstance(error, CharacterRequestConflict):
+            self.send_json(409, error_response("character_request_conflict", str(error), retryable=False))
+        elif isinstance(error, CharacterRequestError):
+            self.send_json(400, error_response("character_invalid_request", str(error), retryable=False))
+        else:
+            safe = getattr(error, "safe_message", None)
+            code = getattr(error, "code", "character_service_error")
+            message = safe if isinstance(safe, str) else "角色接口不可用，请检查角色配置或本地后端日志。"
+            status = getattr(error, "http_status", 400 if isinstance(error, (ValueError, UnicodeDecodeError)) else 500)
+            self.send_json(status if type(status) is int and 400 <= status <= 599 else 500,
+                           error_response(code if isinstance(code, str) else "character_service_error",
+                                          message, retryable=True))
+
+    def character_get(self, path: str, query: str) -> None:
+        try:
+            actions = re.fullmatch(r"/characters/([^/]+)/animations", path)
+            if actions:
+                params = parse_qs(query)
+                self.send_json(200, self.server.character.animations(
+                    unquote(actions.group(1)), params.get("variant_id", [""])[0],
+                    int(params.get("offset", ["0"])[0]), int(params.get("limit", ["100"])[0])))
+                return
+            if path == "/characters":
+                self.send_json(200, self.server.character.catalog())
+                return
+            detail = re.fullmatch(r"/characters/([^/]+)", path)
+            task = re.fullmatch(r"/(character-jobs|character-preparation)/([A-Za-z0-9-]+)(/events)?", path)
+            if detail:
+                self.send_json(200, self.server.character.detail(unquote(detail.group(1))))
+            elif task:
+                job_id = task.group(2)
+                job = self.server.character.get(job_id)
+                expected = "preparation" if task.group(1) == "character-preparation" else "export"
+                if job["kind"] != expected:
+                    raise CharacterJobNotFound("Character job belongs to a different route")
+                params = parse_qs(query)
+                result = (self.server.character.events(job_id, int(params.get("after", ["0"])[0]),
+                                                      int(params.get("limit", ["250"])[0]))
+                          if task.group(3) else job)
+                self.send_json(200, result)
+            else:
+                self.send_json(404, {"error": "character_route_not_found", "message": "角色接口不存在。"})
+        except Exception as error:
+            self.handle_character_error(error)
+
+    def character_post(self, path: str) -> None:
+        try:
+            task = re.fullmatch(r"/(character-jobs|character-preparation)/([A-Za-z0-9-]+)/cancel", path)
+            expected = "preparation" if path.startswith("/character-preparation") else "export"
+            if task:
+                if self.server.character.get(task.group(2))["kind"] != expected:
+                    raise CharacterJobNotFound("Character job belongs to a different route")
+                self.send_json(202, self.server.character.cancel(task.group(2)))
+            elif path in {"/character-jobs", "/character-jobs/validate", "/character-preparation", "/character-preparation/validate"}:
+                payload = self.read_json_body()
+                required_format = "CharacterPreparationRequest/1" if expected == "preparation" else "CharacterExportRequest/1"
+                if payload.get("format") != required_format:
+                    raise CharacterRequestError("Request format does not match this character route")
+                result = (self.server.character.validate(payload) if path.endswith("/validate")
+                          else self.server.character.submit(payload))
+                self.send_json(200 if path.endswith("/validate") else 202, result)
+            else:
+                self.send_json(404, {"error": "character_route_not_found", "message": "角色接口不存在。"})
+        except Exception as error:
+            self.handle_character_error(error)
+
     def do_GET(self) -> None:
         if not self.authorized():
             self.send_json(404, {"error": "not_found"})
             return
         parsed = urlparse(self.path)
+        if parsed.path == "/characters" or parsed.path.startswith(("/characters/", "/character-jobs/", "/character-preparation/")):
+            self.character_get(parsed.path, parsed.query)
+            return
+        if parsed.path == "/instanced-scenes" or parsed.path.startswith(("/instanced-scenes/", "/instanced-scene-jobs/")):
+            try:
+                query = parse_qs(parsed.query)
+                catalog_id = query.get("catalog_id", [None])[0]
+                scene_match = re.fullmatch(r"/instanced-scenes/([a-z][a-z0-9_]*)(/preview)?", parsed.path)
+                task_match = re.fullmatch(r"/instanced-scene-jobs/([A-Za-z0-9-]+)(/events)?", parsed.path)
+                if parsed.path == "/instanced-scenes":
+                    self.send_json(200, self.server.instanced.catalog())
+                elif scene_match:
+                    result = (self.server.instanced.preview(scene_match.group(1), catalog_id) if scene_match.group(2)
+                              else self.server.instanced.detail(scene_match.group(1), catalog_id))
+                    self.send_json(200, result)
+                elif task_match:
+                    result = (self.server.instanced.events(task_match.group(1), int(query.get("after", ["0"])[0]))
+                              if task_match.group(2) else self.server.instanced.get(task_match.group(1)))
+                    self.send_json(200, result)
+                else:
+                    self.send_json(404, {"error": "instanced_route_not_found", "message": "独立场景接口不存在"})
+            except Exception as error:
+                self.handle_instanced_error(error)
+            return
         if parsed.path == "/health":
             self.send_json(200, {"format": "EndfieldLocalBridgeHealth/1", "status": "ready"})
             return
@@ -295,6 +439,25 @@ class PathPickerHandler(BaseHTTPRequestHandler):
             self.send_json(404, {"error": "not_found"})
             return
         parsed = urlparse(self.path)
+        if parsed.path in {"/character-jobs", "/character-preparation"} or parsed.path.startswith(("/character-jobs/", "/character-preparation/")):
+            self.character_post(parsed.path)
+            return
+        if parsed.path == "/instanced-scene-jobs" or parsed.path.startswith("/instanced-scene-jobs/"):
+            try:
+                cancel = re.fullmatch(r"/instanced-scene-jobs/([A-Za-z0-9-]+)/cancel", parsed.path)
+                if cancel:
+                    self.send_json(202, self.server.instanced.cancel(cancel.group(1)))
+                elif parsed.path in {"/instanced-scene-jobs", "/instanced-scene-jobs/validate"}:
+                    payload = self.read_json_body()
+                    if parsed.path.endswith("/validate"):
+                        self.send_json(200, self.server.instanced.validate(payload))
+                    else:
+                        self.send_json(202, self.server.instanced.submit(payload))
+                else:
+                    self.send_json(404, {"error": "instanced_route_not_found", "message": "独立场景接口不存在"})
+            except Exception as error:
+                self.handle_instanced_error(error)
+            return
         cancel_match = re.fullmatch(r"/jobs/([A-Za-z0-9._-]+)/cancel", parsed.path)
         if parsed.path in {"/first-run", "/first-run/validate", "/first-run/cancel"}:
             try:
@@ -381,28 +544,51 @@ def start_path_picker(
     )  # type: ignore[assignment]
 
     def activate_generated_runtime(generated_config: Path, generated_stage: Path) -> None:
-        server.coordinator = ExportCoordinator(
+        replacement = ExportCoordinator(
             stage119_root=generated_stage,
             runtime_config=generated_config,
         )
+        server.coordinator.shutdown()
+        server.coordinator = replacement
         if on_stage_ready is not None:
             on_stage_ready(generated_config, generated_stage)
 
+    character_defaults = first_run_defaults or {}
+    public_first_run_defaults = {name: value for name, value in character_defaults.items() if name != "character_config"}
     complete_initial_request = (
-        {**first_run_defaults, "format": REQUEST_FORMAT}
-        if first_run_defaults
-        and all(first_run_defaults.get(name) for name in ("game_root", "export_root", "cache_root"))
+        {**public_first_run_defaults, "format": REQUEST_FORMAT}
+        if public_first_run_defaults
+        and all(public_first_run_defaults.get(name) for name in ("game_root", "export_root", "cache_root"))
         else None
     )
 
+    def prepared_first_run_interpreter() -> Path:
+        interpreter = venv_python()
+        if not interpreter.is_file():
+            raise FirstRunCoordinatorError(
+                "python_environment_not_prepared",
+                f"Prepared Python environment is missing: {interpreter}. Run: {setup_command()}",
+                http_status=503,
+                retryable=False,
+            )
+        return interpreter
+
     server.first_run = FirstRunCoordinator(
         extractor_root=ROOT,
-        interpreter_provider=lambda: ensure_virtualenv()[0],
+        interpreter_provider=prepared_first_run_interpreter,
         requirements_path=PYTHON_REQUIREMENTS,
         default_run_name=first_run_name,
         on_ready=activate_generated_runtime,
         initial_request=complete_initial_request,
-        initial_defaults=first_run_defaults,
+        initial_defaults=public_first_run_defaults,
+    )
+    server.instanced = InstancedSceneCoordinator(server.first_run.status)
+    from endfield_character_service import CharacterService
+    character_config = character_defaults.get("character_config")
+    character_export_root = character_defaults.get("export_root")
+    server.character = CharacterCoordinator(
+        CharacterService(Path(str(character_config)) if character_config else None),
+        (Path(str(character_export_root)) if character_export_root else ROOT / "exports") / "character_jobs",
     )
     thread = threading.Thread(target=server.serve_forever, name="endfield-path-picker", daemon=True)
     thread.start()
@@ -623,38 +809,10 @@ def bootstrap_first_run(
     cache_root = paths["cache_root"]
     export_root = paths["export_root"]
     assert game_root is not None and cache_root is not None and export_root is not None
-    interpreter, _created = ensure_virtualenv()
-    dependency_log = export_root / "log" / f"first_run_python_dependencies_{run_name}.log"
-    dependency_log.parent.mkdir(parents=True, exist_ok=True)
-    if dependency_log.exists():
-        for index in range(1, 1000):
-            candidate = dependency_log.with_name(
-                f"{dependency_log.stem}.retry{index:03d}{dependency_log.suffix}"
-            )
-            if not candidate.exists():
-                dependency_log = candidate
-                break
-    with dependency_log.open("x", encoding="utf-8", errors="replace") as log:
-        dependency_process = subprocess.run(
-            [
-                str(interpreter),
-                "-m",
-                "pip",
-                "install",
-                "--disable-pip-version-check",
-                "--requirement",
-                str(PYTHON_REQUIREMENTS),
-            ],
-            cwd=str(ROOT),
-            stdout=log,
-            stderr=subprocess.STDOUT,
-            text=True,
-            check=False,
-        )
-    if dependency_process.returncode != 0:
-        raise ConfigurationError(
-            f"Automatic Python dependency installation failed. Inspect {dependency_log}."
-        )
+    try:
+        interpreter = require_virtualenv()
+    except RuntimeError as error:
+        raise ConfigurationError(str(error)) from error
     command = [
         str(interpreter),
         str(FIRST_RUN_SCRIPT),
@@ -704,6 +862,30 @@ def resolve_port(requested: int) -> int:
     raise RuntimeError(f"No free local port was found in {requested}-{requested + 19}.")
 
 
+def frontend_command(
+    npm: str,
+    webui_root: Path,
+    *,
+    development: bool,
+    port: int,
+) -> list[str]:
+    if not (webui_root / "package.json").is_file():
+        raise FileNotFoundError(f"WebUI package is missing: {webui_root}")
+    if not (webui_root / "node_modules").is_dir():
+        raise RuntimeError(
+            f"WebUI dependencies are missing at {webui_root / 'node_modules'}. "
+            f'Run: powershell -ExecutionPolicy Bypass -File "{ROOT / "setup_development_environment.ps1"}"'
+        )
+    if development:
+        return [npm, "run", "dev", "--", "--port", str(port)]
+    if not (webui_root / "dist" / "index.html").is_file():
+        raise RuntimeError(
+            f"Built WebUI is missing: {webui_root / 'dist' / 'index.html'}. "
+            f'Run: powershell -ExecutionPolicy Bypass -File "{ROOT / "setup_development_environment.ps1"}"'
+        )
+    return [npm, "run", "preview", "--", "--port", str(port)]
+
+
 def wait_for_server(url: str, process: subprocess.Popen[object], timeout: float = 30.0) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -720,7 +902,8 @@ def wait_for_server(url: str, process: subprocess.Popen[object], timeout: float 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Start the Endfield local WebUI.")
-    parser.add_argument("--port", type=int, default=5173, help="Preferred local port (default: 5173).")
+    parser.add_argument("--port", type=int, help="Preferred local port (default: 4174 preview, 5173 development).")
+    parser.add_argument("--development", action="store_true", help="Run Vite's development server instead of the built preview.")
     parser.add_argument("--no-browser", action="store_true", help="Do not open the browser after startup.")
     parser.add_argument(
         "--stage119-root",
@@ -733,6 +916,8 @@ def main() -> int:
     parser.add_argument("--webui-output-root", type=Path, help="Default WebUI output directory offered to the local WebUI.")
     parser.add_argument("--blender-exe", type=Path, help="Default Blender executable offered to the local WebUI.")
     parser.add_argument("--runtime-config", type=Path, help="Optional EndfieldRuntimeConfig/1 local JSON file.")
+    parser.add_argument("--character-config", type=Path,
+                        help="Character reader configuration (CLI > ENDFIELD_CHARACTER_CONFIG > endfield.character.local.json).")
     parser.add_argument("--first-run-name", default="bootstrap_v1", help="Stable resumable first-run identifier.")
     parser.add_argument("--no-first-run", action="store_true", help="Do not generate a missing Stage dataset automatically.")
     first_run_mode = parser.add_mutually_exclusive_group()
@@ -750,7 +935,7 @@ def main() -> int:
     )
     parser.set_defaults(defer_first_run_to_webui=True)
     parser.add_argument("--no-setup-dialogs", action="store_true", help="Do not open native path dialogs when first-run paths are unconfigured.")
-    parser.add_argument("--skip-first-run-helpers", action="store_true", help="Skip pinned .NET helper bootstrap during automatic first run.")
+    parser.add_argument("--skip-first-run-helpers", action="store_true", help="Skip prepared pinned .NET helpers during first-run scene discovery.")
     parser.add_argument("--skip-scene-discovery", action="store_true", help="Skip automatic bundle candidate discovery during first run.")
     parser.add_argument(
         "--check-paths",
@@ -758,6 +943,12 @@ def main() -> int:
         help="Validate configured game, Stage119 cache, Blender, and output paths without starting WebUI or Blender.",
     )
     args = parser.parse_args()
+
+    try:
+        character_config = resolve_character_config(args.character_config, os.environ, ROOT)
+    except ConfigurationError as error:
+        print(f"CONFIGURATION_ERROR: {error}", file=sys.stderr)
+        return 2
 
     if args.defer_first_run_to_webui:
         try:
@@ -857,19 +1048,21 @@ def main() -> int:
 
     npm = shutil.which("npm.cmd") or shutil.which("npm")
     if not npm:
-        print("Node.js/npm was not found. Install Node.js, then run this launcher again.", file=sys.stderr)
+        print(
+            f'Node.js/npm was not found. Install Node.js, then run: powershell -ExecutionPolicy Bypass -File "{ROOT / "setup_development_environment.ps1"}"',
+            file=sys.stderr,
+        )
         return 2
 
-    if not (WEBUI_ROOT / "node_modules").is_dir():
-        print("Installing the locked WebUI dependencies (first launch only)...")
-        try:
-            subprocess.run([npm, "ci"], cwd=WEBUI_ROOT, check=True)
-        except subprocess.CalledProcessError as error:
-            print(f"Dependency installation failed ({error.returncode}).", file=sys.stderr)
-            return error.returncode or 1
+    preferred_port = args.port if args.port is not None else (5173 if args.development else 4174)
+    try:
+        command = frontend_command(npm, WEBUI_ROOT, development=args.development, port=preferred_port)
+    except (FileNotFoundError, RuntimeError) as error:
+        print(str(error), file=sys.stderr)
+        return 2
 
     try:
-        port = resolve_port(args.port)
+        port = resolve_port(preferred_port)
     except RuntimeError as error:
         print(error, file=sys.stderr)
         return 2
@@ -907,11 +1100,14 @@ def main() -> int:
         write_stage_pointer(stage_pointer, generated_stage, generated_config)
 
     defaults = {
+        "character_config": str(character_config) if character_config is not None else None,
         "game_root": str(runtime_paths["game_root"]) if runtime_paths["game_root"] is not None else None,
         "export_root": str(runtime_paths["export_root"]) if runtime_paths["export_root"] is not None else None,
         "cache_root": str(runtime_paths["cache_root"]) if runtime_paths["cache_root"] is not None else None,
         "run_name": args.first_run_name,
     }
+    if runtime_paths["blender_exe"] is not None:
+        defaults["blender_exe"] = str(runtime_paths["blender_exe"])
 
     picker_server, picker_thread = start_path_picker(
         stage119_root,
@@ -926,10 +1122,14 @@ def main() -> int:
     environment["ENDFIELD_PATH_PICKER_TOKEN"] = picker_server.token
 
     url = f"http://127.0.0.1:{port}/"
-    command = [npm, "run", "dev", "--", "--port", str(port)]
+    command = frontend_command(npm, WEBUI_ROOT, development=args.development, port=port)
+    server_kind = "Vite development server" if args.development else "Vite preview server with local API middleware"
+    if not args.development:
+        print("Serving the built WebUI through Vite preview; local API middleware remains enabled.")
     print(f"Starting Endfield WebUI at {url}")
-    if port != args.port:
-        print(f"Port {args.port} was busy; using {port} instead.")
+    if port != preferred_port:
+        print(f"Port {preferred_port} was busy; using {port} instead.")
+    print(f"Mode: {server_kind}.")
     if args.defer_first_run_to_webui:
         print("The WebUI will open first. Choose directories and extract required files in the setup panel.")
     print("Keep this server window open. Press Ctrl+C or close it to stop the WebUI.")

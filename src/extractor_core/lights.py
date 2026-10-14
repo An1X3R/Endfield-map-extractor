@@ -14,6 +14,7 @@ import tempfile
 
 from . import flatbuffer as fb
 from .projected_decals import build_path_id_index, read_chunk, streaming_records
+from .scene_identity import validate_scene_id
 
 
 _GROUP = "C3442D43"
@@ -233,8 +234,7 @@ def read_native_lights(vfs_root: Path, path_hash: Path, map_id: str,
     """Read map-local native lights; every selected source is verified against its Init partner."""
     from .resources import load_group
 
-    if map_id not in ("map01", "map02"):
-        raise ValueError(f"Unsupported native Light map: {map_id}")
+    validate_scene_id(map_id)
     entries = {entry.file_name: entry for entry in load_group(vfs_root, _GROUP).iter_files()}
     source_sha256: dict[str, str] = {}
     paths = build_path_id_index(path_hash)
@@ -406,8 +406,7 @@ def _cache_row(value: object, map_id: str) -> NativeLight:
 def read_native_lights_cached(vfs_root: Path, path_hash: Path, map_id: str, cache_dir: Path,
                               check_cancelled: Callable[[], None] | None) -> NativeLightInventory:
     """Reuse an inventory only while its catalog, path index, code and chunk metadata match."""
-    if map_id not in ("map01", "map02"):
-        raise ValueError(f"Unsupported native Light map: {map_id}")
+    validate_scene_id(map_id)
     resolved_cache = cache_dir.resolve()
     if resolved_cache.is_relative_to(vfs_root.resolve()) or resolved_cache.is_relative_to(path_hash.resolve().parent):
         raise ValueError(f"Native Light cache must not write into read-only game or metadata trees: {resolved_cache}")

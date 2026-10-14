@@ -6,6 +6,7 @@ All writes remain in the user's external cache and output directories.
 
 from __future__ import annotations
 
+from collections import deque
 import gzip
 import hashlib
 import json
@@ -13,6 +14,7 @@ import math
 import os
 from pathlib import Path
 import threading
+import time
 from typing import Any, Iterable, Mapping
 
 from endfield_runtime_config import (
@@ -166,7 +168,31 @@ class ExportCoordinator:
             job_root = self.stage119_root.parent / "webui_jobs"
         self.store = store or JobStore(job_root)
         self._threads: dict[str, threading.Thread] = {}
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
+        self._scene_condition = threading.Condition(self._lock)
+        self._scene_queue: deque[str] = deque()
+        self._scene_dispatcher: threading.Thread | None = None
+        self._active_scene: str | None = None
+        self._closing = False
+
+    def shutdown(self) -> None:
+        """Cancel owned jobs and wait for their subprocess cleanup before exit."""
+        with self._lock:
+            self._closing = True
+            job_ids = set(self._threads) | set(self._scene_queue)
+            if self._active_scene is not None:
+                job_ids.add(self._active_scene)
+            threads = list(self._threads.values())
+            if self._scene_dispatcher is not None:
+                threads.append(self._scene_dispatcher)
+            for job_id in job_ids:
+                self.cancel(job_id)
+        deadline = time.monotonic() + 10.0
+        for thread in threads:
+            thread.join(max(0.0, deadline - time.monotonic()))
+        alive = [thread.name for thread in threads if thread.is_alive()]
+        if alive:
+            raise RuntimeError(f"Export workers did not stop during shutdown: {alive}")
 
     def validate(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         canonical = canonicalize_job(payload)
@@ -200,17 +226,73 @@ class ExportCoordinator:
         canonical = canonicalize_job(payload)
         if canonical["export_mode"] == "blend":
             self._validate_scene_runtime(canonical)
-        job = self.store.create(canonical)
-        thread = threading.Thread(
-            target=self._run,
-            args=(str(job["job_id"]),),
-            name=f"endfield-export-{job['job_id']}",
+            with self._scene_condition:
+                if self._closing:
+                    raise RuntimeError("Export coordinator is shutting down; restart before submitting a job")
+                job = self.store.create(canonical)
+                job_id = str(job["job_id"])
+                self._scene_queue.append(job_id)
+                self._ensure_scene_dispatcher(job_id)
+            return job
+
+        with self._lock:
+            if self._closing:
+                raise RuntimeError("Export coordinator is shutting down; restart before submitting a job")
+            job = self.store.create(canonical)
+            thread = threading.Thread(
+                target=self._run,
+                args=(str(job["job_id"]),),
+                name=f"endfield-export-{job['job_id']}",
+                daemon=True,
+            )
+            self._threads[str(job["job_id"])] = thread
+            try:
+                thread.start()
+            except RuntimeError as error:
+                self._threads.pop(str(job["job_id"]))
+                self.store.fail(str(job["job_id"]), {
+                    "type": type(error).__name__, "message": str(error), "partial_output": None,
+                })
+                raise
+        return job
+
+    def _ensure_scene_dispatcher(self, job_id: str) -> None:
+        """Start the single scene queue consumer while holding its condition."""
+        if self._scene_dispatcher is not None and self._scene_dispatcher.is_alive():
+            self._scene_condition.notify()
+            return
+        dispatcher = threading.Thread(
+            target=self._run_scene_queue,
+            name="endfield-scene-export-queue",
             daemon=True,
         )
-        with self._lock:
-            self._threads[str(job["job_id"])] = thread
-        thread.start()
-        return job
+        self._scene_dispatcher = dispatcher
+        try:
+            dispatcher.start()
+        except Exception as error:
+            self._scene_dispatcher = None
+            self._scene_queue.remove(job_id)
+            self.store.fail(job_id, {
+                "type": type(error).__name__,
+                "message": f"Cannot start scene export queue worker: {error}",
+                "partial_output": None,
+            })
+            raise RuntimeError(f"Cannot start scene export queue worker for job={job_id}: {error}") from error
+
+    def _run_scene_queue(self) -> None:
+        """Run admitted scene jobs in FIFO order, one job at a time."""
+        while True:
+            with self._scene_condition:
+                if not self._scene_queue:
+                    self._scene_dispatcher = None
+                    return
+                job_id = self._scene_queue.popleft()
+                self._active_scene = job_id
+            try:
+                self._run(job_id)
+            finally:
+                with self._scene_condition:
+                    self._active_scene = None
 
     def _validate_scene_runtime(self, canonical: Mapping[str, Any]) -> None:
         from endfield_scene_export import scene_runtime
@@ -225,7 +307,21 @@ class ExportCoordinator:
         return self.store.events(job_id, after)
 
     def cancel(self, job_id: str) -> dict[str, Any]:
-        return self.store.request_cancel(job_id)
+        self.store.request_cancel(job_id)
+        with self._scene_condition:
+            pending = job_id in self._scene_queue
+            if pending:
+                self._scene_queue.remove(job_id)
+            self._scene_condition.notify_all()
+        current = self.store.get(job_id)
+        if pending and current["state"] == "queued":
+            current = self.store.transition(
+                job_id,
+                "cancelled",
+                progress=float(current["progress"]),
+                message="Scene export cancelled while waiting in the queue",
+            )
+        return current
 
     def _check_cancelled(self, job_id: str) -> None:
         if self.store.cancel_requested(job_id):
@@ -331,6 +427,7 @@ class ExportCoordinator:
     def _run(self, job_id: str) -> None:
         output_dir: Path | None = None
         try:
+            self._check_cancelled(job_id)
             job = self.store.transition(job_id, "preparing", progress=0.05, message="Validating Stage119 and output boundaries")
             canonical = job["canonical"]
             manifest, _ = self._load_dataset()
@@ -492,7 +589,9 @@ class ExportCoordinator:
         except JobCancelled:
             current = self.store.get(job_id)
             if current["state"] not in {"completed", "failed", "cancelled"}:
-                self.store.transition(job_id, "cancelled", progress=float(current["progress"]), message="Export cancelled; partial files were preserved")
+                message = ("Export cancelled before any output was created" if output_dir is None
+                           else "Export cancelled; partial files were preserved")
+                self.store.transition(job_id, "cancelled", progress=float(current["progress"]), message=message)
         except Exception as error:
             self.store.fail(job_id, {
                 "type": type(error).__name__,

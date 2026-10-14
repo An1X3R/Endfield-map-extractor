@@ -25,6 +25,8 @@ class DependencyBootstrapTests(unittest.TestCase):
             source_root = root / "src"
             source_root.mkdir()
             (source_root / "endfield_dependency_bootstrap.py").write_text("source", encoding="utf-8")
+            (root / "third_party").mkdir()
+            (root / "third_party" / "animestudio.lock.json").write_text('{"patches": []}', encoding="utf-8")
             shared = root / "dotnet" / "Shared" / "HelperProgress.cs"
             shared.parent.mkdir(parents=True)
             shared.write_text("first", encoding="utf-8")
@@ -32,6 +34,11 @@ class DependencyBootstrapTests(unittest.TestCase):
             binary = root / "dotnet" / "Probe" / "obj" / "generated.cs"
             binary.parent.mkdir(parents=True)
             binary.write_text("generated", encoding="utf-8")
+            self.assertEqual(first, helper_source_identity(root))
+            character = root / "dotnet" / "CharacterTools" / "Reader.cs"
+            character.parent.mkdir(parents=True)
+            character.write_text("independent character input", encoding="utf-8")
+            (root / "third_party" / "character-dotnet.lock.json").write_text('{}', encoding="utf-8")
             self.assertEqual(first, helper_source_identity(root))
             shared.write_text("second", encoding="utf-8")
             self.assertNotEqual(first, helper_source_identity(root))

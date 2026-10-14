@@ -1,0 +1,94 @@
+{
+  "format": "EndfieldCharacterDotnetDependencies/1",
+  "sdk": "9.0.308",
+  "targetFramework": "net9.0-windows",
+  "buildBehavior": "Explicit install/build only; no fetching at first UI open.",
+  "animeStudio": {
+    "repository": "https://github.com/Variante/AnimeStudio.git",
+    "commit": "5bb936ca1d3662fe9b956ec669ab7ebea08bfd07",
+    "license": "MIT",
+    "patch": "patches/animestudio-character-texture-provider.patch",
+    "patchSha256": "2f5d13855bd6128ff96f827d656ea18f4d61a168faf57dc0d4c7bcc495e6c940",
+    "compiledFiles": [
+      {
+        "path": "AnimeStudio.Utility/ModelConverter.cs",
+        "sha256": "2a2c003f19c4600308a62c88c87783ffc3f480480cf50fda3bdf8a05dfe60e98"
+      },
+      {
+        "path": "AnimeStudio/AnimeStudio.csproj",
+        "sha256": "6e148f81696cd9bd3dc68901841fdd0b420cf30dc9c61cdf9180a486945c39c2"
+      },
+      {
+        "path": "AnimeStudio/BundleFile.cs",
+        "sha256": "64f3824d4bdcf15d488548280a80dfc7b5c68c838108e155e18c8d2d9f52329f"
+      },
+      {
+        "path": "AnimeStudio/Crypto/UnityCN.cs",
+        "sha256": "da291e037d23a0a0892915e87d0cb960ae3d51b85b26738d60fd50645c0c61e9",
+        "override": "third_party/source-overrides/animestudio/Crypto/UnityCN.cs"
+      },
+      {
+        "path": "AnimeStudio/UnityCNManager.cs",
+        "sha256": "5f94b589414eb477925065d25de2cfeaf564311b1a5a261aa2e0a46086d1706b",
+        "override": "third_party/source-overrides/animestudio/UnityCNManager.cs"
+      }
+    ],
+    "removedPaths": [
+      "AnimeStudio/CNKeys.json"
+    ]
+  },
+  "ruri": {
+    "repository": "https://github.com/FractalTools/Ruri.RipperHook.git",
+    "commit": "ed62f85af4e5da83dabd514b29ee93ef7d34e86b",
+    "license": "AGPL-3.0",
+    "scope": "The ACL decoder and Humanoid sources are linked into the shipped character readers. Preserve Ruri copyright and AGPL-3.0 terms and provide matching combined reader source and build materials; process boundaries do not establish a license exemption.",
+    "patch": "patches/ruri-character-humanoid.patch",
+    "patchSha256": "1c89a8a5e388e6fa9992767efec416ed3db8bd5a0f7e6b05047a479fa7fd0186",
+    "compiledFiles": [
+      {
+        "path": "Source/Ruri.ACL/AclCompressedTracks.cs",
+        "sha256": "357d58db848e224c534e80d5410e598b4391784e7bc73b193c0284b996e680e6"
+      },
+      {
+        "path": "Source/Ruri.ACL/AclDecompressor.cs",
+        "sha256": "23109c14af73864338ef0e02ecdd4fc03ca508e430f59422b00eb9b4fc92b31c"
+      },
+      {
+        "path": "Source/Ruri.ACL/AclFloatDecompressor.cs",
+        "sha256": "fd6d476b96c9bdea7b9046b2a601959475a8fad90e3c51f3d59eff0896bf3442"
+      },
+      {
+        "path": "Source/Ruri.RipperHook/Utils/Humanoid/AvatarMuscleReferential.cs",
+        "sha256": "336f138a8dda24abfdd827df66c5799ecd37611d66ad26d2072b2931157e5e2e"
+      },
+      {
+        "path": "Source/Ruri.RipperHook/Utils/Humanoid/AvatarRigInput.cs",
+        "sha256": "15dbe7ce42782d7d7e1a50f6c8889ae938595379ef0d9548d85d219929f424ec"
+      },
+      {
+        "path": "Source/Ruri.RipperHook/Utils/Humanoid/MuscleBone.cs",
+        "sha256": "6c64c5766908cdfbec8ab825eb5fec3a21005e162835b7a74ffef3c4b1f0785c"
+      },
+      {
+        "path": "Source/Ruri.RipperHook/Utils/Humanoid/RootChannelPlan.cs",
+        "sha256": "01e4478b401520caeddb560cae4df77a11a8ac444378e802d124e112e60b2809"
+      }
+    ]
+  },
+  "projects": [
+    "CharacterStaticProbe",
+    "ShaderPropertyDefaultsProbe",
+    "RendererVisibilityProbe",
+    "CharacterAnimationReader",
+    "AnimatorAuxSampler",
+    "NpcAnimationReader",
+    "NpcAssemblyProbe",
+    "NpcShaderIdentityProbe",
+    "ControllerAudit",
+    "GlobalWeatherProbe",
+    "ExpressionSourceProbe",
+    "SnowChannelProbe",
+    "JsonAssetReader"
+  ],
+  "runtimeArtifacts": "Shipped readers use source-built Ooz and the declared managed dependencies. New geometry uses EndfieldCharacterGeometry/1 without Autodesk FBXWrapper or FBXNative. Game keys, game assets, private decompiled sources and Autodesk SDK files are excluded."
+}

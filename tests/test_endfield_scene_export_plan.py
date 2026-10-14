@@ -11,16 +11,62 @@ from contextlib import closing
 from pathlib import Path
 
 from endfield_scene_export_plan import (
+    _manifest_index,
     _merge_mesh_exports,
     _water_global_resource_path,
     load_scene_export_plan,
     owns_static_footprint,
     prepare_scene_export_plan,
 )
+from endfield_scene_io import scene_io_session
 from webui_source_contract import selected_static_categories
 
 
 class PortableScenePlanTests(unittest.TestCase):
+    def test_manifest_mesh_duplicates_keep_canonical_identity_and_reject_multiple_files(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = root / "scene.json"
+            first = root / "first.obj"
+            second = root / "second.obj"
+            first.write_bytes(b"mesh")
+            second.write_bytes(b"mesh")
+            asset = {"Source": "source", "PathId": 1, "Name": "mesh"}
+            payload = {"Format": "EndfieldSceneProbe/1", "Containers": [], "MeshExports": [
+                {"Asset": asset, "File": "first.obj"},
+                {"Asset": asset, "File": "./first.obj"},
+                {"Asset": asset, "File": "missing.obj"},
+            ]}
+            manifest.write_text(json.dumps(payload), encoding="utf-8")
+            self.assertEqual({("source", 1): (asset, first.resolve())}, _manifest_index(manifest)[1])
+            manifest.write_text(json.dumps({**payload, "MeshExports": [
+                *payload["MeshExports"], {"Asset": asset, "File": "second.obj"},
+            ]}), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "multiple export files"):
+                _manifest_index(manifest)
+
+    def test_manifest_index_rechecks_mesh_export_presence_after_cache_hit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = root / "scene.json"
+            mesh = root / "mesh.obj"
+            manifest.write_text(json.dumps({
+                "Format": "EndfieldSceneProbe/1",
+                "Containers": [],
+                "MeshExports": [{"Asset": {"Source": "source", "PathId": 1, "Name": "mesh"},
+                                 "File": "mesh.obj"}],
+            }), encoding="utf-8")
+            mesh.write_text("mesh", encoding="utf-8")
+            with scene_io_session():
+                _, first_exports = _manifest_index(manifest)
+                self.assertIn(("source", 1), first_exports)
+                mesh.unlink()
+                _, missing_exports = _manifest_index(manifest)
+                self.assertNotIn(("source", 1), missing_exports)
+                mesh.write_text("mesh", encoding="utf-8")
+                _, restored_exports = _manifest_index(manifest)
+                self.assertIn(("source", 1), restored_exports)
+
     def test_serialized_draw_parameters_validate_binary_source_identity(self) -> None:
         from extract_scene_renderer_materials import serialized_draw_parameters
         matrix = struct.pack("<16f", *range(16))
@@ -78,6 +124,10 @@ class PortableScenePlanTests(unittest.TestCase):
         index = {b"one": (map01,), b"two": (map02,)}
         self.assertEqual(_water_global_resource_path(index, "map02"), map02)
         self.assertIsNone(_water_global_resource_path({b"one": (map01,)}, "map02"))
+        office = "Assets/Beyond/Scenes/LunaScenes/indie_dg005/ReleaseData/WaterData/Global_Water_Config.asset"
+        self.assertEqual(_water_global_resource_path({b"office": (office,), **index}, "indie_dg005"), office)
+        with self.assertRaises(ValueError):
+            _water_global_resource_path(index, "../indie_dg005")
         with self.assertRaisesRegex(ValueError, "WATER_GLOBAL_PATH_AMBIGUOUS"):
             _water_global_resource_path(
                 {b"one": (map02,), b"two": (map02.replace("ReleaseData", "ReleaseData/Alternate"),)},
@@ -106,6 +156,77 @@ class PortableScenePlanTests(unittest.TestCase):
             self.assertEqual(loaded["water_depth_instances"], [])
             self.assertEqual(loaded["water_depth_pending"], [])
             self.assertEqual(loaded["effect_instances"], [])
+            baseline = json.loads(plan.read_text(encoding="utf-8"))
+            plan.write_text(json.dumps({**baseline, "water_transport_lighting_status": "not_applicable"}),
+                            encoding="utf-8")
+            self.assertEqual(load_scene_export_plan(plan)["water_transport_lighting_status"], "not_applicable")
+            for invalid in ({"water_transport_lighting_status": "unknown"},
+                            {"water_transport_lighting_status": "not_applicable", "water_geometry": [{}]},
+                            {"water_transport_lighting": {"map_id": "map01", "entity_id": 7,
+                                                           "ambient_radiance": [0., 0., 0.],
+                                                           "radiance_scale": 1.}}):
+                plan.write_text(json.dumps({**baseline, **invalid}), encoding="utf-8")
+                with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                    load_scene_export_plan(plan)
+            plan.write_text(json.dumps({**baseline, "fog_depth": {
+                "subdivision_level": 4, "future_field": "ignored"}}), encoding="utf-8")
+            self.assertEqual(load_scene_export_plan(plan)["fog_depth"], {"subdivision_level": 4})
+            for invalid in ({}, {"subdivision_level": True}, {"subdivision_level": -1},
+                            {"subdivision_level": 7}, {"subdivision_level": 1.5}):
+                plan.write_text(json.dumps({**baseline, "fog_depth": invalid}), encoding="utf-8")
+                with self.subTest(fog_depth=invalid), self.assertRaisesRegex(ValueError, "fog_depth"):
+                    load_scene_export_plan(plan)
+            plan.write_text(json.dumps(baseline), encoding="utf-8")
+            for scene_id in ("dung01_cdg001", "dung02_cdg001", "indie_dg005"):
+                standalone = {**json.loads(plan.read_text(encoding="utf-8")), "map_id": scene_id}
+                plan.write_text(json.dumps(standalone), encoding="utf-8")
+                self.assertEqual(load_scene_export_plan(plan)["map_id"], scene_id)
+            for invalid_id in ("../map01", "map01/other", "C:\\map01", ""):
+                standalone["map_id"] = invalid_id
+                plan.write_text(json.dumps(standalone), encoding="utf-8")
+                with self.assertRaises(ValueError):
+                    load_scene_export_plan(plan)
+
+    def test_loader_accepts_explicit_water_pending_preflight_plan(self) -> None:
+        from endfield_scene_lights_plan import build_water_transport_directional_dependency
+        from extractor_core.lights import LightProperty, NativeLight, NativeLightInventory
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sidecar = root / "sidecar.json"
+            sidecar.write_text("{}", encoding="utf-8")
+            init_path = "Data/Streaming/PC/map01/Streaming/InitChunkData_0_0_0_0.bytes"
+            stream_path = init_path.replace("/InitChunkData_", "/StreamingChunkData_")
+            light = NativeLight(
+                "map01", 90982682, "Sun", (20.0, 30.0, 40.0), (0.0, 0.0, 0.0), (1.0, 1.0, 1.0),
+                1, 0, (1.0, 1.0, 1.0, 1.0), 2.0, 10.0, 45.0, 20.0, 0.0, 6500.0,
+                False, False, False, 1.0, None, 131072,
+                tuple(LightProperty(index, 1, "00") for index in range(60)),
+                tuple(LightProperty(index, 1, "00") for index in range(21)),
+                (init_path,), (stream_path,), "0" * 64,
+            )
+            inventory = NativeLightInventory("map01", (light,),
+                                             ((init_path, "1" * 64), (stream_path, "2" * 64)), 1)
+            dependency = build_water_transport_directional_dependency(inventory, "map01", light.entity_id)
+            pending = {"entity_id": 7, "entity_base": "water", "component": "water_geometry",
+                       "reason": "resource_pending", "detail": "water geometry awaits first resource preparation"}
+            plan = root / "plan.json"
+            plan.write_text(json.dumps({
+                "format": "EndfieldPortableScenePlan/1", "map_id": "map01",
+                "bounds": {"xmin": 0, "xmax": 1, "zmin": 0, "zmax": 1},
+                "scene_manifests": [], "terrain_surfaces": [], "category_filter": ["water"],
+                "decal_manifest": str(sidecar), "decal_materials": str(sidecar),
+                "instances": [], "pending": [pending], "source_sha256": dict(dependency.source_sha256),
+                "light_instances": list(dependency.rows), "water_geometry": [], "water_materials": [],
+                "water_transport_lighting": {"map_id": "map01", "entity_id": light.entity_id,
+                                              "ambient_radiance": [0.1, 0.2, 0.3], "radiance_scale": 1.0},
+                "summary": {"selected_static": 0, "ready_static": 0, "selected_decals": 0,
+                            "ready_decals": 0, "pending": 1},
+            }), encoding="utf-8")
+            loaded = load_scene_export_plan(plan)
+            self.assertEqual(loaded["pending"], [pending])
+            self.assertEqual(loaded["water_transport_lighting"]["entity_id"], light.entity_id)
+            self.assertEqual(loaded["light_instances"][0]["selection_scope"], "water_transport_dependency")
 
     def test_bottom_dependencies_are_validated_without_counting_as_exported_instances(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -135,6 +256,25 @@ class PortableScenePlanTests(unittest.TestCase):
             loaded = load_scene_export_plan(plan)
             self.assertEqual(loaded["instances"], [])
             self.assertEqual(len(loaded["water_depth_instances"]), 1)
+            self.assertEqual(loaded["water_depth_instances"][0]["selected_submeshes"], [0])
+            for invalid in ([], [1], [-1], [True], [0, 0]):
+                row["selected_submeshes"] = invalid
+                plan.write_text(json.dumps(payload), encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, "selected source submesh"):
+                    load_scene_export_plan(plan)
+            row.pop("selected_submeshes")
+            split = {**row, "submesh_slot_indices": [0, 0], "material_refs": [None, None],
+                     "selected_submeshes": [0]}
+            surface = {**split, "selected_submeshes": [1]}
+            split_payload = {**payload, "water_depth_instances": [split], "surface_effect_instances": [surface]}
+            plan.write_text(json.dumps(split_payload), encoding="utf-8")
+            self.assertEqual(load_scene_export_plan(plan)["surface_effect_instances"][0]["selected_submeshes"], [1])
+            for changed, detail in (({"selected_submeshes": [0]}, "submeshes overlap"),
+                                    ({"entity_index": 1}, "source differs")):
+                split_payload["surface_effect_instances"] = [{**surface, **changed}]
+                plan.write_text(json.dumps(split_payload), encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, detail):
+                    load_scene_export_plan(plan)
             row["serialized_draw_parameters"] = [index / 4 for index in range(20)]
             plan.write_text(json.dumps(payload), encoding="utf-8")
             loaded = load_scene_export_plan(plan)
@@ -206,9 +346,35 @@ class PortableScenePlanTests(unittest.TestCase):
             self.assertEqual(actual["instances"], [])
             self.assertEqual(actual["water_geometry"], [])
             self.assertEqual(actual["water_materials"], [])
+            self.assertNotIn("water_transport_lighting", actual)
+            self.assertNotIn("water_transport_lighting_status", actual)
             self.assertEqual(actual["water_depth_surfaces"], [])
             self.assertEqual(actual["terrain_surfaces"], [])
             self.assertEqual(actual["pending"], [])
+            self.assertNotIn("fog_depth", actual)
+            snapshot = {
+                "format": "EndfieldSceneColorSnapshot/1",
+                "camera_matrix_world": [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1],
+                "lens_mm": 50.0, "resolution": [320, 240], "engine": "CYCLES",
+                "samples": 8, "time_seconds": 1.0, "clip_start": 0.1, "clip_end": 500.0,
+            }
+            snapshot_plan_data = json.loads(output.read_text(encoding="utf-8"))
+            snapshot_plan_data["category_filter"] = ["effects"]
+            snapshot_plan_data["scene_color_snapshot"] = snapshot
+            snapshot_plan_path = selected_export / "snapshot_plan.json"
+            snapshot_plan_path.write_text(json.dumps(snapshot_plan_data), encoding="utf-8")
+            self.assertEqual(load_scene_export_plan(snapshot_plan_path)["scene_color_snapshot"], snapshot)
+            snapshot_plan_data["scene_color_snapshot"]["clip_end"] = snapshot["clip_start"]
+            snapshot_plan_path.write_text(json.dumps(snapshot_plan_data), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "clip distances"):
+                load_scene_export_plan(snapshot_plan_path)
+            snapshot["clip_end"] = 500.0
+            with self.assertRaisesRegex(ValueError, "effects layer and effects group"):
+                prepare_scene_export_plan(config, {**canonical, "scene_color_snapshot": snapshot},
+                                          selected_export / "invalid_snapshot_plan.json", None)
+            fog_plan = prepare_scene_export_plan(config, {**canonical, "fog_depth": {"subdivision_level": 3}},
+                                                 selected_export / "fog_plan.json", None)
+            self.assertEqual(load_scene_export_plan(fog_plan)["fog_depth"], {"subdivision_level": 3})
             self.assertEqual(actual["summary"]["ready_decals"], 0)
             self.assertEqual(actual["summary"]["excluded_hlod"], 0)
             self.assertEqual(json.loads(Path(actual["decal_manifest"]).read_text())["records"], [])
@@ -216,17 +382,15 @@ class PortableScenePlanTests(unittest.TestCase):
                 prepare_scene_export_plan(config, canonical, output, None)
             terrain_request = {**canonical, "export_groups": ["terrain"],
                                "layers": {"instances": False, "terrain": True}}
-            terrain_plan = load_scene_export_plan(prepare_scene_export_plan(
-                config, terrain_request, selected_export / "terrain_plan.json", None))
-            self.assertEqual(terrain_plan["terrain_surfaces"], [str(terrain)])
+            from extractor_core.resources import BootstrapExtractionError
+
+            # Selecting ordinary geometry now requires its actual Dynamic ECS source group.
+            with self.assertRaisesRegex(BootstrapExtractionError, "Required VFS group 23D53F5D is incomplete"):
+                prepare_scene_export_plan(config, terrain_request, selected_export / "terrain_plan.json", None)
             disabled_request = {**canonical, "export_groups": ["all"],
                                 "layers": {"instances": True, "terrain": False}}
-            disabled_plan = load_scene_export_plan(prepare_scene_export_plan(
-                config, disabled_request, selected_export / "disabled_plan.json", None))
-            self.assertEqual(disabled_plan["terrain_surfaces"], [])
-            self.assertEqual(disabled_plan["summary"]["excluded_hlod"], 1)
-            self.assertEqual(disabled_plan["summary"]["selected_static"], 0)
-            self.assertEqual(disabled_plan["summary"]["pending"], 0)
+            with self.assertRaisesRegex(BootstrapExtractionError, "Required VFS group 23D53F5D is incomplete"):
+                prepare_scene_export_plan(config, disabled_request, selected_export / "disabled_plan.json", None)
 
     def test_loader_rejects_missing_exact_source_hash(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

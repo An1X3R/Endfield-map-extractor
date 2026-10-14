@@ -35,6 +35,22 @@ def base_texture_mode(record: MaterialRecord) -> int:
     return int(value)
 
 
+def has_verified_lit_top_layer(record: MaterialRecord) -> bool:
+    """Match the decoded two-map top-layer surface branch, independent of asset names."""
+    keywords = set((record.get("RenderState") or {}).get("ValidKeywords", []))
+    floats = record["Floats"]
+    return (surface_family(record) == "lit"
+            and {"_LAYERBLEND_TOP", "_TWO_BASEMAP"} <= keywords
+            and keywords <= {"_LAYERBLEND_TOP", "_TWO_BASEMAP", "_TERRAIN_BLEND"}
+            and floats.get("_BaseTextureMapCount") == 2
+            and floats.get("_LayerBlend") == 1
+            and floats.get("_LayerBlendType") == 2
+            and floats.get("_LayerBlendUVType") in (0, 1, 2)
+            and floats.get("_BaseUVSet") in (0, 1)
+            and floats.get("_BasePbrMapUVSet") in (0, 1)
+            and floats.get("_LayerBlendHeight") in (0, 1))
+
+
 def normal_layout(record: MaterialRecord) -> NormalLayout:
     family = surface_family(record)
     if family in ("leaf", "card"):

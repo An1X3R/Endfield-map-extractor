@@ -13,6 +13,12 @@ import subprocess
 import sys
 from typing import Any, Mapping
 
+from release_source_collection import verify_source_snapshot
+from release_source_overrides import (
+    FileDigest, SourceOverrideReport, apply_animestudio_source_overrides,
+    verify_animestudio_source_overrides,
+)
+
 
 ROOT = Path(__file__).resolve().parent.parent
 LOCK_PATH = ROOT / "third_party" / "animestudio.lock.json"
@@ -41,7 +47,11 @@ def sha256_file(path: Path) -> str:
 def helper_source_identity(root: Path) -> str:
     """Invalidate a completed helper build when its published source inputs change."""
     files = {root / "src" / "endfield_dependency_bootstrap.py", root / "global.json"}
-    for directory in (root / "dotnet", root / "third_party"):
+    files.add(root / "third_party" / "animestudio.lock.json")
+    lock = json.loads((root / "third_party" / "animestudio.lock.json").read_text(encoding="utf-8"))
+    files.update(root / patch["path"] for patch in lock["patches"])
+    files.update(root / path for path in lock.get("buildInputs", []))
+    for directory in (root / "dotnet" / "EndfieldSceneProbe", root / "dotnet" / "EndfieldBundleScanner", root / "dotnet" / "Shared"):
         files.update(path for path in directory.rglob("*")
                      if path.is_file() and not {"bin", "obj", ".git"}.intersection(path.relative_to(directory).parts)
                      and path.suffix in (".cs", ".csproj", ".json", ".patch", ".props", ".targets"))
@@ -261,6 +271,7 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--log-dir", type=Path, required=True)
     parser.add_argument("--plan-only", action="store_true")
     parser.add_argument("--output-root", type=Path)
+    parser.add_argument("--source-root", type=Path)
     parser.add_argument("--include-shader-diagnostics", action="store_true")
     return parser.parse_args()
 
@@ -270,7 +281,7 @@ def main() -> int:
     lock = load_lock()
     workspace = args.workspace.resolve()
     log_dir = args.log_dir.resolve()
-    checkout = workspace / "AnimeStudio"
+    checkout = args.source_root.resolve() if args.source_root is not None else workspace / "AnimeStudio"
     if args.plan_only:
         print(
             json.dumps(
@@ -295,10 +306,6 @@ def main() -> int:
                    "NUGET_PACKAGES": str(workspace / "nuget_packages"),
                    "NUGET_HTTP_CACHE_PATH": str(workspace / "nuget_http_cache"),
                    "DOTNET_SKIP_FIRST_TIME_EXPERIENCE": "1"}
-    git = require_tool(
-        "git.exe",
-        "GIT_NOT_FOUND: install Git for Windows, then rerun first-run dependency bootstrap.",
-    )
     dotnet = require_tool(
         "dotnet.exe",
         f"DOTNET_NOT_FOUND: .NET SDK {lock['sdk']} x64 is required; a runtime is insufficient.",
@@ -316,22 +323,38 @@ def main() -> int:
         )
 
     workspace.mkdir(parents=True, exist_ok=True)
-    head = ensure_pinned_checkout(
-        git,
-        checkout=checkout,
-        workspace=workspace,
-        repository=str(lock["repository"]),
-        commit=str(lock["commit"]),
-        log_dir=log_dir,
-    )
-
     applied = []
-    for patch_row in lock["patches"]:
-        if patch_row["role"] == "optional_shader_diagnostics" and not args.include_shader_diagnostics:
-            continue
-        patch_path = (ROOT / patch_row["path"]).resolve()
-        verify_patch(patch_path, patch_row["sha256"])
-        applied.append({"role": patch_row["role"], "status": apply_patch(git, checkout, patch_path)})
+    required_patches = [row for row in lock["patches"]
+                        if row["role"] != "optional_shader_diagnostics" or args.include_shader_diagnostics]
+    snapshot_path = checkout / "SOURCE-PROVENANCE.json"
+    if snapshot_path.is_file():
+        verify_source_snapshot(checkout, ROOT, lock["repository"], lock["commit"], lock["license"])
+        snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
+        for row in required_patches:
+            verify_patch(ROOT / row["path"], row["sha256"])
+            if not any(item["path"] == row["path"] and item["sha256"].upper() == row["sha256"].upper()
+                       for item in snapshot["appliedPatches"]):
+                raise DependencyBootstrapError(f"ANIMESTUDIO_SNAPSHOT_PATCH_MISSING: {row['path']}")
+            applied.append({"role": row["role"], "status": "verified_source_snapshot"})
+        head = lock["commit"]
+    else:
+        git = require_tool("git.exe", "GIT_NOT_FOUND: use the corresponding-source snapshot or install Git for developer builds.")
+        head = ensure_pinned_checkout(git, checkout=checkout, workspace=workspace,
+                                      repository=lock["repository"], commit=lock["commit"], log_dir=log_dir)
+        for row in required_patches:
+            patch_path = ROOT / row["path"]
+            verify_patch(patch_path, row["sha256"])
+            applied.append({"role": row["role"], "status": apply_patch(git, checkout, patch_path)})
+        if (checkout / "AnimeStudio" / "CNKeys.json").exists():
+            apply_animestudio_source_overrides(checkout, ROOT / "third_party/source-overrides/animestudio")
+
+    override = lock["sourceOverrides"]
+    expected_override = SourceOverrideReport(
+        tuple(FileDigest(row["path"], row["sha256"].lower()) for row in override["files"]),
+        tuple(FileDigest(row["path"], sha256_file(ROOT / row["path"]).lower()) for row in override["inputs"]),
+        tuple(override["removedPaths"]),
+    )
+    verify_animestudio_source_overrides(checkout, ROOT / "third_party/source-overrides/animestudio", expected_override)
 
     upstream = []
     for row in lock.get("upstreamFiles") or []:
@@ -343,6 +366,14 @@ def main() -> int:
             )
         upstream.append({"path": row["path"], "sha256": actual})
 
+    native_library = workspace / "native" / "AnimeStudio.Ooz.dll"
+    run_logged(
+        ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(ROOT / "src/build_ooz_source.ps1"),
+         "-SourceRoot", str(checkout / "AnimeStudio.Oodle"), "-BuildRoot", str(workspace / "ooz_build"),
+         "-OutputPath", str(native_library)],
+        cwd=ROOT, log_path=log_dir / "ooz_build.log", error_code="OOZ_SOURCE_BUILD_FAILED", environment=environment,
+    )
+
     outputs = {}
     for index, (name, project) in enumerate(PROJECTS.items(), start=1):
         lock_file = project.parent / "packages.lock.json"
@@ -350,7 +381,7 @@ def main() -> int:
             raise DependencyBootstrapError(
                 f"NUGET_LOCK_MISSING: published project lock is absent: {lock_file}"
             )
-        common = [f"-p:AnimeStudioRoot={checkout}"]
+        common = [f"-p:AnimeStudioRoot={checkout}", f"-p:AnimeStudioOozPath={native_library}"]
         run_logged(
             [dotnet, "restore", str(project), "--locked-mode", *common],
             cwd=ROOT,

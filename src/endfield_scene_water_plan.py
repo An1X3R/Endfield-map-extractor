@@ -11,11 +11,13 @@ from collections import defaultdict
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from endfield_scene_io import read_scene_manifest
 from typing import cast
 
 from endfield_scene_material_contract import reference_key, resolve_export_path
 from endfield_scene_slot_contract import asset_name
 from extractor_core.projected_decals import read_chunk
+from extractor_core.scene_identity import validate_scene_id
 from extractor_core.vfs import VfsFile
 from extractor_core.water import WaterInstance, decode_water_instances
 
@@ -162,7 +164,7 @@ def _mesh_payloads(
             check_cancelled()
         if not manifest_path.is_file():
             raise FileNotFoundError(f"WATER_SCENE_MANIFEST_MISSING path={manifest_path}")
-        data = _object(json.loads(manifest_path.read_text(encoding="utf-8-sig")), str(manifest_path))
+        data = _object(read_scene_manifest(manifest_path), str(manifest_path))
         if data.get("Format") != "EndfieldSceneProbe/1":
             raise ValueError(f"WATER_SCENE_MANIFEST_FORMAT_INVALID path={manifest_path}")
         for raw in _array(data.get("Containers"), "SceneProbe.Containers"):
@@ -228,8 +230,7 @@ def build_water_geometry_plan(
     This plan reads Global chunks only. Sector-scoped water components require a
     separate audited source contract before they can extend this plan.
     """
-    if map_id not in ("map01", "map02"):
-        raise ValueError(f"WATER_MAP_UNSUPPORTED map_id={map_id}")
+    validate_scene_id(map_id)
     batch = _bounds(batch_bounds, "batch")
     selection = _bounds(selection_bounds, "selection")
     if not (

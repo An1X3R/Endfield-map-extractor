@@ -20,6 +20,39 @@ def material_record() -> dict[str, object]:
 
 
 class SceneMaterialTests(unittest.TestCase):
+    def test_texture_candidates_stop_after_first_existing_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            texture = root / "first.png"
+            texture.write_bytes(b"texture")
+            manifest = root / "scene.json"
+            asset = {"Source": "CAB-texture", "PathId": 3}
+            manifest.write_text(json.dumps({"Format": "EndfieldSceneProbe/1", "Materials": [],
+                "TextureExports": [{"Asset": asset, "File": "first.png"},
+                                   {"Asset": asset, "File": "invalid\0.png"}]}), encoding="utf-8")
+            self.assertEqual({("cab-texture", 3): (texture.parent, texture.name)}, load_catalog((manifest,))[1])
+            texture.unlink()
+            with self.assertRaisesRegex(ValueError, "embedded null"):
+                load_catalog((manifest,))
+
+    def test_top_layer_authored_white_mask_is_not_a_missing_resource(self) -> None:
+        row = {**material_record(),
+               "Shader": {"Source": "CAB-93483c2cb844b6b343af0950ad4630ad", "PathId": 5324015590718682574,
+                          "TextureDefaults": [{"Property": "_LayerBlendMaskMap", "Name": "white", "Dimension": 2}]},
+               "Floats": {"_BaseTextureMapCount": 2, "_LayerBlend": 1, "_LayerBlendType": 2,
+                          "_LayerBlendUVType": 0, "_BaseUVSet": 0, "_BasePbrMapUVSet": 0, "_LayerBlendHeight": 1},
+               "RenderState": {"DisabledShaderPasses": [], "CustomRenderQueue": 2000,
+                               "ValidKeywords": ["_LAYERBLEND_TOP", "_TWO_BASEMAP"]},
+               "Textures": [{"Property": name, "Texture": {"Source": "CAB-texture", "PathId": index + 1},
+                             "Scale": [1, 1], "Offset": [0, 0]}
+                            for index, name in enumerate(("_NormalMap", "_Layer1BaseMap", "_Layer1BumpMap"))] +
+                           [{"Property": "_LayerBlendMaskMap", "Texture": None, "Scale": [1, 1], "Offset": [0, 0]}]}
+        slots = supported_slots(validate_material(row))
+        self.assertEqual({slot["Property"] for slot in slots}, {"_NormalMap", "_Layer1BaseMap", "_Layer1BumpMap"})
+        unsupported = {**row, "Shader": {**row["Shader"], "TextureDefaults": []}}
+        with self.assertRaisesRegex(ValueError, "verified shader defaults"):
+            supported_slots(validate_material(unsupported))
+
     def test_alpha_sweep_requires_the_verified_two_map_clip_contract(self) -> None:
         from endfield_shader_contract import has_verified_lit_sweep
         record = {**material_record(),

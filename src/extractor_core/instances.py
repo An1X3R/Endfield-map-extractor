@@ -1,4 +1,4 @@
-"""Authoritative Map01/Map02 instance inventory built directly from read-only VFS data."""
+"""Authoritative scene instance inventory built directly from read-only VFS data."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 
 from . import flatbuffer as fb
+from .scene_identity import validate_scene_id
 from .lz4 import decompress_lz4_inv
 from .resources import BootstrapExtractionError, load_group, validate_vfs_root
 
@@ -143,8 +144,7 @@ def build_instance_database(
     progress: Progress | None = None,
     cancelled: Cancelled | None = None,
 ) -> dict[str, str]:
-    if map_id not in PATH_PATTERNS:
-        raise ValueError(f"unsupported map id: {map_id}")
+    validate_scene_id(map_id)
     target = output.expanduser().resolve()
     game_vfs = validate_vfs_root(vfs_root)
     if target.exists():
@@ -154,7 +154,12 @@ def build_instance_database(
     target.parent.mkdir(parents=True, exist_ok=True)
 
     group = load_group(game_vfs, GROUP_HASH)
-    pattern = PATH_PATTERNS[map_id]
+    pattern = PATH_PATTERNS.get(map_id)
+    if pattern is None:
+        pattern = re.compile(
+            rf"^Data/Streaming/PC/{re.escape(map_id)}/Streaming/InitChunkData_(?:Global|-?\d+_-?\d+)_0_0\.bytes$",
+            re.I,
+        )
     files = sorted(
         (item for item in group.iter_files() if pattern.match(item.file_name)),
         key=lambda item: item.file_name.casefold(),

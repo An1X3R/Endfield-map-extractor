@@ -16,6 +16,8 @@ from mathutils import Matrix, Vector
 from blender_build_map02_chunk_20260727 import import_obj, join_submeshes, unity_matrix
 from blender_scene_water import WaterOptics, adapt_water_surface, configure_water_scene, create_water_volume
 from blender_scene_water_depth import WaterBottomGeometryMissing, WaterDepthAudit, WaterDepthResult, sample_water_depths
+from blender_scene_water_foam import build_source_water_foam
+from blender_water_screen_distortion import create_water_screen_distortion, water_camera_perspective
 from endfield_scene_water_materials import read_water_material_row
 
 
@@ -217,17 +219,20 @@ def build_scene_water(
             if shore_index is None:
                 shore_index = prepare_water_shore_index(heightfields)
             clipped = clip_water_to_prepared_heightfield(obj, shore_index, 0.02)
-            if clipped:
+            removed = obj.get("endfield_water_shore_removed_degenerate_triangles", 0)
+            if clipped or removed:
                 shore_changed = True
                 if not obj.data.polygons:
                     results.append({"entity_id": entity, "status": "covered_by_terrain",
                                     "detail": "Source water surface lies below the verified heightfield",
-                                    "vertices": 0, "missing_bottom_vertices": 0})
+                                    "vertices": 0, "missing_bottom_vertices": 0,
+                                    "removed_degenerate_triangles": removed})
                     _drop_surface(obj)
                     continue
                 obj["endfield_water_shore_clearance_meters"] = 0.02
                 obj["endfield_water_shore_clipped_faces"] = clipped
-                refine_water_depth_samples(obj, 8.0)
+                if clipped:
+                    refine_water_depth_samples(obj, 8.0)
         retained.append((entity, obj))
     objects = retained
     if not objects:
@@ -241,7 +246,8 @@ def build_scene_water(
         if missing:
             results.append({"entity_id": entity, "status": "bottom_geometry_missing" if bottom_error else "bottom_geometry_incomplete",
                             "detail": bottom_error or "No opaque bottom hit within 150 m at every clipped surface vertex; include terrain and bottom assets",
-                            "vertices": len(obj.data.vertices), "missing_bottom_vertices": missing})
+                            "vertices": len(obj.data.vertices), "missing_bottom_vertices": missing,
+                            "removed_degenerate_triangles": obj.get("endfield_water_shore_removed_degenerate_triangles", 0)})
             _drop_surface(obj)
             continue
         spec = materials[entity]
@@ -264,6 +270,14 @@ def build_scene_water(
         material.use_nodes = True
         normal = build_water_normal(material, spec)
         adapt_water_surface(material, normal, optics)
+        core = material.node_tree.nodes["EF_Water_Shared_Core"]
+        settings = material.node_tree.nodes["EF_Water_Shared_Settings"]
+        distortion = create_water_screen_distortion(
+            material, normal, core.inputs["Depth"].links[0].from_socket,
+            spec.flow.water_ior, optics.ior, water_camera_perspective(bpy.context.scene.camera))
+        material.node_tree.links.new(settings.outputs["IOR"], distortion.inputs["Host IOR"])
+        material.node_tree.links.new(distortion.outputs["Transmission Normal"], core.inputs["Transmission Normal"])
+        foam_status = build_source_water_foam(material, spec)
         material["endfield_water_config"] = spec.config_resource_path
         material["endfield_source_screen_distortion"] = spec.flow.water_ior
         material["endfield_optics_parameters"] = (
@@ -277,8 +291,9 @@ def build_scene_water(
             face.material_index = 0
         volume = create_water_volume(obj, values, material)
         collection.objects.link(volume)
-        results.append({"entity_id": entity, "status": "restored", "detail": "Source waves and measured bottom; calibrated dual-engine optics",
-                        "vertices": len(obj.data.vertices), "missing_bottom_vertices": 0})
+        results.append({"entity_id": entity, "status": "restored", "detail": "Source waves and measured bottom; calibrated dual-engine optics; foam=" + foam_status,
+                        "vertices": len(obj.data.vertices), "missing_bottom_vertices": 0,
+                        "removed_degenerate_triangles": obj.get("endfield_water_shore_removed_degenerate_triangles", 0)})
     if any(row["status"] == "restored" for row in results):
         configure_water_scene(bpy.context.scene)
     return results

@@ -53,7 +53,7 @@ SCRIPT_ROOT = Path(__file__).resolve().parent
 REPOSITORY_ROOT = SCRIPT_ROOT.parent
 DEFAULT_CONFIG = REPOSITORY_ROOT / "endfield.runtime.example.json"
 RUNTIME_MANIFEST = REPOSITORY_ROOT / "webui" / "src" / "data" / "region_map_runtime_manifest.json"
-DEPENDENCY_BOOTSTRAP = SCRIPT_ROOT / "endfield_dependency_bootstrap.py"
+DEVELOPMENT_SETUP = REPOSITORY_ROOT / "setup_development_environment.ps1"
 
 
 class FirstRunError(RuntimeError):
@@ -410,17 +410,12 @@ def arguments() -> argparse.Namespace:
     parser.add_argument(
         "--skip-helper-bootstrap",
         action="store_true",
-        help="Skip the automatic pinned SceneProbe/BundleScanner build (base map extraction still works).",
+        help="Skip prepared SceneProbe/BundleScanner helpers and defer scene discovery (base map extraction still works).",
     )
     parser.add_argument(
         "--skip-scene-discovery",
         action="store_true",
         help="Skip automatic BundleScanner candidate discovery and SceneProbe manifest extraction.",
-    )
-    parser.add_argument(
-        "--skip-shader-diagnostics",
-        action="store_true",
-        help="Build helpers without the optional shader diagnostic patch.",
     )
     parser.add_argument(
         "--no-activate-runtime-config",
@@ -523,7 +518,7 @@ def plan(paths: dict[str, Any], run_name: str) -> dict[str, Any]:
         "automatic": True,
         "geometryClosure": {
             "status": "automatic_pending",
-            "reason": "BundleScanner and SceneProbe discovery will run automatically when pinned helpers are available.",
+            "reason": "Scene discovery reuses hash-verified pinned helpers already present in the configured cache; missing helpers require explicit setup.",
         },
     }
 
@@ -604,7 +599,7 @@ def run() -> int:
 
         dependency_result: dict[str, Any]
         helper_source = helper_source_identity(REPOSITORY_ROOT)
-        from endfield_scene_helpers import verified_helpers
+        from endfield_scene_helpers import load_cached_scene_helper_report, verified_helpers
         if args.skip_helper_bootstrap:
             dependency_result = {
                 "status": "skipped",
@@ -615,61 +610,30 @@ def run() -> int:
                                helper_source, run_root) is not None):
             dependency_result = state["steps"]["helper_dependencies"]["outputs"]
         else:
-            emitter.emit(
-                "helper_dependencies",
-                0.0,
-                "Preparing pinned SceneProbe and BundleScanner dependencies",
-            )
-            dependency_workspace = run_root / "dependencies"
-            dependency_log = next_available(log_root / "dependency_bootstrap")
-            command = [
-                sys.executable,
-                str(DEPENDENCY_BOOTSTRAP),
-                "--workspace",
-                str(dependency_workspace),
-                "--log-dir",
-                str(dependency_log),
-                "--output-root",
-                str(dependency_workspace / "builds" / dependency_log.name),
-            ]
-            if not args.skip_shader_diagnostics:
-                command.append("--include-shader-diagnostics")
-            process = subprocess.run(
-                command,
-                cwd=str(REPOSITORY_ROOT),
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                check=False,
-            )
-            console_path = next_available(dependency_log / "console.log")
-            console_path.parent.mkdir(parents=True, exist_ok=True)
-            console_path.write_text(process.stdout or "", encoding="utf-8", newline="\n")
-            dependency_report = dependency_log / "dependency_bootstrap_report.json"
-            if process.returncode == 0 and dependency_report.is_file():
-                payload = json.loads(dependency_report.read_text(encoding="utf-8"))
-                if verified_helpers(payload, helper_source, dependency_log) is None:
-                    raise FirstRunError("Compiled helpers differ from the current source; retry first-run preparation")
-                dependency_result = {
-                    "status": "passed",
-                    "sourceIdentity": helper_source,
-                    "report": descriptor(dependency_report),
-                    "outputs": payload.get("outputs") or {},
-                }
+            shared_helpers = load_cached_scene_helper_report(cache_root, SCRIPT_ROOT)
+            if shared_helpers is not None:
+                if verified_helpers(shared_helpers.result, helper_source, shared_helpers.helper_root) is None:
+                    raise FirstRunError(
+                        "Prepared shared helpers do not match current source identity or file hashes. "
+                        "Run the explicit setup command to rebuild them."
+                    )
+                dependency_result = dict(shared_helpers.result)
                 complete_step("helper_dependencies", dependency_result)
                 emitter.emit(
                     "helper_dependencies",
                     1.0,
-                    "Pinned extraction helpers are ready",
+                    "Reused hash-verified pinned extraction helpers from the shared cache",
                 )
             else:
+                setup_command = (
+                    f'powershell -ExecutionPolicy Bypass -File "{DEVELOPMENT_SETUP}" '
+                    f'-PrepareSceneHelpers -HelperCacheRoot "{cache_root}"'
+                )
                 dependency_result = {
                     "status": "deferred",
-                    "error": (process.stdout or "dependency bootstrap failed").strip()[-2000:],
-                    "console": descriptor(console_path),
-                    "retryAutomatic": True,
+                    "reason": "No hash-verified pinned SceneProbe/BundleScanner build is present in the configured cache.",
+                    "setupCommand": setup_command,
+                    "retryAutomatic": False,
                 }
                 state["steps"]["helper_dependencies"] = {
                     "status": "deferred",
@@ -680,8 +644,8 @@ def run() -> int:
                 emitter.emit(
                     "helper_dependencies",
                     1.0,
-                    "Helper bootstrap deferred; continuing baseline map extraction",
-                    {"console": str(console_path)},
+                    "Helper dependencies are missing; continuing baseline extraction without scene discovery",
+                    {"setupCommand": setup_command},
                     status="deferred",
                 )
 

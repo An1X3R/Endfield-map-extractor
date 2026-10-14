@@ -18,14 +18,46 @@
       "sha256": "AF416213B7DC65226ACEB38218B8C07559C3FFA8C4B443498981D9EE0541408B"
     }
   ],
-  "upstreamFiles": [
-    {
-      "path": "AnimeStudio/CNKeys.json",
-      "sha256": "A5338D955B09046EC0B16F3A9625B7955C763AAE07DC722E474E6078745F932F"
-    },
-    {
-      "path": "AnimeStudio.Libraries/AnimeStudio.Ooz.dll",
-      "sha256": "AA007FA0FDD62370876FA368E6262E8C8DE425F5C3A2967D0EDC9A76E9E7F470"
-    }
-  ]
+  "upstreamFiles": [],
+  "buildInputs": [
+    "src/release_source_collection.py",
+    "src/release_source_overrides.py",
+    "src/build_ooz_source.ps1",
+    "third_party/source-overrides/animestudio/UnityCNManager.cs",
+    "third_party/source-overrides/animestudio/Crypto/UnityCN.cs"
+  ],
+  "sourceOverrides": {
+    "files": [
+      {
+        "path": "AnimeStudio/AnimeStudio.csproj",
+        "sha256": "e0cc0be2e0ef8f59c273340e22599104171a310da3a53c6f396098244889a814"
+      },
+      {
+        "path": "AnimeStudio/BundleFile.cs",
+        "sha256": "74346acb61e48276cb608e450ef3547022e3162ed0fef59b7dabdd9f8a7cb650"
+      },
+      {
+        "path": "AnimeStudio/Crypto/UnityCN.cs",
+        "sha256": "da291e037d23a0a0892915e87d0cb960ae3d51b85b26738d60fd50645c0c61e9"
+      },
+      {
+        "path": "AnimeStudio/UnityCNManager.cs",
+        "sha256": "5f94b589414eb477925065d25de2cfeaf564311b1a5a261aa2e0a46086d1706b"
+      }
+    ],
+    "inputs": [
+      {
+        "path": "third_party/source-overrides/animestudio/UnityCNManager.cs"
+      },
+      {
+        "path": "third_party/source-overrides/animestudio/Crypto/UnityCN.cs"
+      },
+      {
+        "path": "src/release_source_overrides.py"
+      }
+    ],
+    "removedPaths": [
+      "AnimeStudio/CNKeys.json"
+    ]
+  }
 }

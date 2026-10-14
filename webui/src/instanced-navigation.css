@@ -1,0 +1,113 @@
+.map-workspace-surfaces { display: contents; }
+.map-workspace-surfaces[hidden] { display: none; }
+.app-shell .top-actions > button[hidden] { display: none; }
+.app-shell .map-switch-with-instanced { display: grid; grid-template-columns: minmax(136px, 1fr) minmax(136px, 1fr) 48px minmax(177px, 1.25fr); width: clamp(690px, 48vw, 760px); min-width: 0; }
+.app-shell .map-switch-with-instanced button { width: 100%; }
+.app-shell .map-switch-with-instanced .map-switch-copy strong,
+.app-shell .map-switch-with-instanced .map-switch-copy small { white-space: nowrap; }
+.instanced-navigation-datum { position: relative; display: flex; flex-direction: column; justify-content: center; align-items: center; color: #8d9797; background: var(--paper); }
+.instanced-navigation-datum::after { content: ""; position: absolute; z-index: 5; inset: auto 0 -8px; height: 12px; background: var(--paper); }
+.instanced-navigation-datum b { font: 800 18px/1 var(--mono); }
+.instanced-navigation-datum small { position: relative; z-index: 6; opacity: .28; font: 9px var(--mono); white-space: nowrap; margin-top: 6px; }
+.app-shell .instanced-navigation-tab { --accent: #ffe600; color: #c4ccce; background: #2b3032; clip-path: polygon(13px 0, 100% 0, 100% 100%, 0 100%, 0 13px); }
+.app-shell .instanced-navigation-tab .map-switch-copy strong { color: #c4ccce; }
+.app-shell .instanced-navigation-tab .map-switch-copy small { color: #aeb8ba; }
+.app-shell .instanced-navigation-tab::after { top: auto; right: 6px; bottom: 5px; left: auto; width: 7px; height: 7px; opacity: 1; background: #867b23; transform: none; }
+.app-shell .instanced-navigation-tab.active { color: #fff; background: #22272a; box-shadow: inset 0 -4px #ffe600; }
+.app-shell .instanced-navigation-tab.active .map-switch-copy strong { color: #fff; }
+.app-shell .instanced-navigation-tab.active .map-switch-copy small { color: #e0e5e2; }
+.instanced-navigation-icon { display: grid; grid-template-columns: repeat(2, 9px); grid-template-rows: repeat(2, 9px); gap: 3px; width: 21px; justify-self: center; }
+.instanced-navigation-icon i { border: 1.5px solid currentColor; }
+.instanced-navigation-icon i:nth-child(2) { background: currentColor; }
+.instanced-navigation-tab.active .instanced-navigation-icon { color: #ffe600; }
+.mode-instanced { --accent: #ffe600; --paper: #f5f6f4; --ink: #171b1d; }
+.mode-instanced .ambient-contours-canvas { opacity: .07; }
+.mode-instanced .brand-mark { background: #ffe600; color: #171b1d; }
+.mode-instanced .map-switch::before { width: 0; }
+.app-shell .map-switch-with-instanced::after { right: calc(4px + (100% - 56px) / 3.25 * 1.25 + 48px); width: 12%; }
+@media (min-width: 801px) {
+  .app-shell.mode-instanced .workspace { height: var(--instanced-workspace-height); min-height: 0; }
+}
+@media (min-width: 1321px) and (max-width: 1360px) {
+  .app-shell .topbar { gap: 14px; grid-template-columns: minmax(220px, 1fr) auto auto; }
+  .app-shell .top-actions { gap: 6px; }
+  .app-shell .top-actions > button:not(.dev-review-button) { width: 36px; min-height: 36px; justify-content: center; padding: 0; }
+  .app-shell .top-actions > button:not(.dev-review-button) span { display: none; }
+}
+@media (max-width: 1320px) {
+  .app-shell .topbar { grid-template-areas: "brand actions" "switch switch"; grid-template-columns: minmax(0, 1fr) auto; grid-template-rows: auto auto; gap: 10px 14px; padding-bottom: 12px; }
+  .app-shell .brand-lockup { grid-area: brand; }
+  .app-shell .map-switch-zone { grid-area: switch; width: 100%; }
+  .app-shell .top-actions { grid-area: actions; justify-self: end; }
+  .app-shell .map-switch-with-instanced { width: min(100%, 760px); }
+}
+.workspace-transition-retract .map-workspace-surfaces > :not(.map-heading),
+.workspace-transition-retract .isc-workspace {
+  pointer-events: none;
+  animation: workspace-retract 200ms cubic-bezier(.18,.7,.24,1) both;
+}
+.workspace-transition-retract .map-stage-frame,
+.workspace-transition-retract .isc-floor {
+  animation: workspace-lines-converge 200ms cubic-bezier(.18,.7,.24,1) both;
+  transform-origin: center;
+}
+.workspace-transition-deploy .isc-workspace,
+.workspace-transition-deploy .map-workspace-surfaces > :not(.map-heading) {
+  pointer-events: none;
+  animation: workspace-deploy 180ms cubic-bezier(.16,1,.3,1) both;
+}
+.workspace-transition-datum {
+  position: absolute;
+  inset: 0;
+  z-index: 38;
+  pointer-events: none;
+  background: linear-gradient(transparent 0 49.7%, #ffe600 49.7% 50.3%, transparent 50.3%);
+  animation: workspace-datum-converge 200ms cubic-bezier(.18,.7,.24,1) both;
+}
+.workspace-transition-deploy .workspace-transition-datum {
+  background: #f5f6f4;
+  border-block: 2px solid #ffe600;
+  animation: workspace-datum-open 180ms cubic-bezier(.16,1,.3,1) both;
+}
+.workspace-title-rebuilding .map-title-lockup,
+.workspace-title-rebuilding .isc-heading h1 { visibility: hidden; }
+.workspace-transition-title {
+  position: absolute;
+  top: 33px;
+  left: 19px;
+  z-index: 45;
+  pointer-events: none;
+  color: #171b1d;
+  font: 900 clamp(54px, 5vw, 72px)/.72 var(--display);
+  letter-spacing: -.045em;
+  white-space: pre;
+}
+.workspace-transition-title span { display: inline-block; position: absolute; top: -9px; left: min(731px, calc(67vw - 56px)); padding: 10px 18px; background: #171b1d; color: #ffe600; font: 800 18px/1.2 var(--sans); white-space: nowrap; }
+.workspace[data-transition-to="maps"] .workspace-transition-title { top: 76px; left: calc(var(--map-rail) + 44px); font-size: clamp(54px, 5vw, 76px); line-height: .92; }
+@keyframes workspace-retract { to { opacity: 0; transform: scale(.98); } }
+@keyframes workspace-lines-converge { to { opacity: 0; transform: scaleY(.015) scaleX(.98); } }
+@keyframes workspace-deploy { from { opacity: 0; clip-path: inset(49.9% 0); } to { opacity: 1; clip-path: inset(0); } }
+@keyframes workspace-datum-converge { from { opacity: 0; transform: scaleY(8); } to { opacity: 1; transform: scaleY(1); } }
+@keyframes workspace-datum-open { from { clip-path: inset(49.8% 0); opacity: 1; } to { clip-path: inset(0); opacity: 0; } }
+@media (max-height: 780px) and (min-width: 801px) {
+  .workspace[data-transition-to="instanced"] .workspace-transition-title { white-space: normal; font-size: clamp(54px, 4.9vw, 64px); line-height: .86; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .workspace-transition-retract *, .workspace-transition-deploy * { animation: none !important; }
+  .workspace-transition-datum, .workspace-transition-title { display: none; }
+  .workspace-title-rebuilding .map-title-lockup, .workspace-title-rebuilding .isc-heading h1 { visibility: visible; }
+}
+@media (max-width: 700px) {
+  .app-shell .map-switch-with-instanced { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) 26px minmax(0, 1.3fr); width: 100%; }
+  .app-shell .map-switch-with-instanced button { grid-template-columns: 20px minmax(0, 1fr) 10px; gap: 5px; padding: 4px 6px; }
+  .app-shell .map-switch-with-instanced .map-switch-copy strong { font-size: clamp(10px, 2.7vw, 15px); white-space: nowrap; }
+  .app-shell .map-switch-with-instanced .map-switch-copy small { font-size: 9px; white-space: nowrap; }
+  .instanced-navigation-datum small { font-size: 5px; }
+  .instanced-navigation-icon { grid-template-columns: repeat(2, 6px); grid-template-rows: repeat(2, 6px); gap: 2px; width: 14px; }
+}
+@media (max-width: 440px) {
+  .app-shell .map-switch-with-instanced button { grid-template-columns: minmax(0, 1fr) 9px; gap: 2px; padding: 4px 5px; }
+  .app-shell .map-switch-with-instanced .map-thumb { display: none; }
+  .app-shell .map-switch-with-instanced .instanced-navigation-tab { grid-template-columns: 14px minmax(0, 1fr); }
+  .instanced-navigation-tab > i { display: none; }
+}

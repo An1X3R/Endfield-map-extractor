@@ -43,6 +43,10 @@ class MeshArrays:
     materials: np.ndarray
     uv: np.ndarray
     normals: np.ndarray
+    source_uv1: np.ndarray | None
+    source_uv2: np.ndarray | None
+    source_uv1_material_slots: frozenset[int]
+    source_uv2_material_slots: frozenset[int]
 
 
 @dataclass(frozen=True)
@@ -84,6 +88,17 @@ def vector(value: object, length: int) -> tuple[float, ...]:
     if len(values) != length or not all(isinstance(v, (int, float)) and math.isfinite(v) for v in values):
         raise ValueError(f"Invalid finite vector, expected length={length}")
     return tuple(float(v) for v in values)
+
+
+def material_source_uv_channels(material: bpy.types.Material | None) -> frozenset[int]:
+    if material is None or not material.use_nodes or material.node_tree is None:
+        return frozenset()
+    layer_channels = {"EF_SOURCE_UV1": 1, "EF_SOURCE_UV2": 2}
+    return frozenset(
+        layer_channels[node.uv_map]
+        for node in material.node_tree.nodes
+        if node.type == "UVMAP" and node.uv_map in layer_channels and node.outputs["UV"].is_linked
+    )
 
 
 def read_decals(path: Path) -> tuple[ProjectedDecal, ...]:
@@ -156,8 +171,25 @@ def mesh_arrays(mesh: bpy.types.Mesh) -> MeshArrays:
         surface_uv.data.foreach_get("uv", uv)
     normals = np.empty(len(mesh.corner_normals) * 3, dtype=np.float32)
     mesh.corner_normals.foreach_get("vector", normals)
+    source_uv_material_slots = {1: set(), 2: set()}
+    for index, material in enumerate(mesh.materials):
+        for channel in material_source_uv_channels(material):
+            source_uv_material_slots[channel].add(index)
+    source_uv_values: dict[int, np.ndarray | None] = {}
+    for channel in (1, 2):
+        layer = mesh.uv_layers.get(f"EF_SOURCE_UV{channel}")
+        if layer is None:
+            source_uv_values[channel] = None
+            continue
+        if len(layer.data) != len(mesh.loops):
+            raise ValueError(f"DECAL_SOURCE_UV_TOPOLOGY_MISMATCH mesh={mesh.name} channel={channel}")
+        values = np.empty(len(mesh.loops) * 2, dtype=np.float32)
+        layer.data.foreach_get("uv", values)
+        source_uv_values[channel] = values.reshape(-1, 2)
     return MeshArrays(positions.reshape(-1, 3), triangles.reshape(-1, 3), loops.reshape(-1, 3),
-                      materials, uv.reshape(-1, 2), normals.reshape(-1, 3))
+                      materials, uv.reshape(-1, 2), normals.reshape(-1, 3),
+                      source_uv_values[1], source_uv_values[2],
+                      frozenset(source_uv_material_slots[1]), frozenset(source_uv_material_slots[2]))
 
 
 def grid_cells(minimum: tuple[float, ...], maximum: tuple[float, ...]) -> tuple[tuple[int, ...], ...]:
@@ -402,8 +434,18 @@ def project_decal(decal: ProjectedDecal, spec: MaterialSpec, receivers: list[Rec
     low = tuple(min(v[i] for v in corners) for i in range(3))
     high = tuple(max(v[i] for v in corners) for i in range(3))
     candidates = sorted({i for cell in grid_cells(low, high) for i in grid.get(cell, ())})
-    vertices, faces, uv_surface, uv_decal, normals, material_ids = [], [], [], [], [], []
-    receiver_origins: list[tuple[float, float, float]] = []
+    position_parts: list[np.ndarray] = []
+    receiver_origin_parts: list[np.ndarray] = []
+    normal_parts: list[np.ndarray] = []
+    uv_surface_parts: list[np.ndarray] = []
+    uv_decal_parts: list[np.ndarray] = []
+    material_id_parts: list[np.ndarray] = []
+    source_uv1_parts: list[np.ndarray] = []
+    source_uv2_parts: list[np.ndarray] = []
+    source_uv1_used = False
+    source_uv2_used = False
+    vertex_count = 0
+    face_count = 0
     used_materials: list[bpy.types.Material] = []
     hits = 0
     for candidate in candidates:
@@ -418,16 +460,43 @@ def project_decal(decal: ProjectedDecal, spec: MaterialSpec, receivers: list[Rec
         projected = data.positions @ transform[:3, :3].T + transform[:3, 3]
         triangle_positions = projected[data.triangles]
         overlaps = np.all(triangle_positions.min(axis=1) < 0.5, axis=1) & np.all(triangle_positions.max(axis=1) > -0.5, axis=1)
+        fog_slots = [index for index, material in enumerate(receiver.mesh.materials)
+                     if material is not None and material.get("endfield_fx_fog_simple_shader") == "HGRP/FogSimple"]
+        if fog_slots:
+            overlaps &= ~np.isin(data.materials, fog_slots)
         selection = np.flatnonzero(overlaps)
         if not len(selection):
             continue
+        selected_material_slots = data.materials[selection]
+        source_uv1_slots = frozenset(int(slot) for slot in selected_material_slots
+                                     if int(slot) in data.source_uv1_material_slots)
+        source_uv2_slots = frozenset(int(slot) for slot in selected_material_slots
+                                     if int(slot) in data.source_uv2_material_slots)
+        if source_uv1_slots and data.source_uv1 is None:
+            raise ValueError(f"DECAL_RECEIVER_SOURCE_UV_MISSING receiver={receiver.name} mesh={receiver.mesh.name} channel=EF_SOURCE_UV1 material_slots={sorted(source_uv1_slots)}")
+        if source_uv2_slots and data.source_uv2 is None:
+            raise ValueError(f"DECAL_RECEIVER_SOURCE_UV_MISSING receiver={receiver.name} mesh={receiver.mesh.name} channel=EF_SOURCE_UV2 material_slots={sorted(source_uv2_slots)}")
         normal_matrix = np.array(receiver.matrix.to_3x3().inverted().transposed(), dtype=np.float64)
         fully_inside = np.all(np.abs(triangle_positions) <= 0.5, axis=(1, 2))
         receiver_matrix = np.array(receiver.matrix, dtype=np.float64)
         world_positions = data.positions @ receiver_matrix[:3, :3].T + receiver_matrix[:3, 3]
         selected_loops = data.loops[selection]
-        attributes = np.concatenate((triangle_positions[selection], data.uv[selected_loops],
-            data.normals[selected_loops] @ normal_matrix.T, world_positions[data.triangles[selection]]), axis=2)
+        attribute_parts = [triangle_positions[selection], data.uv[selected_loops],
+                           data.normals[selected_loops] @ normal_matrix.T,
+                           world_positions[data.triangles[selection]]]
+        if source_uv1_slots:
+            source_uv1_triangles = np.zeros((len(selection), 3, 2), dtype=np.float32)
+            for row, slot in enumerate(selected_material_slots):
+                if int(slot) in source_uv1_slots:
+                    source_uv1_triangles[row] = data.source_uv1[selected_loops[row]]
+            attribute_parts.append(source_uv1_triangles)
+        if source_uv2_slots:
+            source_uv2_triangles = np.zeros((len(selection), 3, 2), dtype=np.float32)
+            for row, slot in enumerate(selected_material_slots):
+                if int(slot) in source_uv2_slots:
+                    source_uv2_triangles[row] = data.source_uv2[selected_loops[row]]
+            attribute_parts.append(source_uv2_triangles)
+        attributes = np.concatenate(attribute_parts, axis=2)
         inside = fully_inside[selection]
         fragments = [attributes[inside]]
         fragment_slots = [data.materials[selection[inside]]]
@@ -461,39 +530,90 @@ def project_decal(decal: ProjectedDecal, spec: MaterialSpec, receivers: list[Rec
             if mat not in used_materials:
                 used_materials.append(mat)
             slot = used_materials.index(mat)
-            values = triangles[source_slots == source_slot].reshape(-1, 11)
+            values = triangles[source_slots == source_slot].reshape(-1, triangles.shape[2])
             transformed_normals = values[:, 5:8]
             lengths = np.linalg.norm(transformed_normals, axis=1)
             # Blender's split-normal API uses zero vectors to request automatic normals.
             unit_normals = np.divide(transformed_normals, lengths[:, None],
                                      out=np.zeros_like(transformed_normals), where=lengths[:, None] > 0)
             offsets = np.repeat(face_normals[source_slots == source_slot], 3, axis=0)
-            start = len(vertices)
-            vertices.extend((values[:, 8:11] + offsets * bias).tolist())
-            receiver_origins.extend([tuple(receiver.matrix.translation)] * len(values))
-            normals.extend(unit_normals.tolist())
-            uv_surface.extend(values[:, 3:5].tolist())
-            uv_decal.extend(((values[:, (0, 2)] + 0.5) * np.array(decal.uv_scale) + np.array(decal.uv_offset)).tolist())
-            faces.extend(np.arange(start, len(vertices)).reshape(-1, 3).tolist())
-            material_ids.extend([slot] * (len(values) // 3))
-    if not faces:
+            position_parts.append(values[:, 8:11] + offsets * bias)
+            receiver_translation = np.asarray(receiver.matrix.translation, dtype=np.float32)
+            receiver_origin_parts.append(np.broadcast_to(receiver_translation, (len(values), 3)))
+            normal_parts.append(unit_normals)
+            uv_surface_parts.append(values[:, 3:5])
+            uv_decal_parts.append((values[:, (0, 2)] + 0.5) * np.array(decal.uv_scale) + np.array(decal.uv_offset))
+            attribute_offset = 11
+            if source_uv1_slots:
+                channel_values = values[:, attribute_offset:attribute_offset + 2]
+                if int(source_slot) in data.source_uv1_material_slots:
+                    if not source_uv1_used:
+                        source_uv1_parts.append(np.zeros((vertex_count, 2), dtype=np.float32))
+                    source_uv1_parts.append(channel_values)
+                    source_uv1_used = True
+                elif source_uv1_used:
+                    source_uv1_parts.append(np.zeros((len(values), 2), dtype=np.float32))
+                attribute_offset += 2
+            elif source_uv1_used:
+                source_uv1_parts.append(np.zeros((len(values), 2), dtype=np.float32))
+            if source_uv2_slots:
+                channel_values = values[:, attribute_offset:attribute_offset + 2]
+                if int(source_slot) in data.source_uv2_material_slots:
+                    if not source_uv2_used:
+                        source_uv2_parts.append(np.zeros((vertex_count, 2), dtype=np.float32))
+                    source_uv2_parts.append(channel_values)
+                    source_uv2_used = True
+                elif source_uv2_used:
+                    source_uv2_parts.append(np.zeros((len(values), 2), dtype=np.float32))
+            elif source_uv2_used:
+                source_uv2_parts.append(np.zeros((len(values), 2), dtype=np.float32))
+            group_face_count = len(values) // 3
+            material_id_parts.append(np.full(group_face_count, slot, dtype=np.int32))
+            vertex_count += len(values)
+            face_count += group_face_count
+    if not face_count:
         return 0, 0
+    world_positions = np.concatenate(position_parts, axis=0)
+    if len(world_positions) != vertex_count or vertex_count != face_count * 3:
+        raise ValueError(f"DECAL_BATCH_TRIANGLE_SOUP_COUNT_MISMATCH entity_id={decal.entity_id}")
     mesh = bpy.data.meshes.new(f"ProjectedDecal_{decal.entity_id}")
     origin = world.translation
-    mesh.from_pydata([tuple(Vector(point) - origin) for point in vertices], [], faces)
+    local_positions = np.asarray(world_positions, dtype=np.float32) - np.asarray(origin, dtype=np.float32)
+    mesh.vertices.add(len(local_positions))
+    mesh.loops.add(len(local_positions))
+    mesh.polygons.add(face_count)
+    mesh.vertices.foreach_set("co", local_positions.ravel())
+    mesh.loops.foreach_set("vertex_index", np.arange(len(local_positions), dtype=np.int32))
+    mesh.polygons.foreach_set("loop_start", np.arange(face_count, dtype=np.int32) * 3)
+    loop_totals = np.empty(face_count, dtype=np.int32)
+    mesh.polygons.foreach_get("loop_total", loop_totals)
+    if not np.all(loop_totals == 3):
+        raise ValueError(f"DECAL_BATCH_POLYGON_LOOP_LAYOUT entity_id={decal.entity_id}")
+    mesh.update(calc_edges=True)
     receiver_origin = mesh.attributes.new(name="endfield_receiver_world_origin", type="FLOAT_VECTOR", domain="POINT")
-    receiver_origin.data.foreach_set("vector", np.asarray(receiver_origins, dtype=np.float32).ravel())
+    receiver_origin.data.foreach_set("vector", np.concatenate(receiver_origin_parts, axis=0).ravel())
     for material in used_materials:
         mesh.materials.append(material)
+    material_ids = np.concatenate(material_id_parts)
     mesh.polygons.foreach_set("material_index", material_ids)
-    mesh.uv_layers.new(name="UVMap").data.foreach_set("uv", np.array(uv_surface, dtype=np.float32).ravel())
-    mesh.uv_layers.new(name="DecalUV").data.foreach_set("uv", np.array(uv_decal, dtype=np.float32).ravel())
+    mesh.uv_layers.new(name="UVMap").data.foreach_set("uv", np.concatenate(uv_surface_parts, axis=0).astype(np.float32).ravel())
+    mesh.uv_layers.new(name="DecalUV").data.foreach_set("uv", np.concatenate(uv_decal_parts, axis=0).astype(np.float32).ravel())
+    if source_uv1_used:
+        source_uv1_values = np.concatenate(source_uv1_parts, axis=0)
+        if len(source_uv1_values) != len(mesh.loops):
+            raise ValueError(f"DECAL_SOURCE_UV_OUTPUT_TOPOLOGY_MISMATCH channel=EF_SOURCE_UV1 mesh={mesh.name}")
+        mesh.uv_layers.new(name="EF_SOURCE_UV1").data.foreach_set("uv", np.asarray(source_uv1_values, dtype=np.float32).ravel())
+    if source_uv2_used:
+        source_uv2_values = np.concatenate(source_uv2_parts, axis=0)
+        if len(source_uv2_values) != len(mesh.loops):
+            raise ValueError(f"DECAL_SOURCE_UV_OUTPUT_TOPOLOGY_MISMATCH channel=EF_SOURCE_UV2 mesh={mesh.name}")
+        mesh.uv_layers.new(name="EF_SOURCE_UV2").data.foreach_set("uv", np.asarray(source_uv2_values, dtype=np.float32).ravel())
     mesh.uv_layers["UVMap"].active_render = True
     mesh.uv_layers.active_index = 0
     tint = mesh.color_attributes.new(name="DecalTint", type="FLOAT_COLOR", domain="CORNER")
     color = (*[c * decal.intensity for c in decal.color[:3]], decal.color[3])
     tint.data.foreach_set("color", np.tile(np.array(color, dtype=np.float32), len(mesh.loops)))
-    mesh.normals_split_custom_set(normals)
+    mesh.normals_split_custom_set(np.concatenate(normal_parts, axis=0))
     mesh.update()
     obj = bpy.data.objects.new(f"DECAL_{decal.entity_id}_{decal.entity_base}", mesh)
     obj.location = origin
@@ -504,10 +624,10 @@ def project_decal(decal: ProjectedDecal, spec: MaterialSpec, receivers: list[Rec
     obj["source_path"] = decal.source_path
     obj["receiver_triangle_count"] = hits
     obj["undrawn_receiver_triangle_count"] = sum(
-        material_ids.count(index) for index, material in enumerate(used_materials)
+        int(np.count_nonzero(material_ids == index)) for index, material in enumerate(used_materials)
         if material.get("endfield_runtime_role") == "no_non_shadow_draw_for_submesh")
     obj["authored_draw_order"] = spec.floats["_DrawOrder"]
-    return len(faces), hits
+    return face_count, hits
 
 
 def terrain_hash() -> str:

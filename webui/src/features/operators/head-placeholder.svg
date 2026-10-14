@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="360" height="440" viewBox="0 0 360 440" fill="none">
+  <title>通用角色头部占位图 · 非角色定稿</title>
+  <defs>
+    <linearGradient id="face" x1="103" y1="148" x2="256" y2="302" gradientUnits="userSpaceOnUse"><stop stop-color="#eef0f3"/><stop offset="1" stop-color="#aeb6c0"/></linearGradient>
+    <linearGradient id="hair" x1="82" y1="78" x2="252" y2="188" gradientUnits="userSpaceOnUse"><stop stop-color="#e0e4ea"/><stop offset="1" stop-color="#8b96a5"/></linearGradient>
+  </defs>
+  <g stroke="#cbd0d8" stroke-linejoin="miter">
+    <path d="m140 294-2 50-42 22 43 45h88l39-45-44-23-2-50" fill="#788596" stroke-width="1.4"/>
+    <path d="m142 306 39 25 38-25-1 37-37 38-40-37Z" fill="#b7c0cb" stroke="none"/>
+    <path d="m96 360 31-15 54 48 49-48 37 16 21 40-57 16H127l-55-17Z" fill="#252b35" stroke-width="1.7"/>
+    <path d="m129 348 10 47 28 12-15-29m78-30-10 47-25 12 14-29" stroke="#b2bdcc" stroke-width="1.5"/>
+    <path d="M93 181 80 177l-5 22 11 39 16 7m160-64 14-4 7 22-11 39-16 7" fill="#97a3b2" stroke-width="1.5"/>
+    <path d="m101 136-3 78 10 56 30 39 42 23 42-23 28-40 11-65-7-68-68-48Z" fill="url(#face)" stroke-width="1.5"/>
+    <path d="m185 153 3 70 18 35-23 11-1 62 40-22 28-40 11-65-23-63Z" fill="#939eae" stroke="none"/>
+    <path d="m110 225 16 35 35 10-16-24Z" fill="#c4cbd5" stroke="none"/>
+    <path d="m204 247 28-19-11 40-31 9Z" fill="#8693a4" stroke="none"/>
+    <path d="m111 199 18-6 31 7m40 0 27-7 19 6" stroke="#343e4d" stroke-width="4"/>
+    <path d="m112 215 16 7 25-5m53 0 22 5 16-8" stroke="#394454" stroke-width="2.6"/>
+    <path d="m128 216 2 6m97-6-1 6" stroke="#293542" stroke-width="4"/>
+    <path d="m180 218-6 36 13 5m-27 29 21 4 21-5m-33 13h22" stroke="#68788c" stroke-width="1.5"/>
+    <path d="m100 235 8 29 14 16m125-48-8 33-12 16" stroke="#e7eaf0" opacity=".55"/>
+    <path d="m78 192-9-54 20-51 47-32 61-12 50 17 34 37 9 56-20 66-17-35-3-53-33 29-24-50-28 55-13-29-28 41-16-13-10 57Z" fill="url(#hair)" stroke-width="1.8"/>
+    <path d="m89 87 47-32 61-12-43 39-43 53-13 57-20 0-9-54Z" fill="#606f83" stroke="none"/>
+    <path d="m197 43 50 17 34 37 9 56-20 66-17-35-3-53-33 29 10-70Z" fill="#76869b" stroke="none"/>
+    <path d="m145 79-29 73m57-93-29 68m49-49 24 82m21-85 13 56m-162-3 22-29m159 41-13 31" stroke="#edf0f4" stroke-width="1.15" opacity=".6"/>
+    <path d="m78 149 18-10-2 58-13 21-8-28Z" fill="#384555" stroke-width="1.4"/>
+    <path d="m263 146 16 10 2 35-12 25-9-22Z" fill="#384555" stroke-width="1.4"/>
+    <path d="m78 165 13-5m-12 17 12-5m172-9 13 7m-12 5 11 7" stroke="#d9dee6" stroke-width="2"/>
+    <path d="M86 219v43l31 31h12" stroke="#bfcad5" stroke-width="2"/><path d="M123 291h14v5h-14Z" fill="#e4e8ec" stroke="none"/>
+    <path d="m94 96 13-12 8 9-14 11Z" fill="#ffe600" stroke="none"/>
+  </g>
+</svg>

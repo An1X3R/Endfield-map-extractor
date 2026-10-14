@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <StartupObject>AnimationReader</StartupObject>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="$(AnimeStudioRoot)/AnimeStudio/AnimeStudio.csproj" />
+    <ProjectReference Include="../ThirdParty/Ruri/ACL/Ruri.ACL.csproj" />
+    <ProjectReference Include="../ThirdParty/Ruri/Humanoid/RuriHumanoid.csproj" />
+  </ItemGroup>
+</Project>

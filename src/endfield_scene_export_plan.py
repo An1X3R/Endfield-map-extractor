@@ -7,36 +7,75 @@ import json
 import math
 import sqlite3
 import struct
+from collections.abc import Iterable
 from collections import defaultdict
 from contextlib import closing
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Mapping, NotRequired, TypedDict, cast
+from endfield_scene_io import (SceneSourceCacheSlot, cached_scene_source_value,
+                               configure_scene_manifest_cache, read_scene_manifest)
+from typing import Callable, Literal, Mapping, NotRequired, TypedDict, cast
 
+from extractor_core.scene_identity import validate_scene_id
+from extractor_core.vfs import VfsFile
 from endfield_map_layer_contract import classify_entity, is_hlod_name
-from endfield_scene_material_contract import load_catalog, reference_key, resolve_export_path, supported_slots
+from endfield_scene_material_contract import (reference_key, resolve_export_path,
+                                             resolve_existing_export_files, supported_slots)
+from endfield_scene_material_handoff import (MaterialCatalogHandoff, build_material_catalog_handoff,
+                                              capture_material_catalog_sources, require_material_catalog_sources)
+from endfield_scene_planning_catalog import load_planning_catalog
 from endfield_scene_effects_plan import EffectInstance, build_effect_plan
-from endfield_scene_lights_plan import LightPlanRow, build_light_plan, validate_light_plan_rows
+from endfield_scene_direct_effects_plan import (DirectEffectRow, DirectEffectPending, build_direct_effect_plan,
+                                                validate_direct_effect_rows)
+from endfield_scene_dynamic_geometry_plan import DynamicGeometryRow, DynamicGeometryPending, build_dynamic_geometry_plan
+from endfield_scene_mesh_uv_contract import (MeshUvCatalog, RequiredUvStreams, SourceUvStream,
+                                             load_mesh_uv_catalog, required_uv_channels, source_uv_streams)
+from endfield_scene_lights_plan import (LightPlanRow, build_light_plan,
+                                        build_water_transport_directional_dependency,
+                                        validate_light_plan_rows)
+from endfield_water_transport import (WaterTransportLighting, WaterTransportLightingRow,
+                                     read_water_transport_lighting,
+                                     serialize_water_transport_lighting)
 from endfield_scene_slot_contract import (
     AmbiguousSubmeshSlots, RuntimeDraw, asset_name, primary_visible_mesh,
     runtime_submesh_slots,
 )
-from webui_source_contract import selected_static_categories
+from endfield_scene_vfxrefract_contract import SceneColorSnapshotPlan, read_scene_color_snapshot
+from endfield_scene_spatial_plan import (StaticSpatialRow, StaticSpatialSelection, WorldBounds,
+                                         owns_static_footprint, select_static_source_rows)
+from endfield_scene_spatial_cache import (read_spatial_source_records, require_spatial_source_version,
+                                          spatial_parser_identity, spatial_source_identity)
+from webui_source_contract import FogDepthPlan, read_fog_depth_options, selected_static_categories
 
 
 FORMAT = "EndfieldPortableScenePlan/1"
 
 
-def owns_static_footprint(bounds: Mapping[str, float], selection: Mapping[str, float],
-                          origin: tuple[float, float], footprint: tuple[float, ...]) -> bool:
-    """Assign crossing geometry once using the legacy clipped-footprint owner rule."""
-    x, z = origin
-    if selection["xmin"] <= x < selection["xmax"] and selection["zmin"] <= z < selection["zmax"]:
-        return bounds["xmin"] <= x < bounds["xmax"] and bounds["zmin"] <= z < bounds["zmax"]
-    xmin, xmax, _, _, zmin, zmax = footprint
-    if xmax <= selection["xmin"] or xmin >= selection["xmax"] or zmax <= selection["zmin"] or zmin >= selection["zmax"]:
-        return False
-    owner_x, owner_z = max(xmin, selection["xmin"]), max(zmin, selection["zmin"])
-    return bounds["xmin"] <= owner_x < bounds["xmax"] and bounds["zmin"] <= owner_z < bounds["zmax"]
+@dataclass(frozen=True)
+class _CachedSpatialSource:
+    source: str
+    selected_rows: tuple[StaticSpatialRow, ...]
+    chunk: bytes
+    source_sha256: str
+    renderer_columns: Mapping[int, Mapping[int, bytes]]
+
+
+@dataclass(frozen=True)
+class _CachedSpatialSelection:
+    sources: tuple[_CachedSpatialSource, ...]
+    visible_static_ids: frozenset[int]
+    bottom_candidate_ids: frozenset[int]
+    surface_candidate_ids: frozenset[int]
+    selected_static_count: int
+    footprint_extras: int
+
+
+_MANIFEST_INDEX_CACHE = SceneSourceCacheSlot(
+    "scene-manifest-index", tuple, 256, 256 * 1024 * 1024
+)
+_SPATIAL_SELECTION_CACHE = SceneSourceCacheSlot(
+    "scene-spatial-selection-v2", _CachedSpatialSelection, 2, 128 * 1024 * 1024
+)
 
 
 class AssetRef(TypedDict):
@@ -77,7 +116,9 @@ class PlanInstance(TypedDict):
     submesh_slot_indices: list[int]
     material_refs: list[AssetRef | None]
     undrawn_submeshes: list[int]
+    selected_submeshes: NotRequired[list[int]]
     serialized_draw_parameters: NotRequired[list[float] | None]
+    source_uv_streams: NotRequired[list[SourceUvStream]]
 
 
 class WaterMeshAssetPlan(TypedDict):
@@ -189,6 +230,7 @@ class SceneExportPlan(TypedDict):
     bounds: Bounds
     category_filter: list[str]
     scene_manifests: list[str]
+    material_catalog: NotRequired[MaterialCatalogHandoff]
     terrain_surfaces: list[str]
     water_depth_surfaces: list[str]
     water_depth_instances: list[PlanInstance]
@@ -197,15 +239,142 @@ class SceneExportPlan(TypedDict):
     decal_manifest: str
     decal_materials: str
     instances: list[PlanInstance]
+    dynamic_geometry_instances: list[DynamicGeometryRow]
+    dynamic_geometry_pending: list[DynamicGeometryPending]
+    surface_effect_instances: list[PlanInstance]
     effect_instances: list[EffectInstance]
     effect_physics: EffectPhysicsPlan | None
+    direct_effect_renderers: list[DirectEffectRow]
+    direct_effect_pending: list[DirectEffectPending]
+    required_effect_mesh_paths: list[str]
     light_instances: list[LightPlanRow]
     water_geometry: list[WaterGeometryPlanRow]
     water_materials: list[WaterMaterialPlanRow]
+    water_transport_lighting: NotRequired[WaterTransportLightingRow]
+    water_transport_lighting_status: NotRequired[Literal["not_applicable"]]
+    fog_depth: NotRequired[FogDepthPlan]
+    scene_color_snapshot: NotRequired[SceneColorSnapshotPlan]
     pending: list[Pending]
     source_sha256: dict[str, str]
     summary: dict[str, int]
     required_resource_paths: list[str]
+    required_uv_streams: list[RequiredUvStreams]
+
+
+def _cached_spatial_selection(
+    instance_db: Path,
+    cache_root: Path,
+    vfs: Path,
+    entries: Mapping[str, VfsFile],
+    by_source: Mapping[str, tuple[StaticSpatialRow, ...]],
+    decal_source_names: frozenset[str],
+    bounds: Bounds,
+    selection: Bounds,
+    groups: set[str],
+    layers: Mapping[str, object],
+    allowed_categories: frozenset[str],
+    water_selected: bool,
+    effects_selected: bool,
+    include_decals: bool,
+    water_geometry_rows: list[WaterGeometryPlanRow],
+    read_chunk: Callable[[Path, VfsFile], bytes],
+    component_columns: Callable[[bytes], dict[int, dict[int, bytes]]],
+    iter_entities: Callable[[bytes], Iterable[Mapping[str, object]]],
+    check_cancelled: Callable[[], None] | None,
+) -> _CachedSpatialSelection:
+    """Select from persisted spatial records and decode only selected/decal sources."""
+    candidate_sources = tuple(sorted(set(by_source) | decal_source_names))
+    water_sources = tuple(sorted({
+        source
+        for row in water_geometry_rows
+        for source in (row["init_source_path"], row["streaming_source_path"])
+    }))
+    source_names = tuple(sorted(set(candidate_sources) | set(water_sources)))
+    source_paths = [instance_db]
+    entry_qualifiers: list[str] = []
+    for source in source_names:
+        entry = entries.get(source)
+        if entry is None:
+            raise FileNotFoundError(f"Spatial source is absent from VFS: {source}")
+        source_paths.append(vfs / "C3442D43" / f"{entry.file_chunk_md5_name}.chk")
+        entry_qualifiers.extend((source, entry.file_name, entry.file_chunk_md5_name,
+                                 entry.file_data_md5, str(entry.offset), str(entry.length)))
+    unique_sources = tuple({str(path): path for path in source_paths}.values())
+    parser_identity = spatial_parser_identity()
+    spatial_identities = {
+        source: spatial_source_identity(cache_root, vfs, entries[source], parser_identity)
+        for source in by_source
+    }
+    water_bounds = tuple(
+        cast(WorldBounds, tuple(row["world_bounds"]))
+        for row in water_geometry_rows
+    )
+    filter_qualifier = json.dumps({
+        "bounds": bounds,
+        "selection": selection,
+        "groups": sorted(groups),
+        "layers": {name: layers.get(name) for name in
+                   ("terrain", "instances", "roads", "vegetation", "water", "effects", "lights")},
+        "allowed_categories": sorted(allowed_categories),
+        "water_selected": water_selected,
+        "effects_selected": effects_selected,
+        "include_decals": include_decals,
+        "water_geometry": [
+            [row["entity_id"], row["init_source_path"], row["streaming_source_path"], row["world_bounds"]]
+            for row in water_geometry_rows
+        ],
+    }, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    qualifiers = ("scene-spatial-selection-v2", str(cache_root.resolve()), parser_identity,
+                  filter_qualifier, *entry_qualifiers,
+                  *(spatial_identities[source].metadata for source in sorted(spatial_identities)))
+
+    def build() -> _CachedSpatialSelection:
+        selected_sources: list[_CachedSpatialSource] = []
+        visible_static_ids: set[int] = set()
+        bottom_candidate_ids: set[int] = set()
+        surface_candidate_ids: set[int] = set()
+        selected_static_count = 0
+        footprint_extras = 0
+        for source in candidate_sources:
+            if check_cancelled is not None:
+                check_cancelled()
+            entry = entries[source]
+            chunk: bytes | None = None
+            rows = by_source.get(source, ())
+            if rows:
+                spatial_source = read_spatial_source_records(
+                    spatial_identities[source], vfs, entry, read_chunk, iter_entities, check_cancelled)
+                chunk = spatial_source.decoded_chunk
+                source_selection = select_static_source_rows(
+                    source, rows, spatial_source.records, bounds, selection, allowed_categories,
+                    water_bounds, effects_selected,
+                )
+                visible_static_ids.update(source_selection.visible_static_ids)
+                bottom_candidate_ids.update(source_selection.bottom_candidate_ids)
+                surface_candidate_ids.update(source_selection.surface_candidate_ids)
+                selected_static_count += source_selection.selected_static_count
+                footprint_extras += source_selection.footprint_extras
+                selected_rows = source_selection.selected_rows
+                del spatial_source
+            else:
+                selected_rows = ()
+            if selected_rows or source in decal_source_names:
+                if chunk is None:
+                    chunk = read_chunk(vfs, entry)
+                    if rows:
+                        require_spatial_source_version(spatial_identities[source])
+                all_columns = component_columns(chunk) if selected_rows else {}
+                selected_ids = {row[0] for row in selected_rows}
+                selected_columns = {entity_id: all_columns[entity_id] for entity_id in selected_ids
+                                    if entity_id in all_columns}
+                selected_sources.append(_CachedSpatialSource(
+                    source, selected_rows, chunk, hashlib.sha256(chunk).hexdigest(), selected_columns))
+        return _CachedSpatialSelection(
+            tuple(selected_sources), frozenset(visible_static_ids), frozenset(bottom_candidate_ids),
+            frozenset(surface_candidate_ids), selected_static_count, footprint_extras,
+        )
+
+    return cached_scene_source_value(_SPATIAL_SELECTION_CACHE, unique_sources, qualifiers, build)
 
 
 def _object(value: object, label: str) -> dict[str, object]:
@@ -237,8 +406,7 @@ def _water_global_resource_path(
     path_index: Mapping[bytes, tuple[str, ...]], map_id: str
 ) -> str | None:
     """Find this map's unique Global_Water_Config asset path by exact scene scope."""
-    if map_id not in ("map01", "map02"):
-        raise ValueError(f"WATER_GLOBAL_PATH_MAP_UNSUPPORTED map_id={map_id}")
+    validate_scene_id(map_id)
     scene_prefix = f"assets/beyond/scenes/lunascenes/{map_id.capitalize()}/releasedata/".casefold()
     suffix = "/waterdata/global_water_config.asset"
     matches: dict[str, str] = {}
@@ -313,14 +481,40 @@ def _asset(value: object, label: str) -> AssetRef:
 
 
 def _manifest_index(path: Path) -> tuple[
-    dict[str, set[tuple[str, int]]],
-    dict[tuple[str, int], tuple[AssetRef, Path]],
+    Mapping[str, frozenset[tuple[str, int]]],
+    Mapping[tuple[str, int], tuple[AssetRef, Path]],
 ]:
-    data = _object(json.loads(path.read_text(encoding="utf-8-sig")), str(path))
+    resolved = resolve_export_path(path)
+    containers, candidates = cached_scene_source_value(
+        _MANIFEST_INDEX_CACHE, (resolved,), (),
+        lambda: _build_manifest_index(resolved),
+    )
+    exports: dict[tuple[str, int], tuple[AssetRef, Path]] = {}
+    resolved_files = resolve_existing_export_files(tuple(candidate
+        for values in candidates.values() for _, candidate in values))
+    for key, values in candidates.items():
+        existing: list[tuple[AssetRef, Path]] = []
+        for asset, candidate in values:
+            resolved_candidate = resolved_files.get(str(candidate))
+            if resolved_candidate is not None:
+                existing.append((asset, resolved_candidate))
+        if existing:
+            paths = {value[1] for value in existing}
+            if len(paths) > 1:
+                raise ValueError(f"Mesh AssetRef has multiple export files: {key}")
+            exports[key] = existing[-1]
+    return containers, exports
+
+
+def _build_manifest_index(path: Path) -> tuple[
+    dict[str, set[tuple[str, int]]],
+    dict[tuple[str, int], list[tuple[AssetRef, Path]]],
+]:
+    data = _object(read_scene_manifest(path), str(path))
     if data.get("Format") != "EndfieldSceneProbe/1":
         raise ValueError(f"Unsupported SceneProbe manifest: {path}")
     containers: dict[str, set[tuple[str, int]]] = defaultdict(set)
-    exports: dict[tuple[str, int], tuple[AssetRef, Path]] = {}
+    exports: dict[tuple[str, int], list[tuple[AssetRef, Path]]] = defaultdict(list)
     for value in _list(data.get("Containers"), "SceneProbe.Containers"):
         row = _object(value, "SceneProbe container")
         if row.get("Asset") is not None and _object(row["Asset"], "container Asset").get("Type") in ("Mesh", "Material"):
@@ -331,18 +525,15 @@ def _manifest_index(path: Path) -> tuple[
         if row.get("File") is None:
             continue
         asset = _asset(row.get("Asset"), "mesh Asset")
-        file = resolve_export_path(path.parent / _text(row["File"], "mesh export File").replace("\\", "/"))
-        if file.is_file():
-            key = reference_key(asset)
-            if key in exports and exports[key][1] != file:
-                raise ValueError(f"Mesh AssetRef has multiple export files: {key}")
-            exports[key] = (asset, file)
+        file = path.parent / _text(row["File"], "mesh export File").replace("\\", "/")
+        key = reference_key(asset)
+        exports[key].append((asset, file))
     return containers, exports
 
 
 def _merge_mesh_exports(
     existing: dict[tuple[str, int], tuple[AssetRef, Path]],
-    incoming: dict[tuple[str, int], tuple[AssetRef, Path]],
+    incoming: Mapping[tuple[str, int], tuple[AssetRef, Path]],
 ) -> dict[tuple[str, int], tuple[AssetRef, Path]]:
     """Keep the first exact export and reject conflicting content for shared AssetRefs."""
     merged = dict(existing)
@@ -442,9 +633,28 @@ def prepare_scene_export_plan(
     if runtime.get("format") != "EndfieldRuntimeConfig/1" or canonical.get("format") != "EndfieldCanonicalExportJob/2":
         raise ValueError("Portable plan requires current runtime config and canonical export job")
     map_id = _text(canonical.get("map_id"), "canonical map_id")
-    if map_id not in ("map01", "map02"):
-        raise ValueError(f"Unsupported map: {map_id}")
+    validate_scene_id(map_id)
+    water_lighting = (read_water_transport_lighting(canonical["water_transport_lighting"])
+                      if "water_transport_lighting" in canonical else None)
+    if water_lighting is not None:
+        if water_lighting.map_id != map_id:
+            raise ValueError(f"Water transport map identity differs: plan={map_id}, lighting={water_lighting.map_id}")
+        if canonical.get("export_mode") != "blend":
+            raise ValueError("water_transport_lighting requires Blender scene export")
+    groups = {_text(value, "export group") for value in _list(canonical.get("export_groups"), "export_groups")}
+    layers = _object(canonical.get("layers"), "canonical layers")
+    scene_color_snapshot = (read_scene_color_snapshot(canonical["scene_color_snapshot"])
+                            if "scene_color_snapshot" in canonical else None)
+    if scene_color_snapshot is not None and (
+            canonical.get("export_mode") != "blend" or layers.get("effects") is not True
+            or not groups.intersection({"effects", "all"})):
+        raise ValueError("scene_color_snapshot requires Blender export with the effects layer and effects group")
+    water_selected = layers.get("water") is True and bool(groups & {"water", "all"})
+    lights_selected = layers.get("lights") is True and bool(groups & {"lighting", "all"})
+    if water_lighting is not None and (not water_selected or not lights_selected):
+        raise ValueError("water_transport_lighting requires selected water and lighting layers/groups")
     bounds = _bounds(canonical.get("bounds"))
+    fog_depth = read_fog_depth_options(canonical["fog_depth"]) if "fog_depth" in canonical else None
     selection = _bounds(canonical.get("selection_bounds", bounds))
     if not (selection["xmin"] <= bounds["xmin"] < bounds["xmax"] <= selection["xmax"]
             and selection["zmin"] <= bounds["zmin"] < bounds["zmax"] <= selection["zmax"]):
@@ -452,6 +662,9 @@ def prepare_scene_export_plan(
     paths = _object(runtime.get("paths"), "runtime paths")
     game_root = _runtime_path(paths.get("game_root"), "runtime game_root", runtime_path.parent)
     cache_root = _runtime_path(paths.get("cache_root"), "runtime cache_root", runtime_path.parent)
+    if _inside(cache_root, game_root):
+        raise ValueError(f"Runtime cache root must be outside the game installation: {cache_root}")
+    configure_scene_manifest_cache(cache_root)
     export_root = _runtime_path(paths.get("export_root"), "runtime export_root", runtime_path.parent)
     vfs = game_root / "Endfield_Data" / "StreamingAssets" / "VFS"
     if not vfs.is_dir():
@@ -482,7 +695,7 @@ def prepare_scene_export_plan(
     path_hash = _runtime_file(_object(bootstrap.get("main_paths"), "bootstrap main_paths").get("path"),
                               "StringPathHash", runtime_path.parent)
     manifest_paths: list[Path] = []
-    for candidate_map in (map_id, *(name for name in ("map01", "map02") if name != map_id)):
+    for candidate_map in (map_id, *(name for name in maps if name != map_id)):
         candidate = maps.get(candidate_map)
         if candidate is None:
             continue
@@ -493,6 +706,7 @@ def prepare_scene_export_plan(
     from endfield_scene_resources import supplemental_manifests
 
     manifest_paths.extend(supplemental_manifests(runtime_path, runtime))
+    manifest_paths = list(dict.fromkeys(manifest_paths))
     containers: dict[str, set[tuple[str, int]]] = defaultdict(set)
     mesh_exports: dict[tuple[str, int], tuple[AssetRef, Path]] = {}
     for manifest_path in manifest_paths:
@@ -500,11 +714,13 @@ def prepare_scene_export_plan(
         for name, refs in found_containers.items():
             containers[name].update(refs)
         mesh_exports = _merge_mesh_exports(mesh_exports, found_exports)
-    materials, textures = load_catalog(tuple(manifest_paths)) if manifest_paths else ({}, {})
-    groups = {_text(value, "export group") for value in _list(canonical.get("export_groups"), "export_groups")}
-    layers = _object(canonical.get("layers"), "canonical layers")
+    material_sources = capture_material_catalog_sources(tuple(manifest_paths))
+    catalog = load_planning_catalog(tuple(manifest_paths), cache_root)
+    materials, textures = catalog.materials, catalog.textures
+    uv_catalog = (load_mesh_uv_catalog(tuple(manifest_paths))
+                  if catalog.requires_extra_uv else MeshUvCatalog({}, {}))
+    required_uv: dict[str, set[int]] = defaultdict(set)
     terrain_selected = layers.get("terrain") is True and bool(groups & {"all", "terrain"})
-    water_selected = layers.get("water") is True and bool(groups & {"water", "all"})
     terrain_surface_values = map_paths.get("terrainSurfaces")
     terrain_surfaces = (_terrain_surface_roots(terrain_surface_values, runtime_path.parent)
                         if terrain_selected else [])
@@ -514,23 +730,24 @@ def prepare_scene_export_plan(
     )
     water_depth_missing = water_selected and not water_depth_surfaces
     allowed_categories = selected_static_categories(layers, groups)
+    effects_selected = layers.get("effects") is True and bool(groups & {"effects", "particle", "all"})
     include_decals = bool(groups & {"all", "terrain", "road", "unknown"}) and (
         layers.get("instances") is True or layers.get("terrain") is True or layers.get("roads") is True)
     with closing(sqlite3.connect(instance_db.as_uri() + "?mode=ro", uri=True)) as database:
         rows = database.execute(
             "SELECT entity_id,entity_base,matrix_type,matrix_col_major,source_path,group_index,entity_index,x,z "
-            "FROM instances WHERE matrix_type=18 OR (x>=? AND x<? AND z>=? AND z<?) ORDER BY source_path,entity_id",
+            "FROM instances WHERE matrix_type=18 OR (x>=? AND x<? AND z>=? AND z<?)",
             (bounds["xmin"], bounds["xmax"], bounds["zmin"], bounds["zmax"]),
         ).fetchall()
-    selected_static = []
-    selected_decals = []
+    selected_static: list[StaticSpatialRow] = []
+    selected_decals: list[tuple[int, str, bytes, str]] = []
     excluded_hlod = 0
     excluded_hlod_mesh = 0
     for entity_id, base, matrix_type, matrix_blob, source_path, group_index, entity_index, origin_x, origin_z in rows:
         if not isinstance(base, str) or not base:
             continue
         category, _ = classify_entity(base)
-        if matrix_type == 18 and (category in allowed_categories or water_selected):
+        if matrix_type == 18 and (category in allowed_categories or water_selected or effects_selected):
             if is_hlod_name(base):
                 if bounds["xmin"] <= origin_x < bounds["xmax"] and bounds["zmin"] <= origin_z < bounds["zmax"]:
                     excluded_hlod += 1
@@ -541,7 +758,7 @@ def prepare_scene_export_plan(
     entries = ({entry.file_name: entry for entry in load_group(vfs, "C3442D43").iter_files()}
                if selected_static or selected_decals or water_selected else {})
     path_index = build_path_id_index(path_hash) if selected_static or selected_decals or water_selected else {}
-    by_source: dict[str, list[tuple[object, ...]]] = defaultdict(list)
+    by_source: dict[str, list[StaticSpatialRow]] = defaultdict(list)
     for row in selected_static:
         by_source[cast(str, row[3])].append(row)
     decoded_decals: list[dict[str, object]] = []
@@ -550,9 +767,13 @@ def prepare_scene_export_plan(
         by_decal_source[cast(str, row[3])].append(row)
     source_hashes: dict[str, str] = {}
     ready: list[PlanInstance] = []
+    submesh_counts: dict[Path, int] = {}
+    surface_effect_instances: list[PlanInstance] = []
+    visible_surface_candidates: set[int] = set()
     water_depth_instances: list[PlanInstance] = []
     water_depth_pending: list[Pending] = []
     visible_static: set[int] = set()
+    bottom_candidates: set[int] = set()
     pending: list[Pending] = []
     required_resources: set[str] = set()
     if water_depth_missing:
@@ -568,19 +789,39 @@ def prepare_scene_export_plan(
     effect_instances: list[EffectInstance] = []
     effect_physics: EffectPhysicsPlan | None = None
     selected_effects = 0
-    if layers.get("effects") is True and groups & {"effects", "particle", "all"}:
-        from extractor_core.effects import read_dynamic_scene_effects
+    direct_effect_renderers: list[DirectEffectRow] = []
+    direct_effect_pending: list[DirectEffectPending] = []
+    required_effect_mesh_paths: set[str] = set()
+    selected_direct_effects = 0
+    from extractor_core.dynamic_renderer_cache import read_dynamic_scene_renderers_cached
 
-        def effect_cancelled() -> None:
-            if check_cancelled is not None:
-                check_cancelled()
+    def effect_cancelled() -> None:
+        if check_cancelled is not None:
+            check_cancelled()
 
-        inventory = read_dynamic_scene_effects(vfs, path_hash, effect_cancelled)[map_id]
+    direct_inventory = (read_dynamic_scene_renderers_cached(
+                            vfs, path_hash, map_id, cache_root / "dynamic_renderers", effect_cancelled)
+                        if effects_selected or allowed_categories else None)
+    if effects_selected:
+        from extractor_core.effects import read_dynamic_scene_effects_for_scene
+
+        inventory = read_dynamic_scene_effects_for_scene(vfs, path_hash, map_id, effect_cancelled)
         effect_plan = build_effect_plan(inventory, bounds, tuple(manifest_paths), materials, textures)
         effect_instances.extend(effect_plan.rows)
         pending.extend(cast(list[Pending], list(effect_plan.pending)))
         required_resources.update(effect_plan.required_resource_paths)
         selected_effects = effect_plan.selected_count
+        if direct_inventory is None:
+            raise ValueError("Selected effects require the Dynamic ECS source inventory")
+        direct_plan = build_direct_effect_plan(
+            direct_inventory, bounds, tuple(manifest_paths), materials,
+            scene_color_snapshot=scene_color_snapshot,
+        )
+        direct_effect_renderers.extend(direct_plan.rows)
+        direct_effect_pending.extend(direct_plan.pending)
+        required_resources.update(direct_plan.required_resource_paths)
+        required_effect_mesh_paths.update(direct_plan.required_effect_mesh_paths)
+        selected_direct_effects = direct_plan.selected_count
         if effect_instances:
             from extractor_core.physics import read_physics_settings
 
@@ -589,9 +830,10 @@ def prepare_scene_export_plan(
                               "path_id": physics.path_id, "gravity": list(physics.gravity)}
     light_instances: list[LightPlanRow] = []
     selected_lights = 0
-    if layers.get("lights") is True and groups & {"lighting", "all"}:
+    water_transport_dependency_lights = 0
+    light_inventory = None
+    if lights_selected:
         from extractor_core.lights import read_native_lights_cached
-
         light_inventory = read_native_lights_cached(vfs, path_hash, map_id,
                                                     cache_root / "native_lights", check_cancelled)
         light_plan = build_light_plan(light_inventory, bounds, selection)
@@ -603,6 +845,12 @@ def prepare_scene_export_plan(
             if previous is not None and previous != digest:
                 raise ValueError(f"Light source SHA-256 conflicts with scene source: {source}")
             source_hashes[source] = digest
+    water_dependency_plan = None
+    if water_lighting is not None:
+        if light_inventory is None:
+            raise ValueError("Water transport light inventory was not loaded for the selected lighting layer")
+        water_dependency_plan = build_water_transport_directional_dependency(
+            light_inventory, water_lighting.map_id, water_lighting.entity_id)
     water_geometry_rows: list[WaterGeometryPlanRow] = []
     water_material_rows: list[WaterMaterialPlanRow] = []
     if water_selected:
@@ -683,47 +931,55 @@ def prepare_scene_export_plan(
                 "reason": row.reason,
                 "detail": row.detail,
             } for row in material_plan.pending)
+    water_transport_field: dict[str, object] = {}
+    if water_lighting is not None:
+        unresolved_water = any(row.get("component") in {"water_geometry", "water_materials"}
+                               for row in pending)
+        has_water_scope = bool(water_geometry_rows or water_material_rows or unresolved_water)
+        if not has_water_scope:
+            water_transport_field["water_transport_lighting_status"] = "not_applicable"
+        else:
+            if water_dependency_plan is None:
+                raise ValueError("Water transport directional light dependency is unavailable")
+            matching_lights = [row for row in light_instances
+                               if row["map_id"] == water_lighting.map_id
+                               and row["entity_id"] == water_lighting.entity_id]
+            if len(matching_lights) > 1:
+                raise ValueError("Water transport directional light appears more than once in a scene batch")
+            if not matching_lights:
+                dependency = water_dependency_plan.rows[0]
+                light_instances.append(dependency)
+                water_transport_dependency_lights = 1
+                for source, digest in water_dependency_plan.source_sha256:
+                    previous = source_hashes.get(source)
+                    if previous is not None and previous != digest:
+                        raise ValueError(f"Water transport light source SHA-256 conflicts with scene source: {source}")
+                    source_hashes[source] = digest
+            water_transport_field["water_transport_lighting"] = serialize_water_transport_lighting(water_lighting)
+    spatial_selection = _cached_spatial_selection(
+        instance_db, cache_root, vfs, entries,
+        {source: tuple(rows) for source, rows in by_source.items()},
+        frozenset(by_decal_source), bounds, selection, groups, layers,
+        allowed_categories, water_selected, effects_selected, include_decals,
+        water_geometry_rows, read_chunk, component_columns,
+        cast(Callable[[bytes], Iterable[Mapping[str, object]]], iter_entities), check_cancelled,
+    )
+    visible_static = set(spatial_selection.visible_static_ids)
+    bottom_candidates = set(spatial_selection.bottom_candidate_ids)
+    visible_surface_candidates = set(spatial_selection.surface_candidate_ids)
+    selected_static_count = spatial_selection.selected_static_count
+    footprint_extras = spatial_selection.footprint_extras
+    cached_sources = {source.source: source for source in spatial_selection.sources}
     for source in sorted(set(by_source) | set(by_decal_source)):
         if check_cancelled is not None:
             check_cancelled()
-        if source not in entries:
-            raise FileNotFoundError(f"Selected current ECS source is absent from VFS: {source}")
-        chunk = read_chunk(vfs, entries[source])
-        selected_rows = []
-        if source in by_source:
-            spatial = {record["entity_id"]: record for record in iter_entities(chunk)}
-            for row in by_source[source]:
-                entity_id = cast(int, row[0])
-                record = spatial.get(entity_id)
-                if record is None or record["matrix_blob"] != row[2]:
-                    raise ValueError(f"Current spatial source differs from instance index: entity_id={entity_id}, source={source}")
-                footprint = record["world_bounds"]
-                if footprint is None:
-                    raise ValueError(f"Static entity has no source world bounds: entity_id={entity_id}, source={source}")
-                origin = (record["x"], record["z"])
-                visible = row[6] in allowed_categories and owns_static_footprint(bounds, selection, origin, footprint)
-                bottom = any(
-                    footprint[0] < min(water["world_bounds"][1], bounds["xmax"])
-                    and footprint[1] > max(water["world_bounds"][0], bounds["xmin"])
-                    and footprint[4] < min(water["world_bounds"][5], bounds["zmax"])
-                    and footprint[5] > max(water["world_bounds"][4], bounds["zmin"])
-                    and footprint[2] < water["world_bounds"][3]
-                    and footprint[3] > water["world_bounds"][2] - 150.0
-                    for water in water_geometry_rows
-                )
-                if visible or bottom:
-                    selected_rows.append(row)
-                if visible:
-                    visible_static.add(entity_id)
-                    selected_static_count += 1
-                    if not (selection["xmin"] <= origin[0] < selection["xmax"]
-                            and selection["zmin"] <= origin[1] < selection["zmax"]):
-                        footprint_extras += 1
-        if not selected_rows and source not in by_decal_source:
+        cached_source = cached_sources.get(source)
+        if cached_source is None:
             continue
-        digest = hashlib.sha256(chunk).hexdigest()
-        source_hashes[source] = digest
-        columns = component_columns(chunk) if selected_rows else {}
+        chunk = cached_source.chunk
+        selected_rows = sorted(cached_source.selected_rows, key=lambda row: row[0])
+        source_hashes[source] = cached_source.source_sha256
+        columns = cached_source.renderer_columns
         for entity_id, base, matrix_blob, _, group_index, entity_index, category in selected_rows:
             if check_cancelled is not None:
                 check_cancelled()
@@ -748,9 +1004,23 @@ def prepare_scene_export_plan(
                     excluded_hlod += 1
                     excluded_hlod_mesh += int(entity_id in visible_static)
                     continue
+                visible_pairs = [pair for pair in pairs if pair["mesh_path"] == mesh_path and not pair["flags"] & 1024]
+                selected_pair_paths: set[str] = set()
+                for pair in visible_pairs:
+                    refs = containers.get(pair["material_path"], set())
+                    record = materials.get(next(iter(refs))) if len(refs) == 1 else None
+                    if record is None:
+                        # Resolve missing role metadata before narrowing static FX dependencies.
+                        selected_pair_paths.add(pair["material_path"])
+                    elif record["Shader"].get("Name") == "HGRP/FogSimple":
+                        if entity_id in visible_surface_candidates:
+                            selected_pair_paths.add(pair["material_path"])
+                    elif entity_id in visible_static or entity_id in bottom_candidates:
+                        selected_pair_paths.add(pair["material_path"])
+                if not selected_pair_paths:
+                    continue
                 required_resources.add(mesh_path)
-                required_resources.update(pair["material_path"] for pair in pairs
-                                          if pair["mesh_path"] == mesh_path and not pair["flags"] & 1024)
+                required_resources.update(selected_pair_paths)
                 stem = mesh_path.split("##", 1)[0]
                 candidates = [mesh_exports[key] for key in containers.get(stem, set()) if key in mesh_exports
                               and mesh_exports[key][0]["Name"].casefold() == asset_name(mesh_path)]
@@ -762,11 +1032,15 @@ def prepare_scene_export_plan(
                     excluded_hlod_mesh += int(entity_id in visible_static)
                     continue
                 active = [pair for pair in pairs if pair["mesh_path"] == mesh_path]
-                count = obj_submesh_count(mesh_file)
+                if mesh_file not in submesh_counts:
+                    submesh_counts[mesh_file] = obj_submesh_count(mesh_file)
+                count = submesh_counts[mesh_file]
                 mapping = runtime_submesh_slots(count, tuple(pair["material_id"] for pair in active),
                                                 tuple(RuntimeDraw(pair["submesh"], pair["flags"]) for pair in active))
                 material_refs: list[AssetRef | None] = []
-                for slot_index in mapping.indices:
+                regular_submeshes: list[int] = []
+                fog_submeshes: list[int] = []
+                for submesh, slot_index in enumerate(mapping.indices):
                     if slot_index == len(active):
                         material_refs.append(None)
                         continue
@@ -778,30 +1052,57 @@ def prepare_scene_export_plan(
                     if key not in materials:
                         raise ValueError(f"Material record missing: {pair['material_path']}:{key}")
                     record = materials[key]
-                    if record["Name"].casefold().startswith(("m_fx_", "m_water", "m_shadow", "m_fog", "m_volume")):
-                        raise ValueError(f"Non-ordinary material requires separate renderer: {record['Name']}")
-                    for texture_slot in supported_slots(record):
+                    material_refs.append({"Source": record["Source"], "PathId": record["PathId"], "Name": record["Name"]})
+                    fog = record["Shader"].get("Name") == "HGRP/FogSimple"
+                    if fog:
+                        if entity_id not in visible_surface_candidates:
+                            continue
+                        from endfield_scene_fog_contract import validate_fog_material
+
+                        validate_fog_material(record, None)
+                        fog_submeshes.append(submesh)
+                        texture_slots = tuple(slot for slot in record["Textures"]
+                                              if slot["Property"] in ("_MainTex", "_NoiseTex"))
+                    else:
+                        if entity_id not in visible_static and entity_id not in bottom_candidates:
+                            continue
+                        if record["Name"].casefold().startswith(("m_fx_", "m_water", "m_shadow", "m_fog", "m_volume")):
+                            raise ValueError(f"Non-ordinary material requires separate renderer: {record['Name']}")
+                        regular_submeshes.append(submesh)
+                        texture_slots = supported_slots(record)
+                    for texture_slot in texture_slots:
                         texture = texture_slot["Texture"]
                         if texture is not None and reference_key(texture) not in textures:
                             raise ValueError(f"Required material texture missing: {record['Name']}:{texture_slot['Property']}")
-                    material_refs.append({"Source": record["Source"], "PathId": record["PathId"], "Name": record["Name"]})
+                channels = tuple(sorted({channel for submesh in regular_submeshes
+                                         if material_refs[submesh] is not None
+                                         for channel in required_uv_channels(materials[reference_key(material_refs[submesh])])}))
+                if channels:
+                    required_uv[mesh_path].update(channels)
+                mesh_uv_streams = source_uv_streams(uv_catalog, mesh_asset, channels)
                 matrix = list(struct.unpack("<16f", cast(bytes, matrix_blob)))
                 if not all(math.isfinite(value) for value in matrix):
                     raise ValueError("Entity matrix has non-finite components")
-                destination = ready if entity_id in visible_static else water_depth_instances
-                destination.append({"entity_id": cast(int, entity_id), "entity_base": cast(str, base), "category": cast(str, category),
-                              "source_path": source, "source_sha256": digest,
+                source_row: PlanInstance = {"entity_id": cast(int, entity_id), "entity_base": cast(str, base), "category": cast(str, category),
+                              "source_path": source, "source_sha256": cached_source.source_sha256,
                               "group_index": cast(int, group_index), "entity_index": cast(int, entity_index),
                               "matrix": matrix, "mesh_path": mesh_path, "mesh_file": str(mesh_file),
                               "mesh_asset": mesh_asset, "renderer_pairs": active,
                               "submesh_slot_indices": list(mapping.indices), "material_refs": material_refs,
                               "undrawn_submeshes": list(mapping.undrawn_submeshes),
+                              "source_uv_streams": mesh_uv_streams,
                               "serialized_draw_parameters": serialized_draw_parameters(renderer[18], cast(bytes, matrix_blob))
-                              if 18 in renderer else None})
-            except (ValueError, AmbiguousSubmeshSlots) as error:
-                failures = pending if entity_id in visible_static else water_depth_pending
+                              if 18 in renderer else None}
+                if regular_submeshes:
+                    destination = ready if entity_id in visible_static else water_depth_instances
+                    destination.append({**source_row, "selected_submeshes": regular_submeshes})
+                if fog_submeshes:
+                    surface_effect_instances.append({**source_row, "selected_submeshes": fog_submeshes})
+            except (ValueError, NotImplementedError, AmbiguousSubmeshSlots) as error:
+                failures = pending if entity_id in visible_static or entity_id in visible_surface_candidates else water_depth_pending
                 failures.append({"entity_id": cast(int, entity_id), "entity_base": cast(str, base),
-                                 "component": "static_mesh" if entity_id in visible_static else "water_depth_static",
+                                 "component": ("static_mesh" if entity_id in visible_static else
+                                                "surface_effect" if entity_id in visible_surface_candidates else "water_depth_static"),
                                  "reason": "exact_source_incomplete", "detail": str(error)})
         if source in by_decal_source:
             partner = source.replace("InitChunkData_", "StreamingChunkData_")
@@ -810,7 +1111,7 @@ def prepare_scene_export_plan(
             stream = read_chunk(vfs, entries[partner])
             source_hashes[partner] = hashlib.sha256(stream).hexdigest()
             rects, records = rect_decal_records(chunk), streaming_records(stream)
-            for entity_id, base, expected_matrix, _ in by_decal_source[source]:
+            for entity_id, base, expected_matrix, _ in sorted(by_decal_source[source], key=lambda row: row[0]):
                 if check_cancelled is not None:
                     check_cancelled()
                 try:
@@ -823,6 +1124,25 @@ def prepare_scene_export_plan(
                 except (KeyError, ValueError) as error:
                     pending.append({"entity_id": cast(int, entity_id), "entity_base": cast(str, base),
                                     "component": "projected_decal", "reason": "decal_decode_failed", "detail": str(error)})
+    dynamic_rows: list[DynamicGeometryRow] = []
+    dynamic_pending: list[DynamicGeometryPending] = []
+    dynamic_selected = 0
+    dynamic_duplicates = 0
+    if direct_inventory is not None and allowed_categories:
+        dynamic_plan = build_dynamic_geometry_plan(
+            direct_inventory, bounds, selection, allowed_categories, containers, mesh_exports,
+            materials, textures, tuple(ready), uv_catalog)
+        dynamic_rows.extend(dynamic_plan.rows)
+        dynamic_pending.extend(dynamic_plan.pending)
+        required_resources.update(dynamic_plan.required_resource_paths)
+        for source, digest in dynamic_plan.source_sha256:
+            if source in source_hashes and source_hashes[source] != digest:
+                raise ValueError(f"Dynamic source SHA-256 conflicts with scene source: {source}")
+            source_hashes[source] = digest
+        dynamic_selected = dynamic_plan.selected_count
+        dynamic_duplicates = len(dynamic_plan.excluded_static_duplicates)
+        for requirement in dynamic_plan.required_uv_streams:
+            required_uv[requirement["mesh_path"]].update(requirement["channels"])
     required_resources.update(str(row["material_path"]).replace("\\", "/").casefold() for row in decoded_decals)
     decal_rows, decal_material_rows, decal_pending = _decal_materials(decoded_decals, containers, materials, textures)
     pending.extend(decal_pending)
@@ -839,19 +1159,32 @@ def prepare_scene_export_plan(
         "water_depth_instances": water_depth_instances, "water_depth_pending": water_depth_pending,
         "terrain_details": [],
         "decal_manifest": str(decal_path), "decal_materials": str(decal_material_path),
-        "instances": ready, "effect_instances": effect_instances, "effect_physics": effect_physics,
+        "instances": ready, "surface_effect_instances": surface_effect_instances, "effect_instances": effect_instances, "effect_physics": effect_physics,
+        "dynamic_geometry_instances": dynamic_rows, "dynamic_geometry_pending": dynamic_pending,
+        "direct_effect_renderers": direct_effect_renderers, "direct_effect_pending": direct_effect_pending,
+        "required_effect_mesh_paths": sorted(required_effect_mesh_paths),
         "light_instances": light_instances,
         "water_geometry": water_geometry_rows,
         "water_materials": water_material_rows, "pending": pending, "source_sha256": source_hashes,
+        **water_transport_field,
+        **({"fog_depth": fog_depth} if fog_depth is not None else {}),
+        **({"scene_color_snapshot": scene_color_snapshot} if scene_color_snapshot is not None else {}),
         "required_resource_paths": sorted(required_resources),
+        "required_uv_streams": [{"mesh_path": path, "channels": sorted(channels)} for path, channels in sorted(required_uv.items())],
         "summary": {"selected_static": selected_static_count - excluded_hlod_mesh,
                     "footprint_overlap_extras": footprint_extras,
                     "excluded_hlod": excluded_hlod,
-                    "ready_static": len(ready),
+                    "ready_static": len(ready), "ready_surface_effects": len(surface_effect_instances),
+                    "selected_dynamic_geometry": dynamic_selected, "ready_dynamic_geometry": len(dynamic_rows),
+                    "pending_dynamic_geometry": len(dynamic_pending), "excluded_dynamic_static_duplicates": dynamic_duplicates,
                     "selected_effects": selected_effects, "ready_effects": len(effect_instances),
+                    "selected_direct_effects": selected_direct_effects, "ready_direct_effects": len(direct_effect_renderers),
+                    "pending_direct_effects": len(direct_effect_pending),
                     "selected_lights": selected_lights, "ready_lights": len(light_instances),
+                    "water_transport_dependency_lights": water_transport_dependency_lights,
                     "selected_decals": len(selected_decals), "ready_decals": len(decal_rows), "pending": len(pending)},
     }
+    result["material_catalog"] = build_material_catalog_handoff(result, materials, textures, material_sources)
     decal_payload = {"format": "EndfieldProjectedDecals/1", "instances_db": str(instance_db),
                      "path_hash_sha256": hashlib.sha256(path_hash.read_bytes()).hexdigest(),
                      "bounds": [bounds[name] for name in ("xmin", "xmax", "zmin", "zmax")],
@@ -863,6 +1196,7 @@ def prepare_scene_export_plan(
             with path.open("x", encoding="utf-8") as handle:
                 created.append(path)
                 json.dump(payload, handle, indent=2)
+        require_material_catalog_sources(material_sources)
     except OSError:
         for path in created:
             path.unlink(missing_ok=True)
@@ -873,17 +1207,54 @@ def prepare_scene_export_plan(
 def load_scene_export_plan(path: Path) -> SceneExportPlan:
     """Validate the versioned plan before a Blender worker uses its paths."""
     source = _object(json.loads(_file(path, "scene export plan").read_text(encoding="utf-8-sig")), "scene export plan")
-    if source.get("format") != FORMAT or source.get("map_id") not in ("map01", "map02"):
-        raise ValueError("Unsupported portable scene plan format or map")
+    if source.get("format") != FORMAT:
+        raise ValueError("Unsupported portable scene plan format")
+    validate_scene_id(_text(source.get("map_id"), "scene map_id"))
+    lighting: WaterTransportLighting | None = None
+    if "water_transport_lighting" in source:
+        lighting = read_water_transport_lighting(source["water_transport_lighting"])
+    lighting_status = source.get("water_transport_lighting_status")
+    if lighting_status is not None and lighting_status != "not_applicable":
+        raise ValueError(f"Unsupported water transport lighting status: {lighting_status!r}")
+    if lighting is not None and lighting_status is not None:
+        raise ValueError("Water transport lighting cannot be both active and not_applicable")
+    if "fog_depth" in source:
+        source["fog_depth"] = read_fog_depth_options(source["fog_depth"])
+    if "scene_color_snapshot" in source:
+        source["scene_color_snapshot"] = read_scene_color_snapshot(source["scene_color_snapshot"])
+        selected_categories = _list(source.get("category_filter"), "scene export category_filter")
+        if not any(category in ("all", "effects") for category in selected_categories):
+            raise ValueError("scene_color_snapshot plan requires the effects export group")
     source.setdefault("water_geometry", [])
     source.setdefault("water_materials", [])
     source.setdefault("water_depth_surfaces", [])
     source.setdefault("water_depth_instances", [])
     source.setdefault("water_depth_pending", [])
+    source.setdefault("surface_effect_instances", [])
+    source.setdefault("dynamic_geometry_instances", [])
+    source.setdefault("dynamic_geometry_pending", [])
+    source.setdefault("required_uv_streams", [])
     source.setdefault("effect_instances", [])
     source.setdefault("effect_physics", None)
+    source.setdefault("direct_effect_renderers", [])
+    source.setdefault("direct_effect_pending", [])
+    source.setdefault("required_effect_mesh_paths", [])
     source.setdefault("light_instances", [])
     _bounds(source.get("bounds"))
+    water_geometry_rows = _list(source["water_geometry"], "scene export water geometry")
+    water_material_rows = _list(source["water_materials"], "scene export water materials")
+    pending_rows = _list(source.get("pending", []), "scene export pending")
+    water_pending = any(isinstance(value, dict)
+                        and value.get("component") in {"water_geometry", "water_materials"}
+                        for value in pending_rows)
+    has_water_scope = bool(water_geometry_rows or water_material_rows or water_pending)
+    if lighting is not None and lighting.map_id != source["map_id"]:
+        raise ValueError(f"Water transport map identity differs: plan={source['map_id']}, lighting={lighting.map_id}")
+    if lighting is not None and not has_water_scope:
+        raise ValueError("Active water transport lighting requires water geometry or explicit water pending rows")
+    if lighting_status == "not_applicable":
+        if has_water_scope:
+            raise ValueError("not_applicable water transport status conflicts with water geometry or pending rows")
     for name in ("scene_manifests", "terrain_surfaces", "water_depth_surfaces", "instances", "pending", "category_filter"):
         _list(source.get(name), f"scene export plan.{name}")
     details = _list(source.get("terrain_details", []), "scene export plan.terrain_details")
@@ -907,15 +1278,45 @@ def load_scene_export_plan(path: Path) -> SceneExportPlan:
         _text(name, "source path")
         if not isinstance(digest, str) or len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
             raise ValueError(f"Invalid source SHA-256: source={name}")
-    seen: set[int] = set()
+    seen: set[int | str] = set()
     validate_light_plan_rows(source["light_instances"], str(source["map_id"]), hashes)
-    for value in (*_list(source["instances"], "scene export instances"),
-                  *_list(source["water_depth_instances"], "scene export water depth instances")):
+    if lighting is not None:
+        matches = [row for row in source["light_instances"]
+                   if row["map_id"] == lighting.map_id and row["entity_id"] == lighting.entity_id]
+        if len(matches) != 1 or matches[0]["light_type"] != 1:
+            raise ValueError("Water transport Sun must identify exactly one directional light in this scene plan")
+    instance_rows = (*_list(source["instances"], "scene export instances"),
+                     *_list(source["water_depth_instances"], "scene export water depth instances"))
+    surface_rows = _list(source["surface_effect_instances"], "scene export surface effects")
+    surface_ids: set[int | str] = set()
+    dynamic_rows = _list(source["dynamic_geometry_instances"], "scene dynamic geometry")
+    dynamic_keys: set[int | str] = set()
+    for ids, value in (*((seen, row) for row in instance_rows), *((surface_ids, row) for row in surface_rows),
+                       *((dynamic_keys, row) for row in dynamic_rows)):
         row = _object(value, "scene export instance")
-        entity_id = row.get("entity_id")
-        if type(entity_id) is not int or entity_id in seen:
-            raise ValueError(f"Scene instance ID is invalid or repeated: {entity_id}")
-        seen.add(entity_id)
+        dynamic = ids is dynamic_keys
+        entity_id = row.get("source_key") if dynamic else row.get("entity_id")
+        if dynamic:
+            _text(entity_id, "dynamic source_key")
+            if "entity_id" in row or "entity_index" in row:
+                raise ValueError("Dynamic geometry must preserve source record identity without fabricated entity IDs")
+            for name in ("chunk_id", "init_scene_index", "record_index", "common_instance_offset",
+                         "renderer_reference_offset", "runtime_draw_offset"):
+                if type(row.get(name)) is not int or cast(int, row[name]) < 0:
+                    raise ValueError(f"Invalid dynamic source provenance: field={name}, source_key={entity_id}")
+            references = _list(row.get("reference_keys"), "dynamic main reference_keys")
+            if not references or any(not isinstance(key, str) or not key for key in references):
+                raise ValueError(f"Dynamic geometry requires actual main reference keys: source_key={entity_id}")
+            if entity_id != f"{row.get('source_path')}:{row['group_index']}:{row['record_index']}":
+                raise ValueError(f"Dynamic source key differs from source group/record: source_key={entity_id}")
+            if (row.get("activation_status") != "serialized_initial_not_runtime"
+                    or row.get("lod_selection") != "authored_base_lod_reference_not_runtime_camera_selection"):
+                raise ValueError(f"Dynamic geometry must disclose activation and reference LOD limits: source_key={entity_id}")
+        elif type(entity_id) is not int:
+            raise ValueError(f"Scene instance ID is invalid: {entity_id}")
+        if entity_id in ids:
+            raise ValueError(f"Scene instance identity is repeated: {entity_id}")
+        ids.add(entity_id)
         entity_base = _text(row.get("entity_base"), "scene entity_base")
         _text(row.get("category"), "scene category")
         mesh_path = _text(row.get("mesh_path"), "scene mesh_path")
@@ -926,7 +1327,7 @@ def load_scene_export_plan(path: Path) -> SceneExportPlan:
         source_path = _text(row.get("source_path"), "scene source_path")
         if row.get("source_sha256") != hashes.get(source_path):
             raise ValueError(f"Scene source hash mismatch: entity_id={entity_id}, source={source_path}")
-        for name in ("group_index", "entity_index"):
+        for name in (("group_index",) if dynamic else ("group_index", "entity_index")):
             if type(row.get(name)) is not int or cast(int, row[name]) < 0:
                 raise ValueError(f"Scene {name} must be nonnegative integer: entity_id={entity_id}")
         _file(row.get("mesh_file"), "scene mesh_file")
@@ -934,6 +1335,22 @@ def load_scene_export_plan(path: Path) -> SceneExportPlan:
         if len(matrix) != 16 or any(type(value) not in (int, float) or not math.isfinite(float(value)) for value in matrix):
             raise ValueError(f"Scene instance has invalid 16-float matrix: entity_id={entity_id}")
         parameters = row.get("serialized_draw_parameters")
+        for value in _list(row.get("source_uv_streams", []), "source UV streams"):
+            uv = _object(value, "source UV stream")
+            if uv.get("channel") not in (1, 2) or type(uv.get("channel")) is not int:
+                raise ValueError(f"Invalid ordinary source UV channel: placement={entity_id}")
+            if type(uv.get("vertex_count")) is not int or uv["vertex_count"] <= 0:
+                raise ValueError(f"Invalid ordinary source UV vertex count: placement={entity_id}")
+            _file(uv.get("source_obj_file"), "source UV exact OBJ")
+            _file(uv.get("source_manifest"), "source UV manifest")
+            if uv.get("components") == 0 and type(uv.get("components")) is int:
+                if uv.get("status") != "absent_source_zero_reference" or uv.get("file") is not None:
+                    raise ValueError(f"Missing source UV channel must disclose zero-reference status: placement={entity_id}")
+            elif uv.get("components") == 2 and type(uv.get("components")) is int:
+                if uv.get("status") != "source_stream" or _file(uv.get("file"), "source UV stream file").stat().st_size != uv["vertex_count"] * 8:
+                    raise ValueError(f"Source UV file metadata differs: placement={entity_id}")
+            else:
+                raise ValueError(f"Unsupported source UV components: placement={entity_id}")
         if parameters is not None:
             parameters = _list(parameters, "serialized draw parameters")
             if len(parameters) != 20 or any(type(value) not in (int, float) or not math.isfinite(float(value)) for value in parameters):
@@ -954,15 +1371,75 @@ def load_scene_export_plan(path: Path) -> SceneExportPlan:
                 raise ValueError(f"Renderer mesh differs from selected primary mesh: entity_id={entity_id}")
         if not pairs:
             raise ValueError(f"Scene renderer pairs are empty: entity_id={entity_id}")
+        if dynamic:
+            original = _list(row.get("source_renderer_pairs"), "dynamic source_renderer_pairs")
+            indices = _list(row.get("source_draw_indices"), "dynamic source_draw_indices")
+            if len(indices) != len(pairs) or not original:
+                raise ValueError(f"Dynamic selected draw indices differ from source evidence: source_key={entity_id}")
+            original_pairs = [_object(value, "dynamic original draw") for value in original]
+            base_path = primary_visible_mesh(tuple(
+                (_text(value.get("mesh_path"), "dynamic original mesh"),
+                 RuntimeDraw(value["submesh"], value["flags"])) for value in original_pairs
+                if type(value.get("flags")) is int and type(value.get("submesh")) is int
+                and "/effects/" not in _text(value.get("mesh_path"), "dynamic original mesh")
+                and "/effects/" not in _text(value.get("material_path"), "dynamic original material")
+                and not is_hlod_name(_text(value.get("mesh_path"), "dynamic original mesh"))))
+            if base_path != mesh_path:
+                raise ValueError(f"Dynamic selected mesh differs from authored base LOD: source_key={entity_id}")
+            exclusions = _list(row.get("excluded_source_draw_roles", []), "dynamic excluded source draw roles")
+            for value in exclusions:
+                exclusion = _object(value, "dynamic role exclusion")
+                index = exclusion.get("source_draw_index")
+                if type(index) is not int or not 0 <= index < len(original) or index in indices:
+                    raise ValueError(f"Invalid dynamic role exclusion index: source_key={entity_id}, index={index}")
+                evidence = original_pairs[index]
+                if any(exclusion.get(name) != evidence.get(name) for name in ("mesh_path", "material_path")):
+                    raise ValueError(f"Dynamic role exclusion differs from source draw: source_key={entity_id}, index={index}")
+                _text(exclusion.get("role"), "dynamic excluded source role")
+            for index, pair in zip(indices, pairs, strict=True):
+                if type(index) is not int or not 0 <= index < len(original):
+                    raise ValueError(f"Invalid dynamic source draw index: source_key={entity_id}, index={index}")
+                evidence = _object(original[index], "dynamic source draw")
+                current = _object(pair, "dynamic selected draw")
+                if any(evidence.get(name) != current[name] for name in ("mesh_path", "material_path", "submesh", "flags")):
+                    raise ValueError(f"Selected dynamic draw differs from original source: source_key={entity_id}, index={index}")
+                if current["flags"] & 1024:
+                    raise ValueError(f"Dynamic geometry includes a shadow-only selected draw: source_key={entity_id}")
+                for name in ("lod_min_squared", "lod_max_squared"):
+                    number = evidence.get(name)
+                    if type(number) not in (int, float) or not math.isfinite(float(number)):
+                        raise ValueError(f"Invalid dynamic source LOD value: source_key={entity_id}, field={name}")
         for slot in slots:
             if type(slot) is not int or not 0 <= slot <= len(pairs):
                 raise ValueError(f"Invalid scene material slot index: entity_id={entity_id}, slot={slot}")
         for ref in refs:
             if ref is not None:
                 _asset(ref, "scene material_ref")
+        row.setdefault("selected_submeshes", list(range(len(slots))))
+        selected = _list(row["selected_submeshes"], "scene selected_submeshes")
+        if not selected or any(type(index) is not int or index < 0 or index >= len(slots) for index in selected):
+            raise ValueError(f"Invalid selected source submesh: entity_id={entity_id}")
+        if len(set(cast(list[int], selected))) != len(selected):
+            raise ValueError(f"Repeated selected source submesh: entity_id={entity_id}")
         undrawn = _list(row.get("undrawn_submeshes"), "scene undrawn_submeshes")
         if any(type(index) is not int or index < 0 or index >= len(slots) for index in undrawn):
             raise ValueError(f"Invalid undrawn submesh: entity_id={entity_id}")
+    ordinary_by_id = {_object(value, "instance")["entity_id"]: _object(value, "instance") for value in instance_rows}
+    for value in surface_rows:
+        surface = _object(value, "surface effect")
+        ordinary = ordinary_by_id.get(surface["entity_id"])
+        if ordinary is not None:
+            identity_fields = ("source_path", "source_sha256", "group_index", "entity_index", "matrix",
+                               "mesh_asset", "mesh_file", "renderer_pairs", "material_refs", "submesh_slot_indices",
+                               "undrawn_submeshes", "serialized_draw_parameters")
+            if any(surface.get(name) != ordinary.get(name) for name in identity_fields):
+                raise ValueError(f"Split surface source differs: entity_id={surface['entity_id']}")
+            if set(cast(list[int], surface["selected_submeshes"])) & set(cast(list[int], ordinary["selected_submeshes"])):
+                raise ValueError(f"Split surface source submeshes overlap: entity_id={surface['entity_id']}")
+    if "ready_surface_effects" in _object(source.get("summary"), "scene summary"):
+        count = _object(source["summary"], "scene summary")["ready_surface_effects"]
+        if type(count) is not int or count != len(surface_rows):
+            raise ValueError("Scene summary differs from ready surface effect rows")
     geometry_rows = _list(source["water_geometry"], "scene export water_geometry")
     material_rows = _list(source["water_materials"], "scene export water_materials")
     required_path_values = _list(source.get("required_resource_paths", []), "required_resource_paths")
@@ -970,6 +1447,12 @@ def load_scene_export_plan(path: Path) -> SceneExportPlan:
         _text(value, "required_resource_paths item").replace("\\", "/").casefold()
         for value in required_path_values
     }
+    for value in _list(source["required_uv_streams"], "required UV streams"):
+        requirement = _object(value, "required UV stream")
+        path = _text(requirement.get("mesh_path"), "required UV mesh_path")
+        channels = _list(requirement.get("channels"), "required UV channels")
+        if path not in required_water_paths or not channels or len(set(channels)) != len(channels) or any(type(channel) is not int or channel not in (1, 2) for channel in channels):
+            raise ValueError(f"Required ordinary UV streams must identify exact requested mesh channels: requirement={requirement}")
     effect_rows = _list(source["effect_instances"], "scene export effect_instances")
     if effect_rows:
         physics = _object(source["effect_physics"], "effect_physics; regenerate legacy FX plans to capture game gravity")
@@ -981,6 +1464,16 @@ def load_scene_export_plan(path: Path) -> SceneExportPlan:
         if not isinstance(digest, str) or len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
             raise ValueError("effect_physics.source_sha256 must contain the source file SHA256")
     manifest_names = {str(_file(value, "scene manifest")) for value in source["scene_manifests"]}
+    validate_direct_effect_rows(source["direct_effect_renderers"], frozenset(manifest_names), frozenset(required_water_paths))
+    stream_paths = _list(source["required_effect_mesh_paths"], "required_effect_mesh_paths")
+    if any(not isinstance(path, str) or path not in required_water_paths for path in stream_paths):
+        raise ValueError("FX source mesh stream paths must occur in required_resource_paths")
+    for value in _list(source["direct_effect_pending"], "direct_effect_pending"):
+        row = _object(value, "Direct FX pending")
+        for field in ("source_key", "component", "reason", "detail"):
+            _text(row.get(field), f"Direct FX pending.{field}")
+        if type(row.get("source_pair_index")) is not int or row["source_pair_index"] < 0:
+            raise ValueError("Direct FX pending requires a nonnegative source pair index")
     seen_effects: set[int] = set()
     for value in effect_rows:
         row = _object(value, "effect instance")
@@ -1078,6 +1571,21 @@ def load_scene_export_plan(path: Path) -> SceneExportPlan:
         for name in ("entity_base", "component", "reason", "detail"):
             _text(row.get(name), f"pending.{name}")
     summary = _object(source.get("summary"), "scene summary")
+    dynamic_pending = _list(source["dynamic_geometry_pending"], "dynamic geometry pending")
+    for value in dynamic_pending:
+        row = _object(value, "dynamic geometry pending row")
+        for name in ("source_key", "component", "reason", "detail"):
+            _text(row.get(name), f"dynamic geometry pending.{name}")
+    if dynamic_rows or dynamic_pending or "selected_dynamic_geometry" in summary:
+        for name in ("selected_dynamic_geometry", "ready_dynamic_geometry", "pending_dynamic_geometry",
+                     "excluded_dynamic_static_duplicates"):
+            if type(summary.get(name)) is not int or summary[name] < 0:
+                raise ValueError(f"Invalid dynamic geometry summary: field={name}")
+        if (summary["ready_dynamic_geometry"] != len(dynamic_rows)
+                or summary["pending_dynamic_geometry"] != len(dynamic_pending)
+                or summary["selected_dynamic_geometry"] != len(dynamic_rows) + len(dynamic_pending)
+                + summary["excluded_dynamic_static_duplicates"]):
+            raise ValueError("Scene summary differs from ordinary dynamic geometry rows")
     for name in ("selected_static", "ready_static", "selected_decals", "ready_decals", "pending"):
         if type(summary.get(name)) is not int or cast(int, summary[name]) < 0:
             raise ValueError(f"Invalid scene summary count: {name}")
@@ -1090,4 +1598,12 @@ def load_scene_export_plan(path: Path) -> SceneExportPlan:
             raise ValueError("Scene summary requires integer selected_effects and ready_effects")
         if summary["selected_effects"] < 0 or summary["ready_effects"] != len(effect_rows):
             raise ValueError("Scene summary differs from selected/ready effect rows")
+    if source["direct_effect_renderers"] or source["direct_effect_pending"] or "selected_direct_effects" in summary:
+        for name in ("selected_direct_effects", "ready_direct_effects", "pending_direct_effects"):
+            if type(summary.get(name)) is not int or summary[name] < 0:
+                raise ValueError(f"Invalid direct FX scene summary count: field={name}")
+        if (summary["ready_direct_effects"] != len(source["direct_effect_renderers"])
+                or summary["pending_direct_effects"] != len(source["direct_effect_pending"])
+                or summary["selected_direct_effects"] != summary["ready_direct_effects"] + summary["pending_direct_effects"]):
+            raise ValueError("Scene summary differs from direct source FX draw rows")
     return cast(SceneExportPlan, source)

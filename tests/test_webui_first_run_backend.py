@@ -21,6 +21,7 @@ from tests import SCHEMA_ROOT
 from launch_webui import (
     PathPickerHandler,
     PathPickerServer,
+    frontend_command,
     resolve_deferred_runtime_paths,
     validate_selected_path,
 )
@@ -31,7 +32,7 @@ from webui_first_run_contract_v1 import (
     validate_first_run_paths,
 )
 from webui_first_run_coordinator import build_first_run_command
-from webui_first_run_coordinator import FirstRunCoordinator
+from webui_first_run_coordinator import FirstRunCoordinator, FirstRunCoordinatorError
 
 
 class WebUIFirstRunBackendTests(unittest.TestCase):
@@ -626,20 +627,17 @@ class WebUIFirstRunBackendTests(unittest.TestCase):
                 self.assertTrue(status["resume_available"])
                 self.assertTrue(status["actions"]["can_resume"])
 
-    def test_dependency_process_tree_can_be_cancelled_and_status_is_observable(self) -> None:
+    def test_shutdown_cancels_first_run_process_tree_and_status_is_observable(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             game = self.make_game_root(root)
             export = root / "exports"
             cache = root / "cache"
             export.mkdir()
-            requirements = root / "requirements.txt"
-            requirements.write_text("fixture\n", encoding="utf-8")
             pid_file = root / "child.pid"
             coordinator = FirstRunCoordinator(
                 extractor_root=root,
                 interpreter_provider=lambda: Path(sys.executable),
-                requirements_path=requirements,
             )
             original_spawn = coordinator._spawn_process
             spawned: list[subprocess.Popen[str]] = []
@@ -662,18 +660,15 @@ class WebUIFirstRunBackendTests(unittest.TestCase):
                         "game_root": str(game),
                         "export_root": str(export),
                         "cache_root": str(cache),
-                        "run_name": "cancel-dependencies",
+                        "run_name": "cancel-first-run",
                     }
                 )
                 deadline = time.monotonic() + 10
                 while not pid_file.is_file() and time.monotonic() < deadline:
                     time.sleep(0.05)
                 self.assertTrue(pid_file.is_file())
-                requested = coordinator.cancel()
-                self.assertTrue(requested["cancel_requested"])
-                self.assertFalse(requested["actions"]["can_cancel"])
-                while coordinator._thread and coordinator._thread.is_alive() and time.monotonic() < deadline:
-                    time.sleep(0.05)
+                coordinator.shutdown()
+                self.assertFalse(coordinator._thread.is_alive())
 
             self.assertTrue(spawned)
             self.assertIsNotNone(spawned[0].poll())
@@ -698,6 +693,127 @@ class WebUIFirstRunBackendTests(unittest.TestCase):
             self.assertEqual("cancelled", final["state"])
             self.assertFalse(final["cancel_requested"])
             self.assertTrue(final["error"]["retryable"])
+            with self.assertRaises(FirstRunCoordinatorError) as closed:
+                coordinator.submit(
+                    {
+                        "format": REQUEST_FORMAT,
+                        "game_root": str(game),
+                        "export_root": str(export),
+                        "cache_root": str(cache),
+                        "run_name": "cancel-first-run",
+                    }
+                )
+            self.assertEqual("coordinator_closed", closed.exception.code)
+
+    def test_first_run_offline_dependency_check_never_spawns_installer(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            game = self.make_game_root(root)
+            export = root / "exports"
+            export.mkdir()
+            requirements = root / "requirements.txt"
+            requirements.write_text("endfield-test-package-that-does-not-exist==99\n", encoding="utf-8")
+            coordinator = FirstRunCoordinator(
+                extractor_root=root,
+                interpreter_provider=lambda: Path(sys.executable),
+                requirements_path=requirements,
+            )
+            with mock.patch.object(coordinator, "_spawn_process") as spawn:
+                coordinator.submit(
+                    {
+                        "format": REQUEST_FORMAT,
+                        "game_root": str(game),
+                        "export_root": str(export),
+                        "cache_root": str(root / "cache"),
+                        "run_name": "offline-dependency-check",
+                    }
+                )
+                deadline = time.monotonic() + 10
+                while coordinator.status()["state"] in {"queued", "running"} and time.monotonic() < deadline:
+                    time.sleep(0.05)
+                status = coordinator.status()
+                self.assertEqual("failed", status["state"])
+                self.assertEqual("python_dependencies_not_prepared", status["error"]["code"])
+                self.assertIn("setup_development_environment.ps1", status["error"]["message"])
+                spawn.assert_not_called()
+            coordinator.shutdown()
+
+    def test_frontend_preview_retains_vite_api_server_and_dev_is_explicit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            webui = Path(temporary)
+            (webui / "package.json").write_text("{}", encoding="utf-8")
+            (webui / "node_modules").mkdir()
+            (webui / "dist").mkdir()
+            (webui / "dist" / "index.html").write_text("<html></html>", encoding="utf-8")
+
+            self.assertEqual(
+                ["npm.cmd", "run", "preview", "--", "--port", "4174"],
+                frontend_command("npm.cmd", webui, development=False, port=4174),
+            )
+            self.assertEqual(
+                ["npm.cmd", "run", "dev", "--", "--port", "5173"],
+                frontend_command("npm.cmd", webui, development=True, port=5173),
+            )
+            (webui / "dist" / "index.html").unlink()
+            with self.assertRaisesRegex(RuntimeError, "setup_development_environment.ps1"):
+                frontend_command("npm.cmd", webui, development=False, port=4174)
+
+    def test_shutdown_reports_timeout_and_worker_can_finish_after_release(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            game = self.make_game_root(root)
+            export = root / "exports"
+            cache = root / "cache"
+            export.mkdir()
+            entered = threading.Event()
+            release = threading.Event()
+
+            def blocked_interpreter_provider() -> Path:
+                entered.set()
+                release.wait()
+                return Path(sys.executable)
+
+            coordinator = FirstRunCoordinator(
+                extractor_root=root,
+                interpreter_provider=blocked_interpreter_provider,
+            )
+            coordinator.submit(
+                {
+                    "format": REQUEST_FORMAT,
+                    "game_root": str(game),
+                    "export_root": str(export),
+                    "cache_root": str(cache),
+                    "run_name": "shutdown-timeout",
+                }
+            )
+            worker = coordinator._thread
+            self.assertIsNotNone(worker)
+            self.assertTrue(entered.wait(timeout=5))
+
+            try:
+                with mock.patch("webui_first_run_coordinator.FIRST_RUN_SHUTDOWN_TIMEOUT_SECONDS", 0.01):
+                    with self.assertRaises(FirstRunCoordinatorError) as timeout:
+                        coordinator.shutdown()
+                self.assertEqual("shutdown_timeout", timeout.exception.code)
+                self.assertTrue(worker.is_alive())
+                self.assertTrue(coordinator.status()["cancel_requested"])
+            finally:
+                release.set()
+                worker.join(timeout=5)
+
+            self.assertFalse(worker.is_alive())
+            self.assertEqual("cancelled", coordinator.status()["state"])
+            with self.assertRaises(FirstRunCoordinatorError) as closed:
+                coordinator.submit(
+                    {
+                        "format": REQUEST_FORMAT,
+                        "game_root": str(game),
+                        "export_root": str(export),
+                        "cache_root": str(cache),
+                        "run_name": "shutdown-timeout",
+                    }
+                )
+            self.assertEqual("coordinator_closed", closed.exception.code)
 
     def test_resumed_event_sequences_are_paged_by_file_order(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -754,12 +870,18 @@ class WebUIFirstRunBackendTests(unittest.TestCase):
             def cancel(self):
                 return {"format": "EndfieldWebUIFirstRunStatus/1", "state": "cancelled", "ready": False}
 
+            def shutdown(self):
+                return None
+
         class FakeExportCoordinator:
             def validate(self, payload):
                 return {"status": "valid", "payload": payload}
 
             def submit(self, payload):
                 return {"job_id": "job", "payload": payload}
+
+            def shutdown(self):
+                return None
 
         server = PathPickerServer(("127.0.0.1", 0), PathPickerHandler)
         server.token = "test-token"

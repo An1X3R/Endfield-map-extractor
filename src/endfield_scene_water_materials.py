@@ -9,9 +9,11 @@ import re
 from collections import defaultdict
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from endfield_scene_io import read_scene_manifest
 from typing import TYPE_CHECKING, cast
 
 from endfield_scene_material_contract import reference_key, resolve_export_path
+from extractor_core.scene_identity import validate_scene_id
 if TYPE_CHECKING:
     from endfield_scene_water_plan import WaterGeometryRow
 
@@ -149,11 +151,7 @@ def read_water_material_row(value: object) -> WaterMaterialRow:
     flow_map_value = row["flow_map"]
     if flow.use_flow_map and flow_map_value is None:
         raise ValueError(f"WATER_FLOW_MAP_REQUIRED entity_id={row.get('entity_id')}")
-    if not flow.use_flow_map and flow_map_value is not None:
-        unused_flow_map = _object(flow_map_value, "unused water flow map")
-        asset(unused_flow_map.get("asset"))
-        _text(unused_flow_map.get("file"), "unused water flow map file")
-    flow_map = texture(flow_map_value) if flow.use_flow_map else None
+    flow_map = texture(flow_map_value) if flow_map_value is not None else None
     return WaterMaterialRow(
         _integer(row.get("entity_id"), "water entity_id"),
         _text(row.get("config_resource_path"), "water config_resource_path"),
@@ -275,9 +273,8 @@ def _insert_export(
     if label == "TextureArrayExports" and asset.type_name != "Texture2DArray":
         raise ValueError(f"WATER_ARRAY_EXPORT_TYPE_INVALID ref={key} type={asset.type_name}")
     file_value = record.get("File")
-    file = resolve_export_path(
-        manifest_path.parent / _text(file_value, f"{label}.File").replace("\\", "/")
-    ) if file_value is not None else None
+    file = (manifest_path.parent / _text(file_value, f"{label}.File").replace("\\", "/")
+            if file_value is not None else None)
     candidates = target.setdefault(key, [])
     for prior in candidates:
         if _source_json(_export_identity(prior[0])) != _source_json(_export_identity(record)):
@@ -326,7 +323,7 @@ def _load_catalog(
     for manifest_path in scene_manifests:
         if not manifest_path.is_file():
             raise FileNotFoundError(f"WATER_MATERIAL_MANIFEST_MISSING path={manifest_path}")
-        manifest = _object(json.loads(manifest_path.read_text(encoding="utf-8-sig")), str(manifest_path))
+        manifest = _object(read_scene_manifest(manifest_path), str(manifest_path))
         if manifest.get("Format") != "EndfieldSceneProbe/1":
             raise ValueError(f"WATER_MATERIAL_MANIFEST_FORMAT_INVALID path={manifest_path}")
         water = _object(manifest.get("Water", {}), f"{manifest_path}.Water")
@@ -401,6 +398,11 @@ def _flow_core(config: dict[str, object]) -> WaterFlowCore:
     )
 
 
+def _foam_requires_flow_resources(config: dict[str, object]) -> bool:
+    appearance = _object(config.get("Appearance"), "water config Appearance")
+    return _number(appearance.get("FoamOpacity"), "Appearance.FoamOpacity") > 0
+
+
 def _texture(
     asset: WaterAssetRef,
     exports: dict[tuple[str, int], list[ExportCandidate]],
@@ -410,8 +412,10 @@ def _texture(
         exported = _asset(record.get("Asset"), "TextureExports.Asset")
         if exported.type_name != asset.type_name:
             raise ValueError(f"WATER_TEXTURE_TYPE_CONFLICT asset={asset} export={exported}")
-        if not record.get("Error") and file is not None and file.is_file():
-            available.append(file)
+        if not record.get("Error") and file is not None:
+            resolved = resolve_export_path(file)
+            if resolved.is_file():
+                available.append(resolved)
     if not available:
         return None
     _assert_matching_payloads(available, f"Texture2D ref={asset}")
@@ -425,8 +429,26 @@ def _assert_matching_payloads(files: list[Path], label: str) -> None:
     for file in files:
         with file.open("rb") as stream:
             digests.add(hashlib.file_digest(stream, "sha256").hexdigest())
-    if len(digests) != 1:
+    if len(digests) == 1:
+        return
+    # PNG compression can change between helper versions without changing water data.
+    if len({_png_payload_signature(file, label) for file in files}) != 1:
         raise ValueError(f"WATER_MATERIAL_EXPORT_PAYLOAD_CONFLICT label={label} files={files}")
+
+
+def _png_payload_signature(file: Path, label: str) -> tuple[str, tuple[int, int], str]:
+    from PIL import Image
+
+    with Image.open(file) as image:
+        if image.format != "PNG" or image.mode == "P":
+            raise ValueError(
+                f"WATER_MATERIAL_EXPORT_ENCODING_UNSUPPORTED label={label} "
+                f"file={file} format={image.format} mode={image.mode}"
+            )
+        # SceneProbe exports 8-bit Non-Color water data; retain layout and transparency.
+        digest = hashlib.sha256(image.tobytes())
+        digest.update(repr(image.info.get("transparency")).encode("utf-8"))
+        return image.mode, image.size, digest.hexdigest()
 
 
 def _slice_layer(
@@ -558,8 +580,7 @@ def build_water_material_plan(
     map_id: str,
 ) -> WaterMaterialPlan:
     """Bind exact water records, exported textures, and intersecting sectors."""
-    if map_id not in ("map01", "map02"):
-        raise ValueError(f"WATER_MATERIAL_MAP_UNSUPPORTED map_id={map_id}")
+    validate_scene_id(map_id)
     containers, paths_by_ref, globals_by_ref, configs, sectors, textures, arrays = _load_catalog(
         scene_manifests
     )
@@ -596,7 +617,6 @@ def build_water_material_plan(
     global_asset = _record_asset(global_record, "GlobalConfig")
     global_key = global_asset.source.casefold(), global_asset.path_id
     global_path = _unique_path(paths_by_ref.get(global_key, set()), "GlobalConfig")
-    flow_asset = _pointer(global_record.get("FlowMap"), "GlobalConfig.FlowMap", "Texture2D")
     array_asset = _pointer(
         global_record.get("NormalMapArray"), "GlobalConfig.NormalMapArray", "Texture2DArray"
     )
@@ -637,11 +657,13 @@ def build_water_material_plan(
             continue
         config_asset = _record_asset(config, "WaterConfig")
         flow = _flow_core(config)
+        needs_flow_resources = flow.use_flow_map or _foam_requires_flow_resources(config)
         small = _normal_slice(array_asset, flow.small_wave_normal_type, arrays)
         large = _normal_slice(array_asset, flow.large_wave_normal_type, arrays)
         core_failures: list[WaterMaterialPending] = []
         flow_map: WaterTextureBinding | None = None
-        if flow.use_flow_map:
+        if needs_flow_resources:
+            flow_asset = _pointer(global_record.get("FlowMap"), "GlobalConfig.FlowMap", "Texture2D")
             if flow_resolution is None:
                 provider, issue = _texture_provider(
                     flow_asset, paths_by_ref, global_asset, global_path
@@ -672,7 +694,7 @@ def build_water_material_plan(
             ))
         sector_bindings: list[WaterSectorBinding] = []
         sector_failures: list[WaterMaterialPending] = []
-        sector_candidates = _sector_candidates(global_record, row.world_bounds) if flow.use_flow_map else ()
+        sector_candidates = _sector_candidates(global_record, row.world_bounds) if needs_flow_resources else ()
         for sector_path, sector_x, sector_z in sector_candidates:
             required.add(sector_path)
             sector_refs = containers.get(sector_path.casefold(), set())
@@ -717,7 +739,7 @@ def build_water_material_plan(
         pending.extend(sector_failures)
         if core_failures:
             continue
-        if (flow.use_flow_map and flow_map is None) or small is None or large is None:
+        if (needs_flow_resources and flow_map is None) or small is None or large is None:
             raise RuntimeError(f"WATER_MATERIAL_CORE_BINDING_INCONSISTENT entity_id={row.entity_id}")
         ready.append(WaterMaterialRow(
             row.entity_id, row.config_resource_path, config_asset, global_path, global_asset,

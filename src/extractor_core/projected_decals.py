@@ -18,6 +18,7 @@ from pathlib import Path
 from . import flatbuffer as fb
 from .lz4 import decompress_lz4_inv
 from .vfs import VfsFile
+from endfield_scene_io import SceneSourceCacheSlot, cached_scene_source_value, resolve_scene_read_path
 from endfield_projected_decal_contract import ProjectedDecal
 
 
@@ -27,6 +28,11 @@ class StreamingRecord:
     type_tag: int
     start: int
     end: int
+
+
+_PATH_ID_INDEX_CACHE = SceneSourceCacheSlot(
+    "path-id-index", dict, 4, 320 * 1024 * 1024
+)
 
 
 def read_chunk(vfs_root: Path, entry: VfsFile) -> bytes:
@@ -44,16 +50,30 @@ def read_chunk(vfs_root: Path, entry: VfsFile) -> bytes:
 
 def build_path_id_index(path: Path) -> dict[bytes, tuple[str, ...]]:
     """Reuse the recovered path-ID/relative-string-offset scan, without name guesses."""
+    resolved = resolve_scene_read_path(path)
+    return cached_scene_source_value(
+        _PATH_ID_INDEX_CACHE, (resolved,), (),
+        lambda: _build_path_id_index(resolved),
+    )
+
+
+def _build_path_id_index(path: Path) -> dict[bytes, tuple[str, ...]]:
     data = path.read_bytes()
     offset, count = struct.unpack_from("<II", data)
     if offset != 8 + 24 * count or offset > len(data):
         raise ValueError(f"PATH_HASH_HEADER_INVALID path={path} offset={offset} count={count}")
     found: dict[bytes, set[str]] = defaultdict(set)
-    for position in range(8, offset - 8, 8):
-        identifier = data[position:position + 8]
-        relative = struct.unpack_from("<Q", data, position + 8)[0]
+    words = struct.iter_unpack("<Q", memoryview(data)[8:offset])
+    previous = next(words, None)
+    if previous is None:
+        return {}
+    identifier = previous[0]
+    # Keep overlapping eight-byte candidates, including those between 24-byte rows.
+    for (relative,) in words:
+        current = identifier
+        identifier = relative
         start = offset + relative
-        if not any(identifier) or start + 6 > len(data):
+        if not current or start + 6 > len(data):
             continue
         length = struct.unpack_from("<I", data, start)[0]
         end = start + 4 + length
@@ -64,7 +84,7 @@ def build_path_id_index(path: Path) -> dict[bytes, tuple[str, ...]]:
         except UnicodeDecodeError:
             continue
         if value.casefold().startswith(("assets/", "data/", "packages/")):
-            found[identifier].add(value)
+            found[current.to_bytes(8, "little")].add(value)
     return {key: tuple(sorted(values)) for key, values in found.items()}
 
 

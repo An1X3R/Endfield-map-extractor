@@ -1,0 +1,22 @@
+.app-shell .map-switch-with-operators { grid-template-columns: minmax(130px,1fr) minmax(130px,1fr) 40px minmax(158px,1.18fr) 40px minmax(160px,1.2fr); width: clamp(840px,51vw,980px); }
+.app-shell .operator-navigation-tab { --accent: #ffe600; color: #c4c8d0; background: #16181d; clip-path: polygon(0 0,calc(100% - 6px) 0,100% 6px,100% 100%,0 100%); }
+.app-shell .operator-navigation-tab .map-switch-copy strong { color: #c4c8d0; }
+.app-shell .operator-navigation-tab .map-switch-copy small { color: #aeb8ba; }
+.app-shell .operator-navigation-tab.active { color: #fff; background: #20242d; box-shadow: inset 0 -3px #ffe600; }
+.app-shell .operator-navigation-tab.active .map-switch-copy strong { color: #fff; }
+.operator-navigation-icon { width: 22px; height: 22px; justify-self: center; }
+.operator-navigation-tab.active .operator-navigation-icon { color: #ffe600; }
+.mode-operators { --accent: #ffe600; --paper: #f4f5f7; --ink: #121418; }
+.mode-operators .ambient-contours-canvas { opacity: .03; }
+.mode-operators > .ambient-grid { display: none; }
+.app-shell.mode-operators > .workspace::before,
+.app-shell.mode-operators > .workspace::after { display: none; }
+.app-shell.mode-operators > .workspace:has(.settings.drawer-visible) { z-index: 60; }
+.mode-operators .brand-mark { background: #ffe600; color: #171b1d; }
+.app-shell.mode-operators > .workspace { display: block; height: var(--instanced-workspace-height); min-height: 0; padding: 0; }
+.app-shell .operator-task-pill { max-width: 240px; color: #6d6300; font-size: 9px; }
+.app-shell .operator-navigation-datum::after { bottom: -7px; }
+@media (max-width: 1760px) { .app-shell .topbar { grid-template-areas: "brand actions" "switch switch"; grid-template-columns: minmax(0,1fr) auto; grid-template-rows: auto auto; gap: 10px 14px; padding-bottom: 12px; } .app-shell .brand-lockup { grid-area: brand; } .app-shell .map-switch-zone { grid-area: switch; width: 100%; } .app-shell .top-actions { grid-area: actions; justify-self: end; } .app-shell .map-switch-with-operators { width: min(100%,980px); } }
+@media (min-width: 1200px) and (max-width: 1599px) { .app-shell .map-switch-with-operators { grid-template-columns: minmax(130px,1fr) minmax(130px,1fr) 24px minmax(158px,1.18fr) 24px minmax(160px,1.2fr); } }
+@media (max-width: 1199px) { .app-shell .map-switch-with-operators { grid-template-columns: minmax(0,1fr) minmax(0,1fr) 16px minmax(0,1.18fr) 16px minmax(0,1.2fr); } .app-shell .map-switch-with-operators button { padding-inline: 7px; gap: 5px; grid-template-columns: 24px minmax(0,1fr) 10px; } .app-shell .map-switch-with-operators .map-switch-copy strong { font-size: clamp(11px,1.3vw,15px); } .app-shell .map-switch-with-operators .map-switch-copy small { font-size: 8px; } .instanced-navigation-datum small { font-size: 6px; } }
+@media (max-width: 700px) { .app-shell .map-switch-with-operators { grid-template-columns: minmax(0,1fr) minmax(0,1fr) 12px minmax(0,1.18fr) 12px minmax(0,1.2fr); min-width: 0; } .app-shell .map-switch-with-operators button { grid-template-columns: minmax(0,1fr); padding: 4px; gap: 0; } .app-shell .map-switch-with-operators .map-thumb, .app-shell .map-switch-with-operators .instanced-navigation-icon, .app-shell .map-switch-with-operators .operator-navigation-icon, .app-shell .map-switch-with-operators button > i { display: none; } .app-shell .map-switch-with-operators .map-switch-copy strong { font-size: clamp(9px,2.3vw,14px); } .app-shell .map-switch-with-operators .map-switch-copy small { font-size: 7px; } .instanced-navigation-datum small { display: none; } .instanced-navigation-datum b { font-size: 10px; } .app-shell .top-actions > .operator-task-pill { max-width: 140px; overflow: hidden; text-overflow: ellipsis; } }

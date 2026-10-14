@@ -1,0 +1,10 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="$(AnimeStudioRoot)/AnimeStudio/AnimeStudio.csproj" />
+    <ProjectReference Include="../CharacterAnimationReader/CharacterAnimationReader.csproj" />
+  </ItemGroup>
+</Project>

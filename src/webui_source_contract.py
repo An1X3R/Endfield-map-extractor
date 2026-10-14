@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, TypedDict
 
 
 EXPORT_GROUPS = (
@@ -19,6 +19,20 @@ EXPORT_GROUPS = (
     "effects",
     "unknown",
 )
+
+
+class FogDepthPlan(TypedDict):
+    subdivision_level: int
+
+
+def read_fog_depth_options(value: object) -> FogDepthPlan:
+    """Validate explicit host-depth sampling without enabling it by default."""
+    if not isinstance(value, dict):
+        raise ValueError("fog_depth must be an object with subdivision_level")
+    level = value.get("subdivision_level")
+    if type(level) is not int or not 0 <= level <= 6:
+        raise ValueError("fog_depth.subdivision_level must be an integer from 0 to 6")
+    return {"subdivision_level": level}
 
 
 def selected_static_categories(layers: Mapping[str, object], groups: Iterable[str]) -> frozenset[str]:

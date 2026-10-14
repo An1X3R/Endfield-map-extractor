@@ -315,16 +315,16 @@ def polygon_cell_area(points: list[tuple[float, float]], left: float, right: flo
     return abs(sum(a[0] * b[1] - b[0] * a[1] for a, b in zip(clipped, clipped[1:] + clipped[:1]))) * 0.5
 
 
-def face_layers(obj: bpy.types.Object, polygon: bpy.types.MeshPolygon, detail: TerrainDetail,
+def face_layers(object_name: str, polygon: bpy.types.MeshPolygon,
+                world_points: tuple[tuple[float, float], ...], detail: TerrainDetail,
                 indices: NDArray[np.int16]) -> frozenset[int]:
     """Collect every nearest-sampled index texel with positive face overlap."""
     points = []
     x0, x1, z0, z1 = detail["bounds"]
     for vertex in polygon.vertices:
-        world = obj.matrix_world @ obj.data.vertices[vertex].co
-        point = (float(world.x), float(-world.y))
+        point = world_points[vertex]
         if not (x0-0.01 <= point[0] <= x1+0.01 and z0-0.01 <= point[1] <= z1+0.01):
-            raise ValueError(f"Terrain face exceeds detail resource bounds: object={obj.name}, face={polygon.index}, point={point}")
+            raise ValueError(f"Terrain face exceeds detail resource bounds: object={object_name}, face={polygon.index}, point={point}")
         points.append(point)
     origin_x, origin_z = detail["position"][0], detail["position"][2]
     width = indices.shape[1]
@@ -340,7 +340,7 @@ def face_layers(obj: bpy.types.Object, polygon: bpy.types.MeshPolygon, detail: T
                                  origin_z + row*8, origin_z + (row+1)*8) > 1e-10:
                 needed.update(int(value) for value in indices[row, column])
     if not needed:
-        raise ValueError(f"Terrain face has no positive index texel coverage: object={obj.name}, face={polygon.index}")
+        raise ValueError(f"Terrain face has no positive index texel coverage: object={object_name}, face={polygon.index}")
     return frozenset(needed)
 
 
@@ -367,18 +367,30 @@ def apply_scene_detail(scene: bpy.types.Scene, path: Path) -> list[dict[str, str
     layer_lookup = {layer["ordinal"]: layer for layer in detail["layers"]}
     pending: dict[bpy.types.Material, list[tuple[bpy.types.Object, int, frozenset[int]]]] = {}
     adapted: dict[bpy.types.Material, tuple[int, ...]] = {}
+    eligible: dict[bpy.types.Material, bool] = {}
+    resolved_detail_path = str(path.resolve())
     for obj in sorted(scene.objects, key=lambda item: item.name):
         if obj.type != "MESH" or "unity_tile" not in obj:
             continue
         mesh = obj.data
+        source_materials = tuple(mesh.materials)
+        world_points: tuple[tuple[float, float], ...] = ()
         for polygon in mesh.polygons:
-            if polygon.material_index >= len(mesh.materials):
+            if polygon.material_index >= len(source_materials):
                 raise ValueError(f"Terrain face has an invalid material slot: object={obj.name}, face={polygon.index}")
-            material = mesh.materials[polygon.material_index]
-            if (material is None or not material.get("endfield_terrain_surface_source")
-                    or (surface is not None and resolve_export_path(Path(material["endfield_terrain_surface_source"])) != surface)):
+            material = source_materials[polygon.material_index]
+            if material is None:
                 continue
-            required = face_layers(obj, polygon, detail, index)
+            if material not in eligible:
+                source_path = material.get("endfield_terrain_surface_source")
+                eligible[material] = bool(source_path) and (surface is None or resolve_export_path(Path(source_path)) == surface)
+            if not eligible[material]:
+                continue
+            if not world_points:
+                transform = obj.matrix_world
+                world_points = tuple((float(world.x), float(-world.y))
+                                     for vertex in mesh.vertices for world in (transform @ vertex.co,))
+            required = face_layers(obj.name, polygon, world_points, detail, index)
             absent = required - layer_lookup.keys()
             if absent:
                 raise ValueError(f"Terrain source index references unprepared layers: object={obj.name}, face={polygon.index}, ordinals={sorted(absent)}")
@@ -388,19 +400,21 @@ def apply_scene_detail(scene: bpy.types.Scene, path: Path) -> list[dict[str, str
                     raise ValueError(f"Terrain material was adapted without sampler partition metadata: {material.name}")
                 pending.setdefault(material, []).append((obj, polygon.index, required))
             else:
-                ordinals = tuple(int(value) for value in material["endfield_terrain_detail_layers"])
+                ordinals = (adapted[material] if material in adapted else
+                            tuple(int(value) for value in material["endfield_terrain_detail_layers"]))
                 if (len(ordinals) > MAX_LAYERS_PER_MATERIAL or not required.issubset(ordinals)
-                        or material.get("endfield_terrain_detail_source") != str(path.resolve())
-                        or bpy.data.materials.get(base_name) is None):
+                        or (material not in adapted and (material.get("endfield_terrain_detail_source") != resolved_detail_path
+                            or bpy.data.materials.get(base_name) is None))):
                     raise ValueError(f"Terrain partition no longer covers its source face: material={material.name}, object={obj.name}, face={polygon.index}, required={sorted(required)}")
                 adapted[material] = ordinals
     if not pending and not adapted:
         raise ValueError("Scene contains no terrain tiles for detail reconstruction")
     results = {material: apply_detail_material(material, path, detail,
                [layer_lookup[ordinal] for ordinal in ordinals]) for material, ordinals in adapted.items()}
+    slot_lookup: dict[bpy.types.Mesh, dict[bpy.types.Material, int]] = {}
     for source, faces in sorted(pending.items(), key=lambda item: item[0].name):
         groups = packed_layer_groups([required for _, _, required in faces])
-        if any(obj.data.users != 1 for obj, _, _ in faces):
+        if any(obj.data.users != 1 for obj in {obj for obj, _, _ in faces}):
             raise ValueError(f"Terrain material partition requires an unshared mesh: material={source.name}")
         materials: dict[tuple[int, ...], bpy.types.Material] = {}
         for ordinals in groups:
@@ -418,14 +432,24 @@ def apply_scene_detail(scene: bpy.types.Scene, path: Path) -> list[dict[str, str
             results[material] = apply_detail_material(material, path, detail,
                                 [layer_lookup[ordinal] for ordinal in ordinals])
             materials[ordinals] = material
+        required_groups = {required: min((group for group in groups if required.issubset(group)),
+                                        key=lambda group: (len(group), group))
+                           for required in {required for _, _, required in faces}}
         for obj, polygon_index, required in faces:
-            ordinals = min((group for group in groups if required.issubset(group)), key=lambda group: (len(group), group))
+            ordinals = required_groups[required]
             material = materials[ordinals]
-            slots = obj.data.materials
-            slot = next((index for index, item in enumerate(slots) if item == material), None)
+            mesh = obj.data
+            slots = mesh.materials
+            if mesh not in slot_lookup:
+                slot_lookup[mesh] = {}
+                for slot_index, item in enumerate(slots):
+                    if item is not None:
+                        slot_lookup[mesh].setdefault(item, slot_index)
+            slot = slot_lookup[mesh].get(material)
             if slot is None:
                 slots.append(material)
                 slot = len(slots) - 1
-            obj.data.polygons[polygon_index].material_index = slot
+                slot_lookup[mesh][material] = slot
+            mesh.polygons[polygon_index].material_index = slot
     return [{"material": material.name, "status": status}
             for material, status in sorted(results.items(), key=lambda item: item[0].name)]

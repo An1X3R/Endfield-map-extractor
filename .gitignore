@@ -10,6 +10,13 @@ __pycache__/
 .runtime_status.json
 reconstruction.local.json
 endfield.runtime.local.json
+endfield.character.local.json
+.tools/
+*.shader
+*.glsl
+*.hlsl
+GameAssembly.dll
+global-metadata.dat
 .env
 .env.*
 !.env.example
@@ -60,6 +67,7 @@ exports/
 output/
 logs/
 reports/
+/character_jobs/
 
 # .NET build products; publish source and lock files only
 dotnet/**/bin/
@@ -92,5 +100,4 @@ dotnet/**/obj/
 /endfield_fx_export.py
 /endfield_fx_tk_ui.py
 /endfield_fx_ui.py
-/launch_extractor.ps1
 /test_endfield_fx_export.py

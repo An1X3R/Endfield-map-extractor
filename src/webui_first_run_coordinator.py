@@ -23,6 +23,8 @@ from webui_first_run_contract_v1 import (
     validate_first_run_paths,
 )
 
+FIRST_RUN_SHUTDOWN_TIMEOUT_SECONDS = 10.0
+
 
 class FirstRunCoordinatorError(RuntimeError):
     def __init__(
@@ -147,6 +149,7 @@ class FirstRunCoordinator:
         self._thread: threading.Thread | None = None
         self._process: subprocess.Popen[str] | None = None
         self._cancel_requested = False
+        self._closing = False
         self._cancel_marker: Path | None = None
         self._request: dict[str, Any] | None = None
         self._defaults = {
@@ -185,6 +188,14 @@ class FirstRunCoordinator:
         return validate_first_run_paths(request)
 
     def submit(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            if self._closing:
+                raise FirstRunCoordinatorError(
+                    "coordinator_closed",
+                    "First-run coordinator is shutting down and cannot accept new submissions.",
+                    http_status=503,
+                    retryable=False,
+                )
         validation = self.validate(payload)
         if validation["status"] != "valid":
             raise FirstRunRequestError(
@@ -194,6 +205,13 @@ class FirstRunCoordinator:
             )
         request = dict(validation["canonical"])
         with self._lock:
+            if self._closing:
+                raise FirstRunCoordinatorError(
+                    "coordinator_closed",
+                    "First-run coordinator is shutting down and cannot accept new submissions.",
+                    http_status=503,
+                    retryable=False,
+                )
             if self._thread is not None and self._thread.is_alive():
                 raise FirstRunCoordinatorError(
                     "already_running", "First-run data preparation is already running."
@@ -540,7 +558,7 @@ class FirstRunCoordinator:
             state="running",
             phase="dependencies",
             progress=0.0,
-            message="Preparing the isolated Python runtime",
+            message="Checking the prepared Python runtime offline",
             started_at=utc_now(),
             console_log=str(console_path),
             resume=resume,
@@ -549,6 +567,20 @@ class FirstRunCoordinator:
         )
         try:
             interpreter = self.interpreter_provider().resolve()
+            if self.requirements_path is not None:
+                from bootstrap_environment import setup_command, verify_requirements
+
+                dependencies_ready, dependency_message = verify_requirements(
+                    interpreter, self.requirements_path
+                )
+                if not dependencies_ready:
+                    raise FirstRunCoordinatorError(
+                        "python_dependencies_not_prepared",
+                        f"Python dependencies are not available offline: {dependency_message}. "
+                        f"Run: {setup_command()}",
+                        http_status=503,
+                        retryable=False,
+                    )
             if self._cancel_requested:
                 raise FirstRunCancelled("First-run data preparation was cancelled")
             command = build_first_run_command(
@@ -559,27 +591,6 @@ class FirstRunCoordinator:
                 resume=resume,
             )
             with console_path.open("x", encoding="utf-8", errors="replace") as console:
-                if self.requirements_path is not None:
-                    dependency_process = self._spawn_process(
-                        [
-                            str(interpreter),
-                            "-m",
-                            "pip",
-                            "install",
-                            "--disable-pip-version-check",
-                            "--requirement",
-                            str(self.requirements_path),
-                        ],
-                        console,
-                        request=request,
-                    )
-                    dependency_code = self._wait_process(dependency_process)
-                    if dependency_code != 0:
-                        raise FirstRunCoordinatorError(
-                            "dependency_install_failed",
-                            f"Python dependency installation failed with exit code {dependency_code}",
-                        )
-                    console.flush()
                 process = self._spawn_process(command, console, request=request)
                 self._set_status(phase="preflight", progress=0.0, message="First-run extraction started")
                 exit_code = self._wait_process(process, cancel_marker=cancel_marker)
@@ -788,3 +799,29 @@ class FirstRunCoordinator:
             cancel_requested=True,
         )
         return self.status()
+
+    def shutdown(self) -> None:
+        """Reject new work, request cooperative cancellation, and join the worker with a fixed bound."""
+        with self._lock:
+            self._closing = True
+            thread = self._thread
+        self.cancel()
+        if thread is None:
+            return
+        if thread is threading.current_thread():
+            raise FirstRunCoordinatorError(
+                "shutdown_from_worker",
+                "First-run shutdown cannot join its own worker thread.",
+                http_status=503,
+                retryable=False,
+            )
+        thread.join(timeout=FIRST_RUN_SHUTDOWN_TIMEOUT_SECONDS)
+        if thread.is_alive():
+            request = self._request or {}
+            raise FirstRunCoordinatorError(
+                "shutdown_timeout",
+                f"First-run worker did not stop within {FIRST_RUN_SHUTDOWN_TIMEOUT_SECONDS:g} seconds after cooperative cancellation.",
+                http_status=503,
+                retryable=True,
+                details={"run_name": request.get("run_name"), "thread_name": thread.name},
+            )

@@ -1,12 +1,14 @@
 """Upgrade cached extraction helpers without rerunning map preparation."""
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+import argparse
+from collections.abc import Mapping
 from dataclasses import dataclass
 import hashlib
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 from uuid import uuid4
 
@@ -14,10 +16,20 @@ from endfield_dependency_bootstrap import helper_source_identity
 from endfield_scene_material_contract import require_object
 
 
+SETUP_SCRIPT = Path(__file__).resolve().parent.parent / "setup_development_environment.ps1"
+
+
 @dataclass(frozen=True)
 class SceneHelpers:
     scanner: Path
     probe: Path
+
+
+@dataclass(frozen=True)
+class CachedSceneHelperReport:
+    result: Mapping[str, object]
+    helper_root: Path
+    receipt_path: Path
 
 
 def _verified_file(value: object, parent: Path) -> Path:
@@ -67,47 +79,136 @@ def verified_helpers(result: Mapping[str, object], source_identity: str,
     return SceneHelpers(paths["bundleScanner"], paths["sceneProbe"])
 
 
-def ensure_current_scene_helpers(runtime_path: Path, cache_root: Path,
-                                 check_cancelled: Callable[[], None],
-                                 progress: Callable[[float, str], None]) -> SceneHelpers:
-    """Reuse the pinned bootstrap and source identity for on-demand upgrades."""
-    from endfield_scene_export import run_scene_process
+def _helper_identity(source_root: Path) -> str:
+    return helper_source_identity(source_root.parent)
 
-    source_root = Path(__file__).resolve().parent
-    identity = helper_source_identity(source_root.parent)
-    state_path = runtime_path.parent / "first_run_state.json"
-    state = require_object(json.loads(state_path.read_text(encoding="utf-8-sig")), str(state_path))
-    steps = require_object(state.get("steps"), "first-run steps")
-    step = require_object(steps.get("helper_dependencies"), "helper dependency step")
-    prior = require_object(step.get("outputs"), "prepared helper result")
-    prepared = verified_helpers(prior, identity, runtime_path.parent)
-    if prepared is not None:
-        return prepared
-    # Keep native DLL search paths short; receipts still verify the full source hash.
-    root = cache_root / "helpers" / identity[:16]
-    receipt = root / "current.json"
-    if receipt.is_file():
-        result = require_object(json.loads(receipt.read_text(encoding="utf-8")), str(receipt))
+
+def _absolute_helper_report(result: Mapping[str, object], helpers: SceneHelpers,
+                            parent: Path) -> Mapping[str, object]:
+    """Keep portable receipts relative on disk while exposing runnable paths."""
+    outputs = require_object(result.get("outputs"), "helper outputs")
+    resolved_outputs: dict[str, object] = {}
+    for name, executable in (("bundleScanner", helpers.scanner), ("sceneProbe", helpers.probe)):
+        row = require_object(outputs[name], f"helper {name}")
+        assembly = require_object(row["assembly"], f"helper {name} assembly")
+        resolved_outputs[name] = {
+            **row,
+            "path": str(executable),
+            "assembly": {**assembly, "path": str(_verified_file(assembly, parent))},
+        }
+    return {**result, "outputs": resolved_outputs}
+
+
+def load_cached_scene_helper_report(cache_root: Path, source_root: Path) -> CachedSceneHelperReport | None:
+    """Find a verified receipt in the configured cache or project-local helper install."""
+    identity = _helper_identity(source_root)
+    candidate_roots = tuple(dict.fromkeys((
+        cache_root.expanduser().resolve(),
+        (source_root.resolve().parent / ".tools" / "scene").resolve(),
+    )))
+    for cache in candidate_roots:
+        root = cache / "helpers" / identity[:16]
+        receipt = root / "current.json"
+        if not receipt.is_file():
+            continue
+        result = require_object(json.loads(receipt.read_text(encoding="utf-8-sig")), str(receipt))
         cached = verified_helpers(result, identity, root)
         if cached is None:
-            raise ValueError(f"Helper cache has an inconsistent source identity: {receipt}")
+            raise ValueError(f"Prepared helper receipt has a different source identity: {receipt}")
+        return CachedSceneHelperReport(_absolute_helper_report(result, cached, root), root, receipt)
+    return None
+
+
+def require_prepared_scene_helpers(runtime_path: Path, cache_root: Path) -> SceneHelpers:
+    """Resolve only hash-verified helpers from this run or the shared cache."""
+    source_root = Path(__file__).resolve().parent
+    identity = _helper_identity(source_root)
+    state_path = runtime_path.parent / "first_run_state.json"
+    if state_path.is_file():
+        state = require_object(json.loads(state_path.read_text(encoding="utf-8-sig")), str(state_path))
+        steps = require_object(state.get("steps"), "first-run steps")
+        step = steps.get("helper_dependencies")
+        if isinstance(step, Mapping) and step.get("status") == "completed":
+            prior = require_object(step.get("outputs"), "prepared helper result")
+            try:
+                prepared = verified_helpers(prior, identity, runtime_path.parent)
+            except (OSError, ValueError, KeyError, TypeError) as error:
+                raise ValueError(f"First-run helper receipt failed integrity validation: {state_path}: {error}") from error
+            if prepared is not None:
+                return prepared
+    root = cache_root / "helpers" / identity[:16]
+    receipt = root / "current.json"
+    result = load_cached_scene_helper_report(cache_root, source_root)
+    if result is not None:
+        cached = verified_helpers(result.result, identity, result.helper_root)
+        if cached is None:
+            raise ValueError(f"Prepared helper cache has an inconsistent source identity: {result.receipt_path}")
         return cached
-    check_cancelled()
+    setup = (
+        f'powershell -ExecutionPolicy Bypass -File "{SETUP_SCRIPT}" '
+        f'-PrepareSceneHelpers -HelperCacheRoot "{cache_root.resolve()}"'
+    )
+    raise FileNotFoundError(
+        f"No hash-verified SceneProbe/BundleScanner build exists for source identity {identity}. Run: {setup}"
+    )
+
+
+def bootstrap_scene_helpers(cache_root: Path) -> SceneHelpers:
+    """Explicitly fetch and build pinned helpers, then publish a shared verified receipt."""
+    source_root = Path(__file__).resolve().parent
+    identity = _helper_identity(source_root)
+    root = cache_root / "helpers" / identity[:16]
+    receipt = root / "current.json"
+    existing = load_cached_scene_helper_report(cache_root, source_root)
+    if existing is not None:
+        prepared = verified_helpers(existing.result, identity, existing.helper_root)
+        if prepared is None:
+            raise ValueError(f"Prepared helper cache has an inconsistent source identity: {existing.receipt_path}")
+        return prepared
+    root.mkdir(parents=True, exist_ok=True)
     work = root / uuid4().hex
-    work.mkdir(parents=True)
-    progress(0.0, "Updating extraction helpers for the current source; existing map caches are retained")
+    work.mkdir(parents=True, exist_ok=False)
+    dependency_workspace = cache_root / "helper_dependencies"
     command = [sys.executable, str(source_root / "endfield_dependency_bootstrap.py"),
-               "--workspace", str(cache_root / "helper_dependencies"), "--log-dir", str(work / "log"),
+               "--workspace", str(dependency_workspace), "--log-dir", str(work / "log"),
                "--output-root", str(work / "bin")]
     environment = {**os.environ, "TEMP": str(work), "TMP": str(work), "PYTHONDONTWRITEBYTECODE": "1"}
-    run_scene_process(command, work / "bootstrap.log", environment, check_cancelled)
+    process = subprocess.run(command, cwd=source_root.parent, env=environment, text=True,
+                             encoding="utf-8", errors="replace", capture_output=True, check=False)
+    bootstrap_log = work / "bootstrap.log"
+    bootstrap_log.parent.mkdir(parents=True, exist_ok=True)
+    bootstrap_log.write_text(process.stdout + process.stderr, encoding="utf-8", newline="\n")
     report = work / "log" / "dependency_bootstrap_report.json"
+    if process.returncode != 0 or not report.is_file():
+        raise RuntimeError(
+            f"Pinned helper bootstrap failed with exit code {process.returncode}; inspect {bootstrap_log}"
+        )
     result = require_object(json.loads(report.read_text(encoding="utf-8")), str(report))
     current = verified_helpers(result, identity, work)
     if current is None:
         raise ValueError(f"Helper source changed during compilation; retry the export: {report}")
+    if receipt.exists():
+        raise FileExistsError(f"Refusing to replace an existing helper receipt: {receipt}")
     temporary = root / f"current.{uuid4().hex}.tmp"
-    temporary.write_text(json.dumps(result, indent=2), encoding="utf-8")
+    temporary.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     os.replace(temporary, receipt)
-    progress(1.0, "Updated extraction helpers verified")
     return current
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Explicitly prepare pinned scene helpers in a selected cache root.")
+    parser.add_argument("--bootstrap-cache-root", type=Path, required=True)
+    args = parser.parse_args()
+    helpers = bootstrap_scene_helpers(args.bootstrap_cache_root.expanduser().resolve())
+    print(json.dumps({
+        "format": "EndfieldPreparedSceneHelpers/1",
+        "sourceIdentity": _helper_identity(Path(__file__).resolve().parent),
+        "bundleScanner": str(helpers.scanner),
+        "sceneProbe": str(helpers.probe),
+        "cacheRoot": str(args.bootstrap_cache_root.expanduser().resolve()),
+    }, ensure_ascii=False, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

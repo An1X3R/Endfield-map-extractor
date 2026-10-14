@@ -1,0 +1,873 @@
+"""Build editable, evidence-bound character surface approximations in a research blend.
+
+Source CAB/PathID identities select five observed shader families. Engine-specific
+lighting, stencil passes, rain, and snow are not claimed to match the game.
+"""
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass
+import hashlib
+import json
+import math
+from pathlib import Path
+import sys
+from types import MappingProxyType
+from typing import Callable, Mapping, Sequence, cast
+
+sys.dont_write_bytecode = True
+import bpy
+from mathutils import Vector
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from character_windows_paths import extended_path, io_path
+from character_node_graph import node, math_node, color_mix, input_socket
+from character_npr_nodes import ArtistLighting, make_artist_lighting, apply_diffuse_response
+
+Identity = tuple[str, int]
+SUPPORTED_SHADERS = frozenset(("HGRP/CharacterNPR", "HGRP/CharacterNPR_Skin", "HGRP/CharacterNPR_Hair", "HGRP/CharacterNPR_Eye", "HGRP/CharacterNPR_OverlayShadow"))
+
+
+@dataclass(frozen=True)
+class TextureSource:
+    identity: Identity
+    name: str
+    path: Path
+    sha256: str
+    width: int
+    height: int
+    color_space: int
+    source_format: str
+
+
+@dataclass(frozen=True)
+class TextureBinding:
+    name: str
+    identity: Identity
+    scale: tuple[float, float]
+    offset: tuple[float, float]
+    uv_index: int
+
+
+@dataclass(frozen=True)
+class MaterialSource:
+    identity: Identity
+    name: str
+    shader: str
+    floats: Mapping[str, float]
+    colors: Mapping[str, tuple[float, float, float, float]]
+    textures: tuple[TextureBinding, ...]
+    keywords: tuple[str, ...]
+    source_json: str
+    tree_json: str
+    null_texture_defaults: Mapping[str, str]
+
+
+@dataclass(frozen=True)
+class SourcePacket:
+    materials: tuple[MaterialSource, ...]
+    textures: Mapping[Identity, TextureSource]
+    renderers: tuple[dict[str, object], ...]
+    selection: tuple[dict[str, object], ...]
+    renderer_pipeline: Mapping[Identity, dict[str, object]]
+    input_hashes: Mapping[str, str]
+    visible_materials: frozenset[Identity]
+
+
+def object_value(value: object, label: str) -> dict[str, object]:
+    if not isinstance(value, dict) or any(not isinstance(key, str) for key in value):
+        raise TypeError(f"Expected object: {label}")
+    return cast(dict[str, object], value)
+
+
+def array_value(value: object, label: str) -> list[object]:
+    if not isinstance(value, list):
+        raise TypeError(f"Expected array: {label}")
+    return cast(list[object], value)
+
+
+def string_value(value: object, label: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise TypeError(f"Expected nonempty string: {label}")
+    return value
+
+
+def int_value(value: object, label: str) -> int:
+    if type(value) is not int:
+        raise TypeError(f"Expected integer: {label}")
+    return cast(int, value)
+
+
+def float_value(value: object, label: str) -> float:
+    if type(value) not in (int, float) or not math.isfinite(float(cast(float, value))):
+        raise TypeError(f"Expected finite number: {label}")
+    return float(cast(float, value))
+
+
+def identity(value: object, label: str) -> Identity:
+    record = object_value(value, label)
+    return string_value(record["source"], label + ".source").casefold(), int_value(record["path_id"], label + ".path_id")
+
+
+def read_json(path: Path) -> object:
+    return json.loads(io_path(path).read_text(encoding="utf-8-sig"))
+
+
+def file_hash(path: Path) -> str:
+    with io_path(path).open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def numeric_tuple(value: object, length: int, label: str) -> tuple[float, ...]:
+    values = array_value(value, label)
+    if len(values) != length:
+        raise ValueError(f"Expected {length} components: {label}")
+    return tuple(float_value(component, label) for component in values)
+
+
+def visible_material_identities(renderers: tuple[dict[str, object], ...], selection: tuple[dict[str, object], ...]) -> frozenset[Identity]:
+    """Require complete source renderer selection before accepting inactive shaders."""
+    renderer_map = {identity(row["object"], "renderer.object"): row for row in renderers}
+    if len(renderer_map) != len(renderers):
+        raise ValueError("Duplicate source renderer identity")
+    seen: set[Identity] = set()
+    visible: set[Identity] = set()
+    for decision in selection:
+        cab, path_id = string_value(decision["renderer_identity"], "renderer_identity").rsplit(":", 1)
+        key = (cab.casefold(), int(path_id))
+        if key not in renderer_map or key in seen:
+            raise ValueError(f"Selection renderer is absent or duplicated: {key}")
+        seen.add(key)
+        if type(decision["visible"]) is not bool:
+            raise TypeError(f"Selection visibility must be boolean: {key}")
+        if decision["visible"]:
+            for pointer in array_value(renderer_map[key]["materials"], "renderer.materials"):
+                visible.add(identity(object_value(pointer, "material.pointer")["resolved"], "material.resolved"))
+    if seen != set(renderer_map):
+        raise ValueError(f"Selection does not cover every source renderer: missing={sorted(set(renderer_map) - seen)}")
+    return frozenset(visible)
+
+
+def read_material_sources(
+    source_dir: Path,
+    material_records: Sequence[dict[str, object]],
+    shader_document: Mapping[str, object],
+    visible_materials: frozenset[Identity],
+) -> tuple[tuple[MaterialSource, ...], Mapping[Identity, TextureSource]]:
+    """Decode verified source material/texture evidence independently of a rig inventory.
+
+    The caller validates the evidence document identity and supplies source material
+    records plus exact visible references. This parser retains the same strict PNG,
+    Shader pointer, source parameter, UV and visible shader checks as read_packet.
+    """
+    shader_names: dict[Identity, str] = {}
+    shader_texture_defaults: dict[Identity, dict[str, str]] = {}
+    for row in array_value(shader_document["shaders"], "shaders"):
+        record = object_value(row, "shader")
+        ref = object_value(record["shader"], "shader.ref")
+        name = string_value(ref["name"], "shader.name")
+        key = identity(ref, "shader.ref")
+        if key in shader_names:
+            raise ValueError(f"Duplicate Shader identity: {key}")
+        shader_names[key] = name
+        defaults: dict[str, str] = {}
+        if "property_defaults" in record:
+            for raw_property in array_value(record["property_defaults"], "shader.property_defaults"):
+                property_row = object_value(raw_property, "shader.property")
+                if int_value(property_row["m_Type"], "shader.property.m_Type") != 4:
+                    continue
+                property_name = string_value(property_row["m_Name"], "shader.property.m_Name")
+                texture_default = object_value(property_row["m_DefTexture"], "shader.property.m_DefTexture")
+                if int_value(texture_default["m_TexDim"], "shader.property.m_TexDim") != 2:
+                    continue
+                if property_name in defaults:
+                    raise ValueError(f"Duplicate source Shader texture property: {key}, {property_name}")
+                default_name = texture_default["m_DefaultName"]
+                if not isinstance(default_name, str):
+                    raise TypeError(f"Expected source Shader texture default string: {key}, {property_name}")
+                defaults[property_name] = default_name
+        shader_texture_defaults[key] = defaults
+    trees: dict[Identity, dict[str, object]] = {}
+    for row in array_value(read_json(source_dir / "material_sources.json"), "material_sources"):
+        record = object_value(row, "material_tree")
+        if record["available"] is not True:
+            raise ValueError(f"Material has no embedded TypeTree: {record['object']}")
+        key = identity(record["object"], "material_tree.object")
+        if key in trees:
+            raise ValueError(f"Duplicate material TypeTree: {key}")
+        trees[key] = object_value(record["data"], "material_tree.data")
+    textures: dict[Identity, TextureSource] = {}
+    for row in array_value(read_json(source_dir / "source_texture_artifacts.json"), "source_texture_artifacts"):
+        record = object_value(row, "texture")
+        ref = object_value(record["object"], "texture.object")
+        png = object_value(record["png"], "texture.png")
+        path = (source_dir / string_value(png["path"], "png.path").replace("\\", "/")).resolve()
+        if not path.is_relative_to(source_dir.resolve()):
+            raise ValueError(f"Texture escapes its source packet: {path}")
+        if io_path(path).stat().st_size != int_value(png["bytes"], "png.bytes") or file_hash(path) != string_value(png["sha256"], "png.sha256").casefold():
+            raise ValueError(f"Source texture identity changed: {path}")
+        key = identity(ref, "texture.object")
+        if key in textures:
+            raise ValueError(f"Duplicate source Texture2D identity: {key}")
+        textures[key] = TextureSource(key, string_value(ref["name"], "texture.name"), path, file_hash(path), int_value(record["width"], "texture.width"), int_value(record["height"], "texture.height"), int_value(record["color_space"], "texture.color_space"), string_value(record["source_format"], "texture.source_format"))
+    materials: list[MaterialSource] = []
+    for row in material_records:
+        material = object_value(row, "material")
+        key = identity(material["object"], "material.object")
+        tree = trees[key]
+        pointer = object_value(material["shader"], "material.shader")
+        tree_shader = object_value(tree["m_Shader"], "material_tree.m_Shader")
+        if int_value(tree_shader["m_PathID"], "material_tree.shader.PathID") != int_value(pointer["path_id"], "material.shader.PathID") or int_value(tree_shader["m_FileID"], "material_tree.shader.FileID") != int_value(pointer["file_id"], "material.shader.FileID"):
+            raise ValueError(f"Material TypeTree and audit Shader pointers disagree: {key}")
+        shader_key = identity(pointer["resolved"], "material.shader.resolved")
+        shader_name = shader_names[shader_key]
+        if shader_name not in SUPPORTED_SHADERS and key in visible_materials:
+            raise ValueError(f"Unsupported actual source Shader referenced by visible renderer: shader={shader_name}, material={key}")
+        saved = object_value(tree["m_SavedProperties"], "m_SavedProperties")
+        texenvs = {string_value(object_value(entry, "texenv")["Key"], "texenv.Key"): object_value(object_value(entry, "texenv")["Value"], "texenv.Value") for entry in array_value(saved["m_TexEnvs"], "m_TexEnvs")}
+        bindings: list[TextureBinding] = []
+        null_texture_defaults: dict[str, str] = {}
+        for raw_slot in array_value(material["textures"], "material.textures"):
+            slot = object_value(raw_slot, "texture.slot")
+            pointer = object_value(slot["reference"], "texture.reference")
+            if int_value(pointer["path_id"], "texture.path_id") == 0:
+                if pointer["resolved"] is not None or int_value(pointer["file_id"], "texture.file_id") != 0:
+                    raise ValueError("Null texture pointer unexpectedly resolved")
+                name = string_value(slot["slot"], "texture.slot")
+                if name in shader_texture_defaults[shader_key]:
+                    null_texture_defaults[name] = shader_texture_defaults[shader_key][name]
+                continue
+            key_texture = identity(pointer["resolved"], "texture.resolved")
+            if key_texture not in textures:
+                raise FileNotFoundError(f"Referenced source texture has no verified PNG: {key_texture}")
+            name = string_value(slot["slot"], "texture.slot")
+            uv_index = int_value(texenvs[name]["m_UVSetIndex"], "m_UVSetIndex")
+            if uv_index != 0 and shader_name in SUPPORTED_SHADERS:
+                raise ValueError(f"Research nodes currently require source UV0; material={key}, slot={name}, UV={uv_index}")
+            bindings.append(TextureBinding(name, key_texture, cast(tuple[float, float], numeric_tuple(slot["scale"], 2, "texture.scale")), cast(tuple[float, float], numeric_tuple(slot["offset"], 2, "texture.offset")), uv_index))
+        floats = {string_value(object_value(entry, "float")["name"], "float.name"): float_value(object_value(entry, "float")["value"], "float.value") for entry in array_value(material["floats"], "material.floats")}
+        colors = {string_value(object_value(entry, "color")["name"], "color.name"): cast(tuple[float, float, float, float], numeric_tuple(object_value(entry, "color")["rgba"], 4, "color.rgba")) for entry in array_value(material["colors"], "material.colors")}
+        keywords = tuple(string_value(keyword, "keyword") for keyword in array_value(tree["m_ValidKeywords"], "m_ValidKeywords"))
+        materials.append(MaterialSource(key, string_value(object_value(material["object"], "material.object")["name"], "material.name"), shader_name, MappingProxyType(floats), MappingProxyType(colors), tuple(bindings), keywords, json.dumps(material, ensure_ascii=True, sort_keys=True), json.dumps(tree, ensure_ascii=True, sort_keys=True), MappingProxyType(null_texture_defaults)))
+    if len({material.identity for material in materials}) != len(materials):
+        raise ValueError("Duplicate source material identity")
+    return tuple(materials), MappingProxyType(textures)
+
+
+def read_packet(source_dir: Path, shader_path: Path, selection_path: Path, visibility_path: Path) -> SourcePacket:
+    paths = (source_dir / "source_audit.json", source_dir / "material_sources.json", source_dir / "source_texture_artifacts.json", shader_path, selection_path, visibility_path)
+    audit = object_value(read_json(paths[0]), "source_audit")
+    shader = object_value(read_json(shader_path), "shader_identity")
+    selection = object_value(read_json(selection_path), "selection")
+    visibility = object_value(read_json(visibility_path), "renderer_visibility")
+    if audit["format"] != "EndfieldCharacterSourceAudit/1" or shader["format"] != "EndfieldCharacterShaderIdentity/1" or selection["format"] != "CharacterLodPreviewSelection/2":
+        raise ValueError("Unsupported input evidence format")
+    if string_value(shader["source_audit_sha256"], "source_audit_sha256").casefold() != file_hash(paths[0]):
+        raise ValueError("Shader identities refer to a different source audit")
+    if identity(audit["actual_root"], "actual_root")[0] != string_value(selection["lod_group_identity"], "lod_group_identity").split(":")[0].casefold():
+        raise ValueError("Selection report belongs to another source container")
+    if visibility["format"] != "EndfieldCharacterRendererVisibility/1" or identity(visibility["actual_root"], "visibility.actual_root") != identity(audit["actual_root"], "actual_root"):
+        raise ValueError("Renderer pipeline evidence belongs to another source root")
+    renderer_pipeline: dict[Identity, dict[str, object]] = {}
+    for row in array_value(visibility["renderers"], "visibility.renderers"):
+        record = object_value(row, "visibility.renderer")
+        key = identity(record["renderer"], "visibility.renderer.identity")
+        tree = object_value(record["renderer_type_tree"], "renderer_type_tree")
+        if tree["available"] is not True or identity(tree["object"], "renderer_type_tree.object") != key:
+            raise ValueError(f"Renderer has no identity-matched pipeline TypeTree: {key}")
+        if key in renderer_pipeline:
+            raise ValueError(f"Duplicate renderer pipeline identity: {key}")
+        renderer_pipeline[key] = object_value(tree["data"], "renderer_type_tree.data")
+    renderers = tuple(object_value(row, "renderer") for row in array_value(audit["renderers"], "renderers"))
+    decisions = tuple(object_value(row, "decision") for row in array_value(selection["renderer_decisions"], "renderer_decisions"))
+    visible_materials = visible_material_identities(renderers, decisions)
+    material_records = tuple(object_value(row, "material") for row in array_value(audit["materials"], "materials"))
+    materials, textures = read_material_sources(source_dir, material_records, shader, visible_materials)
+    return SourcePacket(materials, textures, renderers, decisions, MappingProxyType(renderer_pipeline), MappingProxyType({str(path): file_hash(path) for path in paths}), visible_materials)
+
+
+def source_float(source: MaterialSource, name: str) -> float:
+    if name not in source.floats:
+        raise ValueError(f"Required source parameter missing: material={source.identity}, field={name}")
+    return source.floats[name]
+
+
+def source_color(source: MaterialSource, name: str) -> tuple[float, float, float, float]:
+    if name not in source.colors:
+        raise ValueError(f"Required source color missing: material={source.identity}, field={name}")
+    return source.colors[name]
+
+
+def make_environment(layout: Callable[[bpy.types.NodeTree], None]) -> bpy.types.ShaderNodeTree:
+    tree = bpy.data.node_groups.new("EF Character Environment - APPROXIMATION", "ShaderNodeTree")
+    for name, value, description in (("Wetness", 0.0, "Artist control; original _WetEffectIntensity binding is unverified"), ("Rain Wetness", 0.0, "Uniform wetness approximation; no animated rain streak simulation"), ("Water Height Meters", -1000.0, "World Blender Z corresponds to Unity world Y in this audited meter scene"), ("Submersion Strength", 0.0, "Approximate height-mask intensity"), ("Wet Darkening", 0.25, "Artist preview coefficient, not a recovered game constant"), ("Wet Roughness", 0.12, "Artist preview roughness, not a recovered game constant")):
+        tree.interface.new_socket(name=name, in_out="OUTPUT", socket_type="NodeSocketFloat")
+        control = node(tree, "ShaderNodeValue", name + " (editable)", "Approximate Environment Controls")
+        control.outputs[0].default_value = value
+        control["evidence_note"] = description
+        output = tree.nodes.get("Environment Outputs")
+        if output is None:
+            output = node(tree, "NodeGroupOutput", "Approximation - no snow formula", "Approximate Environment Controls")
+            output.name = "Environment Outputs"
+        tree.links.new(control.outputs[0], output.inputs[name])
+    tree["scope"] = "Wetness preview only; source global/material bindings are unverified. Snow is intentionally absent."
+    layout(tree)
+    return tree
+
+
+def decode_normal(tree: bpy.types.NodeTree, sample: bpy.types.Node, strength: bpy.types.NodeSocket, multiply_alpha: bool, label: str) -> bpy.types.NodeSocket:
+    section = "Packed Tangent Normal - Source Channels"
+    channels = node(tree, "ShaderNodeSeparateColor", label + " RG / BA", section)
+    tree.links.new(sample.outputs["Color"], channels.inputs[0])
+    red = math_node(tree, "MULTIPLY", channels.outputs["Red"], sample.outputs["Alpha"], "Unity R times A", section) if multiply_alpha else channels.outputs["Red"]
+    components = [math_node(tree, "SUBTRACT", math_node(tree, "MULTIPLY", channel, 2.0, "2 * packed channel", section), 1.0, "Signed tangent channel", section) for channel in (red, channels.outputs["Green"])]
+    if not multiply_alpha:
+        components = [math_node(tree, "MULTIPLY", component, strength, "Hair RG strength before Z", section) for component in components]
+    xx = math_node(tree, "MULTIPLY", components[0], components[0], "X squared", section)
+    yy = math_node(tree, "MULTIPLY", components[1], components[1], "Y squared", section)
+    xy = math_node(tree, "ADD", xx, yy, "X squared + Y squared", section)
+    remaining = math_node(tree, "MAXIMUM", math_node(tree, "SUBTRACT", 1.0, xy, "1 - X squared - Y squared", section), 0.0, "Clamp nonnegative Z squared", section)
+    z = math_node(tree, "SQRT", remaining, 0.0, "Reconstruct positive Z", section)
+    if multiply_alpha:
+        components = [math_node(tree, "MULTIPLY", component, strength, "Unity strength after Z", section) for component in components]
+    combine = node(tree, "ShaderNodeCombineColor", "Encoded reconstructed tangent normal", section)
+    for index, component in enumerate((*components, z)):
+        encoded = math_node(tree, "ADD", math_node(tree, "MULTIPLY", component, 0.5, "Encode signed normal", section), 0.5, "Normal to RGB", section)
+        tree.links.new(encoded, combine.inputs[index])
+    normal = node(tree, "ShaderNodeNormalMap", "Shared Eevee / Cycles tangent normal", section)
+    normal.uv_map = "UV0"
+    tree.links.new(combine.outputs[0], normal.inputs["Color"])
+    return normal.outputs[0]
+
+
+def texture_colorspace(binding: TextureBinding, texture: TextureSource) -> str:
+    if texture.color_space not in (0, 1):
+        raise ValueError(f"Unsupported source texture color space: {texture.identity}, {texture.color_space}")
+    color_role = binding.name in {"_BaseMap", "_EmissionMap", "_MatcapTex", "_EmotionMap", "_ShadowLutTex"}
+    return "sRGB" if color_role and texture.color_space == 1 else "Non-Color"
+
+
+def load_images(packet: SourcePacket) -> Mapping[tuple[Identity, str], bpy.types.Image]:
+    images: dict[tuple[Identity, str], bpy.types.Image] = {}
+    for source in packet.materials:
+        for binding in source.textures:
+            texture = packet.textures[binding.identity]
+            colorspace = texture_colorspace(binding, texture)
+            key = (texture.identity, colorspace)
+            if key not in images:
+                image = bpy.data.images.load(extended_path(texture.path), check_existing=False)
+                image.name = "EFCHAR " + texture.name + " " + colorspace
+                image.colorspace_settings.name = colorspace
+                image.alpha_mode = "CHANNEL_PACKED"
+                if tuple(image.size) != (texture.width, texture.height):
+                    raise ValueError(f"Decoded image dimensions differ from source: {texture.path}")
+                image.pack()
+                images[key] = image
+    return MappingProxyType(images)
+
+
+def image_node(tree: bpy.types.NodeTree, binding: TextureBinding, texture: TextureSource, images: Mapping[tuple[Identity, str], bpy.types.Image]) -> bpy.types.Node:
+    image = images[(texture.identity, texture_colorspace(binding, texture))]
+    result = node(tree, "ShaderNodeTexImage", binding.name + " | " + texture.source_format, "Verified Source Texture Inputs")
+    result.image = image
+    result["source_identity"] = json.dumps(texture.identity)
+    result["source_sha256"] = texture.sha256
+    result["source_slot"] = binding.name
+    uv = node(tree, "ShaderNodeUVMap", "Source UV0", "Verified Source Texture Inputs")
+    uv.uv_map = "UV0"
+    mapping = node(tree, "ShaderNodeMapping", "Source slot scale and offset", "Verified Source Texture Inputs")
+    mapping.vector_type = "POINT"
+    mapping.inputs["Scale"].default_value = (*binding.scale, 1.0)
+    mapping.inputs["Location"].default_value = (*binding.offset, 0.0)
+    tree.links.new(uv.outputs[0], mapping.inputs["Vector"])
+    tree.links.new(mapping.outputs[0], result.inputs["Vector"])
+    return result
+
+
+def source_base_sample(tree: bpy.types.NodeTree, source: MaterialSource, samples: Mapping[str, bpy.types.Node]) -> tuple[bpy.types.NodeSocket, bpy.types.NodeSocket]:
+    """Use a source image or the exact referenced Shader's verified white default."""
+    sample = samples.get("_BaseMap")
+    if sample is not None:
+        return sample.outputs["Color"], sample.outputs["Alpha"]
+    if source.null_texture_defaults.get("_BaseMap") != "white":
+        raise ValueError(f"Source shader requires a verified _BaseMap or an exact white default: {source.identity}")
+    color = node(tree, "ShaderNodeRGB", "Exact Shader default _BaseMap: white", "Verified Source Shader Defaults")
+    color.outputs[0].default_value = (1.0, 1.0, 1.0, 1.0)
+    alpha = node(tree, "ShaderNodeValue", "Exact Shader default _BaseMap alpha: one", "Verified Source Shader Defaults")
+    alpha.outputs[0].default_value = 1.0
+    return color.outputs[0], alpha.outputs[0]
+
+
+def archived_material_group(source: MaterialSource, packet: SourcePacket, images: Mapping[tuple[Identity, str], bpy.types.Image], layout: Callable[[bpy.types.NodeTree], None]) -> bpy.types.ShaderNodeTree:
+    """Retain inactive source evidence without pretending to evaluate its shader."""
+    if source.identity in packet.visible_materials or source.shader in SUPPORTED_SHADERS:
+        raise ValueError(f"Archive group requires an unsupported inactive source shader: {source.identity}")
+    tree = bpy.data.node_groups.new("EF Archived Character " + source.name, "ShaderNodeTree")
+    tree["source_shader"] = source.shader
+    tree["source_identity"] = json.dumps(source.identity)
+    tree["source_floats"] = json.dumps(dict(source.floats), sort_keys=True)
+    tree["source_colors"] = json.dumps(dict(source.colors), sort_keys=True)
+    tree["archived_unsupported_shader"] = True
+    tree["scope"] = "All source references are inactive in the audited selection. Texture/parameter archive only; transparent carrier is not a reconstructed shader."
+    for name, kind in (("Shader", "NodeSocketShader"), ("Coverage", "NodeSocketFloat"), ("Multiply Factor", "NodeSocketColor")):
+        tree.interface.new_socket(name=name, in_out="OUTPUT", socket_type=kind)
+    output = node(tree, "NodeGroupOutput", "Inactive unsupported shader archive", "Archived Source Evidence")
+    transparent = node(tree, "ShaderNodeBsdfTransparent", "Non-rendering archive carrier", "Archived Source Evidence")
+    tree.links.new(transparent.outputs[0], output.inputs["Shader"])
+    output.inputs["Coverage"].default_value = 0.0
+    output.inputs["Multiply Factor"].default_value = (1.0, 1.0, 1.0, 1.0)
+    for binding in source.textures:
+        texture = packet.textures[binding.identity]
+        sample = node(tree, "ShaderNodeTexImage", binding.name + " | archived, inactive", "Archived Source Evidence")
+        sample.image = images[(texture.identity, texture_colorspace(binding, texture))]
+        sample["source_identity"] = json.dumps(texture.identity)
+        sample["source_sha256"] = texture.sha256
+        sample["source_slot"] = binding.name
+        sample["source_uv_index"] = binding.uv_index
+        sample["source_scale"] = binding.scale
+        sample["source_offset"] = binding.offset
+    layout(tree)
+    return tree
+
+
+def material_group(source: MaterialSource, packet: SourcePacket, environment: bpy.types.ShaderNodeTree, images: Mapping[tuple[Identity, str], bpy.types.Image], lighting: bpy.types.ShaderNodeTree, layout: Callable[[bpy.types.NodeTree], None]) -> bpy.types.ShaderNodeTree:
+    if source.shader not in SUPPORTED_SHADERS:
+        return archived_material_group(source, packet, images, layout)
+    family = source.shader.split("/")[1]
+    tree = bpy.data.node_groups.new("EF Character " + source.name, "ShaderNodeTree")
+    tree["source_shader"] = source.shader
+    tree["source_identity"] = json.dumps(source.identity)
+    tree["source_floats"] = json.dumps(dict(source.floats), sort_keys=True)
+    tree["source_colors"] = json.dumps(dict(source.colors), sort_keys=True)
+    input_socket(tree, "Base Tint", "NodeSocketColor", source_color(source, "_BaseColor"), "Exact source _BaseColor")
+    input_socket(tree, "Approx Pass Opacity", "NodeSocketFloat", 1.0, "Editable Blender opacity multiplier; source depth/stencil behavior is not reconstructed")
+    for name, kind in (("Shader", "NodeSocketShader"), ("Coverage", "NodeSocketFloat"), ("Multiply Factor", "NodeSocketColor")):
+        tree.interface.new_socket(name=name, in_out="OUTPUT", socket_type=kind)
+    entry = node(tree, "NodeGroupInput", "Editable Source and Preview Parameters", "Editable Parameters")
+    output = node(tree, "NodeGroupOutput", family + " outputs", "Engine Outputs")
+    samples = {binding.name: image_node(tree, binding, packet.textures[binding.identity], images) for binding in source.textures}
+    base_color, base_alpha = source_base_sample(tree, source, samples)
+    if source.null_texture_defaults:
+        tree["source_null_texture_defaults"] = json.dumps({
+            slot: {
+                "slot": slot,
+                "default": default,
+                "evidence": "Exact material-referenced Shader property TypeTree",
+                "scope": "Unity null texture pointer uses the verified shader default; no source image was extracted",
+            }
+            for slot, default in source.null_texture_defaults.items()
+        }, sort_keys=True)
+    tint_alpha = source_color(source, "_BaseColor")[3]
+    input_socket(tree, "Base Tint Alpha", "NodeSocketFloat", tint_alpha, "Exact source _BaseColor.a; Blender color sockets do not expose alpha as a separate output")
+    if family == "CharacterNPR_OverlayShadow":
+        input_socket(tree, "Use Gray As Alpha", "NodeSocketFloat", source_float(source, "_UseGrayAsAlpha"), "Source coverage lerps texture alpha to texture red")
+        split = node(tree, "ShaderNodeSeparateColor", "Overlay source red mask", "Overlay Multiply - APPROXIMATION")
+        tree.links.new(base_color, split.inputs[0])
+        coverage = color_mix(tree, "MIX", entry.outputs["Use Gray As Alpha"], base_alpha, split.outputs["Red"], "Source alpha / red coverage", "Overlay Multiply - APPROXIMATION")
+        rgb = color_mix(tree, "MIX", entry.outputs["Use Gray As Alpha"], base_color, (1.0, 1.0, 1.0, 1.0), "Gray-mask branch uses white before tint", "Overlay Multiply - APPROXIMATION")
+        color = color_mix(tree, "MULTIPLY", 1.0, rgb, entry.outputs["Base Tint"], "Source overlay tint", "Overlay Multiply - APPROXIMATION")
+        alpha = math_node(tree, "MULTIPLY", coverage, entry.outputs["Base Tint Alpha"], "Source coverage times tint alpha", "Overlay Multiply - APPROXIMATION")
+        alpha = math_node(tree, "MULTIPLY", alpha, entry.outputs["Approx Pass Opacity"], "Editable overlay coverage", "Overlay Multiply - APPROXIMATION")
+        factor = color_mix(tree, "MIX", math_node(tree, "MULTIPLY", alpha, entry.outputs["Base Tint Alpha"], "Source multiply intensity", "Overlay Multiply - APPROXIMATION"), (1.0, 1.0, 1.0, 1.0), color, "Source multiply framebuffer factor - no stencil/fog", "Overlay Multiply - APPROXIMATION")
+        emission = node(tree, "ShaderNodeEmission", "Unlit source shadow tint approximation", "Overlay Multiply - APPROXIMATION")
+        tree.links.new(color, emission.inputs["Color"])
+        tree.links.new(emission.outputs[0], output.inputs["Shader"])
+        tree.links.new(alpha, output.inputs["Coverage"])
+        tree.links.new(factor, output.inputs["Multiply Factor"])
+    else:
+        for name, parameter in (("Smoothness", "_Smoothness"), ("Metallic", "_Metallic"), ("Specular", "_Specular")):
+            input_socket(tree, name, "NodeSocketFloat", source_float(source, parameter), "Exact source " + parameter + "; Principled lighting is an approximation")
+        input_socket(tree, "Preview SSS", "NodeSocketFloat", 0.0, "Optional artist skin approximation; no source scattering formula recovered")
+        input_socket(tree, "Preview Hair Anisotropy", "NodeSocketFloat", 0.5 if family == "CharacterNPR_Hair" else 0.0, "Artist anisotropy approximation; source strand dual-normal lighting is not matched")
+        input_socket(tree, "Preview Eye Coat", "NodeSocketFloat", 0.0, "Optional artist eye approximation; source matcap/parallax lighting is not matched")
+        color = color_mix(tree, "MULTIPLY", 1.0, base_color, entry.outputs["Base Tint"], "Source base sample times BaseColor", "Source Surface Channels")
+        if family == "CharacterNPR" and "_CUSTOMIZE_AVATAR" in source.keywords:
+            customize_enabled = source_float(source, "_AvatarCustomizeEnable")
+            if customize_enabled not in (0.0, 1.0):
+                raise ValueError(f"Unsupported source Avatar customization toggle: material={source.identity}, value={customize_enabled}")
+            customize_colors = (
+                ("Customize Base Color", "_CustomizeBaseColor"),
+                ("Customize Base Tint Color", "_CustomizeBaseTintColor"),
+                ("Customize Add Tint Color", "_CustomizeAddTintColor"),
+            )
+            for label, parameter in customize_colors:
+                input_socket(tree, label, "NodeSocketColor", source_color(source, parameter), "Exact source " + parameter)
+            input_socket(tree, "Avatar Customize Enabled", "NodeSocketFloat", customize_enabled, "Exact source _AvatarCustomizeEnable toggle")
+            tree["source_avatar_customization"] = json.dumps({
+                "keyword": "_CUSTOMIZE_AVATAR",
+                "enabled": customize_enabled,
+                "formula": "sampled=BaseMap*BaseColor; tint=mix(AddTint,BaseTint,sampled.g); tint=mix(tint,CustomizeBaseColor,sampled.b); result=sampled.r*tint",
+                "scope": "Generic CharacterNPR only; source sample assignment in the extracted compiled branch is absent, so BaseMap sampling dataflow is not fully verified.",
+            }, sort_keys=True)
+            channels = node(tree, "ShaderNodeSeparateColor", "Avatar customization masks after BaseMap × BaseColor", "Source Avatar Customization")
+            tree.links.new(color, channels.inputs[0])
+            tint = color_mix(tree, "MIX", channels.outputs["Green"], entry.outputs["Customize Add Tint Color"], entry.outputs["Customize Base Tint Color"], "Source green mask: AddTint to BaseTint", "Source Avatar Customization")
+            tint = color_mix(tree, "MIX", channels.outputs["Blue"], tint, entry.outputs["Customize Base Color"], "Source blue mask: tint to BaseColor", "Source Avatar Customization")
+            red = node(tree, "ShaderNodeCombineColor", "Repeat source red mask across RGB", "Source Avatar Customization")
+            for channel in ("Red", "Green", "Blue"):
+                tree.links.new(channels.outputs["Red"], red.inputs[channel])
+            customized = color_mix(tree, "MULTIPLY", 1.0, red.outputs[0], tint, "Source red mask times customized tint", "Source Avatar Customization")
+            color = color_mix(tree, "MIX", entry.outputs["Avatar Customize Enabled"], color, customized, "Source Avatar customization toggle", "Source Avatar Customization")
+        roughness = math_node(tree, "SUBTRACT", 1.0, entry.outputs["Smoothness"], "Roughness = 1 - source smoothness", "Source Surface Channels")
+        metallic = entry.outputs["Metallic"]
+        specular = entry.outputs["Specular"]
+        if source.floats.get("_UseMetallicGlossMap") == 1.0:
+            if "_MetallicGlossMap" not in samples:
+                raise ValueError(f"Enabled source MetallicGlossMap missing: {source.identity}")
+            packed = samples["_MetallicGlossMap"]
+            channels = node(tree, "ShaderNodeSeparateColor", "R metallic / G specular / B AO / A smoothness", "Source Surface Channels")
+            tree.links.new(packed.outputs["Color"], channels.inputs[0])
+            roughness = math_node(tree, "SUBTRACT", 1.0, packed.outputs["Alpha"], "Source packed alpha to roughness", "Source Surface Channels")
+            metallic, specular = channels.outputs["Red"], channels.outputs["Green"]
+            color = color_mix(tree, "MULTIPLY", 1.0, color, channels.outputs["Blue"], "AO applied to diffuse - Blender approximation", "Source Surface Channels")
+        environment_node = node(tree, "ShaderNodeGroup", "Wetness controls - APPROXIMATION", "Approximate Environment")
+        environment_node.node_tree = environment
+        geometry = node(tree, "ShaderNodeNewGeometry", "Audited meter world position", "Approximate Environment")
+        xyz = node(tree, "ShaderNodeSeparateXYZ", "Blender world Z = Unity height", "Approximate Environment")
+        tree.links.new(geometry.outputs["Position"], xyz.inputs[0])
+        height = math_node(tree, "SUBTRACT", environment_node.outputs["Water Height Meters"], xyz.outputs["Z"], "Water height minus position", "Approximate Environment")
+        mask = node(tree, "ShaderNodeMapRange", "Height mask smoothstep - binding unverified", "Approximate Environment")
+        mask.interpolation_type = "SMOOTHSTEP"
+        mask.clamp = True
+        mask.inputs["From Min"].default_value = -0.2
+        mask.inputs["From Max"].default_value = 0.15
+        tree.links.new(height, mask.inputs["Value"])
+        submersion = math_node(tree, "MULTIPLY", mask.outputs["Result"], environment_node.outputs["Submersion Strength"], "Approximate water coverage", "Approximate Environment")
+        wetness = math_node(tree, "MAXIMUM", environment_node.outputs["Wetness"], environment_node.outputs["Rain Wetness"], "Approximate wetness max rain", "Approximate Environment")
+        wetness = math_node(tree, "MINIMUM", math_node(tree, "MAXIMUM", wetness, submersion, "Approximate wetness max water", "Approximate Environment"), 1.0, "Clamp preview wetness", "Approximate Environment")
+        if source.floats.get("_DisableRainEffectOnMaterial") == 1.0:
+            wetness = math_node(tree, "MULTIPLY", wetness, 0.0, "Source material disables environment effect", "Approximate Environment")
+        dark = math_node(tree, "SUBTRACT", 1.0, math_node(tree, "MULTIPLY", wetness, environment_node.outputs["Wet Darkening"], "Artist wet darkening", "Approximate Environment"), "Artist wet albedo scale", "Approximate Environment")
+        color = color_mix(tree, "MULTIPLY", 1.0, color, dark, "Approximate wet surface color", "Approximate Environment")
+        roughness = color_mix(tree, "MIX", wetness, roughness, environment_node.outputs["Wet Roughness"], "Approximate wet roughness", "Approximate Environment")
+        bsdf = node(tree, "ShaderNodeBsdfPrincipled", family + " shared Eevee / Cycles surface", "Shared Engine Surface - APPROXIMATION")
+        for socket, source_socket in (("Base Color", color), ("Roughness", roughness), ("Metallic", metallic), ("Specular IOR Level", specular)):
+            tree.links.new(source_socket, bsdf.inputs[socket])
+        if family == "CharacterNPR_Skin":
+            tree.links.new(entry.outputs["Preview SSS"], bsdf.inputs["Subsurface Weight"])
+        if family == "CharacterNPR_Hair":
+            tree.links.new(entry.outputs["Preview Hair Anisotropy"], bsdf.inputs["Anisotropic"])
+        if family == "CharacterNPR_Eye":
+            tree.links.new(entry.outputs["Preview Eye Coat"], bsdf.inputs["Coat Weight"])
+        if source.floats.get("_UseBumpMap") == 1.0 or "_NORMALMAP" in source.keywords:
+            normal_slot = "_SplitNormalMap" if family == "CharacterNPR_Hair" and "_SPECULAR_NORMALMAP" in source.keywords else "_BumpMap"
+            input_socket(tree, "Normal Strength", "NodeSocketFloat", source_float(source, "_BumpScale"), "Exact source _BumpScale")
+            if normal_slot in samples:
+                tree.links.new(decode_normal(tree, samples[normal_slot], entry.outputs["Normal Strength"], normal_slot == "_BumpMap", normal_slot), bsdf.inputs["Normal"])
+            elif normal_slot == "_BumpMap" and source.null_texture_defaults.get(normal_slot) == "bump":
+                # The exact source Shader declares Unity's neutral bump default.
+                neutral = node(tree, "ShaderNodeNewGeometry", "Verified source null bump default - surface normal", "Source Surface Channels")
+                tree.links.new(neutral.outputs["Normal"], bsdf.inputs["Normal"])
+                tree["source_null_normal_default"] = json.dumps({"slot": normal_slot, "default": "bump", "evidence": "Exact material-referenced Shader property TypeTree", "scope": "Neutral source default, not a replacement for a missing non-null texture"}, sort_keys=True)
+            else:
+                raise ValueError(f"Enabled source normal texture missing or default unverified: material={source.identity}, slot={normal_slot}")
+        if "_EMISSION" in source.keywords:
+            emission_sample = samples.get("_EmissionMap")
+            if emission_sample is not None:
+                emission_map = emission_sample.outputs["Color"]
+            elif source.null_texture_defaults.get("_EmissionMap") == "black":
+                default_node = node(tree, "ShaderNodeRGB", "Exact Shader default _EmissionMap: black", "Verified Source Shader Defaults")
+                default_node.outputs[0].default_value = (0.0, 0.0, 0.0, 1.0)
+                default_node["source_shader_texture_default"] = json.dumps({
+                    "slot": "_EmissionMap",
+                    "default": "black",
+                    "evidence": "Exact material-referenced Shader property TypeTree",
+                    "scope": "Unity null texture pointer uses the verified Shader default; no source image was extracted",
+                }, sort_keys=True)
+                tree["source_null_emission_default"] = json.dumps({
+                    "slot": "_EmissionMap",
+                    "default": "black",
+                    "evidence": "Exact material-referenced Shader property TypeTree",
+                    "scope": "Unity null texture pointer uses the verified Shader default; no source image was extracted",
+                }, sort_keys=True)
+                emission_map = default_node.outputs[0]
+            else:
+                raise ValueError(
+                    f"Enabled source emission texture missing or default unverified: "
+                    f"material={source.identity}, slot=_EmissionMap, "
+                    f"shader_default={source.null_texture_defaults.get('_EmissionMap')!r}"
+                )
+            input_socket(tree, "Emission Tint", "NodeSocketColor", source_color(source, "_EmissionColor"), "Exact source _EmissionColor")
+            input_socket(tree, "Emission Brightness", "NodeSocketFloat", source_float(source, "_EmissionBrightness"), "Exact source _EmissionBrightness; game exposure is not matched")
+            emission = color_mix(tree, "MULTIPLY", 1.0, emission_map, entry.outputs["Emission Tint"], "Source emission texture times color", "Source Emission")
+            tree.links.new(emission, bsdf.inputs["Emission Color"])
+            tree.links.new(entry.outputs["Emission Brightness"], bsdf.inputs["Emission Strength"])
+        alpha = math_node(tree, "MULTIPLY", base_alpha, entry.outputs["Base Tint Alpha"], "Source base alpha times tint alpha", "Source Alpha Rules")
+        if source_float(source, "_AlphaClip") == 1.0:
+            input_socket(tree, "Alpha Clip Threshold", "NodeSocketFloat", source_float(source, "_AlphaClipThreshold"), "Exact source alpha clip threshold")
+            alpha = math_node(tree, "SUBTRACT", 1.0, math_node(tree, "LESS_THAN", alpha, entry.outputs["Alpha Clip Threshold"], "Discard alpha below source threshold", "Source Alpha Rules"), "Keep alpha at or above source threshold", "Source Alpha Rules")
+        elif source_float(source, "_SurfaceType") == 0.0:
+            alpha = math_node(tree, "MULTIPLY", entry.outputs["Base Tint Alpha"], 0.0, "Opaque source surface ignores texture alpha", "Source Alpha Rules")
+            alpha = math_node(tree, "ADD", alpha, 1.0, "Opaque coverage = one", "Source Alpha Rules")
+        elif source_float(source, "_SurfaceType") != 1.0:
+            raise ValueError(f"Unsupported source surface type: {source.identity}")
+        alpha = math_node(tree, "MULTIPLY", alpha, entry.outputs["Approx Pass Opacity"], "Editable surface coverage", "Source Alpha Rules")
+        tree.links.new(alpha, output.inputs["Coverage"])
+        tree.links.new(apply_diffuse_response(tree, source.shader, source.floats, samples, color, bsdf, lighting), output.inputs["Shader"])
+        tree.links.new(color, output.inputs["Multiply Factor"])
+    for sample in samples.values():
+        if not sample.outputs["Color"].is_linked and not sample.outputs["Alpha"].is_linked:
+            sample.label = sample.label + " | preserved, inactive"
+            sample["endfield_layout_note"] = "Retained; formula unknown."
+    layout(tree)
+    return tree
+
+
+def surface_stack(sources: tuple[MaterialSource, ...], groups: Mapping[Identity, bpy.types.ShaderNodeTree], layout: Callable[[bpy.types.NodeTree], None]) -> bpy.types.Material:
+    overlay_count = sum(source.shader == "HGRP/CharacterNPR_OverlayShadow" for source in sources)
+    if overlay_count and overlay_count != len(sources):
+        raise ValueError("Mixed surface and framebuffer-multiply passes require an explicit receiver composition")
+    key = hashlib.sha256(json.dumps([source.identity for source in sources]).encode()).hexdigest()[:12]
+    material = bpy.data.materials.new("EFCHAR " + sources[0].name + (" + source passes " + key if len(sources) > 1 else ""))
+    material.use_nodes = True
+    material.surface_render_method = "DITHERED"
+    material.use_transparency_overlap = False
+    if sources[0].shader in SUPPORTED_SHADERS:
+        material.diffuse_color = source_color(sources[0], "_BaseColor")
+    material["source_shader"] = sources[0].shader
+    material["source_material_stack"] = json.dumps([source.identity for source in sources])
+    material["fidelity"] = "Editable source-sampling approximation; game lighting, stencil and render queues are not reproduced"
+    if any(source.shader not in SUPPORTED_SHADERS for source in sources):
+        material["archived_unsupported_shader"] = True
+        material["fidelity"] = "Inactive unsupported source shader archive; transparent carrier is not reconstructed shading"
+    tree = material.node_tree
+    tree.nodes.clear()
+    output = node(tree, "ShaderNodeOutputMaterial", "Shared Eevee / Cycles output", "Engine Outputs")
+    transparent = node(tree, "ShaderNodeBsdfTransparent", "Transparent outside source coverage", "Source Alpha Rules")
+    previous: bpy.types.NodeSocket = transparent.outputs[0]
+    overlay_factor: bpy.types.NodeSocket | None = None
+    overlay_alpha: bpy.types.NodeSocket | None = None
+    for index, source in enumerate(sources):
+        group = node(tree, "ShaderNodeGroup", source.shader + " | source pass " + str(index), "Ordered Source Material Passes")
+        group.node_tree = groups[source.identity]
+        if index == 0:
+            control = 1.0
+        else:
+            enabled = node(tree, "ShaderNodeValue", "Approx Extra Pass " + str(index) + " Enable (0 / 1)", "Extra Pass Controls - APPROXIMATION")
+            enabled.outputs[0].default_value = 1.0
+            enabled["evidence_note"] = "Native material order retained on last submesh; single-surface composition replaces repeated draws"
+            control = enabled.outputs[0]
+        coverage = math_node(tree, "MULTIPLY", group.outputs["Coverage"], control, "Source pass coverage times enable", "Ordered Source Material Passes")
+        if source.shader == "HGRP/CharacterNPR_OverlayShadow":
+            factor = color_mix(tree, "MIX", control, (1.0, 1.0, 1.0, 1.0), group.outputs["Multiply Factor"], "Optional source multiply overlay", "Overlay Composition - APPROXIMATION")
+            overlay_factor = factor if overlay_factor is None else color_mix(tree, "MULTIPLY", 1.0, overlay_factor, factor, "Multiply ordered source overlay factors", "Overlay Composition - APPROXIMATION")
+            overlay_alpha = coverage if overlay_alpha is None else math_node(tree, "SUBTRACT", 1.0, math_node(tree, "MULTIPLY", math_node(tree, "SUBTRACT", 1.0, overlay_alpha, "Remaining prior coverage", "Overlay Composition - APPROXIMATION"), math_node(tree, "SUBTRACT", 1.0, coverage, "Remaining next coverage", "Overlay Composition - APPROXIMATION"), "Combined uncovered fraction", "Overlay Composition - APPROXIMATION"), "Combined overlay coverage", "Overlay Composition - APPROXIMATION")
+        else:
+            mix = node(tree, "ShaderNodeMixShader", "Ordered source surface-over approximation", "Ordered Source Material Passes")
+            tree.links.new(coverage, mix.inputs[0])
+            tree.links.new(previous, mix.inputs[1])
+            tree.links.new(group.outputs["Shader"], mix.inputs[2])
+            previous = mix.outputs[0]
+    if overlay_factor is not None and overlay_alpha is not None:
+        shadow = node(tree, "ShaderNodeBsdfTransparent", "Source overlay multiplicative transmission", "Overlay Composition - APPROXIMATION")
+        tree.links.new(overlay_factor, shadow.inputs["Color"])
+        previous = shadow.outputs[0]
+        material.surface_render_method = "BLENDED"
+        material["overlay_scope"] = "Tinted transmission bridge for source multiply factors; native screen-space depth/stencil and receiver filtering remain unimplemented"
+    tree.links.new(previous, output.inputs["Surface"])
+    layout(tree)
+    return material
+
+
+def geometry_signature(objects: Sequence[bpy.types.Object]) -> dict[str, tuple[int, int, int, int]]:
+    return {obj.name: (len(obj.data.vertices), len(obj.data.polygons), len(obj.vertex_groups), len(obj.data.shape_keys.key_blocks) if obj.data.shape_keys is not None else 0) for obj in objects}
+
+
+def bind_sources(packet: SourcePacket, groups: Mapping[Identity, bpy.types.ShaderNodeTree], layout: Callable[[bpy.types.NodeTree], None]) -> tuple[list[dict[str, object]], tuple[bpy.types.Object, ...]]:
+    sources = {source.identity: source for source in packet.materials}
+    renderer_map = {identity(renderer["object"], "renderer.object"): renderer for renderer in packet.renderers}
+    stacks: dict[tuple[Identity, ...], bpy.types.Material] = {}
+    rows: list[dict[str, object]] = []
+    bound: list[bpy.types.Object] = []
+    for decision in packet.selection:
+        renderer_key_text = string_value(decision["renderer_identity"], "renderer_identity")
+        cab, path_id = renderer_key_text.rsplit(":", 1)
+        renderer_key = (cab.casefold(), int(path_id))
+        renderer = renderer_map[renderer_key]
+        pipeline = packet.renderer_pipeline[renderer_key]
+        name = string_value(decision["fbx_object_name"], "fbx_object_name")
+        obj = bpy.data.objects.get(name)
+        if obj is None or obj.type != "MESH":
+            raise ValueError(f"Audited renderer mesh not present in blend: {renderer_key}, {name}")
+        if obj.hide_render != (decision["visible"] is False):
+            raise ValueError(f"Audited source visibility changed: {name}")
+        if not obj.data.uv_layers or obj.data.uv_layers[0].name != "UV0":
+            raise ValueError(f"Research source binding requires audited UV0: {name}")
+        submesh_count = int_value(renderer["submesh_count"], "renderer.submesh_count")
+        if submesh_count < 1 or len(obj.material_slots) != submesh_count:
+            raise ValueError(f"FBX/source submesh slot count mismatch: {name}, FBX={len(obj.material_slots)}, source={submesh_count}")
+        refs = tuple(identity(object_value(pointer, "material.pointer")["resolved"], "material.resolved") for pointer in array_value(renderer["materials"], "renderer.materials"))
+        if len(refs) < submesh_count:
+            raise ValueError(f"Source renderer has fewer materials than submeshes: {name}")
+        for index in range(submesh_count):
+            slot_refs = refs[index:] if index == submesh_count - 1 else (refs[index],)
+            if slot_refs not in stacks:
+                stacks[slot_refs] = surface_stack(tuple(sources[ref] for ref in slot_refs), groups, layout)
+            obj.material_slots[index].link = "OBJECT"
+            obj.material_slots[index].material = stacks[slot_refs]
+        obj["source_renderer_identity"] = renderer_key_text
+        obj["source_renderer_pipeline_json"] = json.dumps(pipeline, sort_keys=True)
+        text = bpy.data.texts.new("SOURCE RENDERER " + renderer_key_text + ".json")
+        text.write(json.dumps(pipeline, sort_keys=True))
+        pipeline_names = ("m_CastShadows", "m_ReceiveShadows", "m_RenderingLayerMask", "m_EnableCharacterOutline", "m_EnablePerRendererLighting", "m_PerRendererLightingOffset", "m_PerRendererLightingAnchor", "m_LightModeMask", "m_ProbeAnchor", "m_SortingOrder", "m_RendererSortingFudge")
+        native_pipeline = {name: pipeline[name] for name in pipeline_names if name in pipeline}
+        rows.append({"renderer_identity": renderer_key_text, "object": name, "source_materials": [list(ref) for ref in refs], "submesh_count": submesh_count, "extra_pass_count": len(refs) - submesh_count, "visible": decision["visible"], "native_pipeline_fields": native_pipeline, "unavailable_pipeline_fields": [name for name in pipeline_names if name not in pipeline], "composition": "Single-surface approximation preserving native material order; extra materials apply to final source submesh"})
+        bound.append(obj)
+    return rows, tuple(bound)
+
+
+def configure_render_view(engine: str, direction: Vector, center: Vector, extent: float, width: int, height: int, samples: int) -> None:
+    """Set the actual preview camera and engine controls without invoking rendering."""
+    scene = bpy.context.scene
+    scene.render.engine = engine
+    scene.render.resolution_x, scene.render.resolution_y = width, height
+    scene.render.resolution_percentage = 100
+    scene.render.image_settings.file_format = "PNG"
+    scene.render.image_settings.color_mode = "RGBA"
+    scene.render.film_transparent = False
+    scene.camera.location = center + direction.normalized() * extent * 4.0
+    scene.camera.rotation_euler = (center - scene.camera.location).to_track_quat("-Z", "Y").to_euler()
+    scene.camera.data.ortho_scale = extent * 1.18 * max(1.0, height / width)
+    if engine == "CYCLES":
+        scene.cycles.device = "CPU"
+        scene.cycles.samples = samples
+        scene.cycles.use_denoising = True
+    elif engine == "BLENDER_EEVEE_NEXT":
+        scene.eevee.taa_render_samples = samples
+    else:
+        raise ValueError(f"Unsupported verification engine: {engine}")
+
+
+def render_view(output: Path, name: str, engine: str, direction: Vector, center: Vector, extent: float, width: int, height: int, samples: int) -> dict[str, object]:
+    configure_render_view(engine, direction, center, extent, width, height, samples)
+    bpy.context.scene.render.filepath = extended_path(output / name)
+    bpy.ops.render.render(write_still=True)
+    image = output / name
+    if not io_path(image).is_file() or io_path(image).stat().st_size == 0:
+        raise ValueError(f"Render produced no image: {image}")
+    return {"path": str(image), "engine": engine, "width": width, "height": height, "samples": samples, "bytes": io_path(image).stat().st_size, "sha256": file_hash(image)}
+
+
+def render_material_comparisons(output: Path, center: Vector, extent: float, width: int, height: int, samples: int, environment: bpy.types.ShaderNodeTree, lighting: bpy.types.ShaderNodeTree, settings: ArtistLighting) -> list[dict[str, object]]:
+    renders = [render_view(output, "front_eevee.png", "BLENDER_EEVEE_NEXT", Vector((0.0, -1.0, 0.05)), center, extent, width, height, samples), render_view(output, "side_eevee.png", "BLENDER_EEVEE_NEXT", Vector((1.0, -0.05, 0.05)), center, extent, width, height, samples), render_view(output, "front_cycles_smoke.png", "CYCLES", Vector((0.0, -1.0, 0.05)), center, extent, 192, 256, min(samples, 16))]
+    controls = {item.label: item.outputs[0] for item in lighting.nodes if item.type == "VALUE"}
+    controls["Response Weight"].default_value = 0.0
+    renders.append(render_view(output, "front_npr_disabled_eevee.png", "BLENDER_EEVEE_NEXT", Vector((0.0, -1.0, 0.05)), center, extent, width, height, samples))
+    controls["Response Weight"].default_value = settings.response_weight
+    controls["Light Direction X"].default_value = -settings.direction[0]
+    renders.append(render_view(output, "front_light_reversed_eevee.png", "BLENDER_EEVEE_NEXT", Vector((0.0, -1.0, 0.05)), center, extent, width, height, samples))
+    controls["Light Direction X"].default_value = settings.direction[0]
+    controls["Shadow LUT Weight"].default_value = 0.0
+    renders.append(render_view(output, "front_lut_disabled_eevee.png", "BLENDER_EEVEE_NEXT", Vector((0.0, -1.0, 0.05)), center, extent, width, height, samples))
+    controls["Shadow LUT Weight"].default_value = 1.0
+    controls["Direct Intensity"].default_value = settings.direct_intensity * 0.5
+    renders.append(render_view(output, "front_half_direct_eevee.png", "BLENDER_EEVEE_NEXT", Vector((0.0, -1.0, 0.05)), center, extent, width, height, samples))
+    controls["Direct Intensity"].default_value = settings.direct_intensity
+    wet_control = next(node for node in environment.nodes if node.type == "VALUE" and node.label == "Wetness (editable)")
+    wet_control.outputs[0].default_value = 1.0
+    renders.append(render_view(output, "front_wet_approx_eevee.png", "BLENDER_EEVEE_NEXT", Vector((0.0, -1.0, 0.05)), center, extent, width, height, samples))
+    wet_control.outputs[0].default_value = 0.0
+    renders.append(render_view(output, "front_final_eevee.png", "BLENDER_EEVEE_NEXT", Vector((0.0, -1.0, 0.05)), center, extent, width, height, samples))
+    return renders
+
+
+@dataclass(frozen=True)
+class LoadedMaterialBuild:
+    environment: bpy.types.ShaderNodeTree
+    lighting: bpy.types.ShaderNodeTree
+    image_cache: Mapping[tuple[Identity, str], bpy.types.Image]
+    groups: Mapping[Identity, bpy.types.ShaderNodeTree]
+    renderer_rows: tuple[dict[str, object], ...]
+    bound_objects: tuple[bpy.types.Object, ...]
+    center: Vector
+    extent: float
+
+
+def build_loaded_materials(packet: SourcePacket, lighting_settings: ArtistLighting, layout_shader_node_tree: Callable[[bpy.types.NodeTree], None]) -> LoadedMaterialBuild:
+    """Load, pack and bind source materials without rendering or saving a blend."""
+    environment = make_environment(layout_shader_node_tree)
+    lighting = make_artist_lighting(lighting_settings, layout_shader_node_tree)
+    image_cache = load_images(packet)
+    groups = {source.identity: material_group(source, packet, environment, image_cache, lighting, layout_shader_node_tree) for source in packet.materials}
+    for source in packet.materials:
+        text = bpy.data.texts.new("SOURCE MATERIAL " + source.name + ".json")
+        text.write(source.source_json)
+        tree = bpy.data.texts.new("SOURCE TYPETREE " + source.name + ".json")
+        tree.write(source.tree_json)
+        material = surface_stack((source,), groups, layout_shader_node_tree)
+        material.use_fake_user = True
+    mesh_objects = tuple(obj for obj in bpy.data.objects if obj.type == "MESH" and not obj.name.startswith("PREVIEW_ONLY_"))
+    before = geometry_signature(mesh_objects)
+    renderer_rows, bound_objects = bind_sources(packet, groups, layout_shader_node_tree)
+    if geometry_signature(mesh_objects) != before:
+        raise ValueError("Material rebuild changed source mesh, shape keys, or vertex-group counts")
+    visible = tuple(obj for obj in bound_objects if not obj.hide_render)
+    if not visible:
+        raise ValueError("No audited source renderer is visible")
+    minimum = Vector((min((obj.matrix_world @ Vector(corner))[axis] for obj in visible for corner in obj.bound_box) for axis in range(3)))
+    maximum = Vector((max((obj.matrix_world @ Vector(corner))[axis] for obj in visible for corner in obj.bound_box) for axis in range(3)))
+    center, extent = (minimum + maximum) * 0.5, max(maximum - minimum)
+    scene = bpy.context.scene
+    scene.world.use_nodes = True
+    scene.world.node_tree.nodes.get("Background").inputs["Color"].default_value = (0.045, 0.045, 0.045, 1.0)
+    scene.world.node_tree.nodes.get("Background").inputs["Strength"].default_value = 0.35
+    scene.view_settings.view_transform = "AgX"
+    ground = bpy.data.objects.get("PREVIEW_ONLY_Ground")
+    if ground is not None:
+        ground.hide_render = True
+    for light in (obj for obj in bpy.data.objects if obj.type == "LIGHT"):
+        light.data.use_shadow = True
+    return LoadedMaterialBuild(environment, lighting, image_cache, MappingProxyType(groups), tuple(renderer_rows), bound_objects, center, extent)
+
+
+def build_material_sample(argv: Sequence[str], render_samples: Callable[[Path, Vector, float, int, int, int, bpy.types.ShaderNodeTree, bpy.types.ShaderNodeTree, ArtistLighting], list[dict[str, object]]]) -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    for name in ("blend", "source-dir", "shader-identities", "preview-report", "renderer-visibility", "ruri-glsl", "scene-source-dir", "output-dir"):
+        parser.add_argument("--" + name, required=True, type=Path)
+    for name in ("width", "height", "samples"):
+        parser.add_argument("--" + name, required=True, type=int)
+    parser.add_argument("--npr-light-direction", required=True, type=float, nargs=3)
+    for name in ("npr-direct-intensity", "npr-ambient-intensity", "npr-ramp-bias", "npr-wrap", "npr-weight"):
+        parser.add_argument("--" + name, required=True, type=float)
+    args = parser.parse_args(list(argv))
+    if min(args.width, args.height, args.samples) < 1:
+        raise ValueError("Render dimensions and samples must be positive")
+    output = args.output_dir.resolve()
+    if io_path(output).exists():
+        raise FileExistsError(f"Research output already exists: {output}")
+    if not io_path(args.scene_source_dir / "blender_scene_materials.py").is_file():
+        raise FileNotFoundError("Required production node layout helper is absent")
+    if not io_path(args.ruri_glsl).is_file():
+        raise FileNotFoundError(f"Required pinned shader reference is absent: {args.ruri_glsl}")
+    sys.path.insert(0, str(args.scene_source_dir.resolve()))
+    from blender_scene_materials import layout_shader_node_tree
+    packet = read_packet(args.source_dir, args.shader_identities, args.preview_report, args.renderer_visibility)
+    bpy.ops.wm.open_mainfile(filepath=extended_path(args.blend.resolve()))
+    io_path(output).mkdir(parents=True)
+    lighting_settings = ArtistLighting(tuple(args.npr_light_direction), args.npr_direct_intensity, args.npr_ambient_intensity, args.npr_ramp_bias, args.npr_wrap, args.npr_weight)
+    built = build_loaded_materials(packet, lighting_settings, layout_shader_node_tree)
+    environment, lighting, image_cache = built.environment, built.lighting, built.image_cache
+    renderer_rows, center, extent = built.renderer_rows, built.center, built.extent
+    visible = tuple(obj for obj in built.bound_objects if not obj.hide_render)
+    renders = render_samples(output, center, extent, args.width, args.height, args.samples, environment, lighting, lighting_settings)
+    blend = output / "character_materials.blend"
+    bpy.ops.wm.save_as_mainfile(filepath=extended_path(blend))
+    expected_images = {texture.identity for source in packet.materials for texture in source.textures}
+    actual_images = {identity for identity, _colorspace in image_cache}
+    if actual_images != expected_images or any(image.packed_file is None for image in image_cache.values()):
+        raise ValueError("Referenced source image packing is incomplete")
+    report = {"format": "EndfieldCharacterMaterialRebuild/1", "status": "approximation_smoke_passed", "game_material_fidelity_complete": False, "source_blend": str(args.blend.resolve()), "source_blend_sha256": file_hash(args.blend), "input_hashes": dict(packet.input_hashes), "script_sha256": file_hash(Path(__file__)), "layout_helper_sha256": file_hash(args.scene_source_dir / "blender_scene_materials.py"), "reference_glsl": str(args.ruri_glsl.resolve()), "reference_glsl_sha256": file_hash(args.ruri_glsl), "source_materials": len(packet.materials), "actual_shader_families": sorted({source.shader for source in packet.materials}), "verified_texture_identities": len(actual_images), "packed_image_roles": len(image_cache), "source_geometry_counts_preserved": True, "visible_renderer_count": len(visible), "renderers": renderer_rows, "extra_material_passes_connected": sum(cast(int, row["extra_pass_count"]) for row in renderer_rows), "source_parameters": "All original float/color/texture fields and complete material and renderer TypeTrees retained in blend Text datablocks; active basic parameters exposed on source material groups", "pipeline_support": {"integrated": ["Exact five source Shader identities and CAB/PathID material/texture bindings", "Base tint, UV0/ST sampling, RG/R*A-G packed normal channels, metallic/gloss/spec/AO and keyword-gated emission", "Source opaque/transparent alpha distinction and source alpha-clip threshold", "Ordered extra source material references retained as adjustable Blender composition", "Native LOD0/active/enabled/shadows-only visibility inherited from the audited preview", "Connected source 32-slice skin shadow LUT sampling and source-enabled diffuse ramp RGB/alpha with local chroma normalization; shared artist lighting composition"], "preserved_not_integrated": ["SpecRampMap, native hair strand lobes and skin SDF lighting", "Character light loop types, main/additional-light parameters and game exposure", "Native rendering-layer masks including 258; no equivalent HGRP light filtering implemented", "Per-renderer lighting enable, offset, anchor, light-mode mask and probe anchor", "Stencil/depth, render queues, fog and screen-space overlay multiply/culling", "Global wet/rain binding and response; controls remain artist approximations", "Global snow consumption formula is unknown; no fabricated snow nodes"]}, "control_entry_points": {"source_parameters": "Select mesh material; top-level EF Character <source material name> group inputs; Tab into group for verified texture channels", "artist_lighting": lighting.name + " internal Value nodes (Light Direction X/Y/Z, Direct Intensity, Ambient Intensity, Ramp Bias, Wrap, Response Weight, Shadow LUT Weight)", "wetness": environment.name + " internal Value nodes (Wetness, Rain Wetness, Water Height Meters, Submersion Strength, Wet Darkening, Wet Roughness)", "extra_passes": "Composite EFCHAR material top-level Approx Extra Pass 1 Enable (0 / 1) Value node", "complete_source_parameters": "Blend Text datablocks SOURCE MATERIAL / SOURCE TYPETREE / SOURCE RENDERER"}, "renders": renders, "output_blend": str(blend), "output_blend_bytes": io_path(blend).stat().st_size, "output_blend_sha256": file_hash(blend), "limitations": ["Source ramp/LUT sampling and local chroma arithmetic are connected; their diffuse composition and shared artist light are approximate, with unknown game global uniforms, screen shadows, SDF, matcap/parallax, light loops and outlines unimplemented", "Hair uses source split-normal RG for diffuse normal; source BA specular normal and exact strand lobes are preserved but not reconstructed", "Additional native material passes use adjustable single-surface composition on the final submesh; stencil, depth, fog and render queue semantics are not replicated", "OverlayShadow uses original red/alpha mask and source tint with transparency; framebuffer multiply is approximated by an unlit translucent surface", "Wetness controls are explicitly approximate artist inputs; original wet/rain fields are preserved without an unverified binding", "Snow has no recovered consumption formula and no artificial snow control or node", "Source _EnableAlphaTest is retained but not equated to the independently verified _AlphaClip formula", "Only source UV0 is supported; missing required texture/parameter and other UV indices fail explicitly"]}
+    report["material_support"] = {"visible_supported": [{"identity": list(source.identity), "shader": source.shader} for source in packet.materials if source.identity in packet.visible_materials], "inactive_unsupported": [{"identity": list(source.identity), "shader": source.shader, "status": "archived_unsupported_shader"} for source in packet.materials if source.shader not in SUPPORTED_SHADERS]}
+    report["research_modules"] = {name: file_hash(Path(__file__).with_name(name)) for name in ("character_npr_nodes.py", "character_node_graph.py")}
+    report["artist_lighting"] = {"direction": list(lighting_settings.direction), "direct_intensity": lighting_settings.direct_intensity, "ambient_intensity": lighting_settings.ambient_intensity, "ramp_bias": lighting_settings.ramp_bias, "wrap": lighting_settings.wrap, "response_weight": lighting_settings.response_weight, "shadow_lut_weight": 1.0}
+    report["npr_evidence"] = {"shadow_lut_lines": [1385, 1397], "diffuse_ramp_lines": [1985, 2000], "skin_ramp_lines": [1684, 1705], "local_chroma_normalization_lines": [1460, 1492], "transfer_reference": "https://raw.githubusercontent.com/Unity-Technologies/Graphics/2021.3/staging/Packages/com.unity.render-pipelines.core/ShaderLibrary/Color.hlsl", "transfer_boundary": "Unity 2021.3 reference piecewise transfer; HGRP/Substance helper binary not recovered", "binding_boundary": "Source flags choose native LUT/ramp branches. Geometric surface N, artist bias/wrap/direct/ambient replace unbound SDF/global/light-loop state. Source AO and approximate wetness feed the preview albedo."}
+    io_path(output / "material_rebuild_report.json").write_text(json.dumps(report, indent=2, ensure_ascii=True), encoding="utf-8")
+    print(json.dumps({"status": report["status"], "blend": str(blend), "materials": len(packet.materials), "textures": len(actual_images), "extra_passes": report["extra_material_passes_connected"]}))
+
+
+def main(argv: Sequence[str]) -> None:
+    build_material_sample(argv, render_material_comparisons)
+
+
+if __name__ == "__main__":
+    main(sys.argv[sys.argv.index("--") + 1:])

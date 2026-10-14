@@ -16,10 +16,14 @@ from uuid import uuid4
 
 from PIL import Image
 
+from endfield_scene_io import read_scene_manifest
 from endfield_scene_export_plan import Pending
 from endfield_terrain_detail_contract import DetailLayer, TerrainDetail, read_surface_metadata
 from extractor_core.resources import load_group, validate_vfs_root
 from extractor_core.terrain import CORE_SIZE, GROUP_HASH, PAGE_BORDER, PAGE_SIZE, _read_clear_page
+
+
+TerrainPage = tuple[int, int, int, int, bytes, str, str]
 
 
 def decode_terrain_texture(width: int, height: int, mips: int, code: int, payload: bytes) -> Image.Image:
@@ -46,7 +50,7 @@ def save_cached_texture(path: Path, image: Image.Image) -> None:
 
 def _prepare_detail(map_id: str, metadata: Path, index_path: Path,
                     tiles: tuple[tuple[int, int], ...], output: Path, texture_cache: Path,
-                    read_page: Callable[[str], tuple[int, int, int, int, bytes, str]]) -> TerrainDetail:
+                    read_page: Callable[[str], TerrainPage]) -> TerrainDetail:
     if not re.fullmatch(r"[a-z0-9_]+", map_id):
         raise ValueError(f"Invalid terrain resource map name: {map_id}")
     if output.exists():
@@ -77,7 +81,7 @@ def _prepare_detail(map_id: str, metadata: Path, index_path: Path,
         paths: dict[str, str] = {}
         for kind, expected_code, field in (("D", 108, "diffuse"), ("N", 109, "normal")):
             resource = f"Data/Terrain/PC/{map_id}/Layers/LAYER_{kind}_{source['texture_index']}.bytes"
-            width, height, mips, code, payload, source_md5 = read_page(resource)
+            width, height, mips, code, payload, source_md5, payload_sha256 = read_page(resource)
             if code != expected_code:
                 raise ValueError(f"Unexpected layer colour-space format: {resource}, code={code}")
             image = decode_terrain_texture(width, height, mips, code, payload).transpose(Image.Transpose.FLIP_TOP_BOTTOM)
@@ -86,7 +90,7 @@ def _prepare_detail(map_id: str, metadata: Path, index_path: Path,
             paths[field] = str(target.resolve())
             provenance.append({"resource": resource, "md5": source_md5, "file": str(target),
                                "format": code, "mips_preserved_in_source": mips, "exported_mip": 0,
-                               "payload_sha256": hashlib.sha256(payload).hexdigest()})
+                               "payload_sha256": payload_sha256})
         layers.append({**source, "diffuse": paths["diffuse"], "normal": paths["normal"]})
     size = ((x1 - x0)*CORE_SIZE, (z1 - z0)*CORE_SIZE)
     controls = Image.new("RGBA", size)
@@ -95,7 +99,7 @@ def _prepare_detail(map_id: str, metadata: Path, index_path: Path,
     for x, z in tiles:
         for kind, atlas in (("S", controls), ("T", tint)):
             resource = f"Data/Terrain/PC/{map_id}/Terrain_{level}_{x}_{z}_{kind}.bytes"
-            width, height, mips, code, payload, source_md5 = read_page(resource)
+            width, height, mips, code, payload, source_md5, payload_sha256 = read_page(resource)
             if (width, height, mips, code) != (PAGE_SIZE, PAGE_SIZE, 1, 8 if kind == "S" else 100):
                 raise ValueError(f"Unexpected control page header: {resource}, header={width,height,mips,code}")
             if kind == "S":
@@ -107,7 +111,7 @@ def _prepare_detail(map_id: str, metadata: Path, index_path: Path,
             core = image.crop((PAGE_BORDER,PAGE_BORDER,PAGE_BORDER+CORE_SIZE,PAGE_BORDER+CORE_SIZE))
             atlas.paste(core, ((x-x0)*CORE_SIZE,(z-z0)*CORE_SIZE))
             provenance.append({"resource": resource, "md5": source_md5,
-                               "payload_sha256": hashlib.sha256(payload).hexdigest()})
+                               "payload_sha256": payload_sha256})
     output.mkdir(parents=True)
     controls.save(output / "control.png")
     tint.save(output / "tint.png")
@@ -138,11 +142,12 @@ def prepare_detail(vfs: Path, map_id: str, metadata: Path, index_path: Path,
     pages = {item.file_name.casefold(): item for item in group.iter_files()}
     handles: dict[Path, BinaryIO] = {}
 
-    def read_page(name: str) -> tuple[int, int, int, int, bytes, str]:
+    def read_page(name: str) -> TerrainPage:
         item = pages.get(name.casefold())
         if item is None:
             raise FileNotFoundError(f"Terrain VFS page is missing: {name}")
-        return (*_read_clear_page(item, group_dir, handles), item.file_data_md5)
+        width, height, mips, code, payload = _read_clear_page(item, group_dir, handles)
+        return width, height, mips, code, payload, item.file_data_md5, hashlib.sha256(payload).hexdigest()
 
     try:
         return _prepare_detail(map_id, metadata, index_path, tiles, output, texture_cache, read_page)
@@ -170,7 +175,7 @@ def prepare_cached_detail(map_id: str, metadata: Path, index_path: Path,
             raise ValueError(f"Repeated preserved terrain page: {name}")
         pages[name] = value
 
-    def read_page(name: str) -> tuple[int, int, int, int, bytes, str]:
+    def read_page(name: str) -> TerrainPage:
         row = pages.get(name.casefold())
         if row is None:
             raise FileNotFoundError(f"Preserved terrain page is missing: {name}")
@@ -187,14 +192,15 @@ def prepare_cached_detail(map_id: str, metadata: Path, index_path: Path,
         payload = raw[20:]
         if magic != b"TRET" or version != 1 or len(payload) != length:
             raise ValueError(f"Invalid preserved terrain page header: {path}")
-        if (width, height, mips, code, length, hashlib.sha256(payload).hexdigest()) != (
+        payload_sha256 = hashlib.sha256(payload).hexdigest()
+        if (width, height, mips, code, length, payload_sha256) != (
                 row.get("width"), row.get("height"), row.get("mip_count"), row.get("format_code"),
                 row.get("payload_bytes"), row.get("payload_sha256")):
             raise ValueError(f"Preserved terrain page disagrees with manifest: {path}")
         source_md5 = row.get("source_md5")
         if not isinstance(source_md5, str) or not re.fullmatch(r"[0-9A-Fa-f]{32}", source_md5):
             raise ValueError(f"Invalid preserved terrain source digest: {path}")
-        return width, height, mips, code, payload, source_md5
+        return width, height, mips, code, payload, source_md5, payload_sha256
 
     return _prepare_detail(map_id, metadata, index_path, tiles, output, texture_cache, read_page)
 
@@ -206,10 +212,10 @@ def _scene_sources(manifests: tuple[Path, ...], map_id: str) -> tuple[Path, Path
     index_name = prefix + "splatindexmap.tga"
     metadata_refs: set[tuple[str, int]] = set()
     index_refs: set[tuple[str, int]] = set()
-    serialized: dict[str, list[Path]] = {}
-    textures: dict[tuple[str, int], list[Path]] = {}
+    serialized: dict[str, list[tuple[Path, str]]] = {}
+    textures: dict[tuple[str, int], list[tuple[Path, str]]] = {}
     for manifest in manifests:
-        data = json.loads(manifest.read_text(encoding="utf-8-sig"))
+        data = read_scene_manifest(manifest)
         if not isinstance(data, dict) or data.get("Format") != "EndfieldSceneProbe/1":
             raise ValueError(f"Invalid SceneProbe terrain source manifest: {manifest}")
         for value in data.get("Containers", []):
@@ -230,10 +236,7 @@ def _scene_sources(manifests: tuple[Path, ...], map_id: str) -> tuple[Path, Path
             original = value.get("OriginalPath")
             if not isinstance(original, str) or not original:
                 continue
-            candidate = Path(original)
-            candidate = candidate if candidate.is_absolute() else manifest.parent / candidate
-            candidate = candidate.resolve()
-            serialized.setdefault(value["Name"], []).append(candidate)
+            serialized.setdefault(value["Name"], []).append((manifest, original))
         for value in data.get("TextureExports", []):
             if not isinstance(value, dict) or not isinstance(value.get("Asset"), dict):
                 continue
@@ -241,15 +244,23 @@ def _scene_sources(manifests: tuple[Path, ...], map_id: str) -> tuple[Path, Path
             key = (asset.get("Source"), asset.get("PathId"))
             if not isinstance(key[0], str) or type(key[1]) is not int or not isinstance(value.get("File"), str):
                 continue
-            candidate = (manifest.parent / value["File"].replace("\\", "/")).resolve()
-            textures.setdefault(cast(tuple[str, int], key), []).append(candidate)
+            textures.setdefault(cast(tuple[str, int], key), []).append(
+                (manifest, value["File"].replace("\\", "/")))
     if len(metadata_refs) != 1 or len(index_refs) != 1:
         raise ValueError(f"Expected one exact terrain metadata and index AssetRef for {map_id}: "
                          f"metadata={sorted(metadata_refs)}, index={sorted(index_refs)}")
     metadata_ref = next(iter(metadata_refs))
     index_ref = next(iter(index_refs))
-    bundles = sorted(set(serialized.get(metadata_ref[0], [])))
-    indices = sorted(set(textures.get(index_ref, [])))
+
+    def resolve_export(manifest: Path, value: str) -> Path:
+        candidate = Path(value)
+        candidate = candidate if candidate.is_absolute() else manifest.parent / candidate
+        return candidate.resolve()
+
+    bundles = sorted({resolve_export(manifest, value)
+                      for manifest, value in serialized.get(metadata_ref[0], [])})
+    indices = sorted({resolve_export(manifest, value)
+                      for manifest, value in textures.get(index_ref, [])})
     if not bundles or any(not path.is_file() for path in bundles) or not indices or any(not path.is_file() for path in indices):
         raise FileNotFoundError(f"Terrain source bundle or index export is missing: map={map_id}, "
                                 f"bundles={bundles}, indices={indices}")

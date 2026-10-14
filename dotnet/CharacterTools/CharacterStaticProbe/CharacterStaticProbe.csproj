@@ -1,0 +1,9 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="$(AnimeStudioRoot)/AnimeStudio/AnimeStudio.csproj" />
+    <ProjectReference Include="../CharacterModel/CharacterModel.csproj" />
+  </ItemGroup>
+</Project>

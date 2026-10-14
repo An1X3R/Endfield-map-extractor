@@ -8,9 +8,12 @@ import react from '@vitejs/plugin-react'
 import { stage119LayerApi } from './server/stage119LayerApi.ts'
 import { mapOverviewApi } from './server/mapOverviewApi.ts'
 import { devPreviewAssetApi, parsePreviewAssetRoot } from './server/devPreviewAssetApi.ts'
+import { devInstancedScenePreviewApi, parseInstancedScenePreviewRoot } from './server/devInstancedScenePreviewApi.ts'
 
 const projectRoot = path.dirname(fileURLToPath(import.meta.url))
 const API_PREFIXES = ['/api/v2', '/api/v3'] as const
+const MUTATING_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE'])
+const MAX_REQUEST_BODY_BYTES = 1024 * 1024
 
 const parseBackendOrigin = (value: string): string | null => {
   if (!value.trim()) return null
@@ -37,6 +40,53 @@ const apiBoundary = (): Plugin => ({
   },
 })
 
+const apiMutationOriginGuard = (): Plugin => ({
+  name: 'endfield-api-mutation-origin-guard',
+  configureServer(server) {
+    installApiMutationOriginGuard(server.middlewares)
+  },
+  configurePreviewServer(server) {
+    installApiMutationOriginGuard(server.middlewares)
+  },
+})
+
+const installApiMutationOriginGuard = (middlewares: { use: (handler: (request: IncomingMessage, response: ServerResponse, next: () => void) => void) => void }): void => {
+  middlewares.use((request, response, next) => {
+    const pathname = new URL(request.url ?? '/', 'http://127.0.0.1').pathname
+    const method = (request.method ?? 'GET').toUpperCase()
+    if (!API_PREFIXES.some((prefix) => pathname === prefix || pathname.startsWith(`${prefix}/`)) || !MUTATING_METHODS.has(method)) {
+      next()
+      return
+    }
+    if (isSameOriginMutationRequest(request)) {
+      next()
+      return
+    }
+    sendJson(response, 403, {
+      format: 'EndfieldRequestOriginError/1',
+      error: 'cross_origin_mutation_rejected',
+      message: 'Mutating API requests must be same-origin.',
+    })
+  })
+}
+
+const isSameOriginMutationRequest = (request: IncomingMessage): boolean => {
+  const fetchSite = request.headers['sec-fetch-site']
+  if (fetchSite !== undefined && (Array.isArray(fetchSite) || fetchSite !== 'same-origin')) return false
+
+  const origin = request.headers.origin
+  if (origin === undefined) return true
+  const host = request.headers.host
+  if (Array.isArray(origin) || !host || Array.isArray(host)) return false
+  try {
+    const suppliedOrigin = new URL(origin)
+    const requestOrigin = new URL(`${request.socket.encrypted ? 'https' : 'http'}://${host}`)
+    return suppliedOrigin.origin === origin && suppliedOrigin.origin === requestOrigin.origin
+  } catch {
+    return false
+  }
+}
+
 const installApiBoundary = (middlewares: { use: (handler: (request: IncomingMessage, response: ServerResponse, next: () => void) => void) => void }): void => {
   middlewares.use((request, response, next) => {
     const pathname = new URL(request.url ?? '/', 'http://127.0.0.1').pathname
@@ -60,17 +110,53 @@ const sendJson = (response: ServerResponse, status: number, body: unknown) => {
   response.end(payload)
 }
 
-const readRequestBody = (request: IncomingMessage) =>
+class RequestBodyTooLargeError extends Error {
+  constructor() {
+    super(`Request body exceeds ${MAX_REQUEST_BODY_BYTES} bytes.`)
+    this.name = 'RequestBodyTooLargeError'
+  }
+}
+
+const readRequestBody = (request: IncomingMessage): Promise<string> =>
   new Promise<string>((resolve, reject) => {
-    let body = ''
-    request.setEncoding('utf8')
-    request.on('data', (chunk) => {
-      body += chunk
-      if (body.length > 1024 * 1024) reject(new Error('request body too large'))
+    const chunks: Buffer[] = []
+    let byteCount = 0
+    let oversized = false
+    let settled = false
+    request.on('data', (chunk: Buffer | string) => {
+      if (oversized) return
+      const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+      byteCount += bytes.byteLength
+      if (byteCount > MAX_REQUEST_BODY_BYTES) {
+        oversized = true
+        chunks.length = 0
+        settled = true
+        reject(new RequestBodyTooLargeError())
+        return
+      }
+      chunks.push(bytes)
     })
-    request.on('end', () => resolve(body))
-    request.on('error', reject)
+    request.on('end', () => {
+      if (oversized) return
+      settled = true
+      resolve(Buffer.concat(chunks, byteCount).toString('utf8'))
+    })
+    request.on('error', (error) => {
+      if (settled) return
+      settled = true
+      reject(error)
+    })
   })
+
+const sendBodySizeError = (response: ServerResponse, error: unknown): boolean => {
+  if (!(error instanceof RequestBodyTooLargeError)) return false
+  sendJson(response, 413, {
+    error: 'request_body_too_large',
+    message: error.message,
+    maxBytes: MAX_REQUEST_BODY_BYTES,
+  })
+  return true
+}
 
 const endfieldMapRuntimeApi = (): Plugin => ({
   name: 'endfield-map-runtime-api',
@@ -87,6 +173,55 @@ const installRuntimeApi = (middlewares: { use: (handler: (request: IncomingMessa
     const method = request.method ?? 'GET'
     const requestUrl = new URL(request.url ?? '/', 'http://127.0.0.1')
     const pathname = requestUrl.pathname
+
+    const sceneBridgeRoute = pathname === '/api/v2/instanced-scenes' || pathname.startsWith('/api/v2/instanced-scenes/')
+      ? { publicRoot: '/api/v2/instanced-scenes', bridgeRoot: '/instanced-scenes' }
+      : pathname === '/api/v2/instanced-scene-jobs' || pathname.startsWith('/api/v2/instanced-scene-jobs/')
+        ? { publicRoot: '/api/v2/instanced-scene-jobs', bridgeRoot: '/instanced-scene-jobs' }
+        : ['/characters', '/character-jobs', '/character-preparation']
+          .map((bridgeRoot) => ({ publicRoot: `/api/v2${bridgeRoot}`, bridgeRoot }))
+          .find((route) => pathname === route.publicRoot || pathname.startsWith(`${route.publicRoot}/`)) ?? null
+    if (sceneBridgeRoute) {
+      if (method !== 'GET' && method !== 'POST') {
+        response.setHeader('Allow', 'GET, POST')
+        sendJson(response, 405, { error: 'instanced_scene_method_not_allowed', message: 'Independent scene bridge routes accept GET or POST.' })
+        return
+      }
+      const bridgeRoot = process.env.ENDFIELD_PATH_PICKER_URL?.trim() ?? ''
+      const bridgeToken = process.env.ENDFIELD_PATH_PICKER_TOKEN?.trim() ?? ''
+      let targetUrl: URL | null = null
+      try {
+        const suffix = pathname.slice(sceneBridgeRoute.publicRoot.length)
+        targetUrl = new URL(`${sceneBridgeRoute.bridgeRoot}${suffix}${requestUrl.search}`, bridgeRoot)
+      } catch { /* unavailable response below */ }
+      if (!targetUrl || targetUrl.hostname !== '127.0.0.1' || !bridgeToken) {
+        sendJson(response, 503, { error: 'instanced_scene_bridge_unavailable', message: 'Independent scene bridge unavailable.' })
+        return
+      }
+      void (async () => {
+        const rawBody = method === 'POST' ? await readRequestBody(request) : undefined
+        const bridgeResponse = await fetch(targetUrl, {
+          method,
+          headers: {
+            ...(rawBody !== undefined ? { 'Content-Type': 'application/json' } : {}),
+            'X-Endfield-Path-Picker-Token': bridgeToken,
+          },
+          body: rawBody,
+        })
+        const payload = await bridgeResponse.text()
+        response.statusCode = bridgeResponse.status
+        response.setHeader('Content-Type', bridgeResponse.headers.get('content-type') ?? 'application/json; charset=utf-8')
+        response.setHeader('Cache-Control', 'no-store')
+        response.end(payload)
+      })().catch((error) => {
+        if (sendBodySizeError(response, error)) return
+        sendJson(response, 502, {
+          error: 'instanced_scene_bridge_failed',
+          message: error instanceof Error ? error.message : String(error),
+        })
+      })
+      return
+    }
 
     if (pathname === '/api/v2/first-run' || pathname.startsWith('/api/v2/first-run/')) {
       const bridgeRoot = process.env.ENDFIELD_PATH_PICKER_URL?.trim() ?? ''
@@ -116,9 +251,12 @@ const installRuntimeApi = (middlewares: { use: (handler: (request: IncomingMessa
         response.setHeader('Cache-Control', 'no-store')
         response.end(payload)
       }
-      void forward().catch((error) => sendJson(response, 502, {
-        error: { code: 'first_run_bridge_failed', message: error instanceof Error ? error.message : String(error), retryable: true },
-      }))
+      void forward().catch((error) => {
+        if (sendBodySizeError(response, error)) return
+        sendJson(response, 502, {
+          error: { code: 'first_run_bridge_failed', message: error instanceof Error ? error.message : String(error), retryable: true },
+        })
+      })
       return
     }
 
@@ -150,10 +288,13 @@ const installRuntimeApi = (middlewares: { use: (handler: (request: IncomingMessa
         response.setHeader('Cache-Control', 'no-store')
         response.end(payload)
       }
-      void forward().catch((error) => sendJson(response, 502, {
-        error: 'export_job_bridge_failed',
-        message: error instanceof Error ? error.message : String(error),
-      }))
+      void forward().catch((error) => {
+        if (sendBodySizeError(response, error)) return
+        sendJson(response, 502, {
+          error: 'export_job_bridge_failed',
+          message: error instanceof Error ? error.message : String(error),
+        })
+      })
       return
     }
 
@@ -209,10 +350,13 @@ const installRuntimeApi = (middlewares: { use: (handler: (request: IncomingMessa
           const payload = await bridgeResponse.json() as unknown
           sendJson(response, bridgeResponse.ok ? 200 : 502, payload)
         })
-        .catch(() => sendJson(response, 502, {
-          format: 'EndfieldPathPickerError/1',
-          error: 'path_picker_bridge_failed',
-        }))
+        .catch((error) => {
+          if (sendBodySizeError(response, error)) return
+          sendJson(response, 502, {
+            format: 'EndfieldPathPickerError/1',
+            error: 'path_picker_bridge_failed',
+          })
+        })
       return
     }
 
@@ -236,7 +380,10 @@ const installRuntimeApi = (middlewares: { use: (handler: (request: IncomingMessa
             missing: Object.entries(checks).filter(([, ok]) => !ok).map(([key]) => key),
           })
         })
-        .catch(() => sendJson(response, 400, { error: 'invalid_request_body' }))
+        .catch((error) => {
+          if (sendBodySizeError(response, error)) return
+          sendJson(response, 400, { error: 'invalid_request_body' })
+        })
       return
     }
 
@@ -256,8 +403,10 @@ export default defineConfig(({ mode }) => {
   const fileEnv = loadEnv(mode, projectRoot, '')
   const backendValue = process.env.ENDFIELD_BACKEND_URL ?? fileEnv.ENDFIELD_BACKEND_URL ?? ''
   const assetValue = process.env.ENDFIELD_PREVIEW_ASSET_ROOT ?? fileEnv.ENDFIELD_PREVIEW_ASSET_ROOT ?? ''
+  const sceneAssetValue = process.env.ENDFIELD_SCENE_PREVIEW_ASSET_ROOT ?? fileEnv.ENDFIELD_SCENE_PREVIEW_ASSET_ROOT ?? ''
   const backend = parseBackendOrigin(backendValue)
   const assetRoot = parsePreviewAssetRoot(assetValue)
+  const sceneAssetRoot = parseInstancedScenePreviewRoot(sceneAssetValue)
   if (backend && assetRoot) {
     throw new Error('Set either ENDFIELD_BACKEND_URL or ENDFIELD_PREVIEW_ASSET_ROOT, not both.')
   }
@@ -267,8 +416,8 @@ export default defineConfig(({ mode }) => {
   } : undefined
   return {
     plugins: backend
-      ? [react()]
-      : [react(), devPreviewAssetApi(assetRoot), mapOverviewApi(), endfieldMapRuntimeApi(), stage119LayerApi(projectRoot), apiBoundary()],
+      ? [apiMutationOriginGuard(), react(), devInstancedScenePreviewApi(sceneAssetRoot)]
+      : [apiMutationOriginGuard(), react(), devPreviewAssetApi(assetRoot), devInstancedScenePreviewApi(sceneAssetRoot), mapOverviewApi(), endfieldMapRuntimeApi(), stage119LayerApi(projectRoot), apiBoundary()],
     server: {
       host: '127.0.0.1',
       port: 5173,

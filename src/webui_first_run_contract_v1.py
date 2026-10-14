@@ -194,6 +194,8 @@ def validate_first_run_paths(request: Mapping[str, Any]) -> dict[str, Any]:
         "cache": _disk_space(cache_root, BASELINE_CACHE_BYTES),
         "export": _disk_space(export_root, BASELINE_EXPORT_BYTES),
     }
+    from endfield_scene_helpers import load_cached_scene_helper_report
+    prepared_helpers = load_cached_scene_helper_report(cache_root, Path(__file__).resolve().parent)
     return {
         "format": VALIDATION_FORMAT,
         "status": "valid" if not missing else "incomplete",
@@ -206,7 +208,7 @@ def validate_first_run_paths(request: Mapping[str, Any]) -> dict[str, Any]:
         "prerequisites": {
             "git_available": shutil.which("git") is not None,
             "dotnet_available": shutil.which("dotnet") is not None,
-            "network_required_for_initial_helper_checkout": True,
+            "network_required_for_initial_helper_checkout": prepared_helpers is None,
             "helper_commit_is_pinned": True,
         },
     }

@@ -10,12 +10,17 @@ from typing import Callable, Mapping, Sequence
 
 import bpy
 
-from blender_build_map02_chunk_20260727 import import_obj
+from blender_build_map02_chunk_20260727 import import_obj, unity_matrix
+from blender_scene_effect_materials import make_missing_mesh_uv1_reference
 from blender_scene_effect_vertex_offset import apply_material_vertex_offset, UnsupportedVertexOffset
 from endfield_scene_material_contract import mesh_material_requires_uv1, reference_key, resolve_export_path
 
 
 MeshMaterialFactory = Callable[[Mapping[str, object], Mapping[str, object], int], bpy.types.Material]
+
+
+class UnsupportedMeshVertexMapping(NotImplementedError):
+    """An OBJ export cannot be paired with its source vertex streams."""
 
 
 def _record(value: object, context: str) -> Mapping[str, object]:
@@ -126,6 +131,21 @@ def _vertex_uv1(mesh: bpy.types.Mesh, export: Mapping[str, object], manifest_pat
                                   for loop in mesh.loops for axis in range(2)])
 
 
+def _source_mesh_templates(export: Mapping[str, object], manifest_path: Path) -> tuple[bpy.types.Mesh, ...]:
+    obj_path = resolve_export_path(manifest_path.parent / str(export["File"]).replace("\\", "/"))
+    imported = import_obj(obj_path)
+    try:
+        if not imported:
+            return ()
+        if len(imported) != 1 or not _vertex_colors(imported[0].data, export, manifest_path, obj_path):
+            raise UnsupportedMeshVertexMapping(f"FX source OBJ vertex mapping is unsupported: mesh={obj_path}")
+        _vertex_uv1(imported[0].data, export, manifest_path)
+        return tuple(obj.data for obj in imported)
+    finally:
+        for obj in imported:
+            bpy.data.objects.remove(obj, do_unlink=True)
+
+
 def build_scene_effect_meshes(effect_instances: Sequence[Mapping[str, object]],
                               collection: bpy.types.Collection,
                               material_factory: MeshMaterialFactory,
@@ -208,44 +228,43 @@ def build_scene_effect_meshes(effect_instances: Sequence[Mapping[str, object]],
             refs = tuple(_record(value, "FX material reference") for value in refs_value)
             cache_key = (manifest_path, mesh_key)
             if cache_key not in templates:
-                obj_path = resolve_export_path(manifest_path.parent / str(export["File"]).replace("\\", "/"))
-                imported = import_obj(obj_path)
-                if not imported:
+                try:
+                    templates[cache_key] = _source_mesh_templates(export, manifest_path)
+                except UnsupportedMeshVertexMapping:
+                    audit.append(row | {"status": "unsupported_mesh_vertex_mapping", "mesh": list(mesh_key)})
+                    continue
+                if not templates[cache_key]:
+                    del templates[cache_key]
                     audit.append(row | {"status": "mesh_import_empty", "mesh": list(mesh_key)})
                     continue
-                try:
-                    if len(imported) != 1 or not _vertex_colors(imported[0].data, export, manifest_path, obj_path):
-                        audit.append(row | {"status": "unsupported_mesh_vertex_mapping", "mesh": list(mesh_key)})
-                        continue
-                    _vertex_uv1(imported[0].data, export, manifest_path)
-                    templates[cache_key] = tuple(obj.data for obj in imported)
-                finally:
-                    for obj in imported:
-                        bpy.data.objects.remove(obj, do_unlink=True)
             meshes = templates[cache_key]
-            if len(refs) not in (1, len(meshes)):
+            if len(refs) < len(meshes) and len(refs) != 1:
                 audit.append(row | {"status": "unsupported_material_slot_count", "materials": len(refs), "submeshes": len(meshes)})
                 continue
-            for submesh, template in enumerate(meshes):
-                ref = refs[0 if len(refs) == 1 else submesh]
+            # Unity repeats the last submesh for surplus renderer material slots.
+            draws = (tuple((index, min(index, len(meshes) - 1)) for index in range(len(refs)))
+                     if len(refs) >= len(meshes) else tuple((0, index) for index in range(len(meshes))))
+            for material_slot, submesh in draws:
+                row = row | {"material_slot": material_slot, "submesh": submesh}
+                template = meshes[submesh]
+                ref = refs[material_slot]
                 material_key = _asset(ref, "Material", "FX mesh material")
                 source_material = materials.get(material_key)
                 if source_material is None:
                     audit.append(row | {"status": "material_record_missing", "material": list(material_key)})
                     continue
-                floats = _record(source_material.get("Floats"), "FX material Floats")
-                if (source_material.get("Shader") is not None and
-                        _record(source_material["Shader"], "FX material Shader").get("Name") == "HGRP/Effect/VFXBaseV2" and
-                        floats.get("_DisableVertColor", 0) == 0 and template.color_attributes.get("EF_FX_COLOR") is None):
-                    audit.append(row | {"status": "unsupported_mesh_vertex_color", "material": list(material_key),
-                                        "reason": "Source mesh has no RGBA stream but the material reads vertex color"})
-                    continue
-                if mesh_material_requires_uv1(source_material) and template.uv_layers.get("EF_FX_UV1") is None:
+                missing_uv1 = mesh_material_requires_uv1(source_material) and template.uv_layers.get("EF_FX_UV1") is None
+                zero_uv1_reference = (missing_uv1 and export["Uv1Components"] == 0
+                                      and _record(source_material["Shader"], "FX shader").get("Name") == "HGRP/Effect/VFXBaseV2"
+                                      and _record(source_material["Floats"], "FX floats").get("_InParticle") == 0)
+                if missing_uv1 and not zero_uv1_reference:
                     audit.append(row | {"status": "unsupported_mesh_uv1", "material": list(material_key),
                                         "reason": "Source material reads UV1 but the mesh has no decoded two-component UV1 stream"})
                     continue
                 try:
                     material = material_factory(ref, node, int(export["VertexColorComponents"]))
+                    if zero_uv1_reference:
+                        material = make_missing_mesh_uv1_reference(material, int(export["Uv1Components"]))
                 except NotImplementedError as error:
                     audit.append(row | {"status": "unsupported_material", "material": list(material_key), "reason": str(error)})
                     continue
@@ -263,7 +282,8 @@ def build_scene_effect_meshes(effect_instances: Sequence[Mapping[str, object]],
                     bpy.data.meshes.remove(mesh)
                     mesh = displaced
                 mesh.materials.append(material)
-                obj = bpy.data.objects.new(f"EF_FX_MESH_{entity_id}_{owner[1]}_{submesh}", mesh)
+                suffix = f"{submesh}_{material_slot}" if len(refs) > len(meshes) else str(submesh)
+                obj = bpy.data.objects.new(f"EF_FX_MESH_{entity_id}_{owner[1]}_{suffix}", mesh)
                 collection.objects.link(obj)
                 obj.matrix_world = world
                 if "endfield_fx_vertex_offset_scope" in mesh:
@@ -273,7 +293,111 @@ def build_scene_effect_meshes(effect_instances: Sequence[Mapping[str, object]],
                 obj["endfield_fx_renderer_path_id"] = str(renderer_key[1])
                 obj["endfield_fx_mesh_source"] = mesh_key[0]
                 obj["endfield_fx_mesh_path_id"] = str(mesh_key[1])
+                obj["endfield_fx_material_slot"] = material_slot
+                if len(refs) > len(meshes):
+                    obj["endfield_fx_draw_order_scope"] = "Source material layers preserved; Blender does not reproduce Unity pass ordering"
                 audit.append(row | {"status": "static_preview_partial", "object": obj.name,
                                     "material_status": str(material["endfield_fx_status"]),
+                                    "source_vertex_color_components": int(export["VertexColorComponents"]),
+                                    "source_uv1_components": int(export["Uv1Components"]),
+                                    "uv1_status": ("absent_source_constant_zero_reference" if zero_uv1_reference
+                                                   else "source_stream" if template.uv_layers.get("EF_FX_UV1") is not None
+                                                   else "not_required"),
+                                    "material_limitations": json.loads(material["endfield_fx_limitations"]),
                                     "material": material.name, "submesh": submesh})
+    return audit
+
+
+def build_direct_effect_meshes(rows: Sequence[Mapping[str, object]], collection: bpy.types.Collection,
+                               material_factory: MeshMaterialFactory, snapshot_age_seconds: float,
+                               snapshot_camera: bpy.types.Object) -> list[dict[str, object]]:
+    """Place direct source draws with their actual world matrices and stream evidence."""
+    import hashlib
+
+    from endfield_scene_direct_effects_plan import effect_mesh_streams_ready
+
+    manifests: dict[Path, Mapping[str, object]] = {}
+    templates: dict[tuple[Path, tuple[str, int]], tuple[bpy.types.Mesh, ...]] = {}
+    seen: set[str] = set()
+    audit: list[dict[str, object]] = []
+    for row in rows:
+        identity = row.get("placement_key")
+        if not isinstance(identity, str) or not identity or identity in seen:
+            raise ValueError(f"Direct FX source placement identity invalid or repeated: identity={identity}")
+        seen.add(identity)
+        if row.get("matrix_space") != "dynamic_renderer_world":
+            raise ValueError(f"Direct FX matrix space unsupported: identity={identity}")
+        manifest_path = resolve_export_path(Path(str(row["scene_manifest"])))
+        if manifest_path not in manifests:
+            manifests[manifest_path] = _record(json.loads(manifest_path.read_text("utf-8-sig")), "Direct FX manifest")
+        mesh_key = _asset(row["mesh_asset"], "Mesh", "Direct FX mesh asset")
+        manifest = manifests[manifest_path]
+        exports = manifest.get("MeshExports")
+        if not isinstance(exports, list):
+            raise ValueError(f"Direct FX source mesh exports missing: manifest={manifest_path}")
+        matches = [_record(value, "Direct FX mesh export") for value in exports
+                   if _asset(_record(value, "Direct FX mesh export")["Asset"], "Mesh", "Direct FX export asset") == mesh_key]
+        if len(matches) != 1 or not effect_mesh_streams_ready(matches[0], manifest_path):
+            raise ValueError(f"Direct FX source mesh stream contract changed: identity={identity}, matches={len(matches)}")
+        export = matches[0]
+        evidence: dict[str, object] = {"placement_key": identity, "source_key": row["source_key"],
+            "source_virtual_path": row["source_virtual_path"], "source_pair_index": row["source_pair_index"],
+            "chunk_id": row["chunk_id"], "init_scene_index": row["init_scene_index"],
+            "group_index": row["group_index"], "record_index": row["record_index"],
+            "activation_status": row["activation_status"]}
+        pairs = row.get("renderer_pairs")
+        if not isinstance(pairs, list) or type(row.get("source_pair_index")) is not int:
+            raise ValueError(f"Direct FX source draw pairs missing: identity={identity}")
+        pair = _record(pairs[row["source_pair_index"]], "Direct FX selected pair")
+        if type(pair.get("submesh")) is not int or type(pair.get("flags")) is not int or pair["flags"] & 1024:
+            raise ValueError(f"Direct FX selected source draw is invalid or shadow-only: identity={identity}")
+        cache_key = manifest_path, mesh_key
+        try:
+            if cache_key not in templates:
+                templates[cache_key] = _source_mesh_templates(export, manifest_path)
+            source_meshes = templates[cache_key]
+            submesh = pair["submesh"]
+            if not 0 <= submesh < len(source_meshes):
+                raise UnsupportedMeshVertexMapping(f"Direct FX source submesh exceeds imported OBJ: identity={identity}, submesh={submesh}, count={len(source_meshes)}")
+            material = material_factory(_record(row["material_asset"], "Direct FX material asset"), row,
+                                        int(export["VertexColorComponents"]))
+            material_record = _record(json.loads(material["endfield_fx_source_material_json"]), "Direct FX material evidence")
+            if mesh_material_requires_uv1(material_record) and source_meshes[submesh].uv_layers.get("EF_FX_UV1") is None:
+                material = make_missing_mesh_uv1_reference(material, int(export["Uv1Components"]))
+        except NotImplementedError as error:
+            audit.append(evidence | {"status": "unsupported_direct_effect", "reason": str(error)})
+            continue
+        values = row["matrix"]
+        if not isinstance(values, list) or len(values) != 16 or any(type(value) not in (int, float) or not math.isfinite(value) for value in values):
+            raise ValueError(f"Direct FX source world matrix invalid: identity={identity}")
+        world = unity_matrix(struct.pack("<16f", *values))
+        mesh = source_meshes[submesh].copy()
+        try:
+            displaced = apply_material_vertex_offset(material, mesh, world,
+                snapshot_camera.matrix_world.translation, snapshot_age_seconds)
+        except UnsupportedVertexOffset as error:
+            bpy.data.meshes.remove(mesh)
+            audit.append(evidence | {"status": "unsupported_vertex_offset", "reason": str(error)})
+            continue
+        if displaced is not mesh:
+            bpy.data.meshes.remove(mesh)
+            mesh = displaced
+        mesh.materials.clear()
+        mesh.materials.append(material)
+        name = "EF_FX_MESH_DIRECT_" + hashlib.sha256(identity.encode()).hexdigest()[:24]
+        obj = bpy.data.objects.new(name, mesh)
+        collection.objects.link(obj)
+        obj.matrix_world = world
+        obj["endfield_fx_direct_source_json"] = json.dumps(dict(row), sort_keys=True, allow_nan=False)
+        obj["endfield_fx_source_key"] = str(row["source_key"])
+        obj["endfield_fx_placement_key"] = identity
+        obj["endfield_fx_activation_status"] = str(row["activation_status"])
+        obj["endfield_fx_draw_parameters_status"] = "serialized_initial_not_runtime"
+        obj["endfield_fx_runtime_limitations"] = "Dynamic activation, source LOD switching and runtime property overrides are not captured"
+        audit.append(evidence | {"status": "static_preview_partial", "object": name,
+            "material": material.name, "material_status": str(material["endfield_fx_status"]),
+            "source_vertex_color_components": int(export["VertexColorComponents"]),
+            "source_uv1_components": int(export["Uv1Components"]),
+            "runtime_limitations": obj["endfield_fx_runtime_limitations"],
+            "material_limitations": json.loads(material["endfield_fx_limitations"])})
     return audit

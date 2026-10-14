@@ -1,0 +1,107 @@
+param(
+    [switch]$PrepareSceneHelpers,
+    [string]$HelperCacheRoot
+)
+
+$ErrorActionPreference = 'Stop'
+$root = Split-Path -Parent $MyInvocation.MyCommand.Path
+$bootstrap = Join-Path $root 'bootstrap_environment.py'
+$venvPython = Join-Path $root '.venv\Scripts\python.exe'
+$webui = Join-Path $root 'webui'
+$helpers = Join-Path $root 'src\endfield_scene_helpers.py'
+$localCache = Join-Path $root '.tools\setup-cache'
+$localTemp = Join-Path $localCache 'tmp'
+New-Item -ItemType Directory -Path $localTemp -Force | Out-Null
+$env:TEMP = $localTemp
+$env:TMP = $localTemp
+$env:PIP_CACHE_DIR = Join-Path $localCache 'pip'
+$env:npm_config_cache = Join-Path $localCache 'npm'
+
+$hostPython = $null
+$py = Get-Command py -ErrorAction SilentlyContinue
+if ($py) {
+    & $py.Source -3 -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)" *> $null
+    if ($LASTEXITCODE -eq 0) {
+        $hostPython = @($py.Source, '-3')
+    }
+}
+if (-not $hostPython) {
+    $python = Get-Command python -ErrorAction SilentlyContinue
+    if ($python) {
+        & $python.Source -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)" *> $null
+        if ($LASTEXITCODE -eq 0) {
+            $hostPython = @($python.Source)
+        }
+    }
+}
+if (-not $hostPython) {
+    throw 'Python 3.11 or newer is required. Install it, then rerun setup_development_environment.ps1.'
+}
+
+if ($hostPython.Count -eq 2) {
+    & $hostPython[0] $hostPython[1] $bootstrap --prepare
+} else {
+    & $hostPython[0] $bootstrap --prepare
+}
+if ($LASTEXITCODE -ne 0) {
+    throw "Python environment setup failed with exit code $LASTEXITCODE."
+}
+if (-not (Test-Path -LiteralPath $venvPython -PathType Leaf)) {
+    throw "Python setup completed without the expected interpreter: $venvPython"
+}
+
+$npmCommand = Get-Command npm.cmd -ErrorAction SilentlyContinue
+if (-not $npmCommand) {
+    $npmCommand = Get-Command npm -ErrorAction SilentlyContinue
+}
+if (-not $npmCommand) {
+    throw 'Node.js/npm is required to build the local WebUI. Install Node.js, then rerun this setup script.'
+}
+
+Push-Location $webui
+try {
+    & $npmCommand.Source ci --no-audit --no-fund
+    if ($LASTEXITCODE -ne 0) {
+        throw "WebUI dependency setup failed with exit code $LASTEXITCODE."
+    }
+    $viteVariables = @(
+        'VITE_ENDFIELD_GAME_ROOT',
+        'VITE_ENDFIELD_WEBUI_OUTPUT_ROOT',
+        'VITE_ENDFIELD_CACHE_ROOT',
+        'VITE_ENDFIELD_BLENDER'
+    )
+    $previousViteValues = @{}
+    foreach ($name in $viteVariables) {
+        $previousViteValues[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
+        Remove-Item "Env:$name" -ErrorAction SilentlyContinue
+    }
+    try {
+        & $npmCommand.Source run build
+    } finally {
+        foreach ($name in $viteVariables) {
+            $value = $previousViteValues[$name]
+            if ($null -eq $value) {
+                Remove-Item "Env:$name" -ErrorAction SilentlyContinue
+            } else {
+                Set-Item "Env:$name" $value
+            }
+        }
+    }
+    if ($LASTEXITCODE -ne 0) {
+        throw "WebUI production build failed with exit code $LASTEXITCODE."
+    }
+} finally {
+    Pop-Location
+}
+
+if ($PrepareSceneHelpers) {
+    if (-not $HelperCacheRoot) {
+        throw 'Pass -HelperCacheRoot with the configured runtime cache directory when using -PrepareSceneHelpers.'
+    }
+    & $venvPython $helpers --bootstrap-cache-root $HelperCacheRoot
+    if ($LASTEXITCODE -ne 0) {
+        throw "Pinned SceneProbe/BundleScanner setup failed with exit code $LASTEXITCODE."
+    }
+}
+
+Write-Output "Development environment is ready. Start with: $root\launch_extractor.ps1"

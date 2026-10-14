@@ -1,0 +1,8 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><OutputType>Exe</OutputType><StartupObject>GlobalWeatherProgram</StartupObject></PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../CharacterStaticProbe/Program.cs" Link="SharedReader.cs" />
+    <ProjectReference Include="$(AnimeStudioRoot)/AnimeStudio/AnimeStudio.csproj" />
+    <ProjectReference Include="../CharacterModel/CharacterModel.csproj" />
+  </ItemGroup>
+</Project>

@@ -122,6 +122,13 @@ def decode_draws(raw: bytes, references: bytes) -> tuple[RendererDraw, ...]:
 
 
 def decode_pairs(raw: bytes, paths: dict[bytes, tuple[str, ...]]) -> tuple[tuple[str, str], ...]:
+    return decode_renderer_pair_paths(raw, paths, (".fbx", ".mesh"))
+
+
+def decode_renderer_pair_paths(
+    raw: bytes, paths: dict[bytes, tuple[str, ...]], mesh_suffixes: tuple[str, ...],
+) -> tuple[tuple[str, str], ...]:
+    """Resolve exact renderer hashes within the consumer's explicit mesh-path contract."""
     if len(raw) < 48 or (len(raw) - 8) % 40:
         raise ValueError(f"Invalid renderer reference stride: size={len(raw)}")
     count = struct.unpack_from("<Q", raw)[0]
@@ -134,7 +141,7 @@ def decode_pairs(raw: bytes, paths: dict[bytes, tuple[str, ...]]) -> tuple[tuple
         mesh = paths.get(raw[16 + index * 40:24 + index * 40], ())
         if len(material) != 1 or len(mesh) != 1 or not material[0].casefold().endswith(".mat"):
             raise ValueError(f"Renderer pair has unresolved or ambiguous IDs: pair={index}, material={material}, mesh={mesh}")
-        if Path(mesh[0].split("##")[0]).suffix.casefold() not in (".fbx", ".mesh"):
+        if Path(mesh[0].split("##")[0]).suffix.casefold() not in mesh_suffixes:
             raise ValueError(f"Renderer mesh reference has invalid type: {mesh[0]}")
         pairs.append((mesh[0].casefold(), material[0].casefold()))
     return tuple(pairs)

@@ -564,16 +564,22 @@ def extract_candidate_bundles(
         raise BootstrapExtractionError("Candidate bundle output must be outside the game installation")
     root.mkdir(parents=True)
     wanted = {name.casefold() for name in logical_names}
+
+    def is_requested_bundle(logical_name: str | int | float | bytes | None) -> bool:
+        return str(logical_name).casefold() in wanted
+
     connection = sqlite3.connect(f"file:{source}?mode=ro", uri=True)
     try:
-        rows = list(
+        # Filter using the original Python casefold semantics before materializing payload columns.
+        connection.create_function("requested_bundle", 1, is_requested_bundle, deterministic=True)
+        selected = list(
             connection.execute(
-                "SELECT logical_name,group_hash,virtual_path FROM bundles ORDER BY logical_name"
+                "SELECT logical_name,group_hash,virtual_path FROM bundles "
+                "WHERE requested_bundle(logical_name) ORDER BY logical_name"
             )
         )
     finally:
         connection.close()
-    selected = [row for row in rows if str(row[0]).casefold() in wanted]
     missing = sorted(wanted - {str(row[0]).casefold() for row in selected})
     if missing:
         raise BootstrapExtractionError(

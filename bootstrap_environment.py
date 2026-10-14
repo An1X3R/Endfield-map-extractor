@@ -14,24 +14,44 @@ APP_ROOT = Path(__file__).resolve().parent
 VENV_ROOT = APP_ROOT / ".venv"
 REQUIREMENTS = APP_ROOT / "requirements.txt"
 STATUS_FILE = APP_ROOT / ".runtime_status.json"
+SETUP_SCRIPT = APP_ROOT / "setup_development_environment.ps1"
 
 
 def venv_python() -> Path:
     return VENV_ROOT / "Scripts" / "python.exe"
 
 
-def requirement_lines() -> list[str]:
-    if not REQUIREMENTS.is_file():
+def requirement_lines(requirements: Path) -> list[str]:
+    if not requirements.is_file():
         return []
-    rows = []
-    for line in REQUIREMENTS.read_text(encoding="utf-8").splitlines():
+    rows: list[str] = []
+    for line in requirements.read_text(encoding="utf-8").splitlines():
         value = line.strip()
         if value and not value.startswith("#"):
             rows.append(value)
     return rows
 
 
+def setup_command() -> str:
+    return f'powershell -ExecutionPolicy Bypass -File "{SETUP_SCRIPT}"'
+
+
+def require_virtualenv() -> Path:
+    interpreter = venv_python()
+    if not interpreter.is_file():
+        raise RuntimeError(
+            f"Prepared Python environment is missing: {interpreter}. Run: {setup_command()}"
+        )
+    valid, message = verify_requirements(interpreter, REQUIREMENTS)
+    if not valid:
+        raise RuntimeError(
+            f"Prepared Python dependencies are unavailable: {message}. Run: {setup_command()}"
+        )
+    return interpreter
+
+
 def ensure_virtualenv() -> tuple[Path, bool]:
+    """Create the local venv only for the explicit setup command."""
     interpreter = venv_python()
     created = False
     if not interpreter.is_file():
@@ -43,12 +63,31 @@ def ensure_virtualenv() -> tuple[Path, bool]:
     return interpreter, created
 
 
-def install_requirements(interpreter: Path, no_install: bool) -> tuple[bool, str]:
-    requirements = requirement_lines()
-    if not requirements:
+def verify_requirements(interpreter: Path, requirements: Path) -> tuple[bool, str]:
+    if not requirement_lines(requirements):
         return True, "no third-party requirements"
-    if no_install:
-        return False, "dependency installation skipped by --no-install"
+    command = [
+        str(interpreter),
+        "-m",
+        "pip",
+        "install",
+        "--dry-run",
+        "--no-index",
+        "--no-deps",
+        "--disable-pip-version-check",
+        "--requirement",
+        str(requirements),
+    ]
+    process = subprocess.run(command, text=True, capture_output=True, check=False)
+    if process.returncode == 0:
+        return True, "all pinned requirements are already available offline"
+    details = (process.stderr or process.stdout or "offline requirement check failed").strip()
+    return False, details[-1200:]
+
+
+def install_requirements(interpreter: Path, requirements: Path) -> tuple[bool, str]:
+    if not requirement_lines(requirements):
+        return True, "no third-party requirements"
     command = [
         str(interpreter),
         "-m",
@@ -56,7 +95,7 @@ def install_requirements(interpreter: Path, no_install: bool) -> tuple[bool, str
         "install",
         "--disable-pip-version-check",
         "--requirement",
-        str(REQUIREMENTS),
+        str(requirements),
     ]
     process = subprocess.run(command, text=True, capture_output=True, check=False)
     if process.returncode == 0:
@@ -72,13 +111,13 @@ def blender_path() -> str | None:
     return None
 
 
-def write_status(interpreter: Path, created: bool, dependency_ok: bool, dependency_message: str) -> None:
+def write_status(interpreter: Path | None, created: bool, dependency_ok: bool, dependency_message: str) -> None:
     payload = {
         "format": "EndfieldExtractorRuntimeStatus/1",
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
         "app_root": str(APP_ROOT),
         "venv": str(VENV_ROOT),
-        "interpreter": str(interpreter),
+        "interpreter": str(interpreter) if interpreter is not None else None,
         "venv_created_this_run": created,
         "dependency_ok": dependency_ok,
         "dependency_message": dependency_message,
@@ -91,21 +130,32 @@ def write_status(interpreter: Path, created: bool, dependency_ok: bool, dependen
 
 
 def arguments() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Prepare the isolated Endfield extractor environment.")
-    parser.add_argument("--check", action="store_true", help="Prepare and print status without launching the UI.")
-    parser.add_argument("--no-install", action="store_true", help="Do not invoke pip; useful for offline checks.")
+    parser = argparse.ArgumentParser(description="Check or explicitly prepare the isolated extractor environment.")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--check", action="store_true", help="Check the existing environment without creating or installing anything (default).")
+    mode.add_argument("--prepare", action="store_true", help="Create the venv if needed and install Python requirements; setup-only.")
     return parser.parse_args()
 
 
 def main() -> int:
     args = arguments()
-    interpreter, created = ensure_virtualenv()
-    dependency_ok, dependency_message = install_requirements(interpreter, args.no_install)
-    write_status(interpreter, created, dependency_ok, dependency_message)
+    if args.prepare:
+        interpreter, created = ensure_virtualenv()
+        dependency_ok, dependency_message = install_requirements(interpreter, REQUIREMENTS)
+    else:
+        interpreter = venv_python()
+        created = False
+        if interpreter.is_file():
+            dependency_ok, dependency_message = verify_requirements(interpreter, REQUIREMENTS)
+        else:
+            dependency_ok, dependency_message = False, f"prepared interpreter is missing: {interpreter}"
+    write_status(interpreter if interpreter.is_file() else None, created, dependency_ok, dependency_message)
     print("ENDFIELD_EXTRACTOR_HOME=" + str(APP_ROOT))
-    print("ENDFIELD_EXTRACTOR_PYTHON=" + str(interpreter))
-    print("ENDFIELD_EXTRACTOR_DEPENDENCIES=" + ("ok" if dependency_ok else "degraded"))
+    print("ENDFIELD_EXTRACTOR_PYTHON=" + (str(interpreter) if interpreter.is_file() else "missing"))
+    print("ENDFIELD_EXTRACTOR_DEPENDENCIES=" + ("ok" if dependency_ok else "missing"))
     print("ENDFIELD_EXTRACTOR_DEPENDENCY_MESSAGE=" + dependency_message.replace("\n", " "))
+    if not dependency_ok:
+        print("ENDFIELD_EXTRACTOR_SETUP_COMMAND=" + setup_command())
     return 0 if dependency_ok else 2
 
 

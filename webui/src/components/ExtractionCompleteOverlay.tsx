@@ -49,9 +49,9 @@ export function ExtractionCompleteOverlay({
   const pending = blenderBuild?.pending ?? (scenes.length > 0 ? scenes.reduce((sum, scene) => sum + scene.pending, 0) : null)
   const partial = blenderBuild?.status === 'partial' || (pending !== null && pending > 0)
   const missingScenes = exportMode === 'blend' && scenes.length === 0
-  const title = exportMode === 'data_package'
-    ? '审计数据包已导出'
-    : missingScenes ? '任务结束 · 场景报告缺失' : '场景已导出'
+  const title = missingScenes
+    ? '任务结束 · 场景报告缺失'
+    : partial ? '导出完成，有待处理项' : '导出完成'
   const subtitle = exportMode === 'data_package'
     ? '所选分组、区块索引与审计记录已写入数据包'
     : missingScenes ? '后端未返回场景路径；请检查导出报告'
@@ -130,7 +130,7 @@ export function ExtractionCompleteOverlay({
             {exportMode === 'data_package' ? <p><b>已完成</b><span>数据包导出；实际内容以导出报告为准</span></p> : (
               <>
                 <p><b>场景结果</b><span>{scenes.length > 0 ? `${scenes.length} 批场景文件` : '未返回场景路径'}</span></p>
-                <p><b>待处理</b><span>{pending === null ? '数量未返回' : `${pending} 项`}；待处理不等同于缺失资产数量</span></p>
+                <p><b>待处理</b><span>{pending === null ? '数量未返回' : `${pending} 项`}；待处理项数量不等于缺失资产数量</span></p>
               </>
             )}
           </div>

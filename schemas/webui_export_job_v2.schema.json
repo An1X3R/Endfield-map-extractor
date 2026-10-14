@@ -59,6 +59,49 @@
       "items": {"type": "string", "enum": ["all", "building", "prop", "lighting", "particle", "vegetation", "terrain", "road", "water", "effects", "unknown"]}
     },
     "water_mode": {"type": "string", "enum": ["stable_eevee", "flowmap_fresnel"]},
+    "fog_depth": {
+      "type": "object", "required": ["subdivision_level"],
+      "properties": {"subdivision_level": {"type": "integer", "minimum": 0, "maximum": 6}},
+      "description": "Optional host-camera fog contact fading; requires Blender and effects export."
+    },
+    "scene_color_snapshot": {
+      "type": "object",
+      "required": ["format", "camera_matrix_world", "lens_mm", "resolution", "engine", "samples", "time_seconds", "clip_start", "clip_end"],
+      "properties": {
+        "format": {"const": "EndfieldSceneColorSnapshot/1"},
+        "camera_matrix_world": {"type": "array", "items": {"type": "number"}, "minItems": 16, "maxItems": 16},
+        "lens_mm": {"type": "number", "exclusiveMinimum": 0},
+        "resolution": {"type": "array", "items": {"type": "integer", "minimum": 1, "maximum": 4096}, "minItems": 2, "maxItems": 2},
+        "engine": {"type": "string", "enum": ["BLENDER_EEVEE_NEXT", "CYCLES"]},
+        "samples": {"type": "integer", "minimum": 1, "maximum": 512},
+        "time_seconds": {"type": "number", "minimum": 0},
+        "clip_start": {"type": "number", "exclusiveMinimum": 0},
+        "clip_end": {"type": "number", "exclusiveMinimum": 0}
+      },
+      "description": "Optional camera-bound host SceneColor snapshot recipe; requires Blender and effects export. Extra fields are ignored by the canonicalizer."
+    },
+    "water_transport_lighting": {
+      "type": "object", "additionalProperties": true,
+      "required": ["map_id", "entity_id", "ambient_radiance", "radiance_scale"],
+      "properties": {
+        "map_id": {"type": "string", "minLength": 1},
+        "entity_id": {"type": "integer"},
+        "ambient_radiance": {"type": "array", "items": {"type": "number", "minimum": 0}, "minItems": 3, "maxItems": 3},
+        "radiance_scale": {"type": "number", "exclusiveMinimum": 0},
+        "phase_atmosphere_rgb": {"type": "array", "items": {"type": "number", "minimum": 0}, "minItems": 3, "maxItems": 3},
+        "ambient_l1": {
+          "type": "object", "additionalProperties": true,
+          "required": ["coefficients", "environment_global_scale"],
+          "properties": {
+            "coefficients": {
+              "type": "array", "minItems": 3, "maxItems": 3,
+              "items": {"type": "array", "items": {"type": "number"}, "minItems": 4, "maxItems": 4}
+            },
+            "environment_global_scale": {"type": "number"}
+          }
+        }
+      }
+    },
     "effects": {
       "type": "object", "additionalProperties": false,
       "required": ["selection_mode"],

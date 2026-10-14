@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <AssemblyName>Endfield.PortableUtility</AssemblyName>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <Nullable>disable</Nullable>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Kyaru.Texture2DDecoder.Windows" Version="0.1.0" />
+    <PackageReference Include="Mono.Cecil" Version="0.11.6" />
+    <PackageReference Include="Vortice.D3DCompiler" Version="3.6.2" />
+    <ProjectReference Include="../CharacterModel/CharacterModel.csproj" />
+    <ProjectReference Include="$(AnimeStudioRoot)/AnimeStudio.ShaderRecovery/AnimeStudio.ShaderRecovery.csproj" />
+    <Compile Include="$(AnimeStudioRoot)/AnimeStudio.Utility/**/*.cs" Exclude="$(AnimeStudioRoot)/AnimeStudio.Utility/ModelExporter.cs;$(AnimeStudioRoot)/AnimeStudio.Utility/ModelConverter.cs;$(AnimeStudioRoot)/AnimeStudio.Utility/ACL/*.cs;$(AnimeStudioRoot)/AnimeStudio.Utility/YAML/MuscleHelper.cs;$(AnimeStudioRoot)/AnimeStudio.Utility/AudioClipConverter.cs;$(AnimeStudioRoot)/AnimeStudio.Utility/FMOD Studio API/*.cs;$(AnimeStudioRoot)/AnimeStudio.Utility/**/obj/**;$(AnimeStudioRoot)/AnimeStudio.Utility/**/bin/**;$(AnimeStudioRoot)/AnimeStudio.Utility/**/obj-flat/**;$(AnimeStudioRoot)/AnimeStudio.Utility/**/bin-flat/**" Link="%(RecursiveDir)%(Filename)%(Extension)" />
+  </ItemGroup>
+</Project>

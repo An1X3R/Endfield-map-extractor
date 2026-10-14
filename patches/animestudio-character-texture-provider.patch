@@ -1,0 +1,68 @@
+diff --git a/AnimeStudio.Utility/ModelConverter.cs b/AnimeStudio.Utility/ModelConverter.cs
+index ea214f6..776c78e 100644
+--- a/AnimeStudio.Utility/ModelConverter.cs
++++ b/AnimeStudio.Utility/ModelConverter.cs
+@@ -1,6 +1,7 @@
+ ﻿using Newtonsoft.Json;
+ using System;
+ using System.Collections.Generic;
++using System.IO;
+ using System.Linq;
+ using System.Text;
+ 
+@@ -784,6 +785,17 @@ namespace AnimeStudio
+                 return;
+             }
+ 
++            if (options.textureBytesProvider != null)
++            {
++                var cachedBytes = options.textureBytesProvider(m_Texture2D, name, options.imageFormat, true)
++                    ?? throw new InvalidDataException($"Texture byte provider returned no data: {m_Texture2D.assetsFile.fileName}/{m_Texture2D.m_PathID}, name={name}.");
++                if (cachedBytes.Length == 0) throw new InvalidDataException($"Texture byte provider returned empty data: {m_Texture2D.assetsFile.fileName}/{m_Texture2D.m_PathID}, name={name}.");
++                using var cachedStream = new MemoryStream(cachedBytes, false);
++                iTex = new ImportedTexture(cachedStream, name);
++                TextureList.Add(iTex);
++                return;
++            }
++
+             var stream = m_Texture2D.ConvertToStream(options.imageFormat, true);
+             if (stream != null)
+             {
+@@ -1189,6 +1201,7 @@ namespace AnimeStudio
+             public HashSet<Material> materials;
+             public Dictionary<string, (bool, int)> uvs;
+             public Dictionary<string, int> texs; 
++            public Func<Texture2D, string, ImageFormat, bool, byte[]> textureBytesProvider;
+         }
+     }
+ }
+diff --git a/AnimeStudio/UnityCNManager.cs b/AnimeStudio/UnityCNManager.cs
+index b0ecb85..96508d0 100644
+--- a/AnimeStudio/UnityCNManager.cs
++++ b/AnimeStudio/UnityCNManager.cs
+@@ -1,4 +1,4 @@
+-﻿using System;
++using System;
+ using System.IO;
+ using System.Linq;
+ using System.Text.Json;
+@@ -77,17 +77,14 @@ namespace AnimeStudio
+                 return list;
+             } catch
+             {
+-                Logger.Error($"[UnityCN] Failed to read {UnityCNKeysPath} file, creating a new one.");
++                Logger.Error($"[UnityCN] Failed to read {UnityCNKeysPath} file; using built-in keys in memory.");
+                 return ResetJson();
+             }
+         }
+ 
+         public static List<List<string>> ResetJson()
+         {
+-            var options = new JsonSerializerOptions {
+-                WriteIndented = true
+-            };
+-            File.WriteAllText(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, UnityCNKeysPath), JsonSerializer.Serialize(baseData, options));
++            storedData = baseData;
+             return baseData;
+         }
+ 

@@ -4,19 +4,44 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import Callable, cast
 from uuid import uuid4
 
-from endfield_scene_material_contract import load_catalog, reference_key, require_object, resolve_export_path
+from endfield_scene_io import SceneSourceCacheSlot, cached_scene_source_value
+from endfield_scene_io import read_scene_manifest, resolve_scene_read_path
+from endfield_scene_material_contract import (MaterialRecord, load_catalog, reference_key, require_object, resolve_export_path,
+                                             resolve_existing_export_files)
 from extractor_core.resources import extract_candidate_bundles, read_bundle_closure_names
-from endfield_scene_helpers import SceneHelpers, ensure_current_scene_helpers
+from endfield_scene_helpers import SceneHelpers, require_prepared_scene_helpers
 from endfield_shader_contract import surface_family
 
 
 FORMAT = "EndfieldSceneResourceCache/1"
 PROVIDER_COVERAGE = "all_asset_containers"
 PACKAGE_PROVIDER_COVERAGE = "all_asset_and_package_containers"
+
+
+@dataclass(frozen=True)
+class _FileDescription:
+    """Immutable file identity fields reused within one scene IO session."""
+
+    bytes: int
+    sha256: str
+
+
+@dataclass(frozen=True)
+class _ProviderIndex:
+    """Immutable normalized providers from one complete scanner output."""
+
+    providers: Mapping[str, tuple[str, ...]]
+
+
+_FILE_DESCRIPTION_CACHE = SceneSourceCacheSlot("scene-resource-file-description", _FileDescription, 256, 256 * 1024)
+_PROVIDER_INDEX_CACHE = SceneSourceCacheSlot("scene-resource-provider-index", _ProviderIndex, 1, 384 * 1024 * 1024)
 
 
 def read_json(path: Path) -> dict[str, object]:
@@ -27,13 +52,20 @@ def resolve_path(value: object, parent: Path) -> Path:
     if not isinstance(value, str) or not value:
         raise ValueError(f"Expected a nonempty resource path relative to {parent}")
     path = Path(value).expanduser()
-    return (path if path.is_absolute() else parent / path).resolve()
+    return resolve_scene_read_path(path if path.is_absolute() else parent / path)
 
 
 def describe_file(path: Path) -> dict[str, object]:
-    with path.open("rb") as stream:
-        digest = hashlib.file_digest(stream, "sha256").hexdigest().upper()
-    return {"path": str(path), "bytes": path.stat().st_size, "sha256": digest}
+    source = resolve_scene_read_path(path)
+
+    def build() -> _FileDescription:
+        with source.open("rb") as stream:
+            digest = hashlib.file_digest(stream, "sha256").hexdigest().upper()
+        return _FileDescription(source.stat().st_size, digest)
+
+    description = cached_scene_source_value(
+        _FILE_DESCRIPTION_CACHE, (source,), (str(path),), build)
+    return {"path": str(path), "bytes": description.bytes, "sha256": description.sha256}
 
 
 def write_index(path: Path, value: dict[str, object]) -> None:
@@ -95,16 +127,39 @@ def supplemental_manifests(runtime_path: Path, runtime: dict[str, object]) -> tu
 
 def ready_resource_paths(manifests: tuple[Path, ...]) -> frozenset[str]:
     """Require actual payloads independently of Blender shader support."""
-    from endfield_scene_effects_plan import observed_effect_prefabs
+    from endfield_scene_effects_plan import observed_effect_prefabs_from_catalog
 
     materials, textures = load_catalog(manifests)
+    observed = observed_effect_prefabs_from_catalog(manifests, materials, textures)
+    return _ready_resource_paths(manifests, materials, textures, lambda path: True, observed)
+
+
+def ready_requested_resource_paths(manifests: tuple[Path, ...], requested: frozenset[str],
+                                   cache_root: Path) -> frozenset[str]:
+    """Resolve selected dependencies without decoding unrelated material records."""
+    from endfield_scene_effects_plan import observed_requested_effect_prefabs
+    from endfield_scene_planning_catalog import load_planning_catalog
+
+    catalog = load_planning_catalog(manifests, cache_root)
+    roots = frozenset(path.split("##", 1)[0] for path in requested)
+    observed = observed_requested_effect_prefabs(manifests, roots, catalog.materials, catalog.textures)
+    return _ready_resource_paths(manifests, catalog.materials, catalog.textures, roots.__contains__, observed)
+
+
+def _ready_resource_paths(
+    manifests: tuple[Path, ...], materials: Mapping[tuple[str, int], MaterialRecord],
+    textures: Mapping[tuple[str, int], tuple[Path, str]],
+    selects_container: Callable[[str], bool], observed_effects: frozenset[str],
+) -> frozenset[str]:
+    from endfield_scene_effects_plan import _shader_default_issues
+
     mesh_keys: set[tuple[str, int]] = set()
     water_keys: set[tuple[str, int]] = set()
     array_keys: set[tuple[str, int]] = set()
     water_records: list[tuple[str, dict[str, object]]] = []
     containers: list[dict[str, object]] = []
     for path in manifests:
-        data = read_json(path)
+        data = require_object(read_scene_manifest(path), str(path))
         array_keys.update(ready_texture_arrays(data, path.parent))
         water = require_object(data.get("Water", {}), "water records")
         for kind in ("Configs", "GlobalConfigs", "Sectors"):
@@ -114,9 +169,19 @@ def ready_resource_paths(manifests: tuple[Path, ...]) -> frozenset[str]:
             for value in records:
                 row = require_object(value, "water record")
                 water_records.append((kind, row))
+        mesh_candidates: list[tuple[dict[str, object], Path]] = []
         for value in cast(list[object], data["MeshExports"]):
             row = require_object(value, "mesh export")
-            if row.get("File") and resolve_export_path(resolve_path(row["File"], path.parent)).is_file():
+            file = row.get("File")
+            if not file:
+                continue
+            if not isinstance(file, str):
+                raise ValueError(f"Expected a nonempty resource path relative to {path.parent}")
+            candidate = Path(file).expanduser()
+            mesh_candidates.append((row, candidate if candidate.is_absolute() else path.parent / candidate))
+        existing_meshes = resolve_existing_export_files(tuple(candidate for _, candidate in mesh_candidates))
+        for row, candidate in mesh_candidates:
+            if str(candidate) in existing_meshes:
                 mesh_keys.add(reference_key(require_object(row["Asset"], "mesh asset")))
         containers.extend(require_object(value, "container") for value in cast(list[object], data["Containers"]))
     for kind, row in water_records:
@@ -135,13 +200,15 @@ def ready_resource_paths(manifests: tuple[Path, ...]) -> frozenset[str]:
                 complete = False
         if complete:
             water_keys.add(key)
-    ready = set(observed_effect_prefabs(manifests))
+    ready = set(observed_effects)
     for row in containers:
         if row.get("Asset") is None:
             continue
         asset = require_object(row["Asset"], "container asset")
         key = reference_key(asset)
         container = str(row["Container"]).replace("\\", "/").casefold()
+        if not selects_container(container):
+            continue
         if asset.get("Type") == "Mesh" and key in mesh_keys:
             ready.add(container + "##" + str(asset["Name"]).casefold())
             if container.endswith(".asset"):
@@ -159,7 +226,8 @@ def ready_resource_paths(manifests: tuple[Path, ...]) -> frozenset[str]:
                     )
                 )
             )
-            if sweep_metadata_ready and all(slot["Texture"] is None or reference_key(slot["Texture"]) in textures for slot in slots):
+            if (sweep_metadata_ready and not _shader_default_issues(material)
+                    and all(slot["Texture"] is None or reference_key(slot["Texture"]) in textures for slot in slots)):
                 ready.add(container)
         elif asset.get("Type") == "MonoBehaviour" and key in water_keys:
             ready.add(container)
@@ -202,23 +270,37 @@ def ready_texture_arrays(manifest: dict[str, object], directory: Path) -> frozen
     return frozenset(ready)
 
 
+def _provider_index(index: Path) -> _ProviderIndex:
+    source = resolve_scene_read_path(index)
+
+    def build() -> _ProviderIndex:
+        providers: dict[str, set[str]] = {}
+        last: dict[str, object] = {}
+        with source.open(encoding="utf-8-sig") as stream:
+            for number, line in enumerate(stream, 1):
+                row = require_object(json.loads(line), f"provider record {number}")
+                last = row
+                if row.get("kind") != "match":
+                    continue
+                name, containers = row.get("logical_name"), row.get("containers")
+                if not isinstance(name, str) or not isinstance(containers, list):
+                    raise ValueError(f"Invalid provider record: {source}:{number}")
+                for container in containers:
+                    if not isinstance(container, str):
+                        raise ValueError(f"Non-string provider container: {source}:{number}")
+                    path = container.replace("\\", "/").casefold()
+                    providers.setdefault(path, set()).add(name.casefold())
+        if last.get("kind") != "complete" or last.get("failed") != 0:
+            raise ValueError(f"Provider scan must finish without failures: {source}; last={last}")
+        frozen = MappingProxyType({path: tuple(sorted(names)) for path, names in providers.items()})
+        return _ProviderIndex(frozen)
+
+    return cached_scene_source_value(_PROVIDER_INDEX_CACHE, (source,), (), build)
+
+
 def exact_providers(index: Path, requested: frozenset[str]) -> dict[str, tuple[str, ...]]:
-    result: dict[str, set[str]] = {path: set() for path in requested}
-    with index.open(encoding="utf-8-sig") as stream:
-        for number, line in enumerate(stream, 1):
-            row = require_object(json.loads(line), f"provider record {number}")
-            if row.get("kind") != "match":
-                continue
-            name, containers = row.get("logical_name"), row.get("containers")
-            if not isinstance(name, str) or not isinstance(containers, list):
-                raise ValueError(f"Invalid provider record: {index}:{number}")
-            for container in containers:
-                if not isinstance(container, str):
-                    raise ValueError(f"Non-string provider container: {index}:{number}")
-                path = container.replace("\\", "/").casefold()
-                if path in result:
-                    result[path].add(name.casefold())
-    return {path: tuple(sorted(names)) for path, names in result.items()}
+    providers = _provider_index(index).providers
+    return {path: providers.get(path, ()) for path in requested}
 
 
 def validate_scan(path: Path) -> None:
@@ -246,7 +328,36 @@ def ensure_scene_resources(runtime_path: Path, plan_path: Path,
     if not requested:
         return {"status": "ready", "requested": 0, "missing": []}
     manifests = tuple(resolve_path(p, plan_path.parent) for p in cast(list[str], plan["scene_manifests"]))
-    missing = requested - ready_resource_paths(manifests)
+    paths = require_object(runtime["paths"], "runtime paths")
+    cache_root = resolve_path(paths["cache_root"], runtime_path.parent)
+    if cache_root.is_relative_to(resolve_path(paths["game_root"], runtime_path.parent)):
+        raise ValueError(f"Scene planning cache cannot be inside the game: {cache_root}")
+    missing = requested - ready_requested_resource_paths(manifests, requested, cache_root)
+    from endfield_scene_direct_effects_plan import ready_effect_mesh_paths
+
+    streams = plan.get("required_effect_mesh_paths", [])
+    if not isinstance(streams, list) or any(not isinstance(path, str) or path not in requested for path in streams):
+        raise ValueError("FX source mesh stream requests must be a subset of required_resource_paths")
+    required_streams = frozenset(cast(list[str], streams))
+    if required_streams:
+        missing |= required_streams - ready_effect_mesh_paths(manifests)
+    from endfield_scene_mesh_uv_contract import RequiredUvStreams, ready_uv_stream_paths
+
+    uv_values = plan.get("required_uv_streams", [])
+    if not isinstance(uv_values, list):
+        raise ValueError("Ordinary UV stream requests must be an array")
+    uv_requirements: list[RequiredUvStreams] = []
+    for value in uv_values:
+        row = require_object(value, "ordinary UV requirement")
+        path, channels = row.get("mesh_path"), row.get("channels")
+        if (not isinstance(path, str) or path not in requested or not isinstance(channels, list)
+                or not channels or any(type(channel) is not int or channel not in (1, 2) for channel in channels)
+                or len(set(channels)) != len(channels)):
+            raise ValueError(f"Ordinary source UV requirements must identify exact requested mesh channels: requirement={row}")
+        uv_requirements.append({"mesh_path": path, "channels": channels})
+    required_uv_paths = frozenset(row["mesh_path"] for row in uv_requirements)
+    if uv_requirements:
+        missing |= required_uv_paths - ready_uv_stream_paths(manifests, tuple(uv_requirements))
     if not missing:
         return {"status": "ready", "requested": len(requested), "missing": []}
     root = resource_cache_root(runtime_path, runtime)
@@ -279,7 +390,8 @@ def ensure_scene_resources(runtime_path: Path, plan_path: Path,
             if describe_file(provider_path) != record:
                 raise ValueError(f"Prepared provider index changed: {provider_path}")
         else:
-            helpers = ensure_current_scene_helpers(runtime_path, helper_cache, check_cancelled, progress)
+            check_cancelled()
+            helpers = require_prepared_scene_helpers(runtime_path, helper_cache)
             provider_path = work / "providers.jsonl"
             scan_index = resolve_path(extraction["bundleScanIndex"], runtime_path.parent)
             progress(0.05, "Upgrading complete resource provider index once for this prepared cache")
@@ -292,16 +404,18 @@ def ensure_scene_resources(runtime_path: Path, plan_path: Path,
             validate_scan(provider_path)
             existing = {**existing, "providerIndex": describe_file(provider_path), "providerCoverage": coverage}
             write_index(index_path, existing)
-        validate_scan(provider_path)
         check_cancelled()
-        providers = exact_providers(provider_path, frozenset(path.split("##", 1)[0] for path in missing))
+        indexed = _provider_index(provider_path).providers
+        missing_provider_paths = frozenset(path.split("##", 1)[0] for path in missing)
+        providers = {path: indexed[path] for path in missing_provider_paths}
         roots = sorted({names[0] for names in providers.values() if len(names) == 1})
         unresolved = {path: list(names) for path, names in providers.items() if len(names) != 1}
         result: dict[str, object] = {"requested": len(requested), "missingBefore": len(missing),
                                     "providerRoots": len(roots), "unresolvedProviders": unresolved}
         if roots:
             if helpers is None:
-                helpers = ensure_current_scene_helpers(runtime_path, helper_cache, check_cancelled, progress)
+                check_cancelled()
+                helpers = require_prepared_scene_helpers(runtime_path, helper_cache)
             cab = resolve_path(require_object(discovery["cabInventory"], "CAB inventory")["path"], runtime_path.parent)
             closures, metadata = read_bundle_closure_names({"resources": roots}, cab)
             bundles = work / "bundles"
@@ -323,8 +437,10 @@ def ensure_scene_resources(runtime_path: Path, plan_path: Path,
             manifest = output / "scene_manifest.json"
             if read_json(manifest).get("Format") != "EndfieldSceneProbe/1":
                 raise ValueError(f"Invalid supplementary SceneProbe output: {manifest}")
-            after = ready_resource_paths((*manifests, manifest))
-            result["missingAfter"] = sorted(requested - after)
+            after = ready_requested_resource_paths((*manifests, manifest), requested, cache_root)
+            stream_missing = (required_streams - ready_effect_mesh_paths((*manifests, manifest))) if required_streams else frozenset()
+            uv_missing = (required_uv_paths - ready_uv_stream_paths((*manifests, manifest), tuple(uv_requirements))) if uv_requirements else frozenset()
+            result["missingAfter"] = sorted((requested - after) | stream_missing | uv_missing)
             prior = existing["manifests"]
             if not isinstance(prior, list):
                 raise ValueError("Supplement index requires a manifest list")

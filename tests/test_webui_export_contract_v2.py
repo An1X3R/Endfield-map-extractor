@@ -35,6 +35,20 @@ def payload(map_id: str = "map01") -> dict:
     }
 
 
+def scene_color_snapshot() -> dict[str, object]:
+    return {
+        "format": "EndfieldSceneColorSnapshot/1",
+        "camera_matrix_world": [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1],
+        "lens_mm": 50.0,
+        "resolution": [640, 480],
+        "engine": "CYCLES",
+        "samples": 32,
+        "time_seconds": 1.25,
+        "clip_start": 0.05,
+        "clip_end": 2500.0,
+    }
+
+
 class ContractTests(unittest.TestCase):
     def test_browser_batch_modes_match_schema_and_canonicalizer(self) -> None:
         schema = json.loads((SCHEMA_ROOT / "webui_export_job_v2.schema.json").read_text())
@@ -66,6 +80,83 @@ class ContractTests(unittest.TestCase):
             self.assertEqual(result["export_groups"], ["building", "prop"])
             schema = json.loads((SCHEMA_ROOT / "webui_export_job_v2.schema.json").read_text())
             jsonschema.validate(value, schema)
+
+            value["export_groups"] = ["building", "effects"]
+            value["fog_depth"] = {"subdivision_level": 4}
+            jsonschema.validate(value, schema)
+            self.assertEqual(contract.canonicalize_job(value)["fog_depth"], {"subdivision_level": 4})
+            for invalid in (None, {}, {"subdivision_level": True}, {"subdivision_level": -1}):
+                with self.subTest(fog_depth=invalid), self.assertRaisesRegex(ValueError, "fog_depth"):
+                    contract.canonicalize_job({**value, "fog_depth": invalid})
+            with self.assertRaisesRegex(ValueError, "fog_depth requires"):
+                contract.canonicalize_job({**value, "export_mode": "data_package"})
+            with self.assertRaisesRegex(ValueError, "fog_depth requires"):
+                contract.canonicalize_job({**value, "layers": {**value["layers"], "effects": False}})
+
+    def test_explicit_water_transport_lighting_is_blend_opt_in(self) -> None:
+        value = payload()
+        value.update({"export_mode": "blend", "export_groups": ["water", "lighting"],
+                      "water_transport_lighting": {
+                          "map_id": "map01", "entity_id": 90982682,
+                          "ambient_radiance": [.18, .22, .28], "radiance_scale": 1.25,
+                          "future_field": "ignored",
+                      }})
+        value["layers"].update({"water": True, "lights": True})
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            game = create_game_install(root / "game")
+            blender = root / "blender.exe"
+            blender.write_bytes(b"test")
+            output = root / "output"
+            output.mkdir()
+            value["source"] = {"game_root": str(game), "blender_exe": str(blender)}
+            value["output"]["root"] = str(output)
+            schema = json.loads((SCHEMA_ROOT / "webui_export_job_v2.schema.json").read_text())
+            jsonschema.validate(value, schema)
+            canonical = contract.canonicalize_job(value)
+            self.assertEqual(canonical["water_transport_lighting"], {
+                "map_id": "map01", "entity_id": 90982682,
+                "ambient_radiance": [.18, .22, .28], "radiance_scale": 1.25,
+            })
+            self.assertNotIn("water_transport_lighting", contract.canonicalize_job(payload()))
+            invalid_requests = (
+                ({"water_transport_lighting": {**value["water_transport_lighting"], "map_id": "map02"}}, "map_id must match"),
+                ({"layers": {**value["layers"], "water": False}}, "requires Blender export"),
+                ({"export_groups": ["water"]}, "requires Blender export"),
+                ({"export_mode": "data_package"}, "requires Blender export"),
+            )
+            for changes, message in invalid_requests:
+                with self.subTest(changes=changes), self.assertRaisesRegex(ValueError, message):
+                    contract.canonicalize_job({**value, **changes})
+
+    def test_scene_color_snapshot_is_effects_blend_opt_in(self) -> None:
+        value = {**payload(), "export_mode": "blend", "export_groups": ["effects"],
+                 "scene_color_snapshot": {**scene_color_snapshot(), "unrelated": "ignored"}}
+        value["layers"]["effects"] = True
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            game = create_game_install(root / "game")
+            blender = root / "blender.exe"
+            blender.write_bytes(b"test")
+            output = root / "output"
+            output.mkdir()
+            value["source"] = {"game_root": str(game), "blender_exe": str(blender)}
+            value["output"]["root"] = str(output)
+            jsonschema.validate(value, json.loads((SCHEMA_ROOT / "webui_export_job_v2.schema.json").read_text()))
+            canonical = contract.canonicalize_job(value)
+            self.assertEqual(canonical["scene_color_snapshot"], scene_color_snapshot())
+            self.assertNotIn("scene_color_snapshot", contract.canonicalize_job(payload()))
+            for changes, message in (
+                ({"export_mode": "data_package"}, "requires Blender export"),
+                ({"export_groups": ["building"]}, "requires Blender export"),
+                ({"layers": {**value["layers"], "effects": False}}, "requires Blender export"),
+            ):
+                with self.subTest(changes=changes), self.assertRaisesRegex(ValueError, message):
+                    contract.canonicalize_job({**value, **changes})
+            with self.assertRaisesRegex(ValueError, "clip_end greater than clip_start"):
+                contract.canonicalize_job({**value, "scene_color_snapshot": {
+                    **scene_color_snapshot(), "clip_start": 2.0, "clip_end": 1.0,
+                }})
 
     def test_unknown_export_mode_fails(self) -> None:
         value = payload()

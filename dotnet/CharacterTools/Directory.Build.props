@@ -1,0 +1,11 @@
+<Project>
+  <PropertyGroup>
+    <TargetFramework>net9.0-windows</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+  </PropertyGroup>
+  <Target Name="ValidateCharacterDependencies" BeforeTargets="Restore;PrepareForBuild">
+    <Error Condition="'$(AnimeStudioRoot)' == '' Or !Exists('$(AnimeStudioRoot)/AnimeStudio/AnimeStudio.csproj')" Text="CHARACTER_ANIMESTUDIO_ROOT_MISSING: pass -p:AnimeStudioRoot=pinned patched checkout." />
+  </Target>
+</Project>

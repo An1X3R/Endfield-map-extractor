@@ -16,7 +16,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
-from webui_source_contract import normalize_export_groups, validate_source_paths
+from endfield_water_transport import (WaterTransportLighting, read_water_transport_lighting,
+                                      serialize_water_transport_lighting)
+from endfield_scene_vfxrefract_contract import read_scene_color_snapshot
+from webui_source_contract import normalize_export_groups, read_fog_depth_options, validate_source_paths
 
 
 CONTRACT_FORMAT = "EndfieldWebUIExportJob/2"
@@ -194,6 +197,27 @@ def canonicalize_job(payload: Mapping[str, Any]) -> dict[str, Any]:
     if export_mode == "blend" and (source is None or not source.get("blender_exe")):
         raise ValueError("Blender scene export requires source.blender_exe and source.game_root")
     export_groups = normalize_export_groups(payload.get("export_groups"))
+    water_transport_lighting: WaterTransportLighting | None = None
+    if "water_transport_lighting" in payload:
+        water_transport_lighting = read_water_transport_lighting(payload["water_transport_lighting"])
+        if water_transport_lighting.map_id != map_id:
+            raise ValueError(f"water_transport_lighting.map_id must match request map_id: {water_transport_lighting.map_id} != {map_id}")
+        if (export_mode != "blend" or not normalized_layers["water"] or not normalized_layers["lights"]
+                or not set(export_groups).intersection({"all", "water"})
+                or not set(export_groups).intersection({"all", "lighting"})):
+            raise ValueError("water_transport_lighting requires Blender export with water and lighting selected")
+    fog_depth = None
+    if "fog_depth" in payload:
+        fog_depth = read_fog_depth_options(payload["fog_depth"])
+        if (export_mode != "blend" or not normalized_layers["effects"]
+                or not set(export_groups).intersection({"all", "effects", "particle"})):
+            raise ValueError("fog_depth requires Blender export with the effects layer and effects or particle group")
+    scene_color_snapshot = None
+    if "scene_color_snapshot" in payload:
+        scene_color_snapshot = read_scene_color_snapshot(payload["scene_color_snapshot"])
+        if (export_mode != "blend" or not normalized_layers["effects"]
+                or not set(export_groups).intersection({"all", "effects"})):
+            raise ValueError("scene_color_snapshot requires Blender export with the effects layer and effects group")
     request_id = payload.get("request_id")
     if request_id is not None and not isinstance(request_id, str):
         raise ValueError("request_id must be a string or null")
@@ -221,6 +245,10 @@ def canonicalize_job(payload: Mapping[str, Any]) -> dict[str, Any]:
         "export_groups": export_groups,
         "water_mode": water_mode,
         "effects": {"selection_mode": selection_mode},
+        **({"water_transport_lighting": serialize_water_transport_lighting(water_transport_lighting)}
+           if water_transport_lighting is not None else {}),
+        **({"fog_depth": fog_depth} if fog_depth is not None else {}),
+        **({"scene_color_snapshot": scene_color_snapshot} if scene_color_snapshot is not None else {}),
         "batch_mode": batch_mode,
         "output": _validate_output(
             dict(payload.get("output") or {}),

@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+    <AssemblyName>Ruri.ACL</AssemblyName>
+    <RootNamespace>Ruri.ACL</RootNamespace>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <GenerateTargetFrameworkAttribute>false</GenerateTargetFrameworkAttribute>
+    <CheckForOverflowUnderflow>false</CheckForOverflowUnderflow>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="$(RuriRoot)/Source/Ruri.ACL/AclCompressedTracks.cs" Link="AclCompressedTracks.cs" />
+    <Compile Include="$(RuriRoot)/Source/Ruri.ACL/AclDecompressor.cs" Link="AclDecompressor.cs" />
+    <Compile Include="$(RuriRoot)/Source/Ruri.ACL/AclFloatDecompressor.cs" Link="AclFloatDecompressor.cs" />
+  </ItemGroup>
+  <Target Name="ValidateRuriRoot" BeforeTargets="Restore;PrepareForBuild">
+    <Error Condition="'$(RuriRoot)' == '' Or !Exists('$(RuriRoot)/Source/Ruri.ACL/AclCompressedTracks.cs')" Text="CHARACTER_RURI_ROOT_MISSING: supply the pinned Ruri source checkout via -p:RuriRoot." />
+  </Target>
+</Project>

@@ -1,0 +1,174 @@
+{
+  "scope": "Constructor evidence and explicit preview environment; not final runtime state",
+  "inputs": {
+    "Ambient Color": {
+      "kind": "NodeSocketColor",
+      "value": [
+        1,
+        1,
+        1,
+        1
+      ],
+      "source": "Native constructor tint"
+    },
+    "Light Color": {
+      "kind": "NodeSocketColor",
+      "value": [
+        1,
+        1,
+        1,
+        1
+      ],
+      "source": "Preview environment"
+    },
+    "CP6 Ambient Direction": {
+      "kind": "NodeSocketVector",
+      "value": [
+        0,
+        0,
+        1
+      ],
+      "source": "Native constructor Unity Y up converted to Blender Z up"
+    },
+    "Ambient Intensity": {
+      "kind": "NodeSocketFloat",
+      "value": 0.15,
+      "source": "Preview environment - not captured runtime state"
+    },
+    "Light Intensity": {
+      "kind": "NodeSocketFloat",
+      "value": 0.9,
+      "source": "Preview environment - not captured runtime state"
+    },
+    "Cast Shadow": {
+      "kind": "NodeSocketFloat",
+      "value": 1,
+      "source": "Preview environment - not captured runtime state"
+    },
+    "Preview Atlas Visibility": {
+      "kind": "NodeSocketFloat",
+      "value": 1,
+      "source": "Preview environment - not captured runtime state"
+    },
+    "CP0 Y Lit Scale": {
+      "kind": "NodeSocketFloat",
+      "value": 1,
+      "source": "Native constructor - scene volume overrides unknown"
+    },
+    "CP0 Z Ambient Floor": {
+      "kind": "NodeSocketFloat",
+      "value": 0.7,
+      "source": "Native constructor - scene volume overrides unknown"
+    },
+    "CP0 W Dark Scale": {
+      "kind": "NodeSocketFloat",
+      "value": 1,
+      "source": "Native constructor - scene volume overrides unknown"
+    },
+    "CP1 X Dark Brightness Mix": {
+      "kind": "NodeSocketFloat",
+      "value": 0,
+      "source": "Native constructor - scene volume overrides unknown"
+    },
+    "CP1 Y Shadow Strength": {
+      "kind": "NodeSocketFloat",
+      "value": 0,
+      "source": "Native constructor - scene volume overrides unknown"
+    },
+    "CP7 X Bias": {
+      "kind": "NodeSocketFloat",
+      "value": 0.15000000596,
+      "source": "Native constructor - scene volume overrides unknown"
+    },
+    "CP7 Y Scale": {
+      "kind": "NodeSocketFloat",
+      "value": 0.60000002384,
+      "source": "Native constructor - scene volume overrides unknown"
+    },
+    "CP7 Z Offset": {
+      "kind": "NodeSocketFloat",
+      "value": 1,
+      "source": "Native constructor - scene volume overrides unknown"
+    },
+    "CP12 Y Light Color Mix": {
+      "kind": "NodeSocketFloat",
+      "value": 0,
+      "source": "Native constructor - scene volume overrides unknown"
+    }
+  },
+  "preview_response_weight": 0.65,
+  "standard_wet_film": {
+    "format": "EndfieldStandardWetFilmProfile/1",
+    "orientation": 1.0,
+    "tiling": 1.0
+  },
+  "standard_snow": {
+    "format": "EndfieldStandardSnowProfile/1",
+    "source_family": "HGRP/CharacterNPR",
+    "texture_slot": "characterSnowTexture",
+    "position_attribute": "EF_EXPERIMENTAL_REST_UNITY_POSITION",
+    "normal_attribute": "EF_EXPERIMENTAL_REST_UNITY_NORMAL",
+    "projection_provenance": "Reuses static rest-world projection from the Standard wet-film profile; source TEXCOORD mapping and live weather state remain unverified."
+  },
+  "skin_rain": {
+    "format": "EndfieldSkinRainProfile/1",
+    "source_family": "HGRP/CharacterNPR_Skin",
+    "position_attribute": "EF_EXPERIMENTAL_REST_UNITY_POSITION",
+    "normal_attribute": "EF_EXPERIMENTAL_REST_UNITY_NORMAL",
+    "orientation": 0.0,
+    "tiling": 2.25,
+    "time_x": 0.25,
+    "gravity_mode": "host_geometric_normal_projection",
+    "projection_provenance": "Static host rest-space attributes converted to Unity axes; source TEXCOORD8/TEXCOORD6 and per-draw projection are not captured or verified.",
+    "dry_default": true,
+    "state_defaults": {
+      "rain_intensity": 0.0,
+      "water_submersion": 0.0,
+      "global_wetness": 0.0
+    }
+  },
+  "hair_fur_snow": {
+    "format": "EndfieldHairFurSnowProfile/1",
+    "hair": {
+      "keyword_sets": [
+        [
+          "_DIFF_RAMP_ON",
+          "_DRAW_UNDER_BROW",
+          "_METALLICSPECGLOSSMAP",
+          "_NORMALMAP",
+          "_OUTLINE_MASK",
+          "_SPECULAR_LINE",
+          "_SPECULAR_NORMALMAP",
+          "_SPEC_RAMP_ON"
+        ],
+        [
+          "_ALPHABLEND_ON",
+          "_DIFF_RAMP_ON",
+          "_METALLICSPECGLOSSMAP",
+          "_NORMALMAP",
+          "_OUTLINE_MASK",
+          "_SPECULAR_LINE",
+          "_SPECULAR_NORMALMAP",
+          "_SPEC_RAMP_ON"
+        ]
+      ],
+      "source_scope": "Current exact material keywords; snow core from same Shader ForwardLit core permutation. Complete native runtime permutation and draw-under-brow/outline composition are not established."
+    },
+    "fur": {
+      "keyword_sets": [
+        [
+          "_ALPHABLEND_ON",
+          "_CHARACTER_FUR",
+          "_DIFF_RAMP_ON",
+          "_METALLICSPECGLOSSMAP",
+          "_NORMALMAP"
+        ]
+      ],
+      "source_scope": "Exact compiled _CHARACTER_FUR ForwardLit blob514 snow; retained host PBR/artist diffuse lighting, not a reconstructed native Fur light loop."
+    },
+    "orientation": 0.0,
+    "tiling": 1.0,
+    "projection_provenance": "Explicit source-Y-up rest-world attributes. Native varying, runtime projection, and material weather selection are not captured."
+  },
+  "format": "EndfieldCharacterMaterialProfileTemplate/1"
+}

@@ -10,7 +10,18 @@ import tempfile
 import time
 import unittest
 
-from endfield_scene_export import run_scene_process, scene_batches, scene_runtime
+from endfield_scene_export import (
+    _can_reuse_preflight_plan,
+    _refresh_after_resource_writes,
+    _scene_export_io_session,
+    copy_preflight_plan,
+    run_scene_process,
+    scene_batches,
+    scene_runtime,
+)
+from endfield_scene_export_plan import load_scene_export_plan
+from endfield_scene_io import (_SOURCE_CACHE_BYTE_BUDGET, SceneSourceCacheSlot,
+                               cached_scene_source_value, scene_io_session)
 
 
 class ProcessCancelled(RuntimeError):
@@ -143,6 +154,91 @@ class SceneBatchTests(unittest.TestCase):
             scene_batches({"batch_mode": "merged_selection", "bounds": bounds}),
         )
         self.assertEqual({"xmin": -3, "xmax": 7, "zmin": -11, "zmax": 13}, bounds)
+
+
+class PreflightReuseTests(unittest.TestCase):
+    def test_single_plan_scope_requires_exact_preflight_selection(self) -> None:
+        bounds = {"xmin": 0.0, "xmax": 128.0, "zmin": 0.0, "zmax": 128.0}
+        canonical = {"batch_mode": "merged_selection", "bounds": bounds}
+        batches = scene_batches(canonical)
+        self.assertTrue(_can_reuse_preflight_plan(canonical, batches))
+        with _scene_export_io_session(canonical, batches) as session:
+            self.assertEqual(_SOURCE_CACHE_BYTE_BUDGET, session.source_cache_byte_budget)
+            self.assertEqual(frozenset({"scene-manifest-index", "path-id-index", "dynamic-scene-renderers"}),
+                             session.bypassed_source_cache_slots)
+
+        other_selection = {**canonical, "selection_bounds": {**bounds, "xmax": 256.0}}
+        self.assertFalse(_can_reuse_preflight_plan(other_selection, batches))
+        with _scene_export_io_session(other_selection, batches) as session:
+            self.assertEqual(_SOURCE_CACHE_BYTE_BUDGET, session.source_cache_byte_budget)
+            self.assertEqual(frozenset(), session.bypassed_source_cache_slots)
+
+        multiple = {"batch_mode": "per_sector", "bounds": {**bounds, "xmax": 256.0}}
+        batches = scene_batches(multiple)
+        self.assertEqual(2, len(batches))
+        self.assertFalse(_can_reuse_preflight_plan(multiple, batches))
+        with _scene_export_io_session(multiple, batches) as session:
+            self.assertEqual(_SOURCE_CACHE_BYTE_BUDGET, session.source_cache_byte_budget)
+            self.assertEqual(frozenset(), session.bypassed_source_cache_slots)
+
+    def test_copies_validated_plan_and_sidecars_without_changing_source(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            decals = root / "decals.json"
+            materials = root / "materials.json"
+            decals.write_text('{"records": []}', encoding="utf-8")
+            materials.write_text('{"Materials": []}', encoding="utf-8")
+            source = root / "preflight.json"
+            source.write_text(json.dumps({
+                "format": "EndfieldPortableScenePlan/1", "map_id": "map01",
+                "bounds": {"xmin": 0, "xmax": 1, "zmin": 0, "zmax": 1},
+                "scene_manifests": [], "terrain_surfaces": [], "category_filter": [],
+                "decal_manifest": str(decals), "decal_materials": str(materials),
+                "instances": [], "pending": [], "source_sha256": {},
+                "summary": {"selected_static": 0, "ready_static": 0, "selected_decals": 0,
+                            "ready_decals": 0, "pending": 0},
+            }), encoding="utf-8")
+            source_bytes = source.read_bytes()
+            directory = root / "batch"
+            directory.mkdir()
+            target = copy_preflight_plan(source, directory / "scene_plan.json")
+            original = load_scene_export_plan(source)
+            copied = load_scene_export_plan(target)
+            for field in ("decal_manifest", "decal_materials"):
+                self.assertEqual(Path(copied[field]).parent, directory)
+                self.assertEqual(Path(copied[field]).read_bytes(), Path(original[field]).read_bytes())
+                copied[field] = original[field]
+            self.assertEqual(original, copied)
+            self.assertEqual(source_bytes, source.read_bytes())
+            with self.assertRaises(FileExistsError):
+                copy_preflight_plan(source, target)
+            decals.unlink()
+            with self.assertRaises(FileNotFoundError):
+                copy_preflight_plan(source, directory / "missing_source.json")
+            self.assertFalse((directory / "missing_source.json").exists())
+
+
+class ResourceSourceInvalidationTests(unittest.TestCase):
+    def test_dependency_extraction_retains_unchanged_sources_and_rechecks_changed_sources(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "provider.jsonl"
+            source.write_text("stable", encoding="utf-8")
+            slot = SceneSourceCacheSlot("resource-invalidation-test", str, 1, 64)
+            with scene_io_session() as session:
+                cached_scene_source_value(
+                    slot, (source,), (), lambda: source.read_text(encoding="utf-8"))
+                _refresh_after_resource_writes(session, {"missingBefore": 1})
+                self.assertEqual(1, session.statistics()["retained_source_cache_entries"])
+                _refresh_after_resource_writes(session, {"extraction": {"resources": 1}})
+                self.assertEqual(1, session.statistics()["retained_source_cache_entries"])
+                self.assertEqual("stable", cached_scene_source_value(
+                    slot, (source,), (), lambda: source.read_text(encoding="utf-8")))
+                self.assertEqual(1, session.statistics()["source_cache_hits"])
+                source.write_text("changed", encoding="utf-8")
+                _refresh_after_resource_writes(session, {"extraction": {"resources": 1}})
+                self.assertEqual("changed", cached_scene_source_value(
+                    slot, (source,), (), lambda: source.read_text(encoding="utf-8")))
+                self.assertEqual(2, session.statistics()["source_cache_misses"])
 
 
 class SceneRuntimeTests(unittest.TestCase):

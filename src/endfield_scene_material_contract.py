@@ -5,8 +5,15 @@ import json
 import math
 import os
 from pathlib import Path
+from endfield_scene_io import (SceneSourceCacheSlot, cached_scene_source_value,
+                               read_scene_manifest, resolve_scene_read_path, resolve_scene_existing_files)
 from typing import NotRequired, TypedDict, cast
-from endfield_shader_contract import emission_source, surface_family, uses_mro, uses_normal_map
+from endfield_shader_contract import emission_source, surface_family, uses_mro, uses_normal_map, has_verified_lit_top_layer
+
+
+_MATERIAL_CATALOG_CACHE = SceneSourceCacheSlot(
+    "material-catalog", tuple, 4, 512 * 1024 * 1024
+)
 
 
 def is_neutral_material_name(name: str) -> bool:
@@ -91,25 +98,34 @@ def has_shader_white_texture_default(record: MaterialRecord, property_name: str)
 
 
 def mesh_material_requires_uv1(material: MaterialRecord) -> bool:
-    """Report source UV1 use by enabled VFXBaseV2 sample textures."""
+    """Report source UV1 use by the main and enabled VFXBaseV2 sample textures."""
     floats, colors = material["Floats"], material["Colors"]
     return any(
-        floats.get(f"_UseSampleTex{index}", 0) != 0 and
-        isinstance(weights := colors.get(f"_SampleTex{index}UVWeights"), list) and
+        isinstance(weights := colors.get(f"{name}UVWeights"), list) and
         len(weights) == 4 and weights[1] != 0
-        for index in range(4)
+        for name in ("_MainTex", *(f"_SampleTex{index}" for index in range(5)
+                                   if floats.get(f"_UseSampleTex{index}", 0) != 0))
     )
 
 
 def resolve_export_path(path: Path) -> Path:
     """Use Windows extended paths consistently across Python and embedded Blender."""
-    resolved = path.expanduser().resolve()
+    return _extended_export_path(resolve_scene_read_path(path))
+
+
+def _extended_export_path(resolved: Path) -> Path:
     value = str(resolved)
     if os.name != "nt" or len(value) < 260 or value.startswith("\\\\?\\"):
         return resolved
     if value.startswith("\\\\"):
         return Path("\\\\?\\UNC\\" + value[2:])
     return Path("\\\\?\\" + value)
+
+
+def resolve_existing_export_files(paths: tuple[Path, ...]) -> dict[str, Path]:
+    """Batch existing payload resolution without retaining directory snapshots."""
+    return {path: _extended_export_path(resolved)
+            for path, resolved in resolve_scene_existing_files(paths).items()}
 
 
 def require_object(value: object, context: str) -> dict[str, object]:
@@ -226,13 +242,41 @@ def merge_material_evidence(left: MaterialRecord, right: MaterialRecord) -> Mate
 def load_catalog(paths: tuple[Path, ...]) -> tuple[
     dict[tuple[str, int], MaterialRecord], dict[tuple[str, int], tuple[Path, str]]
 ]:
-    materials: dict[tuple[str, int], MaterialRecord] = {}
+    if not paths:
+        return {}, {}
+    resolved = tuple(resolve_export_path(path) for path in paths)
+    materials, texture_candidates = cached_scene_source_value(
+        _MATERIAL_CATALOG_CACHE, resolved, (),
+        lambda: _build_catalog(resolved),
+    )
     textures: dict[tuple[str, int], tuple[Path, str]] = {}
+    pending = texture_candidates
+    candidate_index = 0
+    while pending:
+        paths = {key: candidates[candidate_index][0] / candidates[candidate_index][1]
+                 for key, candidates in pending.items()}
+        existing = resolve_existing_export_files(tuple(paths.values()))
+        for key, path in paths.items():
+            candidate = existing.get(str(path))
+            if candidate is not None:
+                textures[key] = (candidate.parent, candidate.name)
+        candidate_index += 1
+        pending = {key: candidates for key, candidates in pending.items()
+                   if key not in textures and candidate_index < len(candidates)}
+    return materials, textures
+
+
+def _build_catalog(paths: tuple[Path, ...]) -> tuple[
+    dict[tuple[str, int], MaterialRecord],
+    dict[tuple[str, int], list[tuple[Path, str]]],
+]:
+    materials: dict[tuple[str, int], MaterialRecord] = {}
+    texture_candidates: dict[tuple[str, int], list[tuple[Path, str]]] = {}
     texture_color_spaces: dict[tuple[str, int], int] = {}
     texture_samplers: dict[tuple[str, int], TextureSampler] = {}
     for path in paths:
         path = resolve_export_path(path)
-        data = require_object(json.loads(path.read_text(encoding="utf-8-sig")), str(path))
+        data = require_object(read_scene_manifest(path), str(path))
         if data.get("Format") != "EndfieldSceneProbe/1":
             raise ValueError(f"Unsupported SceneProbe format: {path}")
         for field in ("Materials", "TextureExports"):
@@ -264,11 +308,22 @@ def load_catalog(paths: tuple[Path, ...]) -> tuple[
             if not isinstance(file, str) or not file:
                 raise ValueError(f"Invalid texture filename: reference={key}, manifest={path}")
             # Existing exported manifests may intentionally reference shared absolute caches.
-            candidate = resolve_export_path(path.parent / file.replace("\\", "/"))
-            if candidate.is_file() and key not in textures:
-                textures[key] = (candidate.parent, candidate.name)
+            candidate = path.parent / file.replace("\\", "/")
+            texture_candidates.setdefault(key, []).append((candidate.parent, candidate.name))
+    shader_defaults: dict[tuple[str, int], list[ShaderTextureDefault]] = {}
+    for record in materials.values():
+        defaults = record["Shader"].get("TextureDefaults")
+        if defaults is None:
+            continue
+        shader_key = reference_key(record["Shader"])
+        if shader_key in shader_defaults and shader_defaults[shader_key] != defaults:
+            raise ValueError(f"Conflicting serialized shader texture defaults: shader={shader_key}")
+        shader_defaults[shader_key] = defaults
     enriched: dict[tuple[str, int], MaterialRecord] = {}
     for key, record in materials.items():
+        shader_key = reference_key(record["Shader"])
+        if "TextureDefaults" not in record["Shader"] and shader_key in shader_defaults:
+            record = {**record, "Shader": {**record["Shader"], "TextureDefaults": shader_defaults[shader_key]}}
         slots: list[TextureSlot] = []
         for slot in record["Textures"]:
             ref = slot["Texture"]
@@ -288,7 +343,7 @@ def load_catalog(paths: tuple[Path, ...]) -> tuple[
                 **({"TextureSampler": sampler} if sampler is not None else {})}})
         enriched[key] = {**record, "Textures": slots}
     materials = enriched
-    return materials, textures
+    return materials, texture_candidates
 
 
 def has_procedural_foliage_emission(record: MaterialRecord) -> bool:
@@ -310,6 +365,13 @@ def supported_slots(record: MaterialRecord) -> tuple[TextureSlot, ...]:
     if not uses_normal_map(record):
         properties.remove("_NormalMap")
     required: set[str] = set()
+    if has_verified_lit_top_layer(record):
+        required.update(("_NormalMap", "_Layer1BaseMap", "_Layer1BumpMap", "_LayerBlendMaskMap"))
+        bound = {slot["Property"] for slot in record["Textures"] if slot["Texture"] is not None}
+        defaults = {name for name in ("_Layer1BaseMap", "_LayerBlendMaskMap")
+                    if has_shader_white_texture_default(record, name)}
+        if required - bound - defaults:
+            raise ValueError(f"Top layer requires bound textures or verified shader defaults: material={record['Name']}, properties={sorted(required - bound - defaults)}")
     if floats.get("_EnableTriChannelMask", 0) > 0.5:
         required.add("_MaskMap")
     if (floats.get("_EnableEmissiveMap", 0) > 0.5 or floats.get("_EnableBakedEmissive", 0) > 0.5) and not has_procedural_foliage_emission(record):
@@ -340,8 +402,12 @@ def supported_slots(record: MaterialRecord) -> tuple[TextureSlot, ...]:
 def surface_limitations(record: MaterialRecord) -> tuple[str, ...]:
     flags = {"_LayerBlend": "layer_blend", "_EnableTop": "top_layer", "_UseSubsurfaceProfile": "subsurface_profile"}
     procedural = ("procedural_foliage_glow_not_reconstructed",) if has_procedural_foliage_emission(record) else ()
-    return ("game_lighting_not_reconstructed", "occlusion_retained_not_applied") + procedural + tuple(
-        label for flag, label in flags.items() if record["Floats"].get(flag, 0) > 0.5
+    top = has_verified_lit_top_layer(record)
+    partial = (("top_layer_runtime_uv_feed_unverified",) +
+               (("terrain_blend_runtime_atlas_not_reconstructed",)
+                if record["Floats"].get("_EnableTerrainBlend", 0) > 0.5 else ())) if top else ()
+    return ("game_lighting_not_reconstructed", "occlusion_retained_not_applied") + procedural + partial + tuple(
+        label for flag, label in flags.items() if record["Floats"].get(flag, 0) > 0.5 and not (top and flag == "_LayerBlend")
     )
 
 

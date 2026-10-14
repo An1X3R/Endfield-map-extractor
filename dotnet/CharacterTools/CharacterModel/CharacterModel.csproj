@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <AssemblyName>Endfield.CharacterModel</AssemblyName>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="$(AnimeStudioRoot)/AnimeStudio/AnimeStudio.csproj" />
+    <ProjectReference Include="$(AnimeStudioRoot)/AnimeStudio.PInvoke/AnimeStudio.PInvoke.csproj" />
+    <Compile Include="$(AnimeStudioRoot)/AnimeStudio.Utility/ModelConverter.cs" Link="ModelConverter.cs" />
+    <Compile Include="$(AnimeStudioRoot)/AnimeStudio.Utility/ACL/*.cs" Link="ACL/%(Filename)%(Extension)" />
+    <Compile Include="$(AnimeStudioRoot)/AnimeStudio.Utility/YAML/MuscleHelper.cs" Link="MuscleHelper.cs" />
+    <Using Include="EndfieldCharacterModel.ConverterRotation" Alias="Fbx" />
+  </ItemGroup>
+</Project>

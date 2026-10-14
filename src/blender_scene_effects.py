@@ -13,7 +13,7 @@ from mathutils import Matrix, Quaternion, Vector
 from blender_build_map02_chunk_20260727 import import_obj, unity_matrix
 from blender_scene_effect_vertex_offset import apply_material_vertex_offset, UnsupportedVertexOffset
 from endfield_scene_material_contract import resolve_export_path
-from extractor_core.particle_curves import UnsupportedParticleCurve
+from extractor_core.particle_curves import UnsupportedParticleCurve, parse_minmax_curve
 from extractor_core.particle_snapshot import (
     ParticleSnapshotError, SnapshotParticle, UnsupportedParticleSnapshot,
     generate_particle_snapshot,
@@ -176,11 +176,29 @@ def _gravity_local(gravity_world_unity: tuple[float, float, float], unity_world:
         raise ValueError("Particle world gravity must contain three numbers")
     gravity = Vector(tuple(_finite(value, f"gravity_world_unity[{index}]")
                            for index, value in enumerate(gravity_world_unity)))
+    if all(value == 0.0 for value in gravity):
+        return 0.0, 0.0, 0.0
     try:
         local = unity_world.to_3x3().inverted() @ gravity
     except ValueError as error:
-        raise ValueError("Particle owner transform cannot be inverted for world gravity") from error
+        raise UnsupportedParticleSnapshot(
+            "Nonzero particle world gravity requires an invertible owner transform: "
+            f"gravity={tuple(gravity)}, scale={tuple(unity_world.decompose()[2])}"
+        ) from error
     return tuple(float(value) for value in local)
+
+
+def _system_gravity_local(gravity_world_unity: tuple[float, float, float], unity_world: Matrix,
+                          system: Mapping[str, object]) -> tuple[float, float, float]:
+    gravity = _number_triplet(list(gravity_world_unity), "gravity_world_unity")
+    parameters = _record(_field(system, "Parameters", "System"), "System.Parameters")
+    initial = _record(_field(parameters, "Initial", "Parameters"), "Parameters.Initial")
+    modifier = parse_minmax_curve(_field(initial, "GravityModifier", "Initial"), "Initial.GravityModifier")
+    # Zero source acceleration needs no coordinate inverse, including flattened mesh emitters.
+    if (modifier.mode == 0 and modifier.scalar == 0.0
+            or modifier.mode == 3 and modifier.scalar == 0.0 and modifier.min_scalar == 0.0):
+        return _gravity_local((0.0, 0.0, 0.0), unity_world)
+    return _gravity_local(gravity, unity_world)
 
 
 def _particle_custom_attributes(mesh: bpy.types.Mesh, particles: tuple[SnapshotParticle, ...]) -> None:
@@ -545,7 +563,7 @@ def build_scene_effects(effect_instances: Sequence[Mapping[str, object]], collec
                     anchor @ _owner_matrix_root_relative(nodes, root, owner), nodes[owner],
                     _integer(_field(system, "ScalingMode", "System"), "System.ScalingMode"))
                 world = _blender_matrix(unity_world)
-                local_gravity = _gravity_local(gravity_world_unity, unity_world)
+                local_gravity = _system_gravity_local(gravity_world_unity, unity_world, system)
                 snapshot = generate_particle_snapshot(system, snapshot_age_seconds,
                                                      f"{entity_id}:{system_key[0]}:{system_key[1]}",
                                                      remaining, 100000, local_gravity)

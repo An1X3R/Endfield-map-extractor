@@ -7,6 +7,7 @@ import json
 import math
 from dataclasses import dataclass
 from pathlib import Path
+from endfield_scene_io import read_scene_manifest
 from typing import TYPE_CHECKING, Mapping, NamedTuple, TypedDict, cast
 
 from endfield_scene_material_contract import (
@@ -83,6 +84,7 @@ _MISSING_MATERIAL_DEPENDENCIES = frozenset({
     "mesh_component_schema_missing", "mesh_uv_metadata_missing", "mesh_uv0_missing", "mesh_uv1_missing",
     "shader_texture_defaults_missing",
 })
+_NON_BLOCKING_MESH_COMPONENT_ISSUES = frozenset({"mesh_uv1_unsupported"})
 
 
 def _array(value: object, label: str) -> list[object]:
@@ -102,7 +104,7 @@ def _asset(value: object, label: str) -> EffectAsset:
 
 
 def _manifest(path: Path) -> dict[str, object]:
-    data = require_object(json.loads(path.read_text(encoding="utf-8-sig")), str(path))
+    data = require_object(read_scene_manifest(path), str(path))
     if data.get("Format") != "EndfieldSceneProbe/1":
         raise ValueError(f"Unsupported FX SceneProbe manifest: {path}")
     _array(data.get("Containers"), f"{path}.Containers")
@@ -126,8 +128,35 @@ def _particle_schema(data: dict[str, object], path: Path) -> bool:
 def observed_effect_prefabs(manifests: tuple[Path, ...]) -> frozenset[str]:
     """Treat a probed prefab as present even when its components prove unsupported."""
     materials, textures = load_catalog(manifests)
+    return observed_effect_prefabs_from_catalog(manifests, materials, textures)
+
+
+def observed_effect_prefabs_from_catalog(
+    manifests: tuple[Path, ...],
+    materials: Mapping[tuple[str, int], MaterialRecord],
+    textures: Mapping[tuple[str, int], tuple[Path, str]],
+) -> frozenset[str]:
+    """Check prefab dependencies using this caller's freshly validated catalog."""
+    return _observed_effect_candidates(_candidates(manifests), materials, textures)
+
+
+def observed_requested_effect_prefabs(
+    manifests: tuple[Path, ...], requested: frozenset[str],
+    materials: Mapping[tuple[str, int], MaterialRecord],
+    textures: Mapping[tuple[str, int], tuple[Path, str]],
+) -> frozenset[str]:
+    """Check only requested prefab dependencies after indexing all source candidates."""
+    candidates = {path: rows for path, rows in _candidates(manifests).items() if path in requested}
+    return _observed_effect_candidates(candidates, materials, textures)
+
+
+def _observed_effect_candidates(
+    candidates_by_path: Mapping[str, list[_PrefabCandidate]],
+    materials: Mapping[tuple[str, int], MaterialRecord],
+    textures: Mapping[tuple[str, int], tuple[Path, str]],
+) -> frozenset[str]:
     observed: set[str] = set()
-    for prefab_path, candidates in _candidates(manifests).items():
+    for prefab_path, candidates in candidates_by_path.items():
         paired_seen = False
         fallback_observed = False
         for candidate in candidates:
@@ -140,7 +169,7 @@ def observed_effect_prefabs(manifests: tuple[Path, ...]) -> frozenset[str]:
                 mesh_nodes = _root_mesh_nodes(candidate)
                 if mesh_nodes:
                     issues = _mesh_issues(candidate, mesh_nodes, materials, textures)
-                    if not issues:
+                    if not issues or all(issue.code in _NON_BLOCKING_MESH_COMPONENT_ISSUES for issue in issues):
                         observed.add(prefab_path)
                 else:
                     fallback_observed = True
@@ -343,8 +372,14 @@ def _mesh_issues(candidate: _PrefabCandidate, nodes: tuple[dict[str, object], ..
                 continue
             if mesh_material_requires_uv1(material) and export is not None:
                 uv_file = export.get("Uv1File")
-                if (export.get("Uv1Components") != 2 or not isinstance(uv_file, str) or
-                        not uv_file or not (candidate.manifest.parent / uv_file.replace("\\", "/")).is_file()):
+                uv1_components = export.get("Uv1Components")
+                if uv1_components == 0:
+                    issues.append(_MaterialIssue(
+                        "mesh_uv1_unsupported",
+                        f"Mesh source has no UV1 channel required by material: owner={owner}, mesh={mesh}, material={material['Name']}",
+                    ))
+                elif (uv1_components != 2 or not isinstance(uv_file, str) or
+                      not uv_file or not (candidate.manifest.parent / uv_file.replace("\\", "/")).is_file()):
                     issues.append(_MaterialIssue("mesh_uv1_missing", f"Mesh source UV1 export missing: owner={owner}, mesh={mesh}, material={material['Name']}"))
             shader = require_object(material["Shader"], "FX material Shader")
             issues.extend(_shader_default_issues(material))
@@ -554,8 +589,10 @@ def build_effect_plan(
                         failures.append(("particle_material_incomplete", f"path={prefab_path}, manifest={candidate.manifest}; {issues[0].detail}"))
                         continue
                 mesh_issues = _mesh_issues(candidate, mesh_nodes, materials, textures)
-                if mesh_issues:
-                    failures.append(("mesh_component_incomplete", f"path={prefab_path}, manifest={candidate.manifest}; {mesh_issues[0].detail}"))
+                blocking_mesh_issues = tuple(issue for issue in mesh_issues
+                                             if issue.code not in _NON_BLOCKING_MESH_COMPONENT_ISSUES)
+                if blocking_mesh_issues:
+                    failures.append(("mesh_component_incomplete", f"path={prefab_path}, manifest={candidate.manifest}; {blocking_mesh_issues[0].detail}"))
                     continue
                 kind = "mixed" if paired and mesh_nodes else "particle" if paired else "mesh_renderer"
                 compatible.append((_schema_score(paired) if paired else (0, 0, 0), candidate,
