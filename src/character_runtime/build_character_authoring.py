@@ -94,6 +94,23 @@ def main(request_path: Path) -> None:
     if material_controls is not None and material_controls['status'] == 'attached':
         help_text.write(f"Source material expressions: select {material_controls['controller']} and edit _EmotionIndex (0 to 3) / _EmotionBlend (0 to 1).\n"
                         'These alter the source emotion atlas color only; tile meanings are not inferred.\n')
+    from character_authoring_workspace import prepare_authoring_workspace, verify_authoring_workspace
+    from character_authoring_validation import character_invariants, material_signature_details
+    workspace = prepare_authoring_workspace(authoring_request.source_audit.parent, authoring_request.animations)
+    current = character_invariants(tuple(report['source_meshes']))
+    changed = tuple(key for key, value in report['preserved'].items()
+                    if key != 'material_graph_static_inputs_and_drivers' and current[key] != value)
+    if changed:
+        raise AssertionError(f'Authoring workspace changed source data: fields={changed}')
+    report['preserved'] = current
+    report['material_signature_details'] = material_signature_details()
+    report['authoring_workspace'] = workspace
+    help_text.write('Body posing: select the armature and use Pose Mode; Body and Hands contain FK display controls.\n'
+                    'Source Details retains all other bones. No automatic IK or cloth simulation is added.\n'
+                    'Replace textures at the material root; calculation groups retain the source shading equations.\n'
+                    'Material Properties > Endfield Weather exposes shared wetness, snow and rain values.\n'
+                    'Trust the embedded Endfield Weather Panel.py UI script, or run it once in the Text Editor; shading needs no UI script.\n'
+                    'Expression controls are in their own collection; technical helper objects remain evaluated.\n')
     target = output / 'character_authoring.blend'
     report['blend'] = str(target)
     report['source_blend'] = str(blend)
@@ -106,6 +123,7 @@ def main(request_path: Path) -> None:
     (output/'build_receipt.json').write_text(json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False), encoding='utf-8')
     bpy.ops.wm.open_mainfile(filepath=str(target), use_scripts=False, load_ui=False)
     audit = verify_authoring(report)
+    audit['authoring_workspace'] = verify_authoring_workspace(workspace)
     if hashlib.sha256(blend.read_bytes()).hexdigest() != source_hash:
         raise AssertionError('Read-only input character was modified')
     audit.update({'scripts_enabled_on_reopen': False, 'save_count': 1,

@@ -530,6 +530,11 @@ def main(args: argparse.Namespace) -> None:
     rigs = tuple(obj for obj in bpy.data.objects if obj.type == 'ARMATURE')
     if len(rigs) != 1 or args.head_bone not in rigs[0].pose.bones or rigs[0].data.pose_position != 'POSE':
         raise ValueError('Final build requires the unambiguous actual armature/head in editable POSE mode')
+    from character_authoring_workspace import prepare_authoring_workspace
+    mark = time.perf_counter()
+    workspace = prepare_authoring_workspace(
+        args.source_dir, authoring_request.animations if authoring is not None else ())
+    stage_times['authoring_workspace'] = time.perf_counter() - mark
     output = args.output_dir / 'character.blend'
     if authoring is not None:
         from character_authoring_validation import character_invariants, material_signature_details
@@ -541,6 +546,9 @@ def main(args: argparse.Namespace) -> None:
         raise RuntimeError('Final save did not create a nonempty character blend: ' + str(output))
     stage_times['final_save'] = time.perf_counter() - mark
     source_files = tuple(args.source_dir / name for name in ('source_audit.json','material_sources.json','source_texture_artifacts.json','lod_sources.json','renderer_export_map.json'))
+    humanoid_map = args.source_dir / 'humanoid_bone_map.json'
+    if humanoid_map.is_file():
+        source_files += (humanoid_map,)
     image_rows = packed_image_records(tuple(materials.image_cache.values()))
     family_inventory = weather_family_inventory(packet, wetfilm, late_materials, skin_rain, hair_fur_snow) if weather_input is not None else []
     weather_input_receipt = weather_per_draw_receipt(weather_input, family_inventory)
@@ -552,6 +560,7 @@ def main(args: argparse.Namespace) -> None:
                          'audit_character_materials.py','character_late_materials.py','character_wetfilm_profile.py',
                          'character_standard_snow_profile.py','character_hair_fur_snow_profile.py','character_hair_fur_snow.py',
                          'character_fur_curves_profile.py','character_fur_curve_weather.py','character_fur_geometry.py',
+                         'character_fur_texture_contract.py','character_mesh_effect.py','character_npr_vfx.py',
                          'character_hair_wet.py','character_hair_wet_profile.py','character_rain_droplets.py',
                          'character_fur_wet.py','character_fur_wet_profile.py',
                           'character_weather_nodes.py','character_weather_per_draw.py',
@@ -559,7 +568,9 @@ def main(args: argparse.Namespace) -> None:
                          'character_material_profile.py','character_material_profile_template.json','source_caster_manifest.py',
                          'character_hair_additional_lights.py','character_additional_light_state.py')}}
     source_hashes.update({str(Path(__file__).parent/name): file_hash(Path(__file__).parent/name)
-                         for name in ('character_emotion_atlas.py', 'character_expression_material_controls.py')})
+                         for name in ('character_emotion_atlas.py', 'character_expression_material_controls.py',
+                                      'character_authoring_workspace.py', 'character_material_authoring.py',
+                                      'character_rig_authoring.py', 'character_viewport_preview.py')})
     if weather_input is not None:
         source_artifact_refs.append({'path': str(weather_input.path), 'bytes': weather_input.byte_count,
                                      'sha256': weather_input.sha256})
@@ -594,7 +605,8 @@ def main(args: argparse.Namespace) -> None:
               'fur_curves_snow': fur_curves_snow,
               'skin_rain': skin_rain,
               'weather_per_draw_input': weather_input_receipt,
-              **shadows, 'authoring': authoring, 'stage_seconds': stage_times, 'elapsed_seconds': time.perf_counter() - started,
+              **shadows, 'authoring': authoring, 'authoring_workspace': workspace,
+              'stage_seconds': stage_times, 'elapsed_seconds': time.perf_counter() - started,
               'source_hashes': source_hashes,
               'limits': ['Build-only receipt does not establish successful saved-file reopen or rendered fidelity.',
                          'Frozen mathematical kernels, constructor state and explicit preview frames do not equal native game runtime captures.',

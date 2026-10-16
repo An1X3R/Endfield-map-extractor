@@ -15,6 +15,32 @@ const API_PREFIXES = ['/api/v2', '/api/v3'] as const
 const MUTATING_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE'])
 const MAX_REQUEST_BODY_BYTES = 1024 * 1024
 
+const bridgeMethods = (pathname: string): string[] | null => {
+  if (pathname === '/api/v2/first-run' || pathname === '/api/v2/level-map-preparation') return ['GET', 'POST']
+  if (/^\/api\/v2\/level-map-preparation\/[a-f0-9]{32}$/.test(pathname)) return ['GET']
+  if (/^\/api\/v2\/level-map-preparation\/[a-f0-9]{32}\/cancel$/.test(pathname)) return ['POST']
+  if (/^\/api\/v2\/(level-maps|instanced-scenes|characters)$/.test(pathname) ||
+      /^\/api\/v2\/level-maps\/map\d{2}_lv\d{3}\/image$/.test(pathname) ||
+      /^\/api\/v2\/instanced-scenes\/[a-z][a-z0-9_]*(\/preview)?$/.test(pathname) ||
+      /^\/api\/v2\/characters\/[A-Za-z0-9_:.-]+(\/animations)?$/.test(pathname) ||
+      pathname === '/api/v2/first-run/events' ||
+      (/^\/api\/v2\/(export-jobs|character-jobs|character-preparation|instanced-scene-jobs)\/[A-Za-z0-9._-]+(\/events)?$/.test(pathname) && !pathname.endsWith('/validate'))) return ['GET']
+  if (/^\/api\/v2\/first-run\/(validate|cancel)$/.test(pathname) ||
+      /^\/api\/v2\/(export-jobs|character-jobs|character-preparation|instanced-scene-jobs)(\/validate|\/[A-Za-z0-9._-]+\/cancel)?$/.test(pathname)) return ['POST']
+  return null
+}
+
+const bridgeFamilies = /^\/api\/v2\/(level-maps|level-map-preparation|instanced-scenes|characters|character-jobs|character-preparation|instanced-scene-jobs|first-run|export-jobs)(\/|$)/
+
+const bridgeUrl = (pathname: string, search: string): URL | null => {
+  const root = process.env.ENDFIELD_PATH_PICKER_URL?.trim() ?? ''
+  if (!root) return null
+  const parsed = new URL(root)
+  if (parsed.protocol !== 'http:' || parsed.hostname !== '127.0.0.1' || parsed.username || parsed.password ||
+      parsed.pathname !== '/' || parsed.search || parsed.hash) return null
+  return new URL(`${pathname}${search}`, parsed)
+}
+
 const parseBackendOrigin = (value: string): string | null => {
   if (!value.trim()) return null
   let target: URL
@@ -52,6 +78,20 @@ const apiMutationOriginGuard = (): Plugin => ({
 
 const installApiMutationOriginGuard = (middlewares: { use: (handler: (request: IncomingMessage, response: ServerResponse, next: () => void) => void) => void }): void => {
   middlewares.use((request, response, next) => {
+    const rawPath = (request.url ?? '/').split('?')[0]
+    if (rawPath.startsWith('/api/')) {
+      let safePath = false
+      try {
+        safePath = rawPath.split('/').every(segment => {
+          const decoded = decodeURIComponent(segment)
+          return decoded !== '.' && decoded !== '..' && !/[\\/%\x00-\x1f]/.test(decoded)
+        })
+      } catch { /* invalid encoding is rejected below */ }
+      if (!safePath) {
+        sendJson(response, 400, { error: 'invalid_api_path', message: 'API path segments must not contain traversal or encoded separators.' })
+        return
+      }
+    }
     const pathname = new URL(request.url ?? '/', 'http://127.0.0.1').pathname
     const method = (request.method ?? 'GET').toUpperCase()
     if (!API_PREFIXES.some((prefix) => pathname === prefix || pathname.startsWith(`${prefix}/`)) || !MUTATING_METHODS.has(method)) {
@@ -170,45 +210,71 @@ const endfieldMapRuntimeApi = (): Plugin => ({
 
 const installRuntimeApi = (middlewares: { use: (handler: (request: IncomingMessage, response: ServerResponse, next: () => void) => void) => void }): void => {
   middlewares.use((request, response, next) => {
-    const method = request.method ?? 'GET'
+    const method = (request.method ?? 'GET').toUpperCase()
     const requestUrl = new URL(request.url ?? '/', 'http://127.0.0.1')
     const pathname = requestUrl.pathname
 
-    const sceneBridgeRoute = pathname === '/api/v2/instanced-scenes' || pathname.startsWith('/api/v2/instanced-scenes/')
-      ? { publicRoot: '/api/v2/instanced-scenes', bridgeRoot: '/instanced-scenes' }
-      : pathname === '/api/v2/instanced-scene-jobs' || pathname.startsWith('/api/v2/instanced-scene-jobs/')
-        ? { publicRoot: '/api/v2/instanced-scene-jobs', bridgeRoot: '/instanced-scene-jobs' }
-        : ['/characters', '/character-jobs', '/character-preparation']
-          .map((bridgeRoot) => ({ publicRoot: `/api/v2${bridgeRoot}`, bridgeRoot }))
-          .find((route) => pathname === route.publicRoot || pathname.startsWith(`${route.publicRoot}/`)) ?? null
-    if (sceneBridgeRoute) {
-      if (method !== 'GET' && method !== 'POST') {
-        response.setHeader('Allow', 'GET, POST')
-        sendJson(response, 405, { error: 'instanced_scene_method_not_allowed', message: 'Independent scene bridge routes accept GET or POST.' })
+    const allowedMethods = bridgeMethods(decodeURIComponent(pathname))
+    if (bridgeFamilies.test(pathname)) {
+      if (!allowedMethods) {
+        sendJson(response, 404, { error: 'bridge_route_not_found', message: 'No bridge route matches this API path.' })
         return
       }
-      const bridgeRoot = process.env.ENDFIELD_PATH_PICKER_URL?.trim() ?? ''
+      if (!allowedMethods.includes(method)) {
+        response.setHeader('Allow', allowedMethods.join(', '))
+        sendJson(response, 405, { error: 'bridge_method_not_allowed', message: `This bridge route accepts ${allowedMethods.join(', ')}.` })
+        return
+      }
+    }
+
+    const levelMapImageRoute = pathname.match(/^\/api\/v2\/level-maps\/(map\d{2}_lv\d{3})\/image$/)
+    const sceneBridgeRoute = pathname === '/api/v2/level-maps'
+      ? { publicRoot: '/api/v2/level-maps', bridgeRoot: '/level-maps', methods: ['GET'], binary: false, kind: 'level_map' }
+      : levelMapImageRoute
+        ? { publicRoot: pathname, bridgeRoot: `/level-maps/${levelMapImageRoute[1]}/image`, methods: ['GET'], binary: true, kind: 'level_map' }
+        : pathname === '/api/v2/instanced-scenes' || pathname.startsWith('/api/v2/instanced-scenes/')
+          ? { publicRoot: '/api/v2/instanced-scenes', bridgeRoot: '/instanced-scenes', methods: ['GET', 'POST'], binary: false, kind: 'instanced_scene' }
+          : pathname === '/api/v2/instanced-scene-jobs' || pathname.startsWith('/api/v2/instanced-scene-jobs/')
+            ? { publicRoot: '/api/v2/instanced-scene-jobs', bridgeRoot: '/instanced-scene-jobs', methods: ['GET', 'POST'], binary: false, kind: 'instanced_scene' }
+            : ['/characters', '/character-jobs', '/character-preparation', '/level-map-preparation']
+              .map((bridgeRoot) => ({ publicRoot: `/api/v2${bridgeRoot}`, bridgeRoot, methods: ['GET', 'POST'], binary: false, kind: 'instanced_scene' }))
+              .find((route) => pathname === route.publicRoot || pathname.startsWith(`${route.publicRoot}/`)) ?? null
+    if (sceneBridgeRoute) {
+      if (!sceneBridgeRoute.methods.includes(method)) {
+        const allow = sceneBridgeRoute.methods.join(', ')
+        response.setHeader('Allow', allow)
+        sendJson(response, 405, {
+          error: sceneBridgeRoute.kind === 'level_map' ? 'level_map_method_not_allowed' : 'instanced_scene_method_not_allowed',
+          message: `${sceneBridgeRoute.kind === 'level_map' ? 'Level map' : 'Independent scene bridge'} routes accept ${allow}.`,
+        })
+        return
+      }
       const bridgeToken = process.env.ENDFIELD_PATH_PICKER_TOKEN?.trim() ?? ''
       let targetUrl: URL | null = null
       try {
         const suffix = pathname.slice(sceneBridgeRoute.publicRoot.length)
-        targetUrl = new URL(`${sceneBridgeRoute.bridgeRoot}${suffix}${requestUrl.search}`, bridgeRoot)
+        targetUrl = bridgeUrl(`${sceneBridgeRoute.bridgeRoot}${suffix}`, requestUrl.search)
       } catch { /* unavailable response below */ }
       if (!targetUrl || targetUrl.hostname !== '127.0.0.1' || !bridgeToken) {
-        sendJson(response, 503, { error: 'instanced_scene_bridge_unavailable', message: 'Independent scene bridge unavailable.' })
+        sendJson(response, 503, sceneBridgeRoute.kind === 'level_map'
+          ? { error: 'level_map_bridge_unavailable', message: 'Level map bridge unavailable.' }
+          : { error: 'instanced_scene_bridge_unavailable', message: 'Independent scene bridge unavailable.' })
         return
       }
       void (async () => {
         const rawBody = method === 'POST' ? await readRequestBody(request) : undefined
         const bridgeResponse = await fetch(targetUrl, {
           method,
+          redirect: 'error',
           headers: {
             ...(rawBody !== undefined ? { 'Content-Type': 'application/json' } : {}),
             'X-Endfield-Path-Picker-Token': bridgeToken,
           },
           body: rawBody,
         })
-        const payload = await bridgeResponse.text()
+        const payload = sceneBridgeRoute.binary
+          ? Buffer.from(await bridgeResponse.arrayBuffer())
+          : await bridgeResponse.text()
         response.statusCode = bridgeResponse.status
         response.setHeader('Content-Type', bridgeResponse.headers.get('content-type') ?? 'application/json; charset=utf-8')
         response.setHeader('Cache-Control', 'no-store')
@@ -216,7 +282,7 @@ const installRuntimeApi = (middlewares: { use: (handler: (request: IncomingMessa
       })().catch((error) => {
         if (sendBodySizeError(response, error)) return
         sendJson(response, 502, {
-          error: 'instanced_scene_bridge_failed',
+          error: sceneBridgeRoute.kind === 'level_map' ? 'level_map_bridge_failed' : 'instanced_scene_bridge_failed',
           message: error instanceof Error ? error.message : String(error),
         })
       })
@@ -224,12 +290,11 @@ const installRuntimeApi = (middlewares: { use: (handler: (request: IncomingMessa
     }
 
     if (pathname === '/api/v2/first-run' || pathname.startsWith('/api/v2/first-run/')) {
-      const bridgeRoot = process.env.ENDFIELD_PATH_PICKER_URL?.trim() ?? ''
       const bridgeToken = process.env.ENDFIELD_PATH_PICKER_TOKEN?.trim() ?? ''
       let targetUrl: URL | null = null
       try {
         const suffix = pathname.slice('/api/v2/first-run'.length)
-        targetUrl = new URL(`/first-run${suffix}${requestUrl.search}`, bridgeRoot)
+        targetUrl = bridgeUrl(`/first-run${suffix}`, requestUrl.search)
       } catch { /* unavailable response below */ }
       if (!targetUrl || targetUrl.hostname !== '127.0.0.1' || !bridgeToken) {
         sendJson(response, 503, { error: { code: 'first_run_bridge_unavailable', message: 'First-run bridge unavailable.', retryable: true } })
@@ -239,6 +304,7 @@ const installRuntimeApi = (middlewares: { use: (handler: (request: IncomingMessa
         const rawBody = method === 'POST' ? await readRequestBody(request) : undefined
         const bridgeResponse = await fetch(targetUrl, {
           method,
+          redirect: 'error',
           headers: {
             ...(rawBody !== undefined ? { 'Content-Type': 'application/json' } : {}),
             'X-Endfield-Path-Picker-Token': bridgeToken,
@@ -261,12 +327,11 @@ const installRuntimeApi = (middlewares: { use: (handler: (request: IncomingMessa
     }
 
     if (pathname === '/api/v2/export-jobs' || pathname.startsWith('/api/v2/export-jobs/')) {
-      const bridgeRoot = process.env.ENDFIELD_PATH_PICKER_URL?.trim() ?? ''
       const bridgeToken = process.env.ENDFIELD_PATH_PICKER_TOKEN?.trim() ?? ''
       let targetUrl: URL | null = null
       try {
         const suffix = pathname.slice('/api/v2/export-jobs'.length)
-        targetUrl = new URL(`/jobs${suffix}${requestUrl.search}`, bridgeRoot)
+        targetUrl = bridgeUrl(`/jobs${suffix}`, requestUrl.search)
       } catch { /* unavailable response below */ }
       if (!targetUrl || targetUrl.hostname !== '127.0.0.1' || !bridgeToken) {
         sendJson(response, 503, { error: 'export_job_bridge_unavailable' })
@@ -276,6 +341,7 @@ const installRuntimeApi = (middlewares: { use: (handler: (request: IncomingMessa
         const rawBody = method === 'POST' ? await readRequestBody(request) : undefined
         const bridgeResponse = await fetch(targetUrl, {
           method,
+          redirect: 'error',
           headers: {
             ...(rawBody !== undefined ? { 'Content-Type': 'application/json' } : {}),
             'X-Endfield-Path-Picker-Token': bridgeToken,
@@ -299,15 +365,14 @@ const installRuntimeApi = (middlewares: { use: (handler: (request: IncomingMessa
     }
 
     if (method === 'GET' && pathname === '/api/v2/path-picker/status') {
-      const pickerRoot = process.env.ENDFIELD_PATH_PICKER_URL?.trim() ?? ''
       const pickerToken = process.env.ENDFIELD_PATH_PICKER_TOKEN?.trim() ?? ''
       let healthUrl: URL | null = null
-      try { healthUrl = new URL('/health', pickerRoot) } catch { /* unavailable response below */ }
+      try { healthUrl = bridgeUrl('/health', '') } catch { /* unavailable response below */ }
       if (!healthUrl || healthUrl.hostname !== '127.0.0.1' || !pickerToken) {
         sendJson(response, 503, { format: 'EndfieldPathPickerHealth/1', status: 'unavailable' })
         return
       }
-      void fetch(healthUrl, { headers: { 'X-Endfield-Path-Picker-Token': pickerToken } })
+      void fetch(healthUrl, { redirect: 'error', headers: { 'X-Endfield-Path-Picker-Token': pickerToken } })
         .then(async (bridgeResponse) => {
           const payload = await bridgeResponse.json() as unknown
           sendJson(response, bridgeResponse.ok ? 200 : 502, payload)
@@ -317,11 +382,10 @@ const installRuntimeApi = (middlewares: { use: (handler: (request: IncomingMessa
     }
 
     if (method === 'POST' && pathname === '/api/v2/path-picker') {
-      const pickerRoot = process.env.ENDFIELD_PATH_PICKER_URL?.trim() ?? ''
       const pickerToken = process.env.ENDFIELD_PATH_PICKER_TOKEN?.trim() ?? ''
       let pickerUrl: URL | null = null
       try {
-        pickerUrl = new URL('/pick', pickerRoot)
+        pickerUrl = bridgeUrl('/pick', '')
       } catch { /* unavailable response below */ }
       if (!pickerUrl || pickerUrl.hostname !== '127.0.0.1' || !pickerToken) {
         sendJson(response, 503, {
@@ -341,6 +405,7 @@ const installRuntimeApi = (middlewares: { use: (handler: (request: IncomingMessa
           }
           const bridgeResponse = await fetch(pickerUrl, {
             method: 'POST',
+            redirect: 'error',
             headers: {
               'Content-Type': 'application/json',
               'X-Endfield-Path-Picker-Token': pickerToken,

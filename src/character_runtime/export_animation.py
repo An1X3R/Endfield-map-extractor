@@ -27,6 +27,7 @@ class AnimationRequest:
     source_audit: str
     animator_root_path: str
     controller_bundle: str | None
+    controller_selection_receipt: str | None
     unity_version: str
     maximum_stored_frames: int
     output: str
@@ -34,6 +35,7 @@ class AnimationRequest:
     reader: str
     ordinary_layer_replay: str | None
     ordinary_layer_replay_template: str | None
+    default_clothing_sampling: str | None
     finalik_replay: str | None
     finalik_replay_template: str | None
 
@@ -48,8 +50,8 @@ def read_request(path: Path) -> AnimationRequest:
     raw = require_object(json.loads(path.read_text(encoding='utf-8-sig')), 'animation request')
     values: dict[str, object] = {}
     for name in AnimationRequest.__dataclass_fields__:
-        value = raw.get(name) if name in ('ordinary_layer_replay', 'ordinary_layer_replay_template', 'finalik_replay', 'finalik_replay_template') else raw[name]
-        if name in ('controller_bundle', 'ordinary_layer_replay', 'ordinary_layer_replay_template', 'finalik_replay', 'finalik_replay_template') and value is None:
+        value = raw.get(name) if name in ('controller_selection_receipt', 'ordinary_layer_replay', 'ordinary_layer_replay_template', 'default_clothing_sampling', 'finalik_replay', 'finalik_replay_template') else raw[name]
+        if name in ('controller_bundle', 'controller_selection_receipt', 'ordinary_layer_replay', 'ordinary_layer_replay_template', 'default_clothing_sampling', 'finalik_replay', 'finalik_replay_template') and value is None:
             values[name] = None
         elif name in ('avatar_path_id', 'maximum_stored_frames'):
             if type(value) is not int:
@@ -66,10 +68,14 @@ def read_request(path: Path) -> AnimationRequest:
         normalized[name] = str((path.parent / Path(getattr(request, name))).resolve())
     if request.controller_bundle is not None:
         normalized['controller_bundle'] = str((path.parent / Path(request.controller_bundle)).resolve())
+    if request.controller_selection_receipt is not None:
+        normalized['controller_selection_receipt'] = str((path.parent / Path(request.controller_selection_receipt)).resolve(strict=True))
     if request.ordinary_layer_replay is not None:
         normalized['ordinary_layer_replay'] = str((path.parent / Path(request.ordinary_layer_replay)).resolve())
     if request.ordinary_layer_replay_template is not None:
         normalized['ordinary_layer_replay_template'] = str((path.parent / Path(request.ordinary_layer_replay_template)).resolve())
+    if request.default_clothing_sampling is not None:
+        normalized['default_clothing_sampling'] = str((path.parent / Path(request.default_clothing_sampling)).resolve())
     if request.finalik_replay is not None:
         normalized['finalik_replay'] = str((path.parent / Path(request.finalik_replay)).resolve())
     if request.finalik_replay_template is not None:
@@ -82,6 +88,8 @@ def read_request(path: Path) -> AnimationRequest:
             raise FileNotFoundError(getattr(request, name))
     if request.controller_bundle is not None and not Path(request.controller_bundle).is_file():
         raise FileNotFoundError(request.controller_bundle)
+    if request.controller_selection_receipt is not None and request.controller_bundle is None:
+        raise ValueError('controller_selection_receipt requires its exact controller_bundle')
     if request.ordinary_layer_replay is not None:
         if request.controller_bundle is None:
             raise ValueError('ordinary_layer_replay requires an exact controller_bundle')
@@ -96,6 +104,13 @@ def read_request(path: Path) -> AnimationRequest:
             raise FileNotFoundError(request.ordinary_layer_replay_template)
     if request.finalik_replay is not None and not Path(request.finalik_replay).is_file():
         raise FileNotFoundError(request.finalik_replay)
+    if request.default_clothing_sampling is not None:
+        if request.controller_bundle is None:
+            raise ValueError('default_clothing_sampling requires an exact controller_bundle')
+        if request.ordinary_layer_replay is not None or request.ordinary_layer_replay_template is not None:
+            raise ValueError('Select either default clothing or an explicit ordinary replay')
+        if not Path(request.default_clothing_sampling).is_file():
+            raise FileNotFoundError(request.default_clothing_sampling)
     if request.finalik_replay_template is not None:
         if request.finalik_replay is not None:
             raise ValueError('Select exactly one fixed FinalIK replay or authenticated fresh template')
@@ -150,6 +165,8 @@ def export_animation(request_path: Path) -> dict[str, object]:
     inputs = [Path(request.avatar_bundle), Path(request.clip_bundle), Path(request.source_audit), Path(request.reader), normalized_request]
     if request.controller_bundle is not None:
         inputs.append(Path(request.controller_bundle))
+    if request.controller_selection_receipt is not None:
+        inputs.append(Path(request.controller_selection_receipt))
     inputs.extend(goal_export.input_paths)
     parameter_verification = output / 'native/animator_parameter_verification.json'
     controller_graph = export_controller_graph(output / 'native')
@@ -160,7 +177,9 @@ def export_animation(request_path: Path) -> dict[str, object]:
         inputs.append(Path(__file__).with_name('character_animator_graph.py'))
     effective_frames = goal_export.source_local_frames
     ordinary_receipt: Path | None = None
-    if request.ordinary_layer_replay is not None or request.ordinary_layer_replay_template is not None:
+    default_clothing_status: dict[str, object] | None = None
+    if (request.ordinary_layer_replay is not None or request.ordinary_layer_replay_template is not None
+            or request.default_clothing_sampling is not None):
         from character_animation_ordinary_export import OrdinarySourceIdentity, export_ordinary_layers
         if controller_graph is None:
             raise ValueError('Ordinary replay requires a decoded controller graph')
@@ -175,15 +194,31 @@ def export_animation(request_path: Path) -> dict[str, object]:
             ordinary_configuration = materialized.configuration
             inputs.extend(materialized.input_paths)
             outputs.append(materialized.configuration)
-        if ordinary_configuration is None:
+        if request.default_clothing_sampling is not None:
+            from character_animation_default_clothing import build_default_clothing_replay
+            sampling_path = Path(request.default_clothing_sampling)
+            sampling = require_object(json.loads(sampling_path.read_text(encoding='utf-8-sig')), 'default clothing sampling')
+            generated = build_default_clothing_replay(output, Path(request.source_audit), effective_frames, identity, sampling)
+            ordinary_configuration = generated.configuration_path
+            default_clothing_status = {'status': generated.status, 'reason': generated.reason,
+                                       'layer_binding_hashes': list(generated.layer_binding_hashes)}
+            inputs.extend((sampling_path, *(Path(__file__).with_name(name) for name in (
+                'character_animation_default_clothing.py', 'character_animation_parameter_trace.py',
+                'character_cloth_curve_parameters.py'))))
+            if generated.configuration_path is not None:
+                outputs.extend((generated.configuration_path, generated.parameters_path))
+        if ordinary_configuration is None and request.default_clothing_sampling is None:
             raise ValueError('Ordinary replay has no authenticated configuration')
-        ordinary = export_ordinary_layers(ordinary_configuration, identity, output,
-                                          Path(request.source_audit), hierarchy_path, effective_frames,
-                                          Path(request.dotnet), request.unity_version, request.maximum_stored_frames)
-        effective_frames = ordinary.source_local_frames
-        ordinary_receipt = ordinary.receipt_path
-        inputs.extend(ordinary.input_paths)
-        outputs.extend(ordinary.output_paths)
+        if ordinary_configuration is not None:
+            ordinary = export_ordinary_layers(ordinary_configuration, identity, output,
+                                              Path(request.source_audit), hierarchy_path, effective_frames,
+                                              Path(request.dotnet), request.unity_version, request.maximum_stored_frames)
+            effective_frames = ordinary.source_local_frames
+            ordinary_receipt = ordinary.receipt_path
+            inputs.extend(ordinary.input_paths)
+            outputs.extend(ordinary.output_paths)
+            if default_clothing_status is not None:
+                default_clothing_status['status'] = 'applied'
     pre_finalik_frames = effective_frames
     finalik_receipt: Path | None = None
     if request.finalik_replay is not None or request.finalik_replay_template is not None:
@@ -213,6 +248,8 @@ def export_animation(request_path: Path) -> dict[str, object]:
                      'No hand/foot goal channels were present; the merged source-local frames and unapplied scalar channel list remain unchanged.')
     receipt = {'format': 'EndfieldAnimationExportReceipt/1', 'status': 'decoded_bound_and_merged_candidate', 'character_id': request.character_id, 'resource_path': request.resource_path, 'clip_name': clip['m_name'], 'clip_source': clip['source'], 'clip_path_id': clip['path_id'], 'avatar_cab': request.avatar_cab, 'avatar_path_id': request.avatar_path_id, 'animator_root_path': request.animator_root_path, 'sample_rate': sample_header['sample_rate'], 'frames': merged_receipt['frames'], 'time_domain': time_domain, 'time_domain_verification': str(time_domain_path), 'hierarchy_nodes': merged_receipt['hierarchy_nodes'], 'source_hierarchy': str(hierarchy_path), 'base_source_local_frames': str(base_frames_path), 'source_local_frames': str(goal_export.source_local_frames), 'unapplied_channels': str(goal_export.unapplied_channels), 'source_goal_ik': str(goal_export.receipt_path), 'source_goal_ik_status': goal_export.status, 'merged_receipt': str(merged / 'receipt.json'), 'inputs': [{'path': str(path), 'sha256': file_hash(path)} for path in unique_inputs], 'outputs': [{'path': str(path), 'sha256': file_hash(path)} for path in unique_outputs], 'elapsed_seconds': time.perf_counter() - started, 'game_and_cached_inputs_read_only': True, 'command': command, 'log': str(log), 'validation_boundary': 'Actual stored clip frames and exact Avatar paths verified. ' + goal_boundary + ' Blender visual parity requires the final binder/sample audit.'}
     receipt['source_local_frames'] = str(effective_frames)
+    if default_clothing_status is not None:
+        receipt['default_clothing'] = default_clothing_status
     if ordinary_receipt is not None:
         receipt['source_goal_local_frames'] = str(goal_export.source_local_frames)
         receipt['ordinary_layer_replay'] = str(ordinary_receipt)

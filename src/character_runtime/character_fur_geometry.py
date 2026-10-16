@@ -235,7 +235,7 @@ def expanded_shell_paths(
 def build_source_fur_curves(
     source_object: bpy.types.Object,
     series: tuple[ShellSeries, ...],
-    direction_image: bpy.types.Image,
+    direction_alpha: np.ndarray,
     color_image: bpy.types.Image,
     root_uv_name: str,
     color_uv_scale: tuple[float, float],
@@ -260,14 +260,14 @@ def build_source_fur_curves(
         raise ValueError("Fur parameters and BaseMap UV/tint must be finite")
     if len(color_uv_scale) != 2 or len(color_uv_offset) != 2 or len(color_tint) != 4:
         raise ValueError("Invalid BaseMap UV transform or color tint dimensions")
-    for image in (direction_image, color_image):
+    for image in (color_image,):
         # Accessing pixels materializes Blender's lazily loaded packed image.
         pixel_count = len(image.pixels)
         if image.packed_file is None or image.channels != 4 or pixel_count != image.size[0] * image.size[1] * 4 or pixel_count == 0:
             raise ValueError(f"Required packed RGBA source image missing: {image.name}")
-    if direction_image.colorspace_settings.name != 'Non-Color':
-        raise ValueError("FurDirMap must be sampled as Non-Color")
     mesh = source_object.data
+    if direction_alpha.shape != (len(mesh.vertices),) or not np.isfinite(direction_alpha).all() or np.any(direction_alpha < 0) or np.any(direction_alpha > 1):
+        raise ValueError("Fur direction alpha must contain one finite [0,1] source value per vertex")
     uv = vertex_uvs(mesh, root_uv_name, 1e-6)
     matrix = np.asarray(source_object.matrix_world, dtype=np.float64)
     if np.max(np.abs(np.linalg.svd(matrix[:3, :3], compute_uv=False)-1)) > 1e-5:
@@ -278,10 +278,10 @@ def build_source_fur_curves(
     indices = np.concatenate([np.asarray(row.indices, dtype=np.int32)[:, ::parameters.root_stride] for row in series], axis=1).T
     layers = np.asarray(series[0].parameters, dtype=np.float64)
     paths = world[indices]
-    direction_samples = helpers.sample_image_pixels(helpers.image_pixel_array(direction_image), uv[indices].reshape(-1,2)).reshape((*indices.shape,4))
+    direction_samples = direction_alpha[indices]
     color_uvs = uv[indices[:,0]] * np.asarray(color_uv_scale) + np.asarray(color_uv_offset)
     colors = helpers.sample_image_pixels(helpers.image_pixel_array(color_image), color_uvs) * np.asarray(color_tint)
-    expanded = expanded_shell_paths(paths, normals[indices], layers, direction_samples[:,:,3], parameters)
+    expanded = expanded_shell_paths(paths, normals[indices], layers, direction_samples, parameters)
     inverse = np.linalg.inv(matrix)
     positions = expanded @ inverse[:3,:3].T + inverse[:3,3]
     data = bpy.data.hair_curves.new(source_object.name + ' Source-derived Fur Curves')
@@ -311,7 +311,7 @@ def build_source_fur_curves(
     obj['artist_radius_meters'] = parameters.radius_meters
     obj['artist_root_stride'] = parameters.root_stride
     obj['artist_length_multiplier'] = parameters.artist_length_multiplier
-    return FurCurveResult(obj.name,len(series),tuple(len(row.indices[0][::parameters.root_stride]) for row in series),len(indices),indices.size,float(np.linalg.norm(np.diff(paths,axis=1),axis=2).sum(axis=1).mean()),float(np.linalg.norm(np.diff(expanded,axis=1),axis=2).sum(axis=1).mean()),float(np.linalg.norm(expanded-paths,axis=2).max()),(float(direction_samples[:,:,3].min()),float(direction_samples[:,:,3].max())))
+    return FurCurveResult(obj.name,len(series),tuple(len(row.indices[0][::parameters.root_stride]) for row in series),len(indices),indices.size,float(np.linalg.norm(np.diff(paths,axis=1),axis=2).sum(axis=1).mean()),float(np.linalg.norm(np.diff(expanded,axis=1),axis=2).sum(axis=1).mean()),float(np.linalg.norm(expanded-paths,axis=2).max()),(float(direction_samples.min()),float(direction_samples.max())))
 
 
 def _point_values(data: bpy.types.Curves, name: str, kind: str, field: str, dimensions: int) -> np.ndarray:

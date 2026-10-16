@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 import re
 import shutil
-from typing import TypedDict
+from typing import Literal, TypedDict
 
 
 PROFILE_TEMPLATE_FORMAT = 'EndfieldCharacterMaterialProfileTemplate/1'
@@ -17,6 +17,10 @@ WEATHER_MANIFEST_FORMAT = 'EndfieldCharacterWeatherTextures/1'
 ALPHA_AUDIT_FORMAT = 'EndfieldShadowCasterAlphaAudit/1'
 STANDARD_SHADER = 'HGRP/CharacterNPR'
 VERIFIED_STANDARD_SHADER_SHA256 = '2ee8e1b24874feaeec421f38f65e28647af60fbaab059f1f6f674dcb18745781'
+STANDARD_ALPHA_PROPERTY_TYPES = (
+    ('_BaseMap', 4), ('_BaseColor', 0), ('_SurfaceType', 2),
+    ('_EnableAlphaTest', 2), ('_AlphaClipThreshold', 3),
+)
 WEATHER_SLOTS = (
     'characterSnowTexture',
     'characterRainDropTexture',
@@ -45,6 +49,13 @@ class ShaderIdentity(TypedDict):
     type: str
     name: str
     object_sha256: str
+
+
+class ShaderCompatibility(TypedDict):
+    status: Literal['verified_reference_object', 'host_approximation_source_contract']
+    native_shader_semantics_verified: bool
+    property_contract_verified: bool
+    provenance: str
 
 
 class WeatherTexture(TypedDict):
@@ -126,6 +137,63 @@ def read_shader_identities(path: Path) -> dict[str, ShaderIdentity]:
             raise ValueError(f'Shader family identity is ambiguous: {name}')
         identities[name] = identity
     return identities
+
+
+def standard_shader_compatibility(shader_row: dict[str, object]) -> ShaderCompatibility:
+    """Separate reference-object evidence from current source property compatibility."""
+    shader = object_value(shader_row.get('shader'), 'Standard Shader identity')
+    if shader.get('name') != STANDARD_SHADER or shader.get('type') != 'Shader':
+        raise ValueError('Standard alpha compatibility requires the CharacterNPR Shader identity')
+    digest = sha256_value(shader_row.get('object_sha256'), 'Standard Shader object SHA-256')
+    if digest == VERIFIED_STANDARD_SHADER_SHA256:
+        return {
+            'status': 'verified_reference_object', 'native_shader_semantics_verified': True,
+            'property_contract_verified': False,
+            'provenance': 'The serialized Standard Shader object matches the audited reference object; Blender face-domain sampling remains an approximation.',
+        }
+    properties = shader_row.get('property_defaults')
+    if not isinstance(properties, list) or not properties:
+        raise ValueError(f'Changed Standard Shader requires its source property contract: shader_sha256={digest}')
+    required = dict(STANDARD_ALPHA_PROPERTY_TYPES)
+    found: dict[str, dict[str, object]] = {}
+    for raw in properties:
+        row = object_value(raw, 'Standard Shader property')
+        name = text_value(row.get('m_Name'), 'Standard Shader property name')
+        if name not in required:
+            continue
+        if name in found:
+            raise ValueError(f'Duplicate Standard alpha property: property={name}; shader_sha256={digest}')
+        actual_type = integer_value(row.get('m_Type'), name + '.m_Type')
+        if actual_type != required[name]:
+            raise ValueError(f'Standard alpha property type differs: property={name}; expected={required[name]}; actual={actual_type}; shader_sha256={digest}')
+        found[name] = row
+    missing = sorted(set(required) - set(found))
+    if missing:
+        raise ValueError(f'Standard alpha property contract is incomplete: missing={missing}; shader_sha256={digest}')
+    texture = object_value(found['_BaseMap'].get('m_DefTexture'), '_BaseMap.m_DefTexture')
+    if integer_value(texture.get('m_TexDim'), '_BaseMap.m_TexDim') != 2:
+        raise ValueError(f'Standard alpha BaseMap must be a 2D source texture: shader_sha256={digest}')
+    attributes = found['_EnableAlphaTest'].get('m_Attributes')
+    if not isinstance(attributes, list) or 'Toggle(_ALPHATEST_ON)' not in attributes:
+        raise ValueError(f'Standard alpha source toggle must name _ALPHATEST_ON: shader_sha256={digest}')
+    return {
+        'status': 'host_approximation_source_contract', 'native_shader_semantics_verified': False,
+        'property_contract_verified': True,
+        'provenance': 'Current source Shader identity and required alpha property types are verified. Existing Blender/reference-derived equations are host approximations; current shader program equivalence and native alpha semantics have not been audited.',
+    }
+
+
+def validate_shadow_alpha_compatibility(audit: dict[str, object], shader_row: dict[str, object]) -> ShaderCompatibility:
+    """Reject upgraded audit claims and accept legacy evidence only for the reference object."""
+    expected = standard_shader_compatibility(shader_row)
+    if 'compatibility' not in audit:
+        if expected['status'] != 'verified_reference_object':
+            raise ValueError('Changed Standard Shader alpha evidence requires explicit host approximation compatibility')
+        return expected
+    actual = object_value(audit['compatibility'], 'alpha compatibility')
+    if any(actual.get(key) != value or type(actual.get(key)) is not type(value) for key, value in expected.items()):
+        raise ValueError('Alpha compatibility evidence differs from the actual Shader reference/property contract')
+    return expected
 
 
 def _safe_artifact_path(parent: Path, value: object, label: str) -> Path:
@@ -214,9 +282,12 @@ def create_export_material_profile(
     if STANDARD_SHADER not in identities:
         raise ValueError(f'Required audited alpha consumer Shader is absent: {STANDARD_SHADER}')
     standard_identity = identities[STANDARD_SHADER]
-    if standard_identity['object_sha256'] != VERIFIED_STANDARD_SHADER_SHA256:
-        raise ValueError('Standard alpha consumer Shader object differs from the pinned verified object: '
-                         + standard_identity['object_sha256'])
+    shader_document = object_value(json.loads(shader_identity_path.read_text(encoding='utf-8-sig')), 'shader identity')
+    standard_rows = tuple(object_value(row, 'Shader row') for row in shader_document['shaders']
+                          if object_value(object_value(row, 'Shader row').get('shader'), 'Shader identity').get('name') == STANDARD_SHADER)
+    if len(standard_rows) != 1:
+        raise ValueError('Standard alpha compatibility requires exactly one Shader property record')
+    compatibility = standard_shader_compatibility(standard_rows[0])
     weather_receipt, weather_textures = read_weather_textures(weather_manifest_path)
     template_file = template_path.resolve(strict=True)
     template = object_value(json.loads(template_file.read_text(encoding='utf-8-sig')), 'material profile template')
@@ -253,6 +324,7 @@ def create_export_material_profile(
             'template_sha256': file_sha256(template_file),
         },
         'shader_identities': identities,
+        'standard_shader_compatibility': compatibility,
     })
     manifest_hash = file_sha256(normalized_manifest)
     if STANDARD_SHADER in identities:
@@ -292,7 +364,8 @@ def create_export_material_profile(
             'pathId': str(standard_identity['path_id']),
             'serializedObjectSha256': standard_identity['object_sha256'].upper(),
         },
-        'provenance': 'Generated from the current per-export Shader identity; verified object SHA is fixed by the local material profile builder.',
+        'compatibility': compatibility,
+        'provenance': compatibility['provenance'],
     }
     alpha_path = output / 'shadow_alpha_audit.json'
     alpha_path.write_text(json.dumps(alpha_audit, indent=2) + '\n', encoding='utf-8')
@@ -312,6 +385,7 @@ def create_export_material_profile(
         'shader_identity_sha256': file_sha256(shader_identity_path),
         'weather_source_evidence': weather_receipt,
         'source_shader_object_hashes': {name: row['object_sha256'] for name, row in identities.items()},
+        'standard_shader_compatibility': compatibility,
     }
     receipt_path = output / 'material_profile_receipt.json'
     receipt_path.write_text(json.dumps(receipt, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')

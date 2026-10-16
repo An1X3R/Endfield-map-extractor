@@ -15,11 +15,12 @@ import bpy
 import numpy as np
 
 from audit_character_materials import source_geometry_digest
-from character_fur_curve_weather import CurveTextureBinding, attach_fur_curve_snow, texture_binding
+from character_fur_curve_weather import CurveTextureBinding, attach_fur_curve_snow, curve_attribute_hashes, texture_binding
 from character_fur_geometry import (
     FurGeometryParameters, attach_source_fur_skin_deformation, build_source_fur_curves,
     detect_shell_series, interpolate_source_fur_guides, vertex_uvs,
 )
+from character_fur_texture_contract import null_fur_direction_alpha
 from character_hair_fur_snow_profile import HairFurSnowProfile, read_hair_fur_snow_profile
 from character_wetfilm_profile import file_digest, verified_file
 from character_windows_paths import io_path
@@ -36,6 +37,7 @@ class FurCurvesBuildProfile:
     path: Path
     sha256: str
     mesh_identity: tuple[str, str]
+    renderer_identity: tuple[str, str] | None
     group_identity: tuple[str, str]
     sidecar: Path
     sidecar_sha256: str
@@ -128,6 +130,8 @@ def read_fur_curves_build_profile(path: Path | None) -> FurCurvesBuildProfile | 
     if raw.get('format') != PROFILE_FORMAT:
         raise ValueError(f'Unsupported Fur Curves build profile format: {source}')
     mesh_identity = _identity(raw.get('source_mesh_identity'), 'source_mesh_identity')
+    renderer_identity = (_identity(raw['source_renderer_identity'], 'source_renderer_identity')
+                         if 'source_renderer_identity' in raw else None)
     group_identity = _identity(raw.get('source_group_identity'), 'source_group_identity')
     sidecar = verified_file(source.parent, raw.get('raw_channel_sidecar'), raw.get('raw_channel_sidecar_sha256'))
     helpers = verified_file(source.parent, raw.get('curve_helpers'), raw.get('curve_helpers_sha256'))
@@ -150,7 +154,7 @@ def read_fur_curves_build_profile(path: Path | None) -> FurCurvesBuildProfile | 
     if radius <= 0 or multiplier <= 0 or tolerance <= 0:
         raise ValueError('Fur radius, artist multiplier and shell tolerance must be positive')
     return FurCurvesBuildProfile(
-        source, file_digest(source), mesh_identity, group_identity, sidecar, file_digest(sidecar),
+        source, file_digest(source), mesh_identity, renderer_identity, group_identity, sidecar, file_digest(sidecar),
         helpers, file_digest(helpers), uv_layer, up, radius, root_slot, stride, multiplier, tolerance,
     )
 
@@ -203,13 +207,14 @@ def _load_helpers(profile: FurCurvesBuildProfile) -> ModuleType:
     return module
 
 
-def _mapped_fur_mesh(source_dir: Path, identity: tuple[str, str]) -> tuple[bpy.types.Object, dict[str, object]]:
+def _mapped_fur_mesh(source_dir: Path, identity: tuple[str, str], renderer_identity: tuple[str, str] | None) -> tuple[bpy.types.Object, dict[str, object]]:
     export_map_path = source_dir / 'renderer_export_map.json'
     document = _object(json.loads(export_map_path.read_text(encoding='utf-8-sig')), 'renderer export map')
     if document.get('format') != EXPORT_MAP_FORMAT or not isinstance(document.get('renderers'), list):
         raise ValueError(f'Unsupported renderer export map: {export_map_path}')
     rows = tuple(_object(row, 'renderer export row') for row in document['renderers']
-                 if isinstance(row, dict) and _identity(row.get('mesh_identity'), 'renderer mesh identity') == identity)
+                 if isinstance(row, dict) and _identity(row.get('mesh_identity'), 'renderer mesh identity') == identity
+                 and (renderer_identity is None or _identity(row.get('renderer_identity'), 'source renderer identity') == renderer_identity))
     export_names = tuple(sorted({_string(row.get('export_name'), 'renderer export_name') for row in rows}))
     if not rows or len(export_names) != 1:
         raise ValueError(f'Source mesh identity does not map to one imported FBX object: {identity}')
@@ -261,9 +266,6 @@ def _source_fur_material(source_mesh: bpy.types.Object, profile: FurCurvesBuildP
         raise ValueError(f'Configured Fur group identity is absent or ambiguous on source Mesh: {profile.group_identity}')
     material, group = matches[0]
     keywords = tuple(sorted(source_keywords(group)))
-    families = tuple(item for item in weather_profile.families if item.family == 'HGRP/CharacterNPR')
-    if len(families) != 1 or keywords not in families[0].keyword_sets:
-        raise ValueError('Configured source Fur keyword variant is outside the selected Hair/Fur snow profile')
     return material, group, keywords
 
 
@@ -294,6 +296,64 @@ def _static_mapping(binding: CurveTextureBinding, slot: str, uv_layer: str, iden
     if rotation != (0.0, 0.0, 0.0):
         raise ValueError(f'Source {slot} rotation cannot be represented by the Curves generator')
     return (scale[0], scale[1]), (location[0], location[1])
+
+
+def source_direction_alpha(group: bpy.types.ShaderNodeTree, mesh: bpy.types.Mesh,
+                           uv_layer: str, helpers: ModuleType) -> tuple[np.ndarray, dict[str, object]]:
+    """Read texture alpha or the exact opaque bump default without synthesizing an image."""
+    defaults = _object(json.loads(group.get('source_null_texture_defaults', '{}')), 'source Shader texture defaults')
+    if '_FurDirMap' in defaults:
+        if any(item.type == 'TEX_IMAGE' and item.get('source_slot') == '_FurDirMap' for item in group.nodes):
+            raise ValueError('Source FurDirMap has both an actual image and a null texture default')
+        default = _object(defaults['_FurDirMap'], 'source FurDirMap default')
+        floats = _object(json.loads(group.get('source_floats', '{}')), 'source Fur floats')
+        alpha = null_fur_direction_alpha(_string(default.get('default'), 'FurDirMap default'), 2,
+                                         _number(floats.get('_FurDirMapEnable'), '_FurDirMapEnable'))
+        return np.full(len(mesh.vertices), alpha, dtype=np.float64), {
+            'kind': 'source_shader_null_texture_default', 'slot': '_FurDirMap', 'default': 'bump',
+            'alpha': alpha, 'directional_flow_enabled': False,
+            'evidence': default, 'scope': 'Only opaque default alpha enters the host geometry; no source image is fabricated.'}
+    direction = texture_binding(group, '_FurDirMap')
+    _static_mapping(direction, '_FurDirMap', uv_layer, True)
+    image = direction.texture.image
+    if image is None or image.colorspace_settings.name != 'Non-Color':
+        raise ValueError('Source FurDirMap must be the packed linear RGBA geometry texture')
+    pixel_count = len(image.pixels)
+    if image.channels != 4 or pixel_count != image.size[0] * image.size[1] * 4 or pixel_count == 0:
+        raise ValueError(f'Required packed RGBA source direction image missing: {image.name}')
+    pixels = helpers.image_pixel_array(image)
+    samples = helpers.sample_image_pixels(pixels, vertex_uvs(mesh, uv_layer, 1e-6))
+    return samples[:, 3], {'kind': 'source_texture', 'slot': '_FurDirMap', 'image': image.name,
+                          'packed_sha256': hashlib.sha256(image.packed_file.data).hexdigest()}
+
+
+def apply_source_fur_dye(group: bpy.types.ShaderNodeTree, mesh: bpy.types.Mesh,
+                         guides: bpy.types.Object, uv_layer: str, helpers: ModuleType) -> dict[str, object]:
+    """Sample actual dye inputs onto guide colors using the explicit mesh preview formula."""
+    if '_CHARACTER_FUR_DYE' not in source_keywords(group):
+        return {'status': 'not_selected_by_source_keyword'}
+    source = _object(json.loads(group.get('source_fur_dye', '{}')), 'source Fur dye preview')
+    intensity = _number(source.get('intensity'), 'source Fur dye intensity')
+    if not 0 <= intensity <= 1 or source.get('native_shader_semantics_verified') is not False:
+        raise ValueError('Source Fur dye preview has no bounded source intensity or truthful semantic scope')
+    binding = texture_binding(group, '_FurDyeMap')
+    scale, offset = _static_mapping(binding, '_FurDyeMap', uv_layer, False)
+    image = binding.texture.image
+    indices = np.empty(len(guides.data.points), dtype=np.int32)
+    guides.data.attributes['source_vertex_index'].data.foreach_get('value', indices)
+    if np.any(indices < 0) or np.any(indices >= len(mesh.vertices)):
+        raise ValueError('Fur dye guide vertex indices are outside the exact source Mesh')
+    uv = vertex_uvs(mesh, uv_layer, 1e-6)[indices] * np.asarray(scale) + np.asarray(offset)
+    dye = helpers.sample_image_pixels(helpers.image_pixel_array(image), uv)
+    attribute = guides.data.attributes['hair_source_color']
+    colors = np.empty(len(indices) * 4, dtype=np.float32)
+    attribute.data.foreach_get('color', colors)
+    colors = colors.reshape(-1, 4)
+    colors[:, :3] += intensity * ((1.0 - (1.0 - colors[:, :3]) * (1.0 - dye[:, :3])) - colors[:, :3])
+    attribute.data.foreach_set('color', colors.reshape(-1))
+    return {'status': 'source_inputs_host_appearance_approximation', 'source': source,
+            'image': image.name, 'packed_sha256': hashlib.sha256(image.packed_file.data).hexdigest(),
+            'scale': list(scale), 'offset': list(offset)}
 
 
 def attach_profile_fur_curves(
@@ -333,7 +393,7 @@ def attach_profile_fur_curves(
     if len(mesh_rows) != 1:
         raise ValueError(f'Snow sidecar must contain exactly one configured source Mesh: {profile.mesh_identity}')
     mesh_row = mesh_rows[0]
-    source_mesh, export_map = _mapped_fur_mesh(source_dir, profile.mesh_identity)
+    source_mesh, export_map = _mapped_fur_mesh(source_dir, profile.mesh_identity, profile.renderer_identity)
     vertex_count = mesh_row.get('vertex_count')
     if isinstance(vertex_count, bool) or not isinstance(vertex_count, int) or vertex_count != len(source_mesh.data.vertices):
         raise ValueError('Snow sidecar and normal-build FBX Mesh vertex counts differ')
@@ -346,17 +406,14 @@ def attach_profile_fur_curves(
         raise ValueError('Raw TEXCOORD0 does not match normal-build FBX vertex order and UV layer')
     material, group, keywords = _source_fur_material(source_mesh, profile, weather_profile)
     length, gravity, disable_rain, tint = _source_scalars(group)
-    direction = texture_binding(group, '_FurDirMap')
     base = texture_binding(group, '_BaseMap')
     base_scale, base_offset = _static_mapping(base, '_BaseMap', profile.uv_layer, False)
-    _static_mapping(direction, '_FurDirMap', profile.uv_layer, True)
-    if direction.texture.image is None or direction.texture.image.colorspace_settings.name != 'Non-Color':
-        raise ValueError('Source FurDirMap must be the packed linear RGBA geometry texture')
     if base.texture.image is None or base.texture.image.packed_file is None:
         raise ValueError('Source BaseMap must be the packed source appearance texture')
     if not base.texture.image.has_data:
         base.texture.image.pixels[0]
     helpers = _load_helpers(profile)
+    direction_alpha, direction_record = source_direction_alpha(group, source_mesh.data, profile.uv_layer, helpers)
     series = detect_shell_series(source_mesh.data, raw_layers, profile.uv_layer, profile.shell_tolerance, helpers)
     geometry = source_geometry_digest((source_mesh.name,))
     collection_name = 'EF Optional Source Fur Curves Weather ' + source_mesh.name
@@ -366,16 +423,27 @@ def attach_profile_fur_curves(
     bpy.context.scene.collection.children.link(collection)
     parameters = FurGeometryParameters(length, gravity, disable_rain, profile.source_world_up,
                                        profile.radius_meters, profile.root_stride, profile.artist_length_multiplier)
-    built = build_source_fur_curves(source_mesh, series, direction.texture.image, base.texture.image,
+    built = build_source_fur_curves(source_mesh, series, direction_alpha, base.texture.image,
                                     profile.uv_layer, base_scale, base_offset, tint, parameters, collection, helpers)
     bind_guides = bpy.data.objects[built.object_name]
+    dye = apply_source_fur_dye(group, source_mesh.data, bind_guides, profile.uv_layer, helpers)
     interpolation = interpolate_source_fur_guides(source_mesh, bind_guides, profile.root_material_slot, collection)
     curves = bpy.data.objects[interpolation.object_name]
     skin = attach_source_fur_skin_deformation(source_mesh, bind_guides, curves, collection)
     bind_guides.hide_render = True
     bind_guides.hide_set(True)
     bind_guides['fur_curves_role'] = 'Hidden source-derived bind guides for the optional driven Curves layer'
-    weather = attach_fur_curve_snow(source_mesh, material, group, bind_guides, curves, controls, weather_profile, layout)
+    families = tuple(item for item in weather_profile.families if item.family == 'HGRP/CharacterNPR')
+    if len(families) != 1:
+        raise ValueError('Source Fur Curves require one explicit configured Fur weather family')
+    if keywords in families[0].keyword_sets:
+        weather = attach_fur_curve_snow(source_mesh, material, group, bind_guides, curves, controls, weather_profile, layout)
+    else:
+        weather = {'format': 'EndfieldFurCurveSourcePreview/1', 'status': 'source_variant_weather_pending',
+                   'curves': curves.name, 'bind_guides': bind_guides.name, 'source_keywords': list(keywords),
+                   'attributes': curve_attribute_hashes(curves.data, tuple(attribute.name for attribute in curves.data.attributes)),
+                   'reason': 'Current source keyword variant is outside the verified mapped Fur snow/wet kernel; source geometry, appearance inputs and original shell remain retained.',
+                   'native_shader_semantics_verified': False}
     after = source_geometry_digest((source_mesh.name,))
     if geometry != after:
         raise AssertionError(f'Optional Fur Curves generation changed original Mesh geometry or skin: {source_mesh.name}')
@@ -398,6 +466,8 @@ def attach_profile_fur_curves(
         'curve_helpers': {'path': str(profile.helpers), 'sha256': profile.helpers_sha256},
         'source_fur_values': {'length_intensity': length, 'gravity_strength': gravity,
                               'disable_rain_effect_on_material': disable_rain},
+        'source_fur_direction': direction_record,
+        'source_fur_dye': dye,
         'source_geometry_preserved': True,
         'collection': collection.name,
         'bind_guides': asdict(built),
@@ -443,7 +513,20 @@ def verify_profile_fur_curves(receipt: dict[str, object]) -> dict[str, object]:
         raise ValueError('Unknown saved optional Fur Curves status')
     curves_record = _object(receipt.get('curve_weather'), 'Curves weather attachment')
     from character_fur_curve_weather import verify_fur_curve_snow
-    weather_audit = verify_fur_curve_snow(curves_record)
+    if curves_record.get('format') == 'EndfieldFurCurveSourcePreview/1':
+        saved = bpy.data.objects.get(_string(curves_record.get('curves'), 'source preview curves'))
+        attributes = _object(curves_record.get('attributes'), 'source preview attributes')
+        group = bpy.data.node_groups.get(_string(receipt.get('source_group'), 'source preview group'))
+        if (curves_record.get('status') != 'source_variant_weather_pending'
+                or curves_record.get('native_shader_semantics_verified') is not False
+                or saved is None or saved.type != 'CURVES' or group is None
+                or list(sorted(source_keywords(group))) != curves_record.get('source_keywords')
+                or curve_attribute_hashes(saved.data, tuple(attributes)) != attributes
+                or saved.get('fur_curve_weather')):
+            raise AssertionError('Saved source Fur preview identity, attributes or pending-weather scope differs')
+        weather_audit = {'status': 'source_preview_preserved', 'native_weather': 'pending_for_source_variant'}
+    else:
+        weather_audit = verify_fur_curve_snow(curves_record)
     source_mesh_name = _string(receipt.get('source_mesh'), 'source_mesh')
     source_mesh = bpy.data.objects.get(source_mesh_name)
     curves_name = _string(curves_record.get('curves'), 'driven Curves')
@@ -477,7 +560,7 @@ def attach_prepared_fur_curves(
     entries: list[dict[str, object]] = []
     skipped: list[dict[str, object]] = []
     for profile in preparation.profiles:
-        mesh, mapping = _mapped_fur_mesh(source_dir, profile.mesh_identity)
+        mesh, mapping = _mapped_fur_mesh(source_dir, profile.mesh_identity, profile.renderer_identity)
         if mesh.hide_render or mesh.hide_get():
             skipped.append({'source_mesh': mesh.name, 'source_mesh_identity': list(profile.mesh_identity),
                             'reason': 'source_visibility_or_lod_hidden', 'renderer_export_map': mapping})

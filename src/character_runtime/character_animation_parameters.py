@@ -14,6 +14,11 @@ import math
 from pathlib import Path
 import zlib
 
+VERIFIED_CONTROLLER_STATUSES = (
+    'exact_controller_clip_reference_and_tos_verified',
+    'character_controller_dynamic_clip_and_tos_verified',
+)
+
 @dataclass(frozen=True)
 class ParameterChannel:
     track: int
@@ -86,16 +91,20 @@ def _controller_names(native: Path, request: dict[str, object], clip: dict[str, 
         return {}, None
     evidence_path = native / 'animator_parameter_verification.json'
     evidence = _record(_json(evidence_path), 'controller evidence')
-    if evidence['status'] != 'exact_controller_clip_reference_and_tos_verified' or evidence['clip_reference_path_id'] != clip['path_id']:
-        raise ValueError('Controller name evidence does not verify this exact source clip')
+    if evidence['status'] not in VERIFIED_CONTROLLER_STATUSES:
+        raise ValueError('Controller name evidence has no verified source selection')
     if evidence['binding_type_id'] != 95 or evidence['binding_custom_type'] != 0:
         raise ValueError('Controller name evidence is not for Animator parameters')
     tree = _record(_json(native / 'controller_type_tree.json'), 'controller type tree')
     if tree['m_Name'] != evidence['controller']:
         raise ValueError('Parsed controller name differs from its verification receipt')
     pointers = tuple(_record(row, 'controller clip pointer') for row in _rows(tree['m_AnimationClips'], 'controller clips'))
-    if sum(row['m_FileID'] == evidence['clip_reference_file_id'] and row['m_PathID'] == clip['path_id'] for row in pointers) != 1:
-        raise ValueError('Parsed controller lacks the exact verified clip pointer')
+    if evidence['status'] == 'exact_controller_clip_reference_and_tos_verified':
+        if evidence['clip_reference_path_id'] != clip['path_id'] or sum(row['m_FileID'] == evidence['clip_reference_file_id'] and row['m_PathID'] == clip['path_id'] for row in pointers) != 1:
+            raise ValueError('Parsed controller lacks the exact verified clip pointer')
+    else:
+        _verify_dynamic_controller_selection(native, request, clip, evidence)
+        _verify_dynamic_clip_membership(native, clip, evidence, pointers)
     names_by_hash: dict[int, set[str]] = {}
     for value in _rows(tree['m_TOSData'], 'controller TOS strings'):
         if not isinstance(value, str):
@@ -116,6 +125,62 @@ def _controller_names(native: Path, request: dict[str, object], clip: dict[str, 
             raise ValueError(f'Controller name receipt differs from exact TOS hash lookup: {attribute}')
         resolved[attribute] = expected
     return resolved, evidence_path
+
+
+def _verify_dynamic_controller_selection(native: Path, request: dict[str, object],
+                                         clip: dict[str, object], evidence: dict[str, object]) -> None:
+    """Verify controller ownership without inventing a static action pointer."""
+    if request.get('controller_selection_receipt') is None:
+        audit_path = _source_path(native.parent, request['source_audit'], 'source audit')
+        if _hash(audit_path) != evidence['source_animator_controller_sha256']:
+            raise ValueError('Source Animator controller proof changed after native verification')
+        audit = _record(_json(audit_path), 'source audit')
+        root_name = _text(request['animator_root_path'], 'Animator root').split('/')[-1]
+        animators = tuple(_record(row, 'Animator') for row in _rows(audit['animators'], 'Animators')
+                          if _record(_record(row, 'Animator')['object'], 'Animator object')['name'] == root_name)
+        if len(animators) != 1:
+            raise ValueError('Source Animator controller owner is missing or ambiguous')
+        resolved = _record(_record(animators[0]['controller'], 'Animator controller')['resolved'], 'resolved controller')
+        if resolved['type'] != 'AnimatorController' or resolved['source'] != evidence['source'] or resolved['path_id'] != evidence['controller_path_id']:
+            raise ValueError('Decoded controller differs from its source Animator reference')
+        return
+    selection_path = _source_path(native.parent, request['controller_selection_receipt'], 'controller selection receipt')
+    if _hash(selection_path) != evidence['controller_selection_receipt_sha256']:
+        raise ValueError('Character controller selection changed after native verification')
+    selection = _record(_json(selection_path), 'controller selection')
+    if selection['format'] != 'EndfieldCharacterControllerReceipt/1' or selection['status'] != 'source_normal_controller_dynamic_clip_verified' or selection['scope'] != 'source_normal_controller_not_runtime':
+        raise ValueError('Dynamic parameters require a verified normal character controller selection')
+    if selection['character_id'] != request['character_id']:
+        raise ValueError('Controller selection belongs to a different character')
+    bundle = _source_path(native.parent, request['controller_bundle'], 'controller bundle')
+    if bundle != _source_path(selection_path.parent, selection['reader_controller_bundle'], 'selected controller bundle') or _hash(bundle) != selection['controller_bundle_sha256']:
+        raise ValueError('Controller bundle differs from source selection')
+    controller = _record(selection['controller'], 'selected controller')
+    selected_clip = _record(selection['selected_clip_source'], 'selected clip')
+    if controller['cab'] != evidence['source'] or int(_text(controller['path_id'], 'controller PathID')) != evidence['controller_path_id']:
+        raise ValueError('Selected controller CAB/PathID differs from parameter evidence')
+    if selected_clip['sourceFile'] != clip['source'] or selected_clip['pathId'] != clip['path_id'] or selected_clip['type'] != 'AnimationClip' or _text(selected_clip['container'], 'clip resource').casefold() != _text(request['resource_path'], 'requested clip').casefold():
+        raise ValueError('Controller selection identifies a different action')
+    if selection['clip_reference'] is not None:
+        raise ValueError('Dynamic character selection must not claim a static pointer')
+
+
+def _verify_dynamic_clip_membership(native: Path, clip: dict[str, object], evidence: dict[str, object],
+                                    pointers: tuple[dict[str, object], ...]) -> None:
+    """Keep absent static membership distinct from verified controller ownership."""
+    if evidence['selected_clip_source'] != clip['source'] or evidence['selected_clip_path_id'] != clip['path_id']:
+        raise ValueError('Dynamic parameter evidence identifies a different decoded clip')
+    if evidence['clip_reference_file_id'] is not None or evidence['clip_reference_path_id'] is not None:
+        raise ValueError('Dynamic clip evidence must not claim a static pointer')
+    references = _record(_json(native / 'controller_source_references.json'), 'controller references')
+    externals = tuple(_text(value, 'controller external CAB') for value in _rows(references['external_cabs'], 'external CABs'))
+    for pointer in pointers:
+        file_id = _integer(pointer['m_FileID'], 'clip FileID')
+        if not 0 <= file_id <= len(externals):
+            raise ValueError(f'Controller clip pointer has invalid FileID: {file_id}')
+        cab = references['source'] if file_id == 0 else externals[file_id - 1]
+        if cab == clip['source'] and pointer['m_PathID'] == clip['path_id']:
+            raise ValueError('Dynamic clip evidence contradicts an actual static pointer')
 
 
 def read_source_animator_parameters(source_receipt: Path) -> ParameterSource:
@@ -158,10 +223,12 @@ def read_source_animator_parameters(source_receipt: Path) -> ParameterSource:
     if frame_count <= 0 or rate <= 0:
         raise ValueError('Stored frame count and sample rate must be positive')
     frames = tuple(_record(value, 'scalar frame') for value in _rows(_json(native / 'float_samples.json'), 'scalar frames'))
-    if len(frames) != frame_count:
-        raise ValueError('Stored scalar frames differ from the decoded clip receipt')
+    domain = _record(receipt['time_domain'], 'verified time domain')
+    scalar_domain = _record(domain['float'], 'scalar time domain')
+    if domain['status'] != 'shared_timestamp_prefix_verified' or domain['common_frame_count'] != frame_count or scalar_domain['original_frame_count'] != len(frames) or not 0 < frame_count <= len(frames):
+        raise ValueError('Raw scalar/shared exported frame counts differ from the verified time domain')
     samples: list[tuple[float, ...]] = []
-    for index, frame in enumerate(frames):
+    for index, frame in enumerate(frames[:frame_count]):
         if abs(_number(frame['time'], 'scalar time') - index / rate) > 1e-5:
             raise ValueError(f'Scalar frame timestamp differs from its sample rate: frame={index}')
         values = tuple(_number(value, 'scalar value') for value in _rows(frame['values'], 'scalar values'))
@@ -205,6 +272,10 @@ def read_source_animator_parameters(source_receipt: Path) -> ParameterSource:
         controller = _source_path(request_path.parent, request['controller_bundle'], 'controller bundle')
         if controller not in hashes:
             raise ValueError('Controller binary is not hash-linked by the original animation export')
+        if request.get('controller_selection_receipt') is not None:
+            selection = _source_path(request_path.parent, request['controller_selection_receipt'], 'controller selection receipt')
+            if selection not in hashes:
+                raise ValueError('Character controller selection is not hash-linked by the animation export')
     return ParameterSource(_text(receipt['character_id'], 'character ID'), _text(receipt['animator_root_path'], 'Animator owner path'),
                            _text(receipt['clip_name'], 'clip name'), rate, frame_count, tuple(channels),
                            tuple(hashes.items()), evidence)

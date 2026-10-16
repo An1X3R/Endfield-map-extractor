@@ -171,7 +171,7 @@ _REFERENCE_FIELDS = (
     "earMorphAvatarName",
     "facialMorphAvatarName",
 )
-_CATALOG_CACHE_SCHEMA = "character-catalog-cache/1"
+_CATALOG_CACHE_SCHEMA = "character-catalog-cache/2"
 _PROVIDER_FINGERPRINT_SCHEMA = "character-provider-jsonl/1"
 _VFS_HEADER_FINGERPRINT_SCHEMA = "character-vfs-group-header/1"
 
@@ -289,16 +289,11 @@ def _read_prefab_info(
         raise CharacterCatalogError(f"Invalid PrefabInfo JSON: path={virtual_path}, error={error}") from error
     source = _object(parsed, virtual_path)
     actual_template_id = _string(source.get("id"), f"{virtual_path}.id")
-    actual_character_id = _string(source.get("correspondingCharId"), f"{virtual_path}.correspondingCharId")
     if actual_template_id != template_id:
         raise CharacterCatalogError(
             f"PrefabInfo template identity mismatch: path={virtual_path}, expected={template_id}, actual={actual_template_id}"
         )
-    if actual_character_id != corresponding_character_id:
-        raise CharacterCatalogError(
-            f"PrefabInfo character binding mismatch: template={template_id}, "
-            f"expected={corresponding_character_id}, actual={actual_character_id}"
-        )
+    _validate_prefab_character_binding(source, corresponding_character_id, virtual_path)
     raw_parts = source.get("partNameIdList")
     if not isinstance(raw_parts, list) or not raw_parts:
         raise CharacterCatalogError(f"PrefabInfo partNameIdList must be a nonempty array: path={virtual_path}")
@@ -324,6 +319,17 @@ def _read_prefab_info(
         part_names,
         tuple(references),
     )
+
+
+def _validate_prefab_character_binding(source: dict[str, object], character_id: str, virtual_path: str) -> None:
+    """Validate the optional prefab duplicate of the authoritative character-table binding."""
+    if "correspondingCharId" not in source:
+        return
+    actual = _string(source["correspondingCharId"], f"{virtual_path}.correspondingCharId")
+    if actual != character_id:
+        raise CharacterCatalogError(
+            f"PrefabInfo character binding mismatch: path={virtual_path}, expected={character_id}, actual={actual}"
+        )
 
 
 def _normalize_container_path(value: str) -> str:

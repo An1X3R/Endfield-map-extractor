@@ -31,6 +31,7 @@ class CharacterServiceProtocol(Protocol):
     """Boundary owned by the configured reader and resource service."""
 
     def catalog(self) -> dict[str, object]: ...
+    def creature_catalog(self) -> dict[str, object]: ...
     def detail(self, selection_id: str) -> dict[str, object]: ...
     def animations(self, selection_id: str, variant_id: str, offset: int, limit: int) -> dict[str, object]: ...
     def canonical_export(self, payload: dict[str, object]) -> dict[str, object]: ...
@@ -78,6 +79,9 @@ class CharacterCoordinator:
 
     def catalog(self) -> dict[str, object]:
         return self.service.catalog()
+
+    def creature_catalog(self) -> dict[str, object]:
+        return self.service.creature_catalog()
 
     def detail(self, selection_id: str) -> dict[str, object]:
         return self.service.detail(selection_id)

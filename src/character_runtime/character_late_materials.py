@@ -29,15 +29,21 @@ def _source_switches(tree: bpy.types.ShaderNodeTree) -> dict[str, bool]:
     raw = json.loads(encoded)
     if not isinstance(raw, dict):
         raise TypeError(f'Standard source floats must be an object: {tree.name}')
-    missing = tuple(name for name in REQUIRED_SWITCHES if name not in raw)
-    if missing:
-        raise ValueError(f'Standard source switches missing: {tree.name}/{missing}')
     values: dict[str, bool] = {}
     for name in REQUIRED_SWITCHES:
+        if name not in raw:
+            continue
         value = raw[name]
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
             raise ValueError(f'Standard source switch must be finite numeric: {tree.name}/{name}={value}')
         values[name] = float(value) > .5
+    missing = tuple(name for name in REQUIRED_SWITCHES if name not in values)
+    properties = json.loads(tree.get('source_shader_property_types', '{}'))
+    if not isinstance(properties, dict):
+        raise TypeError(f'Standard source Shader property types must be an object: {tree.name}')
+    required_missing = tuple(name for name in missing if name != '_Pantyhose' or not properties or name in properties)
+    if '_UseBumpMap' in missing or (values['_UseBumpMap'] and required_missing):
+        raise ValueError(f'Standard selected source branch requires missing switches: {tree.name}/{missing}')
     return values
 
 
@@ -45,7 +51,7 @@ def _supported_standard_reason(switches: dict[str, bool]) -> str | None:
     if not switches['_UseBumpMap']:
         return 'Unmapped normal variant has no attachment proof'
     special = ('_UseCharacterFur', '_ClearCoat', '_Pantyhose', '_UseAnisotropy')
-    enabled = tuple(name for name in special if switches[name])
+    enabled = tuple(name for name in special if name in switches and switches[name])
     if enabled:
         return f'Special source branches outside the current Standard path: {enabled}'
     silk = switches['_SilkStockings']
@@ -138,10 +144,11 @@ def attach_supported_late_materials(
         if reason is None and native_weather and '_CHARACTER_FUR' in source_keywords(tree):
             reason = 'Explicit per-draw weather input is limited to the non-Fur Standard keyword family'
         source_identity = str(tree.get('source_identity', tree.name))
-        features = {name: switches[name] for name in REQUIRED_SWITCHES}
+        features = dict(switches)
         if reason is not None:
             records.append({'group': tree.name, 'source_identity': source_identity,
                             'status': 'source_variant_not_implemented', 'source_features': features,
+                            'source_switches_absent_and_unconsumed': [name for name in REQUIRED_SWITCHES if name not in switches],
                             'reason': reason})
             continue
 
@@ -191,6 +198,7 @@ def attach_supported_late_materials(
             'source_identity': source_identity,
             'status': 'connected',
             'source_features': features,
+            'source_switches_absent_and_unconsumed': [name for name in REQUIRED_SWITCHES if name not in switches],
             'main': main,
             'silk': silk,
             'additional_mode': 0,

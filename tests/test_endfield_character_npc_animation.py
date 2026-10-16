@@ -7,7 +7,7 @@ import unittest
 from endfield_character_npc_animation import (
     NpcAnimationBindingError, NpcAnimationPointer, bind_npc_cpu_actions,
     npc_avatar_source_transforms, npc_cpu_animation_resource_path,
-    validate_npc_humanoid_target,
+    validate_npc_generic_target, validate_npc_humanoid_target,
 )
 from endfield_character_npc_assembly import NpcSourceObject
 
@@ -31,6 +31,47 @@ def avatar_source() -> NpcSourceObject:
         "m_AvatarSkeleton": {"m_ID": [0, 3], "m_Node": [{"m_ParentId": -1}, {"m_ParentId": 0}]},
         "m_DefaultPose": {"m_X": [pose, pose]},
     }}, {"type": "Avatar"})
+
+
+def generic_avatar_source(target: bool, driven_pose_delta: float) -> NpcSourceObject:
+    pose = {"t": {"X": 0., "Y": 0., "Z": 0.}, "q": {"X": 0., "Y": 0., "Z": 0., "W": 1.},
+            "s": {"X": 1., "Y": 1., "Z": 1.}}
+    paths = ("", "Mesh", "Root/Bone", "Root") if target else ("", "Root", "Root/Bone", "Mesh")
+    ids = (0, 13, 12, 11) if target else (0, 11, 12, 13)
+    parents = (-1, 0, 3, 0) if target else (-1, 0, 1, 0)
+    default_poses: list[dict[str, object]] = []
+    skeleton_poses: list[dict[str, object]] = []
+    for path in paths:
+        default = {"t": dict(pose["t"]), "q": dict(pose["q"]), "s": dict(pose["s"])}
+        skeleton_pose = {"t": dict(pose["t"]), "q": dict(pose["q"]), "s": dict(pose["s"])}
+        if path == "Mesh":
+            default["t"]["X"] = 0.25
+            skeleton_pose["t"]["X"] = 0.5
+        if path == "Root/Bone" and driven_pose_delta:
+            default["t"]["X"] = driven_pose_delta
+        if target and path in ("Root", "Root/Bone"):
+            default["q"] = {axis: -value for axis, value in default["q"].items()}
+            skeleton_pose["q"] = {axis: -value for axis, value in skeleton_pose["q"].items()}
+        default_poses.append(default)
+        skeleton_poses.append(skeleton_pose)
+    return NpcSourceObject(Path("avatar.json"), {
+        "m_TOS": {str(path_id): path for path_id, path in zip(ids, paths, strict=True)},
+        "m_Avatar": {
+            "m_AvatarSkeleton": {
+                "m_ID": list(ids),
+                "m_Node": [{"m_ParentId": parent} for parent in parents],
+            },
+            "m_DefaultPose": {"m_X": default_poses},
+            "m_AvatarSkeletonPose": {"m_X": skeleton_poses},
+        },
+    }, {"type": "Avatar", "rawDataSha256": "a" * 64 if not target else "b" * 64})
+
+
+def generic_clip(paths: tuple[int, ...]) -> NpcSourceObject:
+    return NpcSourceObject(Path("clip.json"), {
+        "m_ClipBindingConstant": {"genericBindings": [
+            {"typeID": "Transform", "path": path} for path in paths]},
+    }, {"type": "AnimationClip", "rawDataSha256": "c" * 64})
 
 
 class NpcAnimationBindingTests(unittest.TestCase):
@@ -94,6 +135,38 @@ class NpcAnimationBindingTests(unittest.TestCase):
         invalid = replace(source, value={**source.value, "m_TOS": {"3": "Missing/Root"}})
         with self.assertRaisesRegex(NpcAnimationBindingError, "parent"):
             npc_avatar_source_transforms(invalid, "NPC_Root")
+
+    def test_generic_avatar_equivalence_matches_paths_not_array_indices(self) -> None:
+        proof = validate_npc_generic_target(generic_avatar_source(False, 0.), generic_avatar_source(True, 0.),
+                                            (generic_clip((11, 12)),))
+        self.assertEqual(proof.clip_count, 1)
+        self.assertEqual(proof.transform_binding_count, 2)
+        self.assertEqual(proof.driven_path_count, 2)
+        self.assertEqual(proof.validated_path_count, 3)
+        self.assertEqual(proof.max_default_pose_delta, 0.)
+        self.assertEqual(proof.to_document()["format"], "NpcGenericAvatarEquivalence/1")
+
+    def test_generic_avatar_equivalence_rejects_driven_pose_delta(self) -> None:
+        with self.assertRaisesRegex(NpcAnimationBindingError, "driven path or ancestor"):
+            validate_npc_generic_target(generic_avatar_source(False, 0.), generic_avatar_source(True, 2e-6),
+                                        (generic_clip((12,)),))
+
+    def test_generic_avatar_equivalence_rejects_missing_transform_path_hash(self) -> None:
+        target = generic_avatar_source(True, 0.)
+        value = {**target.value,
+            "m_TOS": {"0": "", "13": "Mesh", "12": "Root/Bone", "14": "Root"},
+            "m_Avatar": {**target.value["m_Avatar"],
+                "m_AvatarSkeleton": {"m_ID": [0, 13, 12, 14],
+                    "m_Node": [{"m_ParentId": parent} for parent in (-1, 0, 3, 0)]}}}
+        with self.assertRaisesRegex(NpcAnimationBindingError, "one exact path in both Avatars"):
+            validate_npc_generic_target(generic_avatar_source(False, 0.), replace(target, value=value),
+                                        (generic_clip((11,)),))
+
+    def test_generic_avatar_equivalence_requires_transform_binding_per_clip(self) -> None:
+        empty_clip = generic_clip(())
+        with self.assertRaisesRegex(NpcAnimationBindingError, "no Transform path bindings"):
+            validate_npc_generic_target(generic_avatar_source(False, 0.), generic_avatar_source(True, 0.),
+                                        (empty_clip,))
 
 
 if __name__ == "__main__":

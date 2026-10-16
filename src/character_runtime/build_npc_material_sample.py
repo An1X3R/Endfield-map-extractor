@@ -235,6 +235,7 @@ def main(args: argparse.Namespace) -> None:
     sys.path.insert(0, str(args.repository_src))
     from blender_scene_materials import layout_shader_node_tree
     from rebuild_character_materials import read_json, object_value, array_value, read_material_sources, SourcePacket, SUPPORTED_SHADERS, load_images, material_group, surface_stack, make_environment, file_hash, render_view
+    from character_mesh_effect import collect_mesh_color_sources, pack_group_images, verify_fractional_disturbance_weights
     from character_npr_nodes import ArtistLighting, make_artist_lighting
     from preview_character import reset_static_bind_pose, verify_saved_static_bind_pose, write_static_bind_pose_audit, configure_preview
     from audit_character_materials import geometry_digest
@@ -281,7 +282,13 @@ def main(args: argparse.Namespace) -> None:
     lighting = make_artist_lighting(ArtistLighting((.7, -1., .6), .9, .15, 0., .25, .75), layout_shader_node_tree)
     environment = make_environment(layout_shader_node_tree)
     images = load_images(packet)
-    groups = {source.identity: material_group(source, packet, environment, images, lighting, layout_shader_node_tree) for source in materials}
+    mesh_color_sources = collect_mesh_color_sources(instances, {obj.name: obj for obj in meshes}, sources)
+    groups = {source.identity: material_group(source, packet, environment, images, lighting, layout_shader_node_tree, mesh_color_sources.get(source.identity)) for source in materials}
+    factory_image_names = pack_group_images(groups)
+    material_adapters = [{"material": source.name, "shader": source.shader,
+                          "adapter": groups[source.identity].get("source_adapter"),
+                          "scope": groups[source.identity].get("scope")}
+                         for source in materials if groups[source.identity].get("source_adapter")]
     for source in materials:
         bpy.data.texts.new("SOURCE MATERIAL " + source.name + ".json").write(source.source_json)
         bpy.data.texts.new("SOURCE TYPETREE " + source.name + ".json").write(source.tree_json)
@@ -290,7 +297,8 @@ def main(args: argparse.Namespace) -> None:
     objects = bind_instances(instances, args.lod_index, sources, groups, layout_shader_node_tree)
     refresh_source_transforms(objects)
     object_names = tuple(obj.name for obj in objects)
-    packed_image_names = tuple(image.name for image in images.values())
+    used_cached_image_names = tuple(image.name for image in images.values() if image.users > 0)
+    packed_image_names = tuple(dict.fromkeys((*used_cached_image_names, *factory_image_names)))
     if geometry_digest(object_names) != before:
         raise AssertionError("NPC material binding changed geometry, weights, UVs or visibility.")
     args.output.mkdir(parents=True)
@@ -307,10 +315,19 @@ def main(args: argparse.Namespace) -> None:
     scene.world.node_tree.nodes["Background"].inputs["Color"].default_value = (.045, .045, .045, 1.)
     scene.world.node_tree.nodes["Background"].inputs["Strength"].default_value = .35
     scene.view_settings.view_transform = "AgX"
+    from character_material_authoring import package_material_authoring, verify_material_authoring
+    editable_materials = tuple({slot.material for obj in objects for slot in obj.material_slots
+                                if slot.material is not None and slot.material.use_nodes})
+    material_authoring = package_material_authoring(editable_materials, layout_shader_node_tree)
+    verify_material_authoring(material_authoring)
+    mesh_color_evidence = {json.dumps(identity): json.loads(group["source_mesh_color_evidence"])
+                           for identity, group in groups.items()
+                           if group.get("source_mesh_color_evidence")}
     renders = [render_view(args.output, "front_eevee.png", "BLENDER_EEVEE_NEXT", Vector((0., -1., .05)), center, extent, args.width, args.height, args.samples), render_view(args.output, "side_eevee.png", "BLENDER_EEVEE_NEXT", Vector((1., -.05, .05)), center, extent, args.width, args.height, args.samples), render_view(args.output, "front_cycles_smoke.png", "CYCLES", Vector((0., -1., .05)), center, extent, 192, 256, min(args.samples, 16))]
     blend = args.output / "character_materials.blend"
     bpy.ops.wm.save_as_mainfile(filepath=str(blend))
     bpy.ops.wm.open_mainfile(filepath=str(blend), use_scripts=False)
+    verify_material_authoring(material_authoring)
     bpy.context.view_layer.update()
     verify_saved_static_bind_pose(pose)
     refresh_source_transforms(tuple(bpy.data.objects[name] for name in object_names))
@@ -320,8 +337,23 @@ def main(args: argparse.Namespace) -> None:
         after_state = {name: {"matrix_world": [list(row) for row in bpy.data.objects[name].matrix_world], "visibility": [bpy.data.objects[name].hide_render, bpy.data.objects[name].hide_viewport, bpy.data.objects[name].hide_get()]} for name in changed}
         (args.output / "geometry_failure.json").write_text(json.dumps({"before": before, "reopened": reopened, "changed_objects": changed, "before_state": {name: before_state[name] for name in changed}, "after_state": after_state}, indent=2), encoding="utf-8")
         raise AssertionError(f"NPC saved geometry, weights, UVs or visibility changed: {changed}.")
-    if any(bpy.data.images[name].packed_file is None for name in packed_image_names):
-        raise AssertionError("NPC source image is not packed after reopen.")
+    unpacked_images = tuple(name for name in packed_image_names
+                            if name not in bpy.data.images or bpy.data.images[name].packed_file is None)
+    if unpacked_images:
+        raise AssertionError(f"NPC source images are not packed after reopen: {unpacked_images}")
+    verified_disturbance_weights: list[dict[str, object]] = []
+    for source in materials:
+        if source.shader != "HGRP/Effect/VFXBaseV2":
+            continue
+        matches = tuple(group for group in bpy.data.node_groups
+                        if group.get("source_identity") == json.dumps(source.identity)
+                        and group.get("source_adapter") == "scene.make_mesh_effect_material / bpy.ops.node.group_make")
+        if len(matches) != 1:
+            raise AssertionError(f"NPC VFX source adapter did not reopen uniquely: material={source.identity}, groups={len(matches)}")
+        verified_weights = verify_fractional_disturbance_weights(matches[0], source)
+        verified_disturbance_weights.append({"material": source.name,
+                                             "identity": list(source.identity),
+                                             "weights": verified_weights})
     customization_records: list[dict[str, object]] = []
     for source in materials:
         if source.shader != "HGRP/CharacterNPR" or "_CUSTOMIZE_AVATAR" not in source.keywords:
@@ -360,8 +392,10 @@ def main(args: argparse.Namespace) -> None:
             "shader_formula_evidence": "Formula transcribed from the existing shaders_1.2.4 compiled export; shader_identity.json reads current installed package objects, but no cross-build object hash establishes that this compiled variant is identical to the current package.",
             "sample_assignment_gap": "The extracted compiled branch omits the BaseMap sample write before the first customization use; exact material BaseMap identity and channels are known, but compiled sampler-to-branch dataflow is not closed.",
         })
-    report = {"format": "EndfieldNpcMaterialSample/1", "status": "rendered_reopened", "source_identity_kind": "npc_config_mesh_instance", "input_hashes": dict(packet.input_hashes), "source_mesh_instances": len(instances), "visible_mesh_instances": len(visible_objects), "resolved_materials": len(materials), "actual_shader_families": sorted({source.shader for source in materials}), "visible_material_identities": sorted(visible), "packed_image_roles": len(images), "source_geometry_preserved": True, "source_bind_pose_editable": True, "source_runtime_renderer_fields_known": False, "unresolved_archives": [json.loads(instance.source_json) for instance in instances if any(binding.identity is None for binding in instance.bindings)], "output": str(blend), "sha256": file_hash(blend), "script_sha256": file_hash(Path(__file__)), "shared_material_module_sha256": file_hash(args.module_dir / "rebuild_character_materials.py"), "renders": renders, "limitations": ["Configuration-selected LOD and disabled state are not captured Unity Renderer activeInHierarchy or runtime platform selection.", "No Unity Renderer TypeTree, native cast-shadow/layer fields, animation or complete HGRP runtime fidelity is fabricated.", "Disabled unresolved material evidence is archived without resolving or inventing its shader."]}
+    report = {"format": "EndfieldNpcMaterialSample/1", "status": "rendered_reopened", "source_identity_kind": "npc_config_mesh_instance", "input_hashes": dict(packet.input_hashes), "source_mesh_instances": len(instances), "visible_mesh_instances": len(visible_objects), "resolved_materials": len(materials), "actual_shader_families": sorted({source.shader for source in materials}), "visible_material_identities": sorted(visible), "packed_image_roles": len(packed_image_names), "mesh_color_evidence": mesh_color_evidence, "verified_disturbance_weights": verified_disturbance_weights, "source_geometry_preserved": True, "source_bind_pose_editable": True, "source_runtime_renderer_fields_known": False, "unresolved_archives": [json.loads(instance.source_json) for instance in instances if any(binding.identity is None for binding in instance.bindings)], "output": str(blend), "sha256": file_hash(blend), "script_sha256": file_hash(Path(__file__)), "shared_material_module_sha256": file_hash(args.module_dir / "rebuild_character_materials.py"), "renders": renders, "limitations": ["Configuration-selected LOD and disabled state are not captured Unity Renderer activeInHierarchy or runtime platform selection.", "No Unity Renderer TypeTree, native cast-shadow/layer fields, animation or complete HGRP runtime fidelity is fabricated.", "Disabled unresolved material evidence is archived without resolving or inventing its shader."]}
     report["avatar_customization"] = customization_records
+    report["material_authoring"] = material_authoring
+    report["material_adapters"] = material_adapters
     report["material_support"] = {
         "visible_supported": [{"identity": source.identity, "shader": source.shader} for source in materials if source.identity in visible],
         "inactive_unsupported": [{"identity": source.identity, "shader": source.shader} for source in materials if source.shader not in SUPPORTED_SHADERS],

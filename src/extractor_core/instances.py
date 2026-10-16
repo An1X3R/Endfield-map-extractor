@@ -9,9 +9,9 @@ import re
 import sqlite3
 import struct
 from pathlib import Path
-from typing import Any, Callable, Iterator
+from typing import Any, Callable, Iterator, Literal
 
-from . import flatbuffer as fb
+from . import flatbuffer as fb, vfs
 from .scene_identity import validate_scene_id
 from .lz4 import decompress_lz4_inv
 from .resources import BootstrapExtractionError, load_group, validate_vfs_root
@@ -20,6 +20,7 @@ from .resources import BootstrapExtractionError, load_group, validate_vfs_root
 Progress = Callable[[str, float, str, dict[str, Any] | None], None]
 Cancelled = Callable[[], bool]
 GROUP_HASH = "C3442D43"
+_SOURCE_COLUMNS = frozenset({"source_chunk", "source_data_md5", "source_offset"})
 PATH_PATTERNS = {
     "map01": re.compile(r"^Data/Streaming/PC/map01/Streaming/InitChunkData_(.+)_0_0\.bytes$", re.I),
     "map02": re.compile(
@@ -27,6 +28,25 @@ PATH_PATTERNS = {
         re.I,
     ),
 }
+
+
+class InstanceSourceGenerationError(ValueError):
+    """An instance database cannot be proven to match the selected game source."""
+
+    def __init__(self, reason: Literal["legacy", "source_changed", "database_invalid", "source_unavailable"],
+                 message: str) -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
+def _instance_pattern(map_id: str) -> re.Pattern[str]:
+    pattern = PATH_PATTERNS.get(map_id)
+    if pattern is not None:
+        return pattern
+    return re.compile(
+        rf"^Data/Streaming/PC/{re.escape(map_id)}/Streaming/InitChunkData_(?:Global|-?\d+_-?\d+)_0_0\.bytes$",
+        re.I,
+    )
 
 
 def _emit(progress: Progress | None, phase: str, value: float, message: str, **details: Any) -> None:
@@ -154,12 +174,7 @@ def build_instance_database(
     target.parent.mkdir(parents=True, exist_ok=True)
 
     group = load_group(game_vfs, GROUP_HASH)
-    pattern = PATH_PATTERNS.get(map_id)
-    if pattern is None:
-        pattern = re.compile(
-            rf"^Data/Streaming/PC/{re.escape(map_id)}/Streaming/InitChunkData_(?:Global|-?\d+_-?\d+)_0_0\.bytes$",
-            re.I,
-        )
+    pattern = _instance_pattern(map_id)
     files = sorted(
         (item for item in group.iter_files() if pattern.match(item.file_name)),
         key=lambda item: item.file_name.casefold(),
@@ -176,7 +191,9 @@ def build_instance_database(
             CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE TABLE chunks (
                 virtual_path TEXT PRIMARY KEY, compressed_bytes INTEGER NOT NULL,
-                clear_bytes INTEGER NOT NULL, parsed_instances INTEGER NOT NULL
+                clear_bytes INTEGER NOT NULL, parsed_instances INTEGER NOT NULL,
+                source_chunk TEXT NOT NULL, source_data_md5 TEXT NOT NULL,
+                source_offset INTEGER NOT NULL
             );
             CREATE TABLE instances (
                 entity_id INTEGER PRIMARY KEY, name TEXT, entity_base TEXT,
@@ -233,8 +250,9 @@ def build_instance_database(
                     inserted += 1
                     chunk_instances += 1
                 connection.execute(
-                    "INSERT INTO chunks VALUES (?,?,?,?)",
-                    (item.file_name, item.length, len(clear), chunk_instances),
+                    "INSERT INTO chunks VALUES (?,?,?,?,?,?,?)",
+                    (item.file_name, item.length, len(clear), chunk_instances,
+                     item.file_chunk_md5_name.upper(), item.file_data_md5.upper(), item.offset),
                 )
                 connection.commit()
                 compressed_total += item.length
@@ -253,8 +271,10 @@ def build_instance_database(
             if current_handle is not None:
                 current_handle.close()
         meta = {
-            "format": f"Endfield{map_id.title()}Instances/1",
+            "format": f"Endfield{map_id.title()}Instances/2",
             "map": map_id,
+            "source_vfs_group": GROUP_HASH,
+            "source_vfs_version": str(group.version),
             "source_file_count": str(len(files)),
             "instance_count": str(inserted),
             "duplicate_count": str(duplicate_count),
@@ -266,6 +286,141 @@ def build_instance_database(
         return meta
     finally:
         connection.close()
+
+
+def validate_instance_source_generation(game_root: Path, map_id: str, instances_path: Path) -> None:
+    """Prove an indexed instance database matches current InitChunkData VFS records."""
+    validate_scene_id(map_id)
+    database_path = instances_path.expanduser().resolve()
+    if not database_path.is_file():
+        raise InstanceSourceGenerationError(
+            "database_invalid", f"Instance database is missing: path={database_path}"
+        )
+    uri = f"{database_path.as_uri()}?mode=ro"
+    try:
+        connection = sqlite3.connect(uri, uri=True)
+        connection.execute("PRAGMA query_only=ON")
+        try:
+            tables = {row[0] for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )}
+            if not {"meta", "chunks"}.issubset(tables):
+                raise InstanceSourceGenerationError(
+                    "database_invalid", f"Instance database lacks required tables: path={database_path}"
+                )
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(chunks)")}
+            if not _SOURCE_COLUMNS.issubset(columns):
+                raise InstanceSourceGenerationError(
+                    "legacy",
+                    f"Unverifiable legacy instance database: source-generation fields are absent; path={database_path}",
+                )
+            meta = dict(connection.execute("SELECT key,value FROM meta"))
+            required_meta = {"format", "map", "source_vfs_group", "source_vfs_version", "source_file_count"}
+            if not required_meta.issubset(meta):
+                raise InstanceSourceGenerationError(
+                    "legacy",
+                    f"Unverifiable legacy instance database: source-generation metadata is absent; path={database_path}",
+                )
+            if any(type(meta[key]) is not str for key in required_meta):
+                raise InstanceSourceGenerationError(
+                    "database_invalid", f"Invalid source-generation metadata types: path={database_path}"
+                )
+            expected_format = f"Endfield{map_id.title()}Instances/2"
+            if meta["format"] != expected_format:
+                if meta["format"] == f"Endfield{map_id.title()}Instances/1":
+                    raise InstanceSourceGenerationError(
+                        "legacy",
+                        f"Unverifiable legacy instance database: format={meta['format']}, path={database_path}",
+                    )
+                raise InstanceSourceGenerationError(
+                    "database_invalid",
+                    f"Unsupported instance database format: expected={expected_format}, "
+                    f"actual={meta['format']}, path={database_path}",
+                )
+            if meta["map"] != map_id or meta["source_vfs_group"].upper() != GROUP_HASH:
+                raise InstanceSourceGenerationError(
+                    "source_changed",
+                    f"Instance database source identity differs: map={map_id}, database_map={meta['map']}, "
+                    f"database_group={meta['source_vfs_group']}, path={database_path}",
+                )
+            try:
+                stored_version = int(meta["source_vfs_version"])
+                stored_file_count = int(meta["source_file_count"])
+            except ValueError as exc:
+                raise InstanceSourceGenerationError(
+                    "database_invalid", f"Invalid source-generation metadata: path={database_path}"
+                ) from exc
+            if stored_file_count < 1:
+                raise InstanceSourceGenerationError(
+                    "database_invalid", f"Instance database has invalid source file count: path={database_path}"
+                )
+            rows = list(connection.execute(
+                "SELECT virtual_path,compressed_bytes,source_chunk,source_data_md5,source_offset FROM chunks"
+            ))
+        finally:
+            connection.close()
+    except sqlite3.Error as exc:
+        raise InstanceSourceGenerationError(
+            "database_invalid", f"Cannot read instance source-generation database: path={database_path}, error={exc}"
+        ) from exc
+
+    vfs_root = game_root.expanduser().resolve() / "Endfield_Data" / "StreamingAssets" / "VFS"
+    try:
+        group = load_group(vfs_root, GROUP_HASH)
+    except (BootstrapExtractionError, vfs.ProbeError, OSError) as exc:
+        raise InstanceSourceGenerationError(
+            "source_unavailable", f"Cannot read current InitChunkData VFS records: root={vfs_root}, error={exc}"
+        ) from exc
+    if group.version != stored_version:
+        raise InstanceSourceGenerationError(
+            "source_changed",
+            f"Instance database VFS version differs: map={map_id}, database={stored_version}, current={group.version}",
+        )
+
+    pattern = _instance_pattern(map_id)
+    current: dict[str, vfs.VfsFile] = {}
+    for item in group.iter_files():
+        key = item.file_name.casefold()
+        if not pattern.fullmatch(item.file_name):
+            continue
+        if key in current:
+            raise InstanceSourceGenerationError(
+                "source_changed", f"Current VFS has ambiguous InitChunkData path: map={map_id}, path={item.file_name}"
+            )
+        current[key] = item
+    indexed: dict[str, tuple[str, int, str, str, int]] = {}
+    for path, length, chunk_name, data_md5, offset in rows:
+        if not isinstance(path, str) or not isinstance(chunk_name, str) or not isinstance(data_md5, str):
+            raise InstanceSourceGenerationError(
+                "database_invalid", f"Invalid source-generation row types: map={map_id}, path={database_path}"
+            )
+        key = path.casefold()
+        if key in indexed:
+            raise InstanceSourceGenerationError(
+                "database_invalid", f"Duplicate source-generation path: map={map_id}, path={path}"
+            )
+        if type(length) is not int or type(offset) is not int or length < 1 or offset < 0:
+            raise InstanceSourceGenerationError(
+                "database_invalid", f"Invalid source-generation range: map={map_id}, path={path}"
+            )
+        indexed[key] = (path, length, chunk_name.upper(), data_md5.upper(), offset)
+
+    if len(rows) != stored_file_count or set(indexed) != set(current):
+        raise InstanceSourceGenerationError(
+            "source_changed",
+            f"Instance database InitChunkData set differs: map={map_id}, database_files={len(indexed)}, "
+            f"database_meta_files={stored_file_count}, current_files={len(current)}",
+        )
+    for key, item in current.items():
+        row = indexed[key]
+        expected = (item.file_name, item.length, item.file_chunk_md5_name.upper(),
+                    item.file_data_md5.upper(), item.offset)
+        if row != expected:
+            raise InstanceSourceGenerationError(
+                "source_changed",
+                f"Instance database InitChunkData source differs: map={map_id}, path={item.file_name}, "
+                f"database={row[2:]}, current={expected[2:]}",
+            )
 
 
 def build_unresolved_asset_database(instances: Path, output: Path) -> dict[str, str]:

@@ -2,9 +2,11 @@ import { isJsonObject, requestJson } from '../../lib/backendClient'
 import type {
   CharacterAnimation,
   CharacterAnimationCatalog,
+  CharacterAnimationCoverage,
   CharacterActionAnimationSelection,
   CharacterCancelAcknowledgement,
   CharacterCapabilities,
+  CharacterAssetCategory,
   CharacterCatalog,
   CharacterCpuActionReference,
   CharacterCpuActionReferences,
@@ -26,6 +28,7 @@ import type {
   CharacterReplay,
   CharacterRequestValidation,
   CharacterSummary,
+  CharacterUnsupportedAction,
   CharacterValidationIssue,
   CharacterVariant,
 } from './types'
@@ -116,8 +119,8 @@ const parseVariant = (value: unknown, field: string): CharacterVariant => {
 const parseNameSource = (value: unknown, field: string): CharacterNameSource | null => {
   if (value === null) return null
   const row = object(value, field)
-  if (row.table !== 'NpcTemplateGroupTable' && row.table !== 'NpcTable') {
-    return invalid(`${field}.table`, 'NpcTemplateGroupTable or NpcTable')
+  if (row.table !== 'NpcTemplateGroupTable' && row.table !== 'NpcTable' && row.table !== 'EnemyTemplateDisplayInfoTable' && row.table !== 'EnemyDisplayInfoTable') {
+    return invalid(`${field}.table`, 'NpcTemplateGroupTable, NpcTable, EnemyTemplateDisplayInfoTable, or EnemyDisplayInfoTable')
   }
   return {
     table: row.table,
@@ -127,10 +130,19 @@ const parseNameSource = (value: unknown, field: string): CharacterNameSource | n
   }
 }
 
+const parseAssetCategory = (value: unknown, field: string): CharacterAssetCategory => {
+  if (value === 'playable' || value === 'npc' || value === 'animal' || value === 'creature' || value === 'object') return value
+  return invalid(field, 'playable, npc, animal, creature, or object')
+}
+
 const parseCharacterSummary = (value: unknown, field: string): CharacterSummary => {
   const row = object(value, field)
+  if (row.entry_kind !== 'playable' && row.entry_kind !== 'independent_npc') {
+    return invalid(`${field}.entry_kind`, 'playable or independent_npc')
+  }
   const base = {
     selection_id: text(row.selection_id, `${field}.selection_id`),
+    asset_category: parseAssetCategory(row.asset_category, `${field}.asset_category`),
     english_name: nullableText(row.english_name, `${field}.english_name`),
     variants: array(row.variants, `${field}.variants`, parseVariant),
     capabilities: parseCapabilities(row.capabilities, `${field}.capabilities`),
@@ -146,7 +158,6 @@ const parseCharacterSummary = (value: unknown, field: string): CharacterSummary 
       entry_kind: 'playable',
     }
   }
-  if (row.entry_kind !== 'independent_npc') return invalid(`${field}.entry_kind`, 'playable or independent_npc')
   if (base.english_name !== null) return invalid(`${field}.english_name`, 'null for an independent NPC')
   const npcBase = { ...base, name: nullableText(row.name, `${field}.name`), english_name: null }
   if (row.name_status !== 'resolved' && row.name_status !== 'missing' && row.name_status !== 'ambiguous') {
@@ -303,6 +314,32 @@ const parseCpuActionReferences = (value: unknown, field: string): CharacterCpuAc
   }
 }
 
+const parseUnsupportedAction = (value: unknown, field: string): CharacterUnsupportedAction => {
+  const row = object(value, field)
+  return {
+    state_name: text(row.state_name, `${field}.state_name`),
+    clip_name: text(row.clip_name, `${field}.clip_name`),
+    binding_status: text(row.binding_status, `${field}.binding_status`),
+    reason: text(row.reason, `${field}.reason`),
+  }
+}
+
+const parseAnimationCoverage = (value: unknown, field: string): CharacterAnimationCoverage => {
+  const row = object(value, field)
+  const result: CharacterAnimationCoverage = {
+    scope: text(row.scope, `${field}.scope`),
+    available_action_count: integer(row.available_action_count, `${field}.available_action_count`, 0),
+    unsupported_action_count: integer(row.unsupported_action_count, `${field}.unsupported_action_count`, 0),
+  }
+  if ('source_state_count' in row) result.source_state_count = integer(row.source_state_count, `${field}.source_state_count`, 0)
+  if ('source_reference_count' in row) result.source_reference_count = integer(row.source_reference_count, `${field}.source_reference_count`, 0)
+  if ('runtime_state_machine_reconstructed' in row) {
+    if (row.runtime_state_machine_reconstructed !== false) return invalid(`${field}.runtime_state_machine_reconstructed`, 'false')
+    result.runtime_state_machine_reconstructed = false
+  }
+  return result
+}
+
 export const parseCharacterAnimationCatalog = (value: unknown): CharacterAnimationCatalog => {
   const row = object(value, 'CharacterAnimationCatalog')
   if (row.format !== 'CharacterAnimationCatalog/1') {
@@ -329,6 +366,12 @@ export const parseCharacterAnimationCatalog = (value: unknown): CharacterAnimati
   }
   if ('source_cpu_action_references' in row) {
     result.source_cpu_action_references = parseCpuActionReferences(row.source_cpu_action_references, 'CharacterAnimationCatalog.source_cpu_action_references')
+  }
+  if ('unsupported_actions' in row) {
+    result.unsupported_actions = array(row.unsupported_actions, 'CharacterAnimationCatalog.unsupported_actions', parseUnsupportedAction)
+  }
+  if ('coverage_counts' in row) {
+    result.coverage_counts = parseAnimationCoverage(row.coverage_counts, 'CharacterAnimationCatalog.coverage_counts')
   }
   return result
 }

@@ -63,6 +63,21 @@ def _fixture(root: Path) -> tuple[Path, dict[str, object]]:
 
 
 class SelectedMaterialHandoffTests(unittest.TestCase):
+    def test_ordered_submesh_passes_retain_the_complete_selected_material_closure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, scene_io_session():
+            manifest, plan = _fixture(Path(directory))
+            plan["instances"] = [{"material_refs": [_ref(1, "Material"), None],
+                "submesh_material_passes": [[_ref(1, "Material"), _ref(2, "Material"), _ref(9, "Material")], []],
+                "selected_submeshes": [0]}]
+            materials, textures = load_catalog((manifest,))
+            payload = build_material_catalog_handoff(plan, materials, textures, capture_material_catalog_sources((manifest,)))
+            selected, _ = load_plan_material_catalog({**plan, "material_catalog": payload})
+            self.assertTrue({("cab-source", key) for key in (1, 2, 9)} <= selected.keys())
+            stale = {**plan, "instances": [{"material_refs": [_ref(1, "Material")],
+                "submesh_material_passes": [[_ref(1, "Material"), _ref(10, "Material")]]}], "material_catalog": payload}
+            with self.assertRaisesRegex(ValueError, "omits scene material dependencies"):
+                load_plan_material_catalog(stale)
+
     def test_all_scene_branches_preserve_exact_enriched_catalog_semantics(self) -> None:
         with tempfile.TemporaryDirectory() as directory, scene_io_session():
             manifest, plan = _fixture(Path(directory))

@@ -7,10 +7,22 @@ import unittest
 from pathlib import Path
 
 from endfield_scene_io import read_scene_manifest, scene_io_session
-from prepare_terrain_detail import _detail_resources_path, _existing_detail_result, _scene_sources
+from prepare_terrain_detail import (
+    _detail_resources_path, _existing_detail_result, _scene_sources, terrain_detail_source_paths,
+)
 
 
 class TerrainDetailSourceTests(unittest.TestCase):
+    def test_global_source_assets_are_exact_and_map_scoped(self) -> None:
+        for map_id in ("map01", "map02"):
+            self.assertEqual(terrain_detail_source_paths(map_id), (
+                f"assets/beyond/dynamicassets/scenes/pc/{map_id}/terrain/hgterrainsurfacesdata.asset",
+                f"assets/beyond/dynamicassets/scenes/pc/{map_id}/terrain/splatindexmap.tga",
+            ))
+        for map_id in ("", "../map02", "map02/terrain"):
+            with self.assertRaisesRegex(ValueError, "Invalid terrain resource map name"):
+                terrain_detail_source_paths(map_id)
+
     def test_exact_terrain_refs_ignore_unrelated_export_paths(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

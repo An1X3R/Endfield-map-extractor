@@ -28,6 +28,15 @@ index ea214f6..776c78e 100644
              var stream = m_Texture2D.ConvertToStream(options.imageFormat, true);
              if (stream != null)
              {
+@@ -1140,7 +1152,7 @@ namespace AnimeStudio
+                 }
+                 var skeletonPose = avatar.m_Avatar.m_DefaultPose;
+                 var xform = skeletonPose.m_X[i];
+-                var frame = RootFrame.FindChild(transformName);
++                var frame = RootFrame.FindRelativeFrameWithPath(path);
+                 if (frame != null)
+                 {
+                     SetFrame(frame, xform.t, xform.q, xform.s);
 @@ -1189,6 +1201,7 @@ namespace AnimeStudio
              public HashSet<Material> materials;
              public Dictionary<string, (bool, int)> uvs;

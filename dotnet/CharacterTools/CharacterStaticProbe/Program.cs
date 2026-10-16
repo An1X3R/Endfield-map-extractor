@@ -28,6 +28,10 @@ internal sealed record ColorProperty(string Name, float[] Rgba);
 internal sealed record MaterialAudit(SourceRef Object, PointerRef Shader, TextureAudit[] Textures, FloatProperty[] Floats, IntProperty[] Ints, ColorProperty[] Colors);
 internal sealed record RendererAudit(SourceRef Object, SourceRef GameObject, string Path, bool? Enabled, SourceRef Mesh, int SubmeshCount, int BindposeCount, int SourceBoneReferenceCount, int ResolvedSourceBoneCount, int PositiveUnresolvedBoneInfluences, PointerRef[] Bones, PointerRef[] Materials);
 internal sealed record AnimatorAudit(SourceRef Object, PointerRef Avatar, PointerRef Controller, bool HasTransformHierarchy);
+internal sealed record HumanoidBonePath(int Slot, string Path, string SourceField, int SourceIndex, int HumanSkeletonIndex, uint SkeletonId, string AvatarTosPath);
+internal sealed record SkippedHumanoidBoneSlot(int Slot, string SourceField, int SourceIndex, string Status);
+internal sealed record AnimatorHumanoidBoneMap(string AnimatorPath, string Status, string? AvatarCab, long AvatarPathId, SourceRef? Avatar, int? HumanBoneIndexCount, int? LeftHandBoneIndexCount, int? RightHandBoneIndexCount, HumanoidBonePath[] Bones, SkippedHumanoidBoneSlot[] SkippedSlots);
+internal sealed record HumanoidBoneMapAudit(string Format, string Status, string SlotScheme, string MappingRule, string InputManifestPath, string InputManifestSha256, RootInput RequestedRoot, SourceRef ActualRoot, AnimatorHumanoidBoneMap[] Animators);
 internal sealed record ContainerAudit(string Path, PointerRef Reference);
 internal sealed record SourceAudit(string Format, string Commit, RootInput RequestedRoot, SourceRef ActualRoot, ContainerAudit[] SourceContainers, AnimatorAudit[] Animators, TransformAudit[] Transforms, RendererAudit[] Renderers, MeshAudit[] Meshes, MaterialAudit[] Materials);
 internal sealed record ObjectIdentity(string Source, string PathId);
@@ -95,7 +99,12 @@ internal static class Program
         {
             if (args.SequenceEqual(new[] { "--help" }))
             {
-                Console.WriteLine(JsonSerializer.Serialize(new { usage = new[] { "CharacterStaticProbe.exe --input manifest.json --output new_directory", "CharacterStaticProbe.exe --mesh-stream-audit --input manifest.json --source CAB --path-id signed_int64 --output new_json" }, geometry_format = "EndfieldCharacterGeometry/1", root_selection = "exact CAB and AssetBundle container resource_path", animations = "disabled" }, JsonOptions()));
+                Console.WriteLine(JsonSerializer.Serialize(new { usage = new[] { "CharacterStaticProbe.exe --input manifest.json --output new_directory", "CharacterStaticProbe.exe --humanoid-bone-map --input manifest.json --output new_directory", "CharacterStaticProbe.exe --mesh-stream-audit --input manifest.json --source CAB --path-id signed_int64 --output new_json" }, geometry_format = "EndfieldCharacterGeometry/1", root_selection = "exact CAB and AssetBundle container resource_path", animations = "disabled" }, JsonOptions()));
+                return 0;
+            }
+            if (args.Length == 5 && args[0] == "--humanoid-bone-map" && args[1] == "--input" && args[3] == "--output")
+            {
+                RunHumanoidBoneMap(Path.GetFullPath(args[2]), Path.GetFullPath(args[4]));
                 return 0;
             }
             if (args.Length == 9 && args[0] == "--mesh-stream-audit" && args[1] == "--input" && args[3] == "--source" && args[5] == "--path-id" && args[7] == "--output")
@@ -298,6 +307,7 @@ internal static class Program
             var matches = containers.Where(entry => string.Equals(entry.Key.Replace('\\', '/'), input.Root.ResourcePath.Replace('\\', '/'), StringComparison.OrdinalIgnoreCase)).ToArray();
             var root = SelectHierarchyRoot(matches.Select(entry => Require(entry.Value.asset, "root container subasset")), input.Root.ResourcePath);
             var transforms = WalkTransforms(root);
+            var animators = transforms.Select(transform => Require(transform.m_GameObject, "hierarchy GameObject").m_Animator).Where(animator => animator != null).Cast<Animator>().Distinct<Animator>(ReferenceEqualityComparer.Instance).ToArray();
             var renderers = transforms.Select(transform => Require(transform.m_GameObject, "hierarchy GameObject")).SelectMany(Renderers).ToArray();
             if (renderers.Length == 0) throw new InvalidDataException("Selected hierarchy contains no mesh renderers.");
             var meshes = renderers.Select(RendererMesh).Distinct().ToArray();
@@ -305,8 +315,9 @@ internal static class Program
             var materialRows = materials.Select(AuditMaterial).ToArray();
             var sourceTextures = materials.SelectMany(material => material.m_SavedProperties.m_TexEnvs).Where(entry => entry.Value.m_Texture.m_PathID != 0).Select(entry => RequireTexture(entry.Value.m_Texture, entry.Key)).Distinct().ToArray();
             var textureCount = sourceTextures.Length;
-            var sourceAudit = new SourceAudit("EndfieldCharacterSourceAudit/1", "5bb936ca1d3662fe9b956ec669ab7ebea08bfd07", input.Root, Ref(root), containers.Select(entry => new ContainerAudit(entry.Key, Pointer(entry.Value.asset))).ToArray(), transforms.Select(transform => Require(transform.m_GameObject, "hierarchy GameObject").m_Animator).Where(animator => animator != null).Distinct().Select(animator => new AnimatorAudit(Ref(animator), Pointer(animator.m_Avatar), Pointer(animator.m_Controller), animator.m_HasTransformHierarchy)).ToArray(), transforms.Select(AuditTransform).ToArray(), renderers.Select(AuditRenderer).ToArray(), meshes.Select(AuditMesh).ToArray(), materialRows);
+            var sourceAudit = new SourceAudit("EndfieldCharacterSourceAudit/1", "5bb936ca1d3662fe9b956ec669ab7ebea08bfd07", input.Root, Ref(root), containers.Select(entry => new ContainerAudit(entry.Key, Pointer(entry.Value.asset))).ToArray(), animators.Select(animator => new AnimatorAudit(Ref(animator), Pointer(animator.m_Avatar), Pointer(animator.m_Controller), animator.m_HasTransformHierarchy)).ToArray(), transforms.Select(AuditTransform).ToArray(), renderers.Select(AuditRenderer).ToArray(), meshes.Select(AuditMesh).ToArray(), materialRows);
             WriteJson(outputPath, "source_audit.json", sourceAudit);
+            WriteJson(outputPath, "humanoid_bone_map.json", BuildHumanoidBoneMap(inputPath, input, root, transforms, animators, manager.Game));
             WriteJson(outputPath, "lod_sources.json", source.Objects.Where(value => value.type == ClassIDType.LODGroup).Select(AuditTypeTree).ToArray());
             WriteJson(outputPath, "material_sources.json", materials.Select(AuditTypeTree).ToArray());
             if (sourceAudit.Renderers.Any(renderer => renderer.PositiveUnresolvedBoneInfluences != 0)) throw new InvalidDataException("Source has positive weights referring to unresolved bone pointers; source_audit.json records counts. Static completeness is not established.");
@@ -349,6 +360,190 @@ internal static class Program
             WriteJson(outputPath, "reader_logs.json", log.Snapshot());
             manager.Clear();
         }
+    }
+
+    private static void RunHumanoidBoneMap(string inputPath, string outputPath)
+    {
+        var input = JsonSerializer.Deserialize<CharacterInput>(File.ReadAllText(inputPath), JsonOptions()) ?? throw new InvalidDataException("Input manifest is null.");
+        if (input.Format != "EndfieldSingleCharacterInput/1" || string.IsNullOrWhiteSpace(input.UnityVersion) || input.Bundles.Length == 0 || string.IsNullOrWhiteSpace(input.Root.Source) || string.IsNullOrWhiteSpace(input.Root.ResourcePath)) throw new InvalidDataException("Input format, Unity version, bundle list, and root fields must be nonempty.");
+        if (Directory.Exists(outputPath) || File.Exists(outputPath)) throw new IOException($"Output already exists: {outputPath}");
+        var paths = input.Bundles.Select(bundle => VerifyBundle(bundle, Path.GetDirectoryName(inputPath)!)).ToArray();
+        if (paths.Distinct(StringComparer.OrdinalIgnoreCase).Count() != paths.Length) throw new InvalidDataException("Input bundle paths are duplicated.");
+        if (paths.Any(path => path.StartsWith(outputPath + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))) throw new InvalidDataException("Output must not contain an input bundle.");
+
+        var log = new ReaderLogger();
+        Logger.Default = log;
+        Logger.Flags = LoggerEvent.Warning | LoggerEvent.Error;
+        Logger.Silent = false;
+        var parsedTypes = new[] { ClassIDType.AssetBundle, ClassIDType.ResourceManager, ClassIDType.GameObject, ClassIDType.Transform, ClassIDType.RectTransform, ClassIDType.Animator, ClassIDType.Avatar };
+        TypeFlags.SetTypes(parsedTypes.ToDictionary(type => type, type => (true, false)));
+        var manager = new AssetsManager { Game = GameManager.GetGameByType(GameType.ArknightsEndfield), ResolveDependencies = false, SpecifyUnityVersion = input.UnityVersion, Silent = false, SkipProcess = false };
+        try
+        {
+            manager.LoadPreparedFiles(paths);
+            log.RequireNoErrors();
+            var source = manager.assetsFileList.SingleOrDefault(file => string.Equals(file.fileName, input.Root.Source, StringComparison.OrdinalIgnoreCase)) ?? throw new InvalidDataException($"Expected unique serialized CAB not found: {input.Root.Source}");
+            var containers = source.Objects.OfType<AssetBundle>().SelectMany(bundle => bundle.m_Container).ToArray();
+            var matches = containers.Where(entry => string.Equals(entry.Key.Replace('\\', '/'), input.Root.ResourcePath.Replace('\\', '/'), StringComparison.OrdinalIgnoreCase)).ToArray();
+            var root = SelectHierarchyRoot(matches.Select(entry => Require(entry.Value.asset, "root container subasset")), input.Root.ResourcePath);
+            var transforms = WalkTransforms(root);
+            var animators = transforms.Select(transform => Require(transform.m_GameObject, "hierarchy GameObject").m_Animator).Where(animator => animator != null).Cast<Animator>().Distinct<Animator>(ReferenceEqualityComparer.Instance).ToArray();
+            var audit = BuildHumanoidBoneMap(inputPath, input, root, transforms, animators, manager.Game);
+            var bytes = JsonSerializer.SerializeToUtf8Bytes(audit, JsonOptions());
+            const int maximumOutputBytes = 10 * 1024 * 1024;
+            if (bytes.Length > maximumOutputBytes) throw new InvalidDataException($"Humanoid bone map exceeds the 10 MiB output limit: bytes={bytes.Length}.");
+            Directory.CreateDirectory(outputPath);
+            using (var stream = new FileStream(Path.Combine(outputPath, "humanoid_bone_map.json"), FileMode.CreateNew, FileAccess.Write, FileShare.None)) stream.Write(bytes);
+            Console.WriteLine(JsonSerializer.Serialize(new { status = audit.Status, output = outputPath, animators = audit.Animators.Length, mapped_animators = audit.Animators.Count(animator => animator.Status == "mapped"), bones = audit.Animators.Sum(animator => animator.Bones.Length), skipped_slots = audit.Animators.Sum(animator => animator.SkippedSlots.Length) }, JsonOptions()));
+        }
+        finally
+        {
+            manager.Clear();
+            Logger.Silent = false;
+            Progress.Silent = false;
+        }
+    }
+
+    private static HumanoidBoneMapAudit BuildHumanoidBoneMap(string inputPath, CharacterInput input, GameObject root, Transform[] transforms, Animator[] animators, Game game)
+    {
+        var rows = animators.Select(animator => BuildAnimatorHumanoidBoneMap(animator, transforms, game)).ToArray();
+        return new HumanoidBoneMapAudit(
+            "EndfieldHumanoidBoneMap/1",
+            animators.Length == 0 ? "no_animators" : "completed",
+            "source_avatar_core_then_hands/1",
+            "Core slot IDs retain m_HumanBoneIndex array indexes 0-24. Left-hand slots use 25 plus m_HandBoneIndex indexes 0-14; right-hand slots use 40 plus indexes 0-14. Each source array value indexes m_Human.m_Skeleton.m_ID, whose uint ID resolves exactly through Avatar.m_TOS. The TOS path is walked as exact child names below the Animator GameObject Transform; emitted paths are complete source hierarchy paths.",
+            inputPath,
+            FileHash(inputPath),
+            input.Root,
+            Ref(root),
+            rows);
+    }
+
+    private static AnimatorHumanoidBoneMap BuildAnimatorHumanoidBoneMap(Animator animator, Transform[] transforms, Game game)
+    {
+        var gameObject = Require(animator.m_GameObject, "Animator GameObject");
+        var animatorRoot = gameObject.m_Transform ?? throw new InvalidDataException($"Animator GameObject has no Transform: {JsonSerializer.Serialize(Ref(animator), JsonOptions())}.");
+        if (!transforms.Contains(animatorRoot, ReferenceEqualityComparer.Instance)) throw new InvalidDataException($"Animator Transform is outside the selected source hierarchy: animator={JsonSerializer.Serialize(Ref(animator), JsonOptions())}.");
+        RequireUnambiguousTransformNames(animatorRoot);
+        var animatorPath = TransformPath(animatorRoot);
+        var pointer = animator.m_Avatar;
+        if (pointer.m_PathID == 0)
+        {
+            if (pointer.m_FileID != 0) throw new InvalidDataException($"Null Animator Avatar has a nonzero FileID: animator={JsonSerializer.Serialize(Ref(animator), JsonOptions())}, file_id={pointer.m_FileID}.");
+            return new AnimatorHumanoidBoneMap(animatorPath, "avatar_missing", null, 0, null, null, null, null, Array.Empty<HumanoidBonePath>(), Array.Empty<SkippedHumanoidBoneSlot>());
+        }
+
+        var avatarCab = ResolvePointerCab(animator.assetsFile, pointer.m_FileID);
+        if (!pointer.TryGet(out Avatar loadedAvatar)) return new AnimatorHumanoidBoneMap(animatorPath, "avatar_unresolved", avatarCab, pointer.m_PathID, null, null, null, null, Array.Empty<HumanoidBonePath>(), Array.Empty<SkippedHumanoidBoneSlot>());
+        if (loadedAvatar.m_PathID != pointer.m_PathID || !string.Equals(loadedAvatar.assetsFile.fileName, avatarCab, StringComparison.OrdinalIgnoreCase))
+            throw new InvalidDataException($"Resolved Animator Avatar identity differs from its exact PPtr: animator={JsonSerializer.Serialize(Ref(animator), JsonOptions())}, expected={avatarCab}/{pointer.m_PathID}, actual={loadedAvatar.assetsFile.fileName}/{loadedAvatar.m_PathID}.");
+        var avatarInfo = loadedAvatar.assetsFile.m_Objects.SingleOrDefault(info => info.m_PathID == pointer.m_PathID && info.classID == (int)ClassIDType.Avatar)
+            ?? throw new InvalidDataException($"Exact Avatar object metadata was not found: {loadedAvatar.assetsFile.fileName}/{pointer.m_PathID}.");
+        var avatar = new Avatar(new ObjectReader(loadedAvatar.assetsFile.reader, loadedAvatar.assetsFile, avatarInfo, game));
+        if (avatar.m_PathID != pointer.m_PathID || !string.Equals(avatar.assetsFile.fileName, avatarCab, StringComparison.OrdinalIgnoreCase))
+            throw new InvalidDataException($"Reparsed Animator Avatar identity differs from its exact PPtr: animator={JsonSerializer.Serialize(Ref(animator), JsonOptions())}, expected={avatarCab}/{pointer.m_PathID}, actual={avatar.assetsFile.fileName}/{avatar.m_PathID}.");
+        long consumedBytes = avatar.reader.Position - avatar.reader.byteStart;
+        if (consumedBytes != avatar.byteSize) throw new InvalidDataException($"Avatar TypeTree did not consume the exact serialized object: avatar={avatar.assetsFile.fileName}/{avatar.m_PathID}, consumed={consumedBytes}, object_bytes={avatar.byteSize}.");
+
+        var avatarIdentity = Ref(avatar);
+        var avatarConstant = avatar.m_Avatar ?? throw new InvalidDataException($"Parsed Avatar has no AvatarConstant: {avatar.assetsFile.fileName}/{avatar.m_PathID}.");
+        var humanDescription = avatar.m_HumanDescription ?? throw new InvalidDataException($"Parsed Avatar has no HumanDescription: {avatar.assetsFile.fileName}/{avatar.m_PathID}.");
+        var humanDescriptionBones = humanDescription.m_Human ?? throw new InvalidDataException($"Avatar HumanDescription has no human bone list: {avatar.assetsFile.fileName}/{avatar.m_PathID}.");
+        if (humanDescriptionBones.Count == 0) return new AnimatorHumanoidBoneMap(animatorPath, "non_human_avatar", avatarCab, avatar.m_PathID, avatarIdentity, null, null, null, Array.Empty<HumanoidBonePath>(), Array.Empty<SkippedHumanoidBoneSlot>());
+
+        var human = avatarConstant.m_Human ?? throw new InvalidDataException($"Humanoid Avatar has no Human record: {avatar.assetsFile.fileName}/{avatar.m_PathID}.");
+        var core = human.m_HumanBoneIndex ?? throw new InvalidDataException($"Avatar Human has no HumanBoneIndex array: {avatar.assetsFile.fileName}/{avatar.m_PathID}.");
+        var leftHand = human.m_LeftHand?.m_HandBoneIndex ?? throw new InvalidDataException($"Avatar Human has no LeftHand BoneIndex array: {avatar.assetsFile.fileName}/{avatar.m_PathID}.");
+        var rightHand = human.m_RightHand?.m_HandBoneIndex ?? throw new InvalidDataException($"Avatar Human has no RightHand BoneIndex array: {avatar.assetsFile.fileName}/{avatar.m_PathID}.");
+
+        var humanSkeleton = human.m_Skeleton ?? throw new InvalidDataException($"Humanoid Avatar has no Human skeleton: {avatar.assetsFile.fileName}/{avatar.m_PathID}.");
+        var skeletonIds = humanSkeleton.m_ID ?? throw new InvalidDataException($"Humanoid Avatar Human skeleton has no ID array: {avatar.assetsFile.fileName}/{avatar.m_PathID}.");
+        var skeletonNodes = humanSkeleton.m_Node ?? throw new InvalidDataException($"Humanoid Avatar Human skeleton has no node list: {avatar.assetsFile.fileName}/{avatar.m_PathID}.");
+        var humanBoneMass = human.m_HumanBoneMass ?? throw new InvalidDataException($"Humanoid Avatar has no HumanBoneMass array: {avatar.assetsFile.fileName}/{avatar.m_PathID}.");
+        if (core.Length != 25 || humanBoneMass.Length != core.Length || leftHand.Length != 15 || rightHand.Length != 15 || skeletonIds.Length != skeletonNodes.Count)
+            throw new InvalidDataException($"Humanoid Avatar array dimensions are inconsistent: avatar={avatar.assetsFile.fileName}/{avatar.m_PathID}, core={core.Length}, masses={humanBoneMass.Length}, left_hand={leftHand.Length}, right_hand={rightHand.Length}, skeleton_ids={skeletonIds.Length}, skeleton_nodes={skeletonNodes.Count}.");
+        if (skeletonIds.Distinct().Count() != skeletonIds.Length) throw new InvalidDataException($"Humanoid Avatar Human skeleton IDs are duplicated: {avatar.assetsFile.fileName}/{avatar.m_PathID}.");
+        var avatarTos = avatar.m_TOS ?? throw new InvalidDataException($"Humanoid Avatar has no m_TOS dictionary: {avatar.assetsFile.fileName}/{avatar.m_PathID}.");
+
+        var bones = new List<HumanoidBonePath>();
+        var skipped = new List<SkippedHumanoidBoneSlot>();
+        foreach (var row in core.Select((index, sourceIndex) => MapHumanoidBoneSlot(animatorRoot, avatarTos, skeletonIds, index, sourceIndex, sourceIndex, "m_HumanBoneIndex", avatarIdentity)))
+        {
+            if (row.Bone is not null) bones.Add(row.Bone);
+            if (row.Skipped is not null) skipped.Add(row.Skipped);
+        }
+        foreach (var row in leftHand.Select((index, sourceIndex) => MapHumanoidBoneSlot(animatorRoot, avatarTos, skeletonIds, index, 25 + sourceIndex, sourceIndex, "m_LeftHand.m_HandBoneIndex", avatarIdentity)))
+        {
+            if (row.Bone is not null) bones.Add(row.Bone);
+            if (row.Skipped is not null) skipped.Add(row.Skipped);
+        }
+        foreach (var row in rightHand.Select((index, sourceIndex) => MapHumanoidBoneSlot(animatorRoot, avatarTos, skeletonIds, index, 40 + sourceIndex, sourceIndex, "m_RightHand.m_HandBoneIndex", avatarIdentity)))
+        {
+            if (row.Bone is not null) bones.Add(row.Bone);
+            if (row.Skipped is not null) skipped.Add(row.Skipped);
+        }
+        return new AnimatorHumanoidBoneMap(animatorPath, "mapped", avatarCab, avatar.m_PathID, avatarIdentity, core.Length, leftHand.Length, rightHand.Length, bones.ToArray(), skipped.ToArray());
+    }
+
+    private static (HumanoidBonePath? Bone, SkippedHumanoidBoneSlot? Skipped) MapHumanoidBoneSlot(Transform animatorRoot, IReadOnlyDictionary<uint, string> avatarTos, uint[] skeletonIds, int humanSkeletonIndex, int slot, int sourceIndex, string sourceField, SourceRef avatar)
+    {
+        if (humanSkeletonIndex < -1 || humanSkeletonIndex >= skeletonIds.Length) throw new InvalidDataException($"Avatar Human slot references an invalid skeleton index: avatar={avatar.Source}/{avatar.PathId}, slot={slot}, source_field={sourceField}, source_index={sourceIndex}, human_skeleton_index={humanSkeletonIndex}, skeleton_count={skeletonIds.Length}.");
+        if (humanSkeletonIndex == -1) return (null, new SkippedHumanoidBoneSlot(slot, sourceField, sourceIndex, "source_index_unmapped"));
+        var skeletonId = skeletonIds[humanSkeletonIndex];
+        var hasTosPath = avatarTos.TryGetValue(skeletonId, out var avatarTosPath) && !string.IsNullOrWhiteSpace(avatarTosPath);
+        if (!hasTosPath && skeletonId != 0) throw new InvalidDataException($"Avatar m_TOS has no exact path for Human skeleton ID: avatar={avatar.Source}/{avatar.PathId}, slot={slot}, human_skeleton_index={humanSkeletonIndex}, skeleton_id={skeletonId}.");
+        avatarTosPath = hasTosPath ? avatarTosPath! : string.Empty;
+        var target = ResolveAvatarRelativeTransform(animatorRoot, avatarTosPath, avatar, slot, skeletonId);
+        RequireUnambiguousTransformNames(target);
+        var path = TransformPath(target);
+        return (new HumanoidBonePath(slot, path, sourceField, sourceIndex, humanSkeletonIndex, skeletonId, avatarTosPath), null);
+    }
+
+    private static Transform ResolveAvatarRelativeTransform(Transform animatorRoot, string avatarTosPath, SourceRef avatar, int slot, uint skeletonId)
+    {
+        if (avatarTosPath.Length == 0) return animatorRoot;
+        if (avatarTosPath.Contains('\\') || avatarTosPath.StartsWith('/') || avatarTosPath.EndsWith('/'))
+            throw new InvalidDataException($"Avatar m_TOS path is not a canonical relative path: avatar={avatar.Source}/{avatar.PathId}, slot={slot}, skeleton_id={skeletonId}, path={avatarTosPath}.");
+        var segments = avatarTosPath.Split('/');
+        if (segments.Any(string.IsNullOrWhiteSpace)) throw new InvalidDataException($"Avatar m_TOS path contains an empty segment: avatar={avatar.Source}/{avatar.PathId}, slot={slot}, skeleton_id={skeletonId}, path={avatarTosPath}.");
+        var current = animatorRoot;
+        foreach (var segment in segments)
+        {
+            var children = current.m_Children.Select(child => Require(child, "Avatar TOS child Transform"))
+                .Where(child => string.Equals(Require(child.m_GameObject, "Avatar TOS child GameObject").m_Name, segment, StringComparison.Ordinal))
+                .ToArray();
+            if (children.Length != 1)
+                throw new InvalidDataException($"Avatar m_TOS path did not resolve to exactly one source Transform: avatar={avatar.Source}/{avatar.PathId}, slot={slot}, skeleton_id={skeletonId}, path={avatarTosPath}, segment={segment}, matches={children.Length}.");
+            current = children[0];
+        }
+        return current;
+    }
+
+    private static void RequireUnambiguousTransformNames(Transform transform)
+    {
+        var current = transform;
+        var seen = new HashSet<Transform>();
+        while (true)
+        {
+            if (!seen.Add(current)) throw new InvalidDataException($"Transform parent cycle detected while validating source path: {current.m_PathID}.");
+            var name = Require(current.m_GameObject, "source path GameObject").m_Name;
+            if (name.Contains('/') || name.Contains('\\')) throw new InvalidDataException($"Source Transform name contains a path separator and cannot be represented exactly: transform={current.m_PathID}, name={name}.");
+            if (current.m_Father.m_PathID == 0) return;
+            var parent = Require(current.m_Father, "source path parent Transform");
+            var sameNameSiblings = parent.m_Children.Select(child => Require(child, "source path sibling Transform"))
+                .Where(child => string.Equals(Require(child.m_GameObject, "source path sibling GameObject").m_Name, name, StringComparison.Ordinal))
+                .ToArray();
+            if (sameNameSiblings.Length != 1 || !ReferenceEquals(sameNameSiblings[0], current))
+                throw new InvalidDataException($"Source Transform path segment is not unique among siblings: transform={current.m_PathID}, parent={parent.m_PathID}, name={name}, matches={sameNameSiblings.Length}.");
+            current = parent;
+        }
+    }
+
+    private static string ResolvePointerCab(SerializedFile sourceFile, int fileId)
+    {
+        if (fileId == 0) return sourceFile.fileName;
+        if (fileId < 0 || fileId > sourceFile.m_Externals.Count) throw new InvalidDataException($"Animator Avatar PPtr FileID is out of range: file_id={fileId}, external_count={sourceFile.m_Externals.Count}, animator_source={sourceFile.fileName}.");
+        return sourceFile.m_Externals[fileId - 1].fileName;
     }
 
     private static Dictionary<GameObject, string> BuildRendererExportNames(Renderer[] renderers)

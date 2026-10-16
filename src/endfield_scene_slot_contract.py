@@ -2,12 +2,13 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 from collections import defaultdict
 from pathlib import Path
 from typing import NamedTuple
 
-from endfield_scene_material_contract import reference_key, resolve_export_path
+from endfield_scene_material_contract import MaterialRecord, reference_key, resolve_export_path
 
 
 class SlotPlan(NamedTuple):
@@ -33,18 +34,31 @@ class RuntimeDraw(NamedTuple):
     flags: int
 
 
+class RuntimeLodDraw(NamedTuple):
+    submesh: int
+    flags: int
+    lod_max_squared: float
+    lod_min_squared: float
+
+
 class RuntimeSlotMapping(NamedTuple):
     indices: tuple[int, ...]
     undrawn_submeshes: tuple[int, ...]
     shadow_only_draws: tuple[int, ...]
 
 
-def runtime_submesh_slots(submeshes: int, references: tuple[str, ...], draws: tuple[RuntimeDraw, ...]) -> RuntimeSlotMapping:
-    """Select authored non-shadow draws; retain undrawn geometry in a separate role slot."""
+class RuntimePassMapping(NamedTuple):
+    indices: tuple[tuple[int, ...], ...]
+    undrawn_submeshes: tuple[int, ...]
+    shadow_only_draws: tuple[int, ...]
+
+
+def runtime_submesh_passes(submeshes: int, references: tuple[str, ...], draws: tuple[RuntimeDraw, ...]) -> RuntimePassMapping:
+    """Retain every visible source draw in its serialized order for each submesh."""
     if submeshes <= 0 or not references or len(draws) != len(references):
         raise AmbiguousSubmeshSlots("Runtime mapping requires one verified draw per material reference")
-    selected: dict[int, list[int]] = defaultdict(list)
-    shadow = []
+    selected: list[list[int]] = [[] for _ in range(submeshes)]
+    shadow: list[int] = []
     for index, draw in enumerate(draws):
         if not 0 <= draw.submesh < submeshes or not 0 <= draw.flags <= 0xFFFFFFFF:
             raise AmbiguousSubmeshSlots(f"Invalid native draw: index={index}, draw={draw}, submeshes={submeshes}")
@@ -52,21 +66,46 @@ def runtime_submesh_slots(submeshes: int, references: tuple[str, ...], draws: tu
             shadow.append(index)
         else:
             selected[draw.submesh].append(index)
-    if not selected:
+    if not any(selected):
         raise AmbiguousSubmeshSlots("No non-shadow native draws; an ordinary surface cannot be inferred")
+    return RuntimePassMapping(tuple(tuple(indices) for indices in selected),
+                              tuple(index for index, indices in enumerate(selected) if not indices), tuple(shadow))
+
+
+def validate_ordered_surface_passes(records: tuple[MaterialRecord, ...]) -> None:
+    """Bound the host overwrite approximation to explicit compatible opaque Lit states."""
+    if records and len({reference_key(record) for record in records}) == 1:
+        return
+    expected = {"_EnableAlphaTest": 0, "_DisableZWrite": 0, "_ZTestGBuffer": 4,
+                "_ZWriteGBuffer": 1, "_CullMode": 2, "_DitherTransparentAlpha": 1,
+                "_StencilRef": 0, "_StencilOpGBuffer": 2, "_StencilOpPreZ": 0}
+    for record in records:
+        state = record.get("RenderState")
+        floats = record["Floats"]
+        if (record["Shader"].get("Name") != "HGRP/Lit" or state is None
+                or state["CustomRenderQueue"] != 2000 or "HGBuffer" in state["DisabledShaderPasses"]
+                or "HGBuffer" not in record["Shader"].get("PassNames", [])
+                or any(floats.get(name) != value for name, value in expected.items())
+                or ("_EnableAlphaBlend" in floats and floats["_EnableAlphaBlend"] != 0)
+                or any(value != 0 for name, value in floats.items()
+                       if "stencil" in name.casefold() and name not in expected)):
+            raise AmbiguousSubmeshSlots(f"Ordered surface passes require explicit compatible opaque Lit depth/cull/queue state: material={record['Name']}")
+
+
+def runtime_submesh_slots(submeshes: int, references: tuple[str, ...], draws: tuple[RuntimeDraw, ...]) -> RuntimeSlotMapping:
+    """Select authored non-shadow draws; retain undrawn geometry in a separate role slot."""
+    mapping = runtime_submesh_passes(submeshes, references, draws)
     indices = []
-    undrawn = []
     for submesh in range(submeshes):
-        candidates = selected[submesh]
+        candidates = mapping.indices[submesh]
         if len({references[index] for index in candidates}) > 1:
             raise AmbiguousSubmeshSlots(f"Conflicting non-shadow materials: submesh={submesh}, references={references}")
         if not candidates:
             # The extra slot is an explicit non-drawing role, never a guessed material.
             indices.append(len(references))
-            undrawn.append(submesh)
         else:
             indices.append(candidates[0])
-    return RuntimeSlotMapping(tuple(indices), tuple(undrawn), tuple(shadow))
+    return RuntimeSlotMapping(tuple(indices), mapping.undrawn_submeshes, mapping.shadow_only_draws)
 
 
 def load_runtime_draw_plans(path: Path) -> dict[tuple[str, str, tuple[str, ...]], tuple[tuple[RuntimeDraw, ...], ...]]:
@@ -133,8 +172,17 @@ def mesh_lod_index(name: str) -> int | None:
     return int(matches[0]) if matches else None
 
 
-def primary_visible_mesh(pairs: tuple[tuple[str, RuntimeDraw], ...]) -> str:
-    """Select one authored visible base mesh while excluding shadow-only draws."""
+def resource_mesh_lod_index(path: str) -> int | None:
+    """Use explicit source container LOD when an FBX subasset has a generic name."""
+    container = mesh_lod_index(Path(path.split("##", 1)[0]).stem)
+    subasset = mesh_lod_index(asset_name(path))
+    if container is not None and subasset is not None and container != subasset:
+        raise AmbiguousSubmeshSlots(f"Container and subasset LOD disagree: path={path}")
+    return subasset if subasset is not None else container
+
+
+def _visible_mesh_lods(pairs: tuple[tuple[str, RuntimeDraw], ...]) -> dict[str, int | None]:
+    """Validate native identities before selecting a visible mesh set."""
     if not pairs:
         raise AmbiguousSubmeshSlots("Primary mesh requires current renderer draws")
     visible: set[str] = set()
@@ -144,13 +192,48 @@ def primary_visible_mesh(pairs: tuple[tuple[str, RuntimeDraw], ...]) -> str:
             raise AmbiguousSubmeshSlots(f"Invalid primary mesh draw: path={path}, draw={draw}")
         if not draw.flags & 1024:
             visible.add(path)
-    explicit = {path for path in visible if mesh_lod_index(asset_name(path)) == 0}
+    return {path: resource_mesh_lod_index(path) for path in visible}
+
+
+def primary_visible_mesh(pairs: tuple[tuple[str, RuntimeDraw], ...]) -> str:
+    """Select one authored visible base mesh while excluding shadow-only draws."""
+    source_lods = _visible_mesh_lods(pairs)
+    # A sole authored draw can intentionally use an LOD-named mesh at every distance.
+    if len(source_lods) == 1:
+        return next(iter(source_lods))
+    explicit = {path for path, lod in source_lods.items() if lod == 0}
     if len(explicit) == 1:
         return next(iter(explicit))
-    implicit = {path for path in visible if mesh_lod_index(asset_name(path)) is None}
+    implicit = {path for path, lod in source_lods.items() if lod is None}
     if not explicit and len(implicit) == 1:
         return next(iter(implicit))
-    raise AmbiguousSubmeshSlots(f"No unique visible base mesh: candidates={sorted(visible)}")
+    raise AmbiguousSubmeshSlots(f"No unique visible base mesh: candidates={sorted(source_lods)}")
+
+
+def highest_detail_visible_meshes(pairs: tuple[tuple[str, RuntimeLodDraw], ...]) -> tuple[str, ...]:
+    """Select co-authored base parts only when their native LOD intervals agree."""
+    basic = tuple((path, RuntimeDraw(draw.submesh, draw.flags)) for path, draw in pairs)
+    lods = _visible_mesh_lods(basic)
+    for path, draw in pairs:
+        if (not math.isfinite(draw.lod_max_squared) or not math.isfinite(draw.lod_min_squared)
+                or draw.lod_max_squared < draw.lod_min_squared):
+            raise AmbiguousSubmeshSlots(f"Invalid source mesh LOD interval: mesh={path}, draw={draw}")
+    explicit = {path for path, lod in lods.items() if lod == 0}
+    implicit = {path for path, lod in lods.items() if lod is None}
+    if len(lods) == 1 or len(explicit) == 1 or (not explicit and len(implicit) == 1):
+        return (primary_visible_mesh(basic),)
+    visible = tuple((path, draw) for path, draw in pairs if not draw.flags & 1024)
+    if not visible:
+        raise AmbiguousSubmeshSlots("No non-shadow source meshes for highest-detail selection")
+    interval = max((draw.lod_max_squared, draw.lod_min_squared) for _, draw in visible)
+    selected = {path for path, draw in visible if (draw.lod_max_squared, draw.lod_min_squared) == interval}
+    if len(selected) < 2 or (explicit and selected != explicit):
+        raise AmbiguousSubmeshSlots(f"Source base meshes lack a shared highest-detail interval: candidates={sorted(lods)}")
+    for path, draw in visible:
+        current = (draw.lod_max_squared, draw.lod_min_squared)
+        if current != interval and (path in selected or draw.lod_max_squared > interval[1]):
+            raise AmbiguousSubmeshSlots(f"Source mesh LOD intervals overlap the co-authored base set: mesh={path}, draw={draw}")
+    return tuple(sorted(selected))
 
 
 def lod_family_name(name: str) -> str:

@@ -30,19 +30,27 @@ import {
   Waves,
   X,
 } from 'lucide-react'
-import { EXPORT_GROUPS, LAYER_LABELS, MAPS } from './data/maps'
+import { LAYER_LABELS, MAPS } from './data/maps'
 import { AmbientContours } from './components/AmbientContours'
 import { ExtractionCompleteOverlay } from './components/ExtractionCompleteOverlay'
+import { ExportGroupSelector } from './components/ExportGroupSelector'
 import { MapViewport } from './components/MapViewport'
+import { captureCanvasMap, capturePaintingMap } from './lib/mapSnapshot'
+import type { CanvasMapSnapshot } from './lib/mapSnapshot'
 import { RegionCartouche } from './components/RegionCartouche'
 import { REGION_MAP_RUNTIME_MANIFEST } from './data/regionMapRuntime'
 import { BackendRequestError, isJsonObject, postJson, requestJson } from './lib/backendClient'
 import { resolveSelection } from './lib/mapChunking'
+import { isExportJob, isExportJobEventsResponse, isExportJobValidation } from './lib/mapExportJob'
+import { canStartFirstRunRequest, firstRunRequestMatchesPrepared } from './lib/firstRunActions'
+import type { ExportJob } from './lib/mapExportJob'
 import { useDraggablePanel } from './hooks/useDraggablePanel'
 import { InstancedSceneWorkspace } from './features/instanced-scenes/InstancedSceneWorkspace'
 import { OperatorWorkspace } from './features/operators/OperatorWorkspace'
 import type { OperatorDevelopmentPreview } from './features/operators/developmentPreview'
 import type { InstancedSceneDevelopmentPreview, InstancedSceneSourcePaths } from './features/instanced-scenes/types'
+import { PaintingWorkspace } from './features/si-painting/PaintingWorkspace'
+import { usePaintingRuntime } from './features/si-painting/usePaintingRuntime'
 import './layout.css'
 import './instanced-navigation.css'
 import './features/operators/navigation.css'
@@ -185,36 +193,9 @@ const JOB_PHASES = [
 ] as const
 
 const RECONSTRUCTABLE_BLEND_GROUPS = ['building', 'prop', 'vegetation', 'terrain', 'road', 'unknown', 'water', 'effects', 'particle', 'lighting']
-const EXPORT_GROUP_NOTES: Record<string, string> = {
-  lighting: '原生灯光预览 · 亮度待校准',
-  particle: '静态预览 · 部分组件支持',
-  water: '双引擎重建 · 部分效果近似',
-  effects: '静态预览 · 部分组件支持',
-}
+
 
 type LaunchState = 'idle' | 'running' | 'completed' | 'cancelled' | 'failed'
-
-type ExportJob = {
-  job_id: string
-  state: 'queued' | 'preparing' | 'extracting' | 'building' | 'auditing' | 'completed' | 'failed' | 'cancelled'
-  phase: string
-  progress: number
-  result?: {
-    package?: { output_dir?: string; status?: string; exportMode?: ExportMode; warnings?: string[] }
-    blenderBuild?: BlenderBuildResult
-  } | null
-  error?: { message?: string; type?: string } | null
-}
-
-type ExportJobEventsResponse = {
-  events: Array<{ sequence?: number; message?: string }>
-}
-
-type ExportJobValidation = {
-  status: string
-  message?: string
-  error?: { message?: string }
-}
 
 const isStringRecord = (value: unknown): value is Record<string, string> =>
   isJsonObject(value) && Object.values(value).every((item) => typeof item === 'string')
@@ -322,52 +303,6 @@ const isPathPickerResponse = (value: unknown): value is PathPickerResponse =>
   (value.writable === undefined || typeof value.writable === 'boolean') &&
   (value.writableParent === undefined || typeof value.writableParent === 'boolean') &&
   (value.error === undefined || typeof value.error === 'string')
-
-const isBlenderBuildResult = (value: unknown): value is BlenderBuildResult =>
-  isJsonObject(value) && typeof value.status === 'string' &&
-  (value.scheduled === undefined || typeof value.scheduled === 'boolean') &&
-  (value.pending === undefined || typeof value.pending === 'number') &&
-  (value.scenes === undefined || Array.isArray(value.scenes) && value.scenes.every((scene) =>
-    isJsonObject(scene) && typeof scene.path === 'string' && typeof scene.audit === 'string' &&
-    typeof scene.plan === 'string' && typeof scene.bytes === 'number' &&
-    typeof scene.sha256 === 'string' && typeof scene.instances === 'number' &&
-    typeof scene.pending === 'number'
-  ))
-
-const isExportJob = (value: unknown): value is ExportJob => {
-  const states = ['queued', 'preparing', 'extracting', 'building', 'auditing', 'completed', 'failed', 'cancelled']
-  if (!isJsonObject(value) || typeof value.job_id !== 'string' || typeof value.state !== 'string' ||
-    !states.includes(value.state) || typeof value.phase !== 'string' || typeof value.progress !== 'number') return false
-  if (value.result !== undefined && value.result !== null) {
-    if (!isJsonObject(value.result)) return false
-    if (value.result.package !== undefined && value.result.package !== null) {
-      const resultPackage = value.result.package
-      if (!isJsonObject(resultPackage) ||
-        (resultPackage.output_dir !== undefined && typeof resultPackage.output_dir !== 'string') ||
-        (resultPackage.status !== undefined && typeof resultPackage.status !== 'string') ||
-        (resultPackage.exportMode !== undefined && resultPackage.exportMode !== 'blend' && resultPackage.exportMode !== 'data_package') ||
-        (resultPackage.warnings !== undefined && (!Array.isArray(resultPackage.warnings) || !resultPackage.warnings.every((item) => typeof item === 'string')))) return false
-    }
-    if (value.result.blenderBuild !== undefined && value.result.blenderBuild !== null && !isBlenderBuildResult(value.result.blenderBuild)) return false
-  }
-  if (value.error !== undefined && value.error !== null && (!isJsonObject(value.error) ||
-    (value.error.message !== undefined && typeof value.error.message !== 'string') ||
-    (value.error.type !== undefined && typeof value.error.type !== 'string'))) return false
-  return true
-}
-
-const isExportJobEventsResponse = (value: unknown): value is ExportJobEventsResponse =>
-  isJsonObject(value) && Array.isArray(value.events) && value.events.every((event) =>
-    isJsonObject(event) &&
-    (event.sequence === undefined || typeof event.sequence === 'number') &&
-    (event.message === undefined || typeof event.message === 'string')
-  )
-
-const isExportJobValidation = (value: unknown): value is ExportJobValidation =>
-  isJsonObject(value) && typeof value.status === 'string' &&
-  (value.message === undefined || typeof value.message === 'string') &&
-  (value.error === undefined || isJsonObject(value.error) &&
-    (value.error.message === undefined || typeof value.error.message === 'string'))
 
 const firstRunApiErrorFrom = (error: unknown): FirstRunApiError | null => {
   if (!(error instanceof BackendRequestError) || error.responseBody === null) return null
@@ -589,8 +524,8 @@ function LegalArchive() {
       <ViewTransition update="auto">
         <div className="legal-archive-footnote">
           <span>原创内容授权参考</span>
-          <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/deed.zh-hans" target="_blank" rel="noreferrer">
-            知识共享署名-非商业性使用-相同方式共享 4.0 国际许可
+          <a href="https://github.com/An1X3R/Endfield-map-extractor/blob/main/webui/CONTENT-LICENSE.md" target="_blank" rel="noreferrer">
+            MIT License · 原创内容许可范围
           </a>
           <span>仅适用于项目自身拥有权利的内容</span>
         </div>
@@ -602,10 +537,18 @@ function LegalArchive() {
 export default function App() {
   const reduceMotion = useReducedMotion()
   const [mapId, setMapId] = useState<MapId>('map01')
-  const [workspaceMode, setWorkspaceMode] = useState<'maps' | 'instanced' | 'operators'>('maps')
-  const [workspaceTransition, setWorkspaceTransition] = useState<{ phase: 'retract' | 'deploy'; target: 'maps' | 'instanced' | 'operators' } | null>(null)
+  const [workspaceMode, setWorkspaceMode] = useState<'maps' | 'instanced' | 'operators' | 'painting'>(() => new URLSearchParams(window.location.search).get('painting-preview') === '1' ? 'painting' : 'maps')
+  const [workspaceTransition, setWorkspaceTransition] = useState<{ phase: 'retract' | 'deploy'; target: 'maps' | 'instanced' | 'operators' | 'painting' } | null>(null)
   const [workspaceTransitionTitle, setWorkspaceTransitionTitle] = useState<string | null>(null)
   const [instancedWorkspaceHeight, setInstancedWorkspaceHeight] = useState(0)
+  const [paintingBusy, setPaintingBusy] = useState(false)
+  const [mapHandoffBusy, setMapHandoffBusy] = useState(false)
+  const [paintingEntryBusy, setPaintingEntryBusy] = useState(false)
+  const mapNavigationBusy = mapHandoffBusy || paintingEntryBusy
+  const [paintingPreviousMap, setPaintingPreviousMap] = useState<CanvasMapSnapshot | null>(null)
+  const [paintingExitSnapshot, setPaintingExitSnapshot] = useState<SVGSVGElement | null>(null)
+  const [paintingResetRevision, setPaintingResetRevision] = useState(0)
+  const [paintingPreviewRevision, setPaintingPreviewRevision] = useState(0)
   const [instancedJobBusy, setInstancedJobBusy] = useState(false)
   const [instancedCatalogCount, setInstancedCatalogCount] = useState<number | null>(null)
   const [instancedDevelopmentPreview, setInstancedDevelopmentPreview] = useState<InstancedSceneDevelopmentPreview | null>(null)
@@ -661,6 +604,8 @@ export default function App() {
   const exportPollGeneration = useRef(0)
   const exportPollRef = useRef<((jobId: string, after: number, generation: number) => void) | null>(null)
   const exportConnectionLost = useRef(false)
+  const exportCancelling = useRef(false)
+  const [exportCancelRequested, setExportCancelRequested] = useState(false)
   const firstRunHydrated = useRef(false)
   const scenePreviewInitialized = useRef(false)
   const operatorPreviewInitialized = useRef(false)
@@ -676,6 +621,7 @@ export default function App() {
       preparedRequest.cache_root === sourcePaths.cache,
   )
   const sourceReady = Boolean(firstRunStatus?.ready)
+  const paintingRuntime = usePaintingRuntime(sourcePaths, sourceReady && preparedPathsMatch, import.meta.env.DEV && new URLSearchParams(window.location.search).get('painting-preview') === '1')
   const instancedSource = useMemo<InstancedSceneSourcePaths>(() => ({
     game_root: sourcePaths.game,
     cache_root: sourcePaths.cache,
@@ -735,10 +681,19 @@ export default function App() {
     workspaceTransitionTimers.current.forEach((timer) => window.clearTimeout(timer))
   }, [])
 
-  const switchWorkspace = (target: 'maps' | 'instanced' | 'operators', mapTitle: string): void => {
-    if (target === workspaceMode || workspaceTransition) return
-    if (launchState === 'running' || instancedJobBusy) return
-    if (target === 'operators' || workspaceMode === 'operators') {
+  const switchWorkspace = (target: 'maps' | 'instanced' | 'operators' | 'painting', mapTitle: string): void => {
+    if (target === workspaceMode || workspaceTransition || mapNavigationBusy) return
+    if (launchState === 'running' || instancedJobBusy || paintingBusy) return
+    if (target === 'painting') {
+      const canvas = workspaceMode === 'maps' ? workspaceRef.current?.querySelector('.pixi-host canvas') : null
+      setPaintingPreviousMap(canvas instanceof HTMLCanvasElement ? captureCanvasMap(canvas) : null)
+    }
+    if (workspaceMode === 'painting' && target === 'maps') {
+      const stage = workspaceRef.current?.querySelector<HTMLElement>('.si-map-stage')
+      if (!stage) throw new Error('Cannot leave painting: map stage is missing')
+      setPaintingExitSnapshot(capturePaintingMap(stage))
+    }
+    if (target === 'operators' || workspaceMode === 'operators' || target === 'painting' || workspaceMode === 'painting') {
       setWorkspaceMode(target)
       return
     }
@@ -914,6 +869,7 @@ export default function App() {
   }, [])
 
   const handleMapChange = (nextMap: MapId) => {
+    if (mapNavigationBusy) return
     if (instancedJobBusy) {
       notify('独立场景任务仍在运行；请先请求安全取消')
       return
@@ -1142,7 +1098,9 @@ export default function App() {
 
   const isReady = Boolean(
     sourceReady &&
+      preparedPathsMatch && !firstRunRunning && !firstRunAction &&
       selection &&
+      Object.values(selection.canonicalBounds).every(Number.isFinite) && Object.values(layers).some(Boolean) &&
       (allGroupsSelected || selectedGroups.length > 0) &&
       (exportMode !== 'blend' || (sourcePaths.blender.trim() && reconstructableSelection)) &&
       outputLabel.trim() &&
@@ -1168,7 +1126,11 @@ export default function App() {
   }, [launchState])
 
   const launchVisualTask = () => {
-    if (!isReady || !selection) return
+    if (!isReady || !selection || launchStateRef.current === 'running') return
+    launchStateRef.current = 'running'
+    exportCancelling.current = false
+    setExportCancelRequested(false)
+    setActiveJobId(null)
     stopJob()
     const generation = exportPollGeneration.current
     setLaunchState('running')
@@ -1210,6 +1172,7 @@ export default function App() {
             ),
           ])
           if (pollGeneration !== exportPollGeneration.current) return
+          if (job.job_id !== jobId) throw new Error(`任务标识不匹配：请求 ${jobId}，返回 ${job.job_id}`)
           const events = eventPayload.events ?? []
           const newest = events.at(-1)
           const nextAfter = newest?.sequence ?? after
@@ -1317,16 +1280,17 @@ export default function App() {
   }
 
   const cancelVisualTask = async () => {
-    if (launchState !== 'running' || !activeJobId) return
+    if (launchState !== 'running' || !activeJobId || exportCancelling.current) return
+    exportCancelling.current = true
+    setExportCancelRequested(true)
     try {
-      const response = await fetch(`/api/v2/export-jobs/${encodeURIComponent(activeJobId)}/cancel`, { method: 'POST' })
-      if (!response.ok) {
-        const body = await response.text()
-        throw new Error(`POST /api/v2/export-jobs/${encodeURIComponent(activeJobId)}/cancel failed with HTTP ${response.status}: ${body || '(empty response body)'}`)
-      }
+      const response = await postJson(`/api/v2/export-jobs/${encodeURIComponent(activeJobId)}/cancel`, {}, isExportJob)
+      if (response.job_id !== activeJobId) throw new Error(`取消响应任务标识不匹配：请求 ${activeJobId}，返回 ${response.job_id}`)
       setJobMessage('已请求协作取消；等待当前安全阶段结束')
       notify('取消请求已提交；已经写入的结果会保留')
     } catch (error) {
+      exportCancelling.current = false
+      setExportCancelRequested(false)
       notify(`取消请求失败，后台状态需重新确认：${error instanceof Error ? error.message : String(error)}`)
     }
   }
@@ -1429,7 +1393,7 @@ export default function App() {
   const firstRunCanStart = Boolean(
     validationMatches &&
       firstRunValidation?.status === 'valid' &&
-      firstRunStatus?.actions.can_start &&
+      canStartFirstRunRequest(firstRunStatus, firstRunRequest) &&
       !firstRunAction,
   )
   const firstRunCanResume = Boolean(
@@ -1484,14 +1448,14 @@ export default function App() {
           : '等待设置完成'
 
   return (
-    <div className={`app-shell theme-${mapId} mode-${workspaceMode}`} data-map-theme={mapId} data-workspace-mode={workspaceMode}>
+    <div className={`app-shell theme-${workspaceMode === 'painting' ? 'si' : mapId} mode-${workspaceMode}`} data-map-theme={workspaceMode === 'painting' ? 'si' : mapId} data-workspace-mode={workspaceMode}>
       <div className="ambient-grid" aria-hidden="true" />
-      <AmbientContours />
+      {workspaceMode !== 'painting' && <AmbientContours />}
 
       <header
         ref={topbarRef}
         className="topbar"
-        data-active-map={mapId === 'map01' ? 'M01 / IV' : 'M02 / WL'}
+        data-active-map={workspaceMode === 'painting' ? '03 / SI' : mapId === 'map01' ? 'M01 / IV' : 'M02 / WL'}
         style={{ viewTransitionName: 'persistent-header' }}
       >
         <div className="brand-lockup">
@@ -1504,7 +1468,7 @@ export default function App() {
 
         <div className="map-switch-zone">
           <span className="map-switch-hint">选择地图 · 点击切换场景</span>
-          <nav className="map-switch map-switch-with-instanced map-switch-with-operators" aria-label="选择地图、独立场景或角色档案">
+          <nav className="map-switch map-switch-with-instanced map-switch-with-operators map-switch-with-painting" aria-label="选择地图、独立场景或角色档案">
             {(Object.keys(MAPS) as MapId[]).map((id) => {
               const item = MAPS[id]
               const active = workspaceMode === 'maps' && id === mapId
@@ -1515,7 +1479,7 @@ export default function App() {
                   data-testid={`map-tab-${id}`}
                   className={active ? 'active' : ''}
                   aria-pressed={active}
-                  disabled={launchState === 'running' || instancedJobBusy || workspaceTransition !== null}
+                  disabled={launchState === 'running' || instancedJobBusy || paintingBusy || mapNavigationBusy || workspaceTransition !== null}
                   onClick={() => handleMapChange(id)}
                 >
                   {active && (
@@ -1532,13 +1496,16 @@ export default function App() {
                 </button>
               )
             })}
+            <button type="button" className={`painting-navigation-tab ${workspaceMode === 'painting' ? 'active' : ''}`} data-testid="painting-tab" aria-pressed={workspaceMode === 'painting'} disabled={launchState === 'running' || instancedJobBusy || paintingBusy || mapNavigationBusy || workspaceTransition !== null} onClick={() => switchWorkspace('painting', 'SI’S PAINTING')}>
+              <span className="painting-navigation-icon" aria-hidden="true"><i /><i /><i /></span><span className="map-switch-copy"><strong>SI’S PAINTING</strong><small>祀的画 / 画境</small></span><i aria-hidden="true">→</i>
+            </button>
             <span className="instanced-navigation-datum" aria-hidden="true"><b>//</b><small>IDX // DISCRETE</small></span>
             <button
               type="button"
               data-testid="instanced-tab"
               className={`instanced-navigation-tab ${workspaceMode === 'instanced' ? 'active' : ''}`}
               aria-pressed={workspaceMode === 'instanced'}
-              disabled={launchState === 'running' || instancedJobBusy || workspaceTransition !== null}
+              disabled={launchState === 'running' || instancedJobBusy || paintingBusy || mapNavigationBusy || workspaceTransition !== null}
               onClick={() => switchWorkspace('instanced', map.title)}
             >
               <span className="instanced-navigation-icon" aria-hidden="true"><i /><i /><i /><i /></span>
@@ -1546,7 +1513,7 @@ export default function App() {
               <i aria-hidden="true">→</i>
             </button>
             <span className="instanced-navigation-datum operator-navigation-datum" aria-hidden="true"><b>//</b><small>CAT // ENTITY</small></span>
-            <button type="button" data-testid="operators-tab" className={`operator-navigation-tab ${workspaceMode === 'operators' ? 'active' : ''}`} aria-pressed={workspaceMode === 'operators'} disabled={launchState === 'running' || instancedJobBusy || workspaceTransition !== null} onClick={() => switchWorkspace('operators', map.title)}>
+            <button type="button" data-testid="operators-tab" className={`operator-navigation-tab ${workspaceMode === 'operators' ? 'active' : ''}`} aria-pressed={workspaceMode === 'operators'} disabled={launchState === 'running' || instancedJobBusy || paintingBusy || mapNavigationBusy || workspaceTransition !== null} onClick={() => switchWorkspace('operators', map.title)}>
               <svg className="operator-navigation-icon" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor"><circle cx="12" cy="7" r="4" /><path d="M4 22v-3a8 8 0 0 1 16 0v3M4 22h16" /></svg>
               <span className="map-switch-copy"><strong>OPERATORS</strong><small>角色档案 / {operatorCatalogCount ?? '--'}</small></span><i aria-hidden="true">→</i>
             </button>
@@ -1559,6 +1526,7 @@ export default function App() {
               <i />
               <span>{sourceReady ? 'DATA / READY' : firstRunRunning ? 'DATA / PREPARING' : 'FIRST RUN / REQUIRED'}</span>
             </div>
+          {import.meta.env.DEV && workspaceMode === 'painting' && <button type="button" className="dev-review-button" data-testid="si-preview-entry" onClick={() => setPaintingPreviewRevision(value => value + 1)}><Play size={14} /><span>完成动画</span></button>}
           {import.meta.env.DEV && workspaceMode === 'maps' && (
             <button
               className="dev-review-button"
@@ -1584,7 +1552,7 @@ export default function App() {
           {import.meta.env.DEV && workspaceMode === 'operators' && <button type="button" className="dev-review-button" data-testid="operator-preview-entry" disabled={operatorJobBusy} onClick={() => void loadOperatorDevelopmentPreview()} title="开发样例，不执行提取"><Play size={14} /><span>开发预览</span></button>}
           {import.meta.env.DEV && workspaceMode === 'operators' && operatorDevelopmentPreview && <button type="button" data-testid="operator-live-entry" onClick={() => setOperatorDevelopmentPreview(null)}>返回实时目录</button>}
           <button type="button" onClick={copyRequest} hidden={workspaceMode !== 'maps'} aria-label="复制请求摘要"><Clipboard size={14} /><span>复制摘要</span></button>
-          <button type="button" data-testid="reset-app" disabled={workspaceTransition !== null} onClick={() => workspaceMode === 'operators' ? setOperatorResetRevision(value => value + 1) : resetPrototype()} aria-label="复位页面"><RefreshCw size={14} /><span>复位</span></button>
+          <button type="button" data-testid="reset-app" disabled={workspaceTransition !== null || paintingBusy} onClick={() => workspaceMode === 'painting' ? setPaintingResetRevision(value => value + 1) : workspaceMode === 'operators' ? setOperatorResetRevision(value => value + 1) : resetPrototype()} aria-label="复位页面"><RefreshCw size={14} /><span>复位</span></button>
         </div>
       </header>
 
@@ -1638,6 +1606,8 @@ export default function App() {
             <div className={`map-placeholder-note ${overviewSource === 'fallback' ? 'fallback' : ''}`}><i /> {overviewLabel}</div>
             <div className={`map-transition-screen map-transition-${transitionDirection}`}>
                 <MapViewport
+                  incomingPainting={paintingExitSnapshot}
+                  onHandoffChange={setMapHandoffBusy}
                   mapId={mapId}
                   layers={layers}
                   chunkMode={chunkMode}
@@ -1831,7 +1801,7 @@ export default function App() {
                 ) : (
                   <button className="primary" type="button" onClick={() => void submitFirstRun(false)} disabled={!firstRunCanStart}>
                     {firstRunAction === 'start' ? <RefreshCw className="path-picker-spin" size={13} /> : <Play size={13} fill="currentColor" />}
-                    <span>{sourceReady ? '必要文件已就绪' : '提取必要文件'}</span>
+                    <span>{sourceReady && firstRunRequestMatchesPrepared(firstRunRequest, firstRunStatus?.request) ? '必要文件已就绪' : '提取必要文件'}</span>
                   </button>
                 )}
                 {firstRunStatus?.actions.can_cancel && (
@@ -1896,37 +1866,7 @@ export default function App() {
 
               <div className="setting-block">
                 <span className="setting-label"><Box size={12} />导出分组 · 全部或独立多选</span>
-                <button
-                  className={`export-all-toggle ${allGroupsSelected ? 'active' : ''}`}
-                  type="button"
-                  aria-pressed={allGroupsSelected}
-                  disabled={launchState === 'running'}
-                  onClick={selectAllGroups}
-                >
-                  <span>{allGroupsSelected && <Check size={9} />}</span>
-                  <strong>全部分组</strong>
-                  <small>默认 · 保留限制与待处理报告</small>
-                </button>
-                <div className="export-grid">
-                  {EXPORT_GROUPS.map(([id, label, code]) => {
-                    const active = !allGroupsSelected && selectedGroups.includes(id)
-                    const note = exportMode === 'blend' ? EXPORT_GROUP_NOTES[id] : undefined
-                    return (
-                      <button
-                        key={id}
-                        type="button"
-                        className={active ? 'active' : ''}
-                        aria-pressed={active}
-                        disabled={launchState === 'running'}
-                        onClick={() => toggleGroup(id)}
-                      >
-                        <span>{active && <Check size={9} />}</span>
-                        <strong>{label}</strong>
-                        <small>{note ? `${code} · ${note}` : code}</small>
-                      </button>
-                    )
-                  })}
-                </div>
+                <ExportGroupSelector groups={selectedGroups} allSelected={allGroupsSelected} exportMode={exportMode} disabled={launchState === 'running'} testIdPrefix="map" onSelectAll={selectAllGroups} onToggle={toggleGroup} />
               </div>
             </SettingSection>
 
@@ -2031,7 +1971,7 @@ export default function App() {
                   <RefreshCw size={11} />重连
                 </button>
               )}
-              {launchState === 'running' && <button type="button" data-testid="cancel-export-job" onClick={cancelVisualTask}>取消</button>}
+              {launchState === 'running' && <button type="button" data-testid="cancel-export-job" disabled={!activeJobId || exportCancelRequested} onClick={cancelVisualTask}>{exportCancelRequested ? '正在取消' : '取消'}</button>}
             </div>
             <div className="chunk-mini-grid">
               {chunkPreview.length ? chunkPreview.map((chunk, index) => {
@@ -2070,6 +2010,7 @@ export default function App() {
           </p>
         </section>
         </div>
+        <PaintingWorkspace onHandoffChange={setPaintingEntryBusy} previousMap={paintingPreviousMap} active={workspaceMode === 'painting'} runtime={paintingRuntime} onPrepare={() => { switchWorkspace('maps', map.title); setDrawerCollapsed(false) }} resetRevision={paintingResetRevision} previewRevision={paintingPreviewRevision} onBusyChange={setPaintingBusy} />
         <InstancedSceneWorkspace
           active={workspaceMode === 'instanced'}
           firstRunReady={sourceReady && preparedPathsMatch}
@@ -2099,7 +2040,7 @@ export default function App() {
       <footer className="footer-strip">
         <strong>ENDFIELD / ATLAS</strong>
         <i />
-        <span>{workspaceMode === 'operators' ? `OPERATORS · ${operatorDevelopmentPreview ? 'DEV VISUAL PREVIEW' : operatorCatalogCount !== null ? 'CHARACTER CATALOG READY' : 'CHARACTER SETUP REQUIRED'} · ENTITY ARCHIVE / CHARACTER JOBS` : `${workspaceMode === 'instanced' ? 'INSTANCED SCENES' : map.title} · ${sourceReady ? 'FIRST RUN READY' : firstRunRunning ? 'DATA PREPARING' : 'SETUP REQUIRED'} · ${workspaceMode === 'instanced' ? 'DISCRETE SCENE INDEX / SCENE JOBS' : `SECTOR128 RESOLVED · ${exportMode === 'blend' ? 'BLENDER SCENE + DATA PACKAGE' : 'DATA PACKAGE EXPORT'}`}`}</span>
+        <span>{workspaceMode === 'painting' ? `SI’S PAINTING · ${paintingRuntime.map ? 'MAP METADATA READY' : 'MAP PREPARATION REQUIRED'} / ${paintingRuntime.sourceReady ? '场景已准备' : '场景准备待完成'}` : workspaceMode === 'operators' ? `OPERATORS · ${operatorDevelopmentPreview ? 'DEV VISUAL PREVIEW' : operatorCatalogCount !== null ? 'CHARACTER CATALOG READY' : 'CHARACTER SETUP REQUIRED'} · ENTITY ARCHIVE / CHARACTER JOBS` : `${workspaceMode === 'instanced' ? 'INSTANCED SCENES' : map.title} · ${sourceReady ? 'FIRST RUN READY' : firstRunRunning ? 'DATA PREPARING' : 'SETUP REQUIRED'} · ${workspaceMode === 'instanced' ? 'DISCRETE SCENE INDEX / SCENE JOBS' : `SECTOR128 RESOLVED · ${exportMode === 'blend' ? 'BLENDER SCENE + DATA PACKAGE' : 'DATA PACKAGE EXPORT'}`}`}</span>
       </footer>
 
       <LegalArchive />

@@ -6,16 +6,16 @@
 
 ## 支持内容
 
-- **开放世界场景**：四号谷地、武陵，支持地图框选、分块、合并选区及分类导出。
+- **开放世界场景**：四号谷地、武陵及祀的画，支持地图框选、分块、合并选区及分类导出；底图按当前游戏数据准备。
 - **独立场景**：从游戏数据发现关卡与室内场景，按名称选择导出。
-- **角色与 NPC**：提取模型、材质和骨架，可按可用能力附带动作、基础表情及原始表情数据。
+- **角色、NPC 与生物**：在角色面板按类别选择可操控角色、NPC、动物及敌人，提取模型、材质和骨架，可按可用能力附带动作、基础表情及原始表情数据。
 - **Blender 材质**：提供 Eevee / Cycles 适配，包含普通材质、角色 HGRP 风格材质，以及已支持的水体、灯光和部分特效。
 
 角色与场景分别准备数据。游戏、Blender、缓存和输出目录均由用户选择，不要求固定安装路径。
 
 ## 开始使用
 
-在 [Releases](https://github.com/An1X3R/Endfield-map-extractor/releases/latest) 下载 **Endfield-Extractor-v3-windows-x64.zip**，解压后按 [安装与升级说明](docs/INSTALL.md) 完成一次环境准备。
+在 [Releases](https://github.com/An1X3R/Endfield-map-extractor/releases/latest) 下载 **Endfield-Extractor-v3.1-windows-x64.zip**，解压后按 [安装与升级说明](docs/INSTALL.md) 完成一次环境准备。
 
 | 依赖 | 要求 |
 |---|---|

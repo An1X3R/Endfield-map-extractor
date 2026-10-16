@@ -176,7 +176,7 @@ def main(request_path: Path) -> None:
         timing_path = request.output / 'stage_timings.json'
         timing_path.write_text(json.dumps([asdict(row) for row in stages], indent=2), encoding='utf-8')
         if timing.exit_code != 0:
-            if name != 'source_export' or timing.exit_code != 1:
+            if name != 'source_export' or timing.exit_code != 1 or not (sample / 'static_probe/receipt.json').is_file():
                 raise RuntimeError(f'Character export failed: stage={name}, exit={timing.exit_code}, log={timing.log}')
             require_source_rebuild(sample)
             timing = StageTiming(timing.stage, timing.seconds, timing.cumulative_seconds, timing.exit_code,
@@ -202,7 +202,7 @@ def main(request_path: Path) -> None:
         dependencies = {Path(require_text(provider_source, 'path')), request.prepare_script, request.python, request.weather_manifest, Path(__file__).resolve()}
         dependencies.update(request.repository_src.glob('endfield_character*.py'))
         dependencies.update((request.repository_src / 'extractor_core').glob('*.py'))
-        dependencies.update(module / name for name in ('character_material_profile.py', 'character_material_profile_template.json', 'prepare_character_fur_curves.py'))
+        dependencies.update(module / name for name in ('character_material_profile.py', 'character_material_profile_template.json', 'prepare_character_fur_curves.py', 'character_fur_texture_contract.py'))
         for tool in (request.static_reader, request.shader_reader, request.visibility_reader):
             dependencies.update(path for path in tool.parent.iterdir() if path.is_file())
         weather = require_object(json.loads(request.weather_manifest.read_text(encoding='utf-8-sig')), 'weather manifest')

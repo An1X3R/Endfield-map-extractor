@@ -912,9 +912,10 @@ def verify_profile_skin_rain(receipt: dict[str, object]) -> dict[str, object]:
         selector = root.nodes.get(selector_name)
         if selector is None or selector.get("endfield_skin_rain_role") != "exact_dry_selector":
             raise AssertionError(f"Saved Skin exact dry selector is missing: {tree_name}/{selector_name}")
-        if single_link(selector.inputs[1], tree_name + "/dry selector").node.node_tree != dry_group:
+        from character_material_authoring import matches_authoring_source_output
+        if not matches_authoring_source_output(single_link(selector.inputs[1], tree_name + "/dry selector"), dry_group):
             raise AssertionError(f"Saved Skin dry selector does not use its pristine source group: {tree_name}")
-        if single_link(selector.inputs[2], tree_name + "/wet selector").node.node_tree != wet_group:
+        if not matches_authoring_source_output(single_link(selector.inputs[2], tree_name + "/wet selector"), wet_group):
             raise AssertionError(f"Saved Skin wet selector does not use its compiled group: {tree_name}")
         selector_gate = single_link(selector.inputs[0], tree_name + "/activation gate").node
         if has_snow:

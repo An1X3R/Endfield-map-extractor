@@ -20,7 +20,7 @@ import struct
 from typing import Literal, TypedDict, cast
 from uuid import uuid4
 
-from endfield_scene_io import SceneInputChangedError, _file_stamp, scene_io_session
+from endfield_scene_io import SceneInputChangedError, _FileStamp, _file_stamp, scene_io_session
 from endfield_scene_material_contract import require_object
 from endfield_scene_resources import describe_file, resolve_path
 from extractor_core import vfs
@@ -28,6 +28,7 @@ from extractor_core.instances import build_instance_database, build_unresolved_a
 from extractor_core.resources import load_group
 from extractor_core.scene_identity import validate_scene_id
 from extractor_core.scene_tables import TableValue, read_scene_table
+from extractor_core.scene_string_pool import read_scene_string_pool
 
 
 class InstancedSceneError(ValueError):
@@ -187,14 +188,35 @@ def _payload(root: Path, group_hash: str, group: vfs.VfsGroup,
     return output.getvalue()
 
 
-def _art_owner(data: bytes, path: str) -> str:
-    """Read the LevelConfig leading length-prefixed art-streaming reference."""
+def _chunk_source_evidence(root: Path, group_hash: str, items: tuple[vfs.VfsFile, ...],
+                           stamps: Mapping[Path, _FileStamp]) -> list[dict[str, object]]:
+    """Bind prepared-scene identity to VFS entries and already-collected CHK stamps."""
+    result: list[dict[str, object]] = []
+    for item in sorted(items, key=lambda row: row.file_name.casefold()):
+        source = root / group_hash / f"{item.file_chunk_md5_name}.chk"
+        stamp = stamps.get(source)
+        if stamp is None:
+            raise InstancedSceneError(f"Missing source stamp for instanced chunk: path={source}")
+        result.append({"virtual_path": item.file_name, "chunk": item.file_chunk_md5_name,
+                       "data_md5": item.file_data_md5.upper(), "offset": item.offset,
+                       "length": item.length, "chunk_stamp": asdict(stamp)})
+    return result
+
+
+def _art_owner(data: bytes, path: str, strings: Mapping[int, str] | None) -> str:
+    """Read an explicitly selected inline or pooled LevelConfig art reference."""
     if len(data) < 6:
         raise InstancedSceneError(f"Truncated LevelConfig art reference: path={path}, bytes={len(data)}")
     size = struct.unpack_from("<i", data, 2)[0]
-    if size < 1 or size > len(data) - 6:
-        raise InstancedSceneError(f"Invalid LevelConfig art reference length: path={path}, length={size}")
-    reference = data[6:6 + size].decode("utf-8").replace("\\", "/")
+    if strings is None:
+        if size < 1 or size > len(data) - 6:
+            raise InstancedSceneError(f"Invalid LevelConfig art reference length: path={path}, length={size}")
+        reference = data[6:6 + size].decode("utf-8")
+    else:
+        if size not in strings:
+            raise InstancedSceneError(f"LevelConfig art string ID is absent: path={path}, string_id={size}")
+        reference = strings[size]
+    reference = reference.replace("\\", "/")
     parts = PurePosixPath(reference).parts
     if len(parts) != 2 or parts[1].casefold() not in (f"{parts[0]}_art_streaming.asset".casefold(), f"{parts[0]}_streaming.asset".casefold()):
         raise InstancedSceneError(f"Unsupported LevelConfig art reference: path={path}, reference={reference!r}")
@@ -301,6 +323,7 @@ def _read_instanced_catalog(runtime_path: Path, check_cancelled: Callable[[], No
     group_names = (_JSON_GROUP, _TABLE_GROUP, _STATIC_GROUP, _DYNAMIC_GROUP)
     sources = _group_sources(root, group_names)
     before = tuple(_file_stamp(source) for source in sources)
+    source_stamps = dict(zip(sources, before, strict=True))
     loaded = {name: load_group(root, name) for name in group_names}
     files = {name: _virtual_files(group) for name, group in loaded.items()}
     payload_hashes: dict[str, str] = {}
@@ -311,6 +334,8 @@ def _read_instanced_catalog(runtime_path: Path, check_cancelled: Callable[[], No
         payload_hashes[name] = hashlib.sha256(data).hexdigest()
         return data
 
+    strings = (read_scene_string_pool(lambda name: read(name, _JSON_GROUP))
+               if "data/json/stringpool/stringpool0.byte" in files[_JSON_GROUP] else None)
     basic_path = "Data/Json/GameplayConfig/LevelBasicInfoTable.json"
     basic = require_object(json.loads(read(basic_path, _JSON_GROUP)), basic_path)
     owners: dict[str, str] = {}
@@ -322,13 +347,16 @@ def _read_instanced_catalog(runtime_path: Path, check_cancelled: Callable[[], No
         config_path = _text(row.get("configPath"), f"LevelBasicInfoTable[{level}].configPath")
         if not config_path.casefold().startswith("data/json/levelconfig/") or ".." in PurePosixPath(config_path).parts:
             raise InstancedSceneError(f"Invalid scene LevelConfig source path: level={level}, path={config_path}")
-        owner = _art_owner(read(config_path, _JSON_GROUP), config_path)
+        owner = _art_owner(read(config_path, _JSON_GROUP), config_path, strings)
         owners[level] = owner
         evidence.setdefault(owner, []).append(_evidence("LevelBasicInfoTable", level, "configPath", config_path, None))
     tables = {name: read_scene_table(read(f"Data/TableCfg/{name}.bytes", _TABLE_GROUP), name)
               for name in ("LevelDescTable", "DungeonTable", "DungeonTypeTable", "I18nTextTable_CN")}
     roots: dict[str, int] = {}
     pattern = re.compile(r"^Data/Streaming/PC/([^/]+)/Streaming/InitChunkData_(?:Global|-?\d+_-?\d+)_0_0\.bytes$", re.I)
+    instance_items = tuple(item for item in files[_STATIC_GROUP].values() if pattern.fullmatch(item.file_name))
+    dynamic_pattern = re.compile(r"^Data/DynamicStreaming/PC/Scene/[^/]+/fb_(?:main|init)_.*\.bytes$", re.I)
+    dynamic_items = tuple(item for item in files[_DYNAMIC_GROUP].values() if dynamic_pattern.fullmatch(item.file_name))
     for item in files[_STATIC_GROUP].values():
         match = pattern.fullmatch(item.file_name)
         if match:
@@ -345,8 +373,12 @@ def _read_instanced_catalog(runtime_path: Path, check_cancelled: Callable[[], No
                        "inputs": {name: {"bytes": value["bytes"], "sha256": value["sha256"]} for name, value in inputs.items()},
                        "sceneProbes": sorted(str(describe_file(probe)["sha256"]) for probe in _shared_probes(path, runtime)),
                        "payloads": payload_hashes,
+                       "sceneChunkDependencies": {
+                           "instances": _chunk_source_evidence(root, _STATIC_GROUP, instance_items, source_stamps),
+                           "dynamic": _chunk_source_evidence(root, _DYNAMIC_GROUP, dynamic_items, source_stamps),
+                       },
                        "groups": {name: describe_file(root / name / f"{name}.blc")["sha256"] for name in group_names},
-                       "reader": hashlib.sha256(Path(__file__).read_bytes() + Path(read_scene_table.__code__.co_filename).read_bytes()).hexdigest()}
+                       "reader": hashlib.sha256(Path(__file__).read_bytes() + Path(read_scene_table.__code__.co_filename).read_bytes() + Path(read_scene_string_pool.__code__.co_filename).read_bytes()).hexdigest()}
     identity = hashlib.sha256(json.dumps(identity_inputs, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     if sources != _group_sources(root, group_names) or before != tuple(_file_stamp(source) for source in sources):
         raise SceneInputChangedError(f"Instanced scene catalog sources changed during read: vfs={root}")
@@ -429,7 +461,7 @@ def read_instanced_catalog(runtime_path: Path, check_cancelled: Callable[[], Non
     sources = _catalog_sources(path, runtime, root)
     stamps = tuple(_file_stamp(source) for source in sources)
     key_inputs = {"sources": [(str(source), asdict(stamp)) for source, stamp in zip(sources, stamps, strict=True)],
-                  "reader": hashlib.sha256(Path(__file__).read_bytes() + Path(read_scene_table.__code__.co_filename).read_bytes()).hexdigest()}
+                  "reader": hashlib.sha256(Path(__file__).read_bytes() + Path(read_scene_table.__code__.co_filename).read_bytes() + Path(read_scene_string_pool.__code__.co_filename).read_bytes()).hexdigest()}
     key = hashlib.sha256(json.dumps(key_inputs, sort_keys=True).encode()).hexdigest()
     cache_path = cache / "catalog.json"
     catalog: InstancedSceneCatalog
@@ -484,10 +516,24 @@ def _prepared_from_marker(marker: Path, scene: str, identity: str, input_hash: s
             raise SceneInputChangedError(f"Prepared scene artifact changed: path={source}")
         resolved[key] = source
     bounds = require_object(value.get("bounds"), "prepared scene bounds")
-    if any(type(bounds.get(key)) not in (int, float) or not math.isfinite(cast(float, bounds[key])) for key in ("xmin", "xmax", "zmin", "zmax")):
-        raise InstancedSceneError(f"Invalid prepared scene bounds: path={marker}")
-    if cast(float, bounds["xmin"]) >= cast(float, bounds["xmax"]) or cast(float, bounds["zmin"]) >= cast(float, bounds["zmax"]):
+    numeric_bounds: dict[str, float] = {}
+    for key in ("xmin", "xmax", "zmin", "zmax"):
+        coordinate = bounds.get(key)
+        if type(coordinate) not in (int, float):
+            raise InstancedSceneError(f"Invalid prepared scene bounds: path={marker}")
+        try:
+            numeric = float(coordinate)
+        except OverflowError as error:
+            raise InstancedSceneError(f"Invalid prepared scene bounds: path={marker}") from error
+        if not math.isfinite(numeric):
+            raise InstancedSceneError(f"Invalid prepared scene bounds: path={marker}")
+        numeric_bounds[key] = numeric
+    if numeric_bounds["xmin"] >= numeric_bounds["xmax"] or numeric_bounds["zmin"] >= numeric_bounds["zmax"]:
         raise InstancedSceneError(f"Empty prepared scene bounds: path={marker}")
+    if any(not math.isclose(numeric_bounds[key] / 128.0,
+                            round(numeric_bounds[key] / 128.0), rel_tol=0.0, abs_tol=1e-9)
+           for key in ("xmin", "xmax", "zmin", "zmax")):
+        raise InstancedSceneError(f"Prepared scene bounds are not aligned to the 128 m grid: path={marker}")
     from types import MappingProxyType
 
     limits = value.get("limitations")

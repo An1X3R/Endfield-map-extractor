@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -154,12 +155,32 @@ def _ready_resource_paths(
     from endfield_scene_effects_plan import _shader_default_issues
 
     mesh_keys: set[tuple[str, int]] = set()
+    terrain_metadata_paths: set[str] = set()
     water_keys: set[tuple[str, int]] = set()
     array_keys: set[tuple[str, int]] = set()
     water_records: list[tuple[str, dict[str, object]]] = []
     containers: list[dict[str, object]] = []
     for path in manifests:
         data = require_object(read_scene_manifest(path), str(path))
+        terrain_metadata: list[tuple[str, tuple[str, int]]] = []
+        for value in cast(list[object], data["Containers"]):
+            row = require_object(value, "container")
+            asset = row.get("Asset")
+            container = str(row["Container"]).replace("\\", "/").casefold()
+            if (isinstance(asset, dict) and asset.get("Type") == "MonoBehaviour" and selects_container(container)
+                    and re.fullmatch(r"assets/beyond/dynamicassets/scenes/pc/[a-z0-9_]+/terrain/hgterrainsurfacesdata\.asset", container)):
+                terrain_metadata.append((container, reference_key(asset)))
+        terrain_sources = {key[0] for _, key in terrain_metadata}
+        serialized_sources = {
+            str(row["Name"]).casefold()
+            for value in cast(list[object], data.get("SerializedFiles", []))
+            for row in [require_object(value, "serialized source")]
+            if isinstance(row.get("Name"), str) and str(row["Name"]).casefold() in terrain_sources
+            and isinstance(row.get("OriginalPath"), str)
+            and row["OriginalPath"]
+            and resolve_path(row["OriginalPath"], path.parent).is_file()
+        }
+        terrain_metadata_paths.update(container for container, key in terrain_metadata if key[0] in serialized_sources)
         array_keys.update(ready_texture_arrays(data, path.parent))
         water = require_object(data.get("Water", {}), "water records")
         for kind in ("Configs", "GlobalConfigs", "Sectors"):
@@ -229,7 +250,7 @@ def _ready_resource_paths(
             if (sweep_metadata_ready and not _shader_default_issues(material)
                     and all(slot["Texture"] is None or reference_key(slot["Texture"]) in textures for slot in slots)):
                 ready.add(container)
-        elif asset.get("Type") == "MonoBehaviour" and key in water_keys:
+        elif asset.get("Type") == "MonoBehaviour" and (key in water_keys or container in terrain_metadata_paths):
             ready.add(container)
         elif asset.get("Type") == "Texture2D" and key in textures:
             ready.add(container)
@@ -358,6 +379,17 @@ def ensure_scene_resources(runtime_path: Path, plan_path: Path,
     required_uv_paths = frozenset(row["mesh_path"] for row in uv_requirements)
     if uv_requirements:
         missing |= required_uv_paths - ready_uv_stream_paths(manifests, tuple(uv_requirements))
+    from endfield_scene_prefab_geometry_plan import observed_prefab_geometry_paths
+    from endfield_scene_planning_catalog import load_planning_catalog
+
+    prefab_values = plan.get("required_prefab_geometry_paths", [])
+    if not isinstance(prefab_values, list) or any(not isinstance(path, str) or path not in requested for path in prefab_values):
+        raise ValueError("Ordinary prefab requests must be a subset of required_resource_paths")
+    required_prefabs = frozenset(cast(list[str], prefab_values))
+    if required_prefabs:
+        catalog = load_planning_catalog(manifests, cache_root)
+        prefab_ready = observed_prefab_geometry_paths(manifests, required_prefabs, catalog.materials, catalog.textures)
+        missing = (missing - required_prefabs) | (required_prefabs - prefab_ready)
     if not missing:
         return {"status": "ready", "requested": len(requested), "missing": []}
     root = resource_cache_root(runtime_path, runtime)
@@ -440,7 +472,12 @@ def ensure_scene_resources(runtime_path: Path, plan_path: Path,
             after = ready_requested_resource_paths((*manifests, manifest), requested, cache_root)
             stream_missing = (required_streams - ready_effect_mesh_paths((*manifests, manifest))) if required_streams else frozenset()
             uv_missing = (required_uv_paths - ready_uv_stream_paths((*manifests, manifest), tuple(uv_requirements))) if uv_requirements else frozenset()
-            result["missingAfter"] = sorted((requested - after) | stream_missing | uv_missing)
+            prefab_missing: frozenset[str] = frozenset()
+            if required_prefabs:
+                catalog = load_planning_catalog((*manifests, manifest), cache_root)
+                prefab_missing = required_prefabs - observed_prefab_geometry_paths(
+                    (*manifests, manifest), required_prefabs, catalog.materials, catalog.textures)
+            result["missingAfter"] = sorted((requested - after - required_prefabs) | stream_missing | uv_missing | prefab_missing)
             prior = existing["manifests"]
             if not isinstance(prior, list):
                 raise ValueError("Supplement index requires a manifest list")
@@ -454,3 +491,121 @@ def ensure_scene_resources(runtime_path: Path, plan_path: Path,
         return result
     finally:
         lock.unlink()
+
+def _prefab_bounds_game_generation(game: Path) -> tuple[str, list[dict[str, object]]]:
+    """Reuse the existing executable and VFS generation guard for metadata caches."""
+    from endfield_character_sources import game_source_stamps
+
+    stamps = game_source_stamps(game)
+    digest = hashlib.sha256(json.dumps(stamps, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    return digest, stamps
+
+
+def ensure_prefab_bounds_manifests(
+    runtime_path: Path, requested: frozenset[str], check_cancelled: Callable[[], None],
+) -> tuple[Path, ...]:
+    """Cache source hierarchy and vertex bounds without exporting meshes or images."""
+    import shutil
+    from endfield_scene_export import run_scene_process
+
+    if not requested:
+        return ()
+    if any(not path.startswith(("assets/", "packages/")) or not path.endswith(".prefab") for path in requested):
+        raise ValueError("Prefab bounds requests require normalized exact prefab asset paths")
+    runtime = read_json(runtime_path)
+    extraction = require_object(runtime["extraction"], "bounds runtime extraction")
+    paths = require_object(runtime["paths"], "bounds runtime paths")
+    source_root = resource_cache_root(runtime_path, runtime)
+    discovery = require_object(extraction["sceneDiscovery"], "bounds scene discovery")
+    resource_index = source_root / "index.json"
+    existing = read_json(resource_index) if resource_index.is_file() else {}
+    descriptor = existing.get("providerIndex")
+    coverage = existing.get("providerCoverage")
+    if descriptor is None:
+        descriptor = discovery.get("scannerResults")
+        coverage = discovery.get("providerCoverage")
+    if coverage not in (PROVIDER_COVERAGE, PACKAGE_PROVIDER_COVERAGE) or (any(path.startswith("packages/") for path in requested) and coverage != PACKAGE_PROVIDER_COVERAGE):
+        raise ValueError(f"Prefab bounds require a complete prepared provider index: coverage={coverage}, runtime={runtime_path}")
+    provider = require_object(descriptor, "bounds provider descriptor")
+    provider_path = resolve_path(provider["path"], runtime_path.parent)
+    if describe_file(provider_path) != provider:
+        raise ValueError(f"Prefab bounds provider index changed: path={provider_path}")
+    providers = exact_providers(provider_path, requested)
+    unresolved = {path: list(names) for path, names in providers.items() if len(names) != 1}
+    roots = sorted({names[0] for names in providers.values() if len(names) == 1})
+    helpers = require_prepared_scene_helpers(runtime_path, resolve_path(paths["cache_root"], runtime_path.parent))
+    probe_identity = str(describe_file(helpers.probe)["sha256"])
+    game = resolve_path(paths["game_root"], runtime_path.parent)
+    game_identity, game_stamps = _prefab_bounds_game_generation(game)
+    root = source_root / "prefab_bounds" / probe_identity[:16] / game_identity
+    root.mkdir(parents=True, exist_ok=True)
+    game_sources = root / "game_sources.json"
+    generation = {"format": "EndfieldPrefabBoundsGameSources/1", "sha256": game_identity, "stamps": game_stamps}
+    if game_sources.is_file():
+        if read_json(game_sources) != generation:
+            raise ValueError(f"Prefab bounds game source generation differs: path={game_sources}")
+    else:
+        write_index(game_sources, generation)
+    groups = {hashlib.sha256("\n".join(roots[index:index + 16]).encode()).hexdigest()[:24]: roots[index:index + 16]
+              for index in range(0, len(roots), 16)}
+    manifests: dict[str, Path] = {}
+    missing: dict[str, list[str]] = {}
+    for key, names in groups.items():
+        receipt = root / key / "receipt.json"
+        if not receipt.is_file():
+            missing[key] = names
+            continue
+        row = read_json(receipt)
+        record = require_object(row.get("manifest"), "prefab bounds manifest descriptor")
+        manifest = resolve_path(record["path"], root)
+        if (row.get("roots") != names or row.get("probeSha256") != probe_identity or row.get("gameSourceSha256") != game_identity
+                or not manifest.is_relative_to(root)
+                or describe_file(manifest) != record):
+            raise ValueError(f"Prefab bounds cache integrity differs: receipt={receipt}")
+        manifests[key] = manifest
+    lock = root / "preparing.lock"
+    if missing:
+        with lock.open("x", encoding="utf-8") as stream:
+            stream.write(str(os.getpid()))
+        try:
+            cab = resolve_path(require_object(discovery["cabInventory"], "bounds CAB inventory")["path"], runtime_path.parent)
+            closures, metadata = read_bundle_closure_names(missing, cab)
+            vfs = resolve_path(paths["game_root"], runtime_path.parent) / "Endfield_Data" / "StreamingAssets" / "VFS"
+            database = resolve_path(extraction["resourceDatabase"], runtime_path.parent)
+            for key, names in missing.items():
+                check_cancelled()
+                work = root / key / uuid4().hex
+                work.mkdir(parents=True)
+                bundles = work / "bundles"
+                environment = {**os.environ, "TEMP": str(work), "TMP": str(work), "PYTHONDONTWRITEBYTECODE": "1"}
+
+                def cancelled() -> bool:
+                    check_cancelled()
+                    return False
+
+                extraction_report = extract_candidate_bundles(database, vfs, closures[key], bundles,
+                                                               progress=None, cancelled=cancelled)
+                output = work / "probe"
+                run_scene_process([str(helpers.probe), str(bundles), str(output), "--manifest-only"],
+                                  work / "probe.log", environment, check_cancelled)
+                manifest = output / "scene_manifest.json"
+                payload = read_json(manifest)
+                if payload.get("Format") != "EndfieldSceneProbe/1" or not isinstance(payload.get("MeshBounds"), list):
+                    raise ValueError(f"Prefab bounds probe lacks source mesh bounds: path={manifest}")
+                write_index(root / key / "receipt.json", {"format": "EndfieldPrefabBoundsBatch/1", "roots": names,
+                    "probeSha256": probe_identity, "gameSourceSha256": game_identity,
+                    "manifest": describe_file(manifest), "extraction": extraction_report,
+                    "closure": metadata["maps"][key]})
+                manifests[key] = manifest
+                resolved_bundles = bundles.resolve()
+                if resolved_bundles.parent != work.resolve() or not resolved_bundles.is_relative_to(root.resolve()):
+                    raise ValueError(f"Prefab bounds temporary bundle deletion escaped its cache: path={resolved_bundles}")
+                shutil.rmtree(resolved_bundles)
+        finally:
+            lock.unlink()
+    if _prefab_bounds_game_generation(game)[0] != game_identity:
+        raise OSError(f"Game files changed during prefab bounds preparation; refresh prepared sources after the update: game={game}")
+    write_index(root / "selection_inputs.json", {"format": "EndfieldPrefabBoundsInputs/1", "requested": sorted(requested),
+        "gameSources": describe_file(game_sources), "unresolvedProviders": unresolved,
+        "manifests": [describe_file(manifests[key]) for key in groups]})
+    return tuple(manifests[key] for key in groups)

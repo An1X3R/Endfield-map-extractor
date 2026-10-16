@@ -3,7 +3,7 @@ using System.Text;
 using System.Text.Json;
 using AnimeStudio;
 
-internal sealed record AnimationRequest(string Format, string CharacterId, string AvatarBundle, string AvatarCab, long AvatarPathId, string ClipBundle, string ResourcePath, string SourceAudit, string AnimatorRootPath, string? ControllerBundle, string UnityVersion, int MaximumStoredFrames, string Output);
+internal sealed record AnimationRequest(string Format, string CharacterId, string AvatarBundle, string AvatarCab, long AvatarPathId, string ClipBundle, string ResourcePath, string SourceAudit, string AnimatorRootPath, string? ControllerBundle, string UnityVersion, int MaximumStoredFrames, string Output, string? ControllerSelectionReceipt);
 
 /// <summary>Validates configuration NPC source identities before reusing the established samplers.</summary>
 internal static class NpcAnimationReader
@@ -19,15 +19,40 @@ internal static class NpcAnimationReader
             if (request.Format != "EndfieldAnimationExportRequest/1" || request.MaximumStoredFrames < 2 || request.ControllerBundle != null)
                 throw new InvalidDataException("NPC CPU source reader requires an explicit frame budget and no inferred controller.");
             using var audit = JsonDocument.Parse(File.ReadAllBytes(request.SourceAudit));
-            VerifySources(request, audit.RootElement);
+            string sourceFormat = audit.RootElement.GetProperty("format").GetString() ?? throw new InvalidDataException("NPC source audit has no format.");
+            bool enemySource = sourceFormat == "EndfieldEnemyAnimationSource/1";
+            bool genericEquivalentAvatar = audit.RootElement.TryGetProperty("avatar_binding_status", out var bindingMode) && bindingMode.GetString() == "source_generic_equivalent_avatar";
+            if (enemySource)
+                EnemyAnimationSourceVerifier.Verify(request, audit.RootElement, Options);
+            else VerifySources(request, audit.RootElement);
             Program.Run(request);
             ScalarBinding[] scalarBindings = JsonSerializer.Deserialize<ScalarBinding[]>(File.ReadAllText(Path.Combine(request.Output, "native", "scalar_bindings.json")), Options) ?? throw new InvalidDataException("NPC scalar bindings are null.");
+            using var clipAudit = JsonDocument.Parse(File.ReadAllBytes(Path.Combine(request.Output, "native", "clip_audit.json")));
             using var rootHeader = JsonDocument.Parse(File.ReadAllText(Path.Combine(request.Output, "native", "root_motion_header.json")));
-            if (NpcQvvfProgram.SupportsLayout(scalarBindings, rootHeader.RootElement.GetProperty("tracks").GetInt32()))
+            int rootTrackCount = rootHeader.RootElement.GetProperty("tracks").GetInt32();
+            int auditedRootTrackCount = clipAudit.RootElement.GetProperty("root_track_count").GetInt32();
+            if (rootTrackCount != auditedRootTrackCount)
+                throw new InvalidDataException($"ACL root-motion header disagrees with the parsed clip: header_tracks={rootTrackCount}, clip_tracks={auditedRootTrackCount}.");
+            NpcRootLayoutKind rootLayout = NpcQvvfProgram.IdentifyLayout(scalarBindings, clipAudit.RootElement);
+            bool hasIndependentRootSignature = NpcQvvfProgram.HasIndependentRootSignature(scalarBindings, rootTrackCount);
+            if (hasIndependentRootSignature && rootLayout == NpcRootLayoutKind.Unsupported)
             {
-                if (audit.RootElement.TryGetProperty("avatar_binding_status", out var bindingMode) && bindingMode.GetString() == "source_humanoid_to_selected_avatar")
+                bool legacy = clipAudit.RootElement.GetProperty("m_legacy").GetBoolean();
+                bool motionFloatCurves = clipAudit.RootElement.GetProperty("m_has_motion_float_curves").GetBoolean();
+                bool genericRootTransform = clipAudit.RootElement.GetProperty("m_has_generic_root_transform").GetBoolean();
+                string attributes = string.Join(',', scalarBindings.Select(binding => binding.AttributeName ?? $"custom:{binding.Attribute}"));
+                throw new InvalidDataException($"NPC clip contains MotionT/MotionQ or RootT/RootQ scalar channels with an unsupported root layout: legacy={legacy}, motion_float_curves={motionFloatCurves}, generic_root_transform={genericRootTransform}, root_tracks={rootTrackCount}, float_curves={scalarBindings.Length}, attributes={attributes}.");
+            }
+            if (rootLayout != NpcRootLayoutKind.Unsupported)
+            {
+                if (audit.RootElement.TryGetProperty("avatar_binding_status", out var retargetMode) && retargetMode.GetString() == "source_humanoid_to_selected_avatar")
                     throw new InvalidDataException("Cross-Avatar export requires actual Humanoid muscle channels; qvvf-only layout is unsupported.");
                 NpcQvvfProgram.Export(request, Options);
+            }
+            else if (enemySource || genericEquivalentAvatar || !NpcQvvfProgram.HasHumanoidMuscleChannels(scalarBindings))
+            {
+                string attributes = string.Join(',', scalarBindings.Select(binding => binding.AttributeName ?? $"custom:{binding.Attribute}"));
+                throw new InvalidDataException($"Source-backed action has no validated qvvf root layout and no Humanoid muscle channels: root_tracks={rootTrackCount}, float_curves={scalarBindings.Length}, attributes={attributes}.");
             }
             else HumanoidProgram.Run(request);
             return 0;
@@ -39,7 +64,7 @@ internal static class NpcAnimationReader
         }
     }
 
-    private static JsonDocument ReadEvidence(JsonElement audit, string field)
+    internal static JsonDocument ReadEvidence(JsonElement audit, string field)
     {
         var row = audit.GetProperty(field);
         string path = row.GetProperty("path").GetString() ?? throw new InvalidDataException($"Null evidence path: {field}.");
@@ -57,8 +82,13 @@ internal static class NpcAnimationReader
         using var cpu = ReadEvidence(audit, "cpu_source");
         using var avatarJson = ReadEvidence(audit, "avatar_source");
         using var clipJson = ReadEvidence(audit, "clip_source");
-        bool retarget = audit.TryGetProperty("avatar_binding_status", out var mode) && mode.GetString() == "source_humanoid_to_selected_avatar";
-        using var cpuAvatarJson = retarget ? ReadEvidence(audit, "cpu_avatar_source") : null;
+        string bindingMode = audit.GetProperty("avatar_binding_status").GetString() ?? throw new InvalidDataException("NPC Avatar binding status is null.");
+        bool retarget = bindingMode == "source_humanoid_to_selected_avatar";
+        bool genericEquivalent = bindingMode == "source_generic_equivalent_avatar";
+        bool exactAvatar = bindingMode == "exact_avatar";
+        if (!retarget && !genericEquivalent && !exactAvatar) throw new InvalidDataException($"Unsupported NPC Avatar binding status: {bindingMode}.");
+        bool crossAvatar = retarget || genericEquivalent;
+        using var cpuAvatarJson = crossAvatar ? ReadEvidence(audit, "cpu_avatar_source") : null;
         var selected = input.RootElement.GetProperty("selection");
         var avatarSpec = input.RootElement.GetProperty("avatar");
         if (input.RootElement.GetProperty("format").GetString() != "EndfieldNpcAssemblyInput/1" || selected.GetProperty("character_id").GetString() != request.CharacterId ||
@@ -70,14 +100,23 @@ internal static class NpcAnimationReader
         crc.Update(tagBytes, 0, (uint)tagBytes.Length);
         if (unchecked((uint)cpu.RootElement.GetProperty("configTag").GetProperty("tagId").GetInt32()) != crc.GetDigest())
             throw new InvalidDataException("CPU GameplayTag disagrees with exact PrefabInfo template.");
-        if (retarget)
+        if (crossAvatar)
         {
             var meta = cpuAvatarJson!.RootElement.GetProperty("$animestudio");
             VerifyPointer(cpu.RootElement, "$.avatar", cpu.RootElement.GetProperty("avatar"), meta.GetProperty("sourceFile").GetString()!, meta.GetProperty("pathId").GetInt64());
-            int[] sourceSlots = cpuAvatarJson.RootElement.GetProperty("m_Avatar").GetProperty("m_Human").GetProperty("m_HumanBoneIndex").EnumerateArray().Select(value => value.GetInt32()).ToArray();
-            int[] targetSlots = avatarJson.RootElement.GetProperty("m_Avatar").GetProperty("m_Human").GetProperty("m_HumanBoneIndex").EnumerateArray().Select(value => value.GetInt32()).ToArray();
-            if (sourceSlots.Length != 25 || targetSlots.Length != 25 || sourceSlots[0] < 0 || targetSlots[0] < 0 || sourceSlots.Where((index, slot) => index >= 0 && targetSlots[slot] < 0).Any())
-                throw new InvalidDataException("Target Human Avatar lacks required CPU Human slots.");
+            if (retarget)
+            {
+                int[] sourceSlots = cpuAvatarJson.RootElement.GetProperty("m_Avatar").GetProperty("m_Human").GetProperty("m_HumanBoneIndex").EnumerateArray().Select(value => value.GetInt32()).ToArray();
+                int[] targetSlots = avatarJson.RootElement.GetProperty("m_Avatar").GetProperty("m_Human").GetProperty("m_HumanBoneIndex").EnumerateArray().Select(value => value.GetInt32()).ToArray();
+                if (sourceSlots.Length != 25 || targetSlots.Length != 25 || sourceSlots[0] < 0 || targetSlots[0] < 0 || sourceSlots.Where((index, slot) => index >= 0 && targetSlots[slot] < 0).Any())
+                    throw new InvalidDataException("Target Human Avatar lacks required CPU Human slots.");
+            }
+            else
+            {
+                var cpuAvatarIdentity = cpuAvatarJson.RootElement.GetProperty("$animestudio");
+                if (request.AvatarCab.Equals(cpuAvatarIdentity.GetProperty("sourceFile").GetString(), StringComparison.OrdinalIgnoreCase) && request.AvatarPathId == cpuAvatarIdentity.GetProperty("pathId").GetInt64())
+                    throw new InvalidDataException("Generic cross-Avatar proof refers to the selected Avatar itself.");
+            }
         }
         else VerifyPointer(cpu.RootElement, "$.avatar", cpu.RootElement.GetProperty("avatar"), request.AvatarCab, request.AvatarPathId);
         string stateName = audit.GetProperty("state_name").GetString()!;
@@ -97,7 +136,7 @@ internal static class NpcAnimationReader
         try
         {
             var sourceBundles = new List<string> { request.AvatarBundle, request.ClipBundle, audit.GetProperty("cpu_bundle").GetString()! };
-            if (retarget) sourceBundles.Add(audit.GetProperty("cpu_avatar_bundle").GetString()!);
+            if (crossAvatar) sourceBundles.Add(audit.GetProperty("cpu_avatar_bundle").GetString()!);
             manager.LoadPreparedFiles(sourceBundles.Distinct().ToArray());
             logger.RequireSuccess();
             File.WriteAllText(Path.Combine(request.Output, "npc_hierarchy_inventory.json"), JsonSerializer.Serialize(manager.assetsFileList.Select(file => new {
@@ -113,10 +152,11 @@ internal static class NpcAnimationReader
             }), Options));
             Avatar avatar = manager.assetsFileList.SelectMany(file => file.Objects.OfType<Avatar>()).Single(value => value.m_PathID == request.AvatarPathId && value.assetsFile.fileName.Equals(request.AvatarCab, StringComparison.OrdinalIgnoreCase));
             VerifyObject(avatar, avatarJson.RootElement.GetProperty("$animestudio"));
-            if (retarget)
+            Avatar? cpuAvatar = null;
+            if (crossAvatar)
             {
                 var meta = cpuAvatarJson!.RootElement.GetProperty("$animestudio");
-                Avatar cpuAvatar = manager.assetsFileList.SelectMany(file => file.Objects.OfType<Avatar>()).Single(value => value.m_PathID == meta.GetProperty("pathId").GetInt64() && value.assetsFile.fileName.Equals(meta.GetProperty("sourceFile").GetString(), StringComparison.OrdinalIgnoreCase));
+                cpuAvatar = manager.assetsFileList.SelectMany(file => file.Objects.OfType<Avatar>()).Single(value => value.m_PathID == meta.GetProperty("pathId").GetInt64() && value.assetsFile.fileName.Equals(meta.GetProperty("sourceFile").GetString(), StringComparison.OrdinalIgnoreCase));
                 VerifyObject(cpuAvatar, meta);
             }
             if (!Hash(avatar).Equals(avatarSpec.GetProperty("raw_data_sha256").GetString(), StringComparison.OrdinalIgnoreCase))
@@ -126,22 +166,60 @@ internal static class NpcAnimationReader
             VerifyObject(cpuObject, cpuMeta);
             var clip = manager.assetsFileList.SelectMany(file => file.Objects.OfType<AnimationClip>()).Single(value => value.m_PathID == clipId && value.assetsFile.fileName.Equals(clipCab, StringComparison.OrdinalIgnoreCase));
             VerifyObject(clip, clipMeta);
+            if (genericEquivalent) VerifyGenericAvatarProof(audit, cpuAvatarJson!.RootElement, avatarJson.RootElement, cpuAvatar!, avatar, clip);
             var file = avatar.assetsFile;
             avatar = new Avatar(new ObjectReader(file.reader, file, file.m_Objects.Single(value => value.m_PathID == avatar.m_PathID), manager.Game));
             if (avatar.reader.Position - avatar.reader.byteStart != avatar.byteSize) throw new InvalidDataException("Avatar parser did not consume the complete source object.");
             VerifyHierarchy(avatar, audit, request.AnimatorRootPath);
             File.WriteAllText(Path.Combine(request.Output, "avatar_parsed.json"), Newtonsoft.Json.JsonConvert.SerializeObject(avatar, Newtonsoft.Json.Formatting.Indented));
-            File.WriteAllText(Path.Combine(request.Output, "npc_source_verification.json"), JsonSerializer.Serialize(new { status = "exact_cpu_template_avatar_and_base_clip_verified", binding_mode = retarget ? "source_humanoid_to_selected_avatar" : "exact_avatar", cpu_template = template, state_name = stateName, avatar_cab = request.AvatarCab, avatar_path_id = request.AvatarPathId, cpu_avatar = retarget ? cpuAvatarJson!.RootElement.GetProperty("$animestudio") : avatarJson.RootElement.GetProperty("$animestudio"), clip_cab = clipCab, clip_path_id = clipId, runtime_animator_reconstructed = false, scope = retarget ? "Authenticated source CPU Avatar and base clip; target Human referential reconstructs the selected Avatar. No runtime controller state or complete Unity retargeting equivalence." : "Single source CPU base clip and exact Avatar; no runtime controller state or cross-Avatar retargeting." }, Options));
+            File.WriteAllText(Path.Combine(request.Output, "npc_source_verification.json"), JsonSerializer.Serialize(new { status = "exact_cpu_template_avatar_and_base_clip_verified", binding_mode = bindingMode, cpu_template = template, state_name = stateName, avatar_cab = request.AvatarCab, avatar_path_id = request.AvatarPathId, cpu_avatar = crossAvatar ? cpuAvatarJson!.RootElement.GetProperty("$animestudio") : avatarJson.RootElement.GetProperty("$animestudio"), clip_cab = clipCab, clip_path_id = clipId, runtime_animator_reconstructed = false, scope = retarget ? "Authenticated source CPU Avatar and base clip; target Human referential reconstructs the selected Avatar. No runtime controller state or complete Unity retargeting equivalence." : genericEquivalent ? "Authenticated source CPU Avatar, selected Avatar, Generic clip transform bindings and source pose-equivalence proof. No runtime controller state or complete Unity Generic retargeting equivalence." : "Single source CPU base clip and exact Avatar; no runtime controller state or cross-Avatar retargeting." }, Options));
         }
         finally { manager.Clear(); }
     }
 
-    private static string Hash(AnimeStudio.Object value) => Convert.ToHexString(SHA256.HashData(value.GetRawData()));
+    internal static string Hash(AnimeStudio.Object value) => Convert.ToHexString(SHA256.HashData(value.GetRawData()));
 
-    private static void VerifyObject(AnimeStudio.Object value, JsonElement metadata)
+    internal static void VerifyObject(AnimeStudio.Object value, JsonElement metadata)
     {
         if (metadata.GetProperty("byteSize").GetInt64() != value.byteSize || metadata.GetProperty("rawDataLength").GetInt64() != value.byteSize || !Hash(value).Equals(metadata.GetProperty("rawDataSha256").GetString(), StringComparison.OrdinalIgnoreCase))
             throw new InvalidDataException($"Source JSON does not authenticate actual object bytes: {value.assetsFile.fileName}/{value.m_PathID}.");
+    }
+
+    private static void VerifyGenericAvatarProof(JsonElement audit, JsonElement cpuAvatarJson, JsonElement targetAvatarJson, Avatar cpuAvatar, Avatar targetAvatar, AnimationClip clip)
+    {
+        JsonElement proof = audit.GetProperty("generic_avatar_equivalence");
+        if (proof.GetProperty("format").GetString() != "NpcGenericAvatarEquivalence/1")
+            throw new InvalidDataException("Generic Avatar equivalence proof has an unsupported format.");
+        double tolerance = proof.GetProperty("tolerance").GetDouble();
+        if (tolerance != 1e-6) throw new InvalidDataException($"Generic Avatar pose tolerance is unsupported: tolerance={tolerance}.");
+
+        string sourceDigest = cpuAvatarJson.GetProperty("$animestudio").GetProperty("rawDataSha256").GetString() ?? throw new InvalidDataException("CPU Avatar raw-data hash is null.");
+        string targetDigest = targetAvatarJson.GetProperty("$animestudio").GetProperty("rawDataSha256").GetString() ?? throw new InvalidDataException("Selected Avatar raw-data hash is null.");
+        string auditSourceDigest = audit.GetProperty("cpu_avatar_source_sha256").GetString() ?? throw new InvalidDataException("Generic proof CPU Avatar hash is null.");
+        string auditTargetDigest = audit.GetProperty("target_avatar_source_sha256").GetString() ?? throw new InvalidDataException("Generic proof selected Avatar hash is null.");
+        if (!sourceDigest.Equals(auditSourceDigest, StringComparison.OrdinalIgnoreCase) ||
+            !targetDigest.Equals(auditTargetDigest, StringComparison.OrdinalIgnoreCase) ||
+            !proof.GetProperty("source_avatar_sha256").GetString()!.Equals(sourceDigest, StringComparison.OrdinalIgnoreCase) ||
+            !proof.GetProperty("target_avatar_sha256").GetString()!.Equals(targetDigest, StringComparison.OrdinalIgnoreCase) ||
+            !NpcAnimationReader.Hash(cpuAvatar).Equals(sourceDigest, StringComparison.OrdinalIgnoreCase) ||
+            !NpcAnimationReader.Hash(targetAvatar).Equals(targetDigest, StringComparison.OrdinalIgnoreCase))
+            throw new InvalidDataException("Generic Avatar equivalence proof hashes do not match the authenticated source and selected Avatar objects.");
+
+        int clipCount = proof.GetProperty("clip_count").GetInt32();
+        int transformBindingCount = proof.GetProperty("transform_binding_count").GetInt32();
+        int drivenPathCount = proof.GetProperty("driven_path_count").GetInt32();
+        int validatedPathCount = proof.GetProperty("validated_path_count").GetInt32();
+        int sourceSkeletonCount = cpuAvatar.m_Avatar.m_AvatarSkeleton.m_ID.Length;
+        int targetSkeletonCount = targetAvatar.m_Avatar.m_AvatarSkeleton.m_ID.Length;
+        int actualTransformBindingCount = clip.m_ClipBindingConstant.genericBindings.Count(binding => binding.typeID == ClassIDType.Transform);
+        if (clipCount != 1 || transformBindingCount != actualTransformBindingCount || transformBindingCount <= 0 ||
+            drivenPathCount <= 0 || validatedPathCount < drivenPathCount || validatedPathCount > Math.Min(sourceSkeletonCount, targetSkeletonCount))
+            throw new InvalidDataException($"Generic Avatar equivalence proof counts disagree with the actual clip or Avatar skeletons: clips={clipCount}, transform_bindings={transformBindingCount}, actual_transform_bindings={actualTransformBindingCount}, driven_paths={drivenPathCount}, validated_paths={validatedPathCount}, source_skeleton={sourceSkeletonCount}, target_skeleton={targetSkeletonCount}.");
+
+        double maximumDefaultDelta = proof.GetProperty("max_default_pose_delta").GetDouble();
+        double maximumSkeletonDelta = proof.GetProperty("max_avatar_skeleton_pose_delta").GetDouble();
+        if (!double.IsFinite(maximumDefaultDelta) || !double.IsFinite(maximumSkeletonDelta) || maximumDefaultDelta < 0d || maximumSkeletonDelta < 0d || maximumDefaultDelta > tolerance || maximumSkeletonDelta > tolerance)
+            throw new InvalidDataException($"Generic Avatar equivalence proof exceeds its source-pose tolerance: default_pose_delta={maximumDefaultDelta}, avatar_skeleton_pose_delta={maximumSkeletonDelta}, tolerance={tolerance}.");
     }
 
     private static void VerifyPointer(JsonElement source, string path, JsonElement pointer, string cab, long pathId)
@@ -154,7 +232,7 @@ internal static class NpcAnimationReader
         if (!cab.Equals(actual, StringComparison.OrdinalIgnoreCase)) throw new InvalidDataException($"Source pointer target CAB disagrees: {path}.");
     }
 
-    private static void VerifyHierarchy(Avatar avatar, JsonElement audit, string root)
+    internal static void VerifyHierarchy(Avatar avatar, JsonElement audit, string root)
     {
         var paths = avatar.m_Avatar.m_AvatarSkeleton.m_ID.Select(id => avatar.FindBonePath(id)).ToArray();
         var nodes = audit.GetProperty("transforms").EnumerateArray().ToArray();

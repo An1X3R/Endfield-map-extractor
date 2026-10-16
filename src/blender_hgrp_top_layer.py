@@ -9,7 +9,8 @@ import bpy
 from blender_hgrp_surface import packed_normal_group, authored_albedo_output
 from blender_scene_effect_layers import _link, _math, _scale, _vec, _sampler_settings
 from blender_scene_materials import texture_image
-from endfield_scene_material_contract import MaterialRecord, reference_key, has_shader_white_texture_default
+from endfield_scene_material_contract import (MaterialRecord, reference_key, has_shader_white_texture_default,
+                                             shader_constant_texture_default, top_layer_runtime_limitations)
 
 
 class LayerSample(NamedTuple):
@@ -52,15 +53,22 @@ def _uv(tree: bpy.types.NodeTree, channel: int) -> bpy.types.NodeSocket:
 def _sample(material: bpy.types.Material, record: MaterialRecord, property_name: str,
             textures: dict[tuple[str, int], tuple[Path, str]], uv: bpy.types.NodeSocket,
             colorspace: str, pack: bool) -> LayerSample:
-    slot = next(row for row in record["Textures"] if row["Property"] == property_name)
-    ref = slot["Texture"]
+    slot = next((row for row in record["Textures"] if row["Property"] == property_name), None)
+    ref = slot["Texture"] if slot is not None else None
     if ref is None:
-        if has_shader_white_texture_default(record, property_name):
+        declared = shader_constant_texture_default(record, property_name)
+        if declared is not None:
             color = material.node_tree.nodes.new("ShaderNodeRGB")
-            color.outputs[0].default_value = (1, 1, 1, 1)
-            color.label = property_name + " authored white default"
+            color.outputs[0].default_value = declared
+            color.name = color.label = property_name + " declared Shader default"
+            color["endfield_source_texture_property"] = property_name
+            if property_name == "_BaseHeightMap":
+                color["endfield_source_texture_default_sampled_channel"] = "red"
+                color["endfield_source_texture_default_linear_red"] = declared[0]
+            else:
+                color["endfield_source_texture_default_rgba"] = declared
             alpha = material.node_tree.nodes.new("ShaderNodeValue")
-            alpha.outputs[0].default_value = 1
+            alpha.outputs[0].default_value = declared[3]
             return LayerSample(color.outputs[0], alpha.outputs[0])
         raise ValueError(f"Top layer requires bound texture: material={record['Name']}, property={property_name}")
     key = reference_key(ref)
@@ -75,7 +83,11 @@ def _sample(material: bpy.types.Material, record: MaterialRecord, property_name:
         raise ValueError(f"Unsupported top layer sampler: material={record['Name']}, issue={sampler.issue}")
     node = material.node_tree.nodes.new("ShaderNodeTexImage")
     node.name = node.label = property_name
-    node.image = texture_image(path, colorspace, "CHANNEL_PACKED")
+    source_space = ref.get("ColorSpace")
+    if property_name == "_BaseHeightMap" and source_space is None:
+        raise ValueError(f"Top layer height texture requires source ColorSpace; refresh scene resources: material={record['Name']}, reference={key}")
+    image_space = ("Non-Color" if source_space == 0 else "sRGB") if source_space is not None else colorspace
+    node.image = texture_image(path, image_space, "CHANNEL_PACKED")
     if pack and not node.image.packed_file:
         node.image.pack()
     node.extension = sampler.extension
@@ -109,6 +121,7 @@ def _base_normal(tree: bpy.types.NodeTree, texture: bpy.types.Node, strength: fl
     length = _math(tree, "Base normal XY length squared", "ADD", *squared)
     remaining = _math(tree, "Base normal Z squared", "SUBTRACT", 1, length)
     z = _math(tree, "Base normal reconstructed Z", "SQRT", _clamp(tree, "Base normal Z domain", remaining), 0)
+    z = _math(tree, "Base normal source Z floor", "MAXIMUM", z, 2 ** -11)
     combine = tree.nodes.new("ShaderNodeCombineXYZ")
     for index, component in enumerate(components):
         tree.links.new(_math(tree, "Base normal source strength", "MULTIPLY", component, strength), combine.inputs[index])
@@ -131,7 +144,8 @@ def apply_top_layer(material: bpy.types.Material, principled: bpy.types.Node, re
     floats, colors = record["Floats"], record["Colors"]
     required = ("_Layer1Tilling", "_TopBlendWithBumpMap", "_TopBlendThreshold", "_TopBlendSmoothness",
                 "_LayerBlendHeightTransition", "_Layer1Saturation", "_Layer1ColorBrighterScale",
-                "_Layer1BumpScale", "_Layer1BaseNormalIntensity", "_LayerMetallicType", "_Layer1Metallic")
+                "_Layer1BumpScale", "_Layer1BaseNormalIntensity", "_LayerMetallicType", "_Layer1Metallic",
+                "_Layer1BaseColorBlendMode", "_Layer1BaseColorAdditiveIntensity")
     missing = sorted(set(required) - floats.keys())
     if missing or not {"_Layer1Offset", "_Layer1TintColor"} <= colors.keys():
         raise ValueError(f"Top layer source properties missing: material={record['Name']}, floats={missing}")
@@ -155,7 +169,6 @@ def apply_top_layer(material: bpy.types.Material, principled: bpy.types.Node, re
     coords = _vec(tree, "Layer source offset", "ADD", coords, (offset[0], offset[1], 0))
     layer = _sample(material, record, "_Layer1BaseMap", textures, coords, "sRGB", pack)
     bump = _sample(material, record, "_Layer1BumpMap", textures, coords, "Non-Color", pack)
-    mask = _sample(material, record, "_LayerBlendMaskMap", textures, coords, "Non-Color", pack)
     geometry = tree.nodes.new("ShaderNodeNewGeometry")
     normal_input = principled.inputs["Normal"]
     base_texture = next((node for node in existing if node.type == "TEX_IMAGE" and node.label == "_NormalMap"), None)
@@ -168,8 +181,9 @@ def apply_top_layer(material: bpy.types.Material, principled: bpy.types.Node, re
     factor = _clamp(tree, "Top surface coverage", _math(tree, "Top transition", "DIVIDE", threshold,
                     max(1.175494e-38, floats["_TopBlendSmoothness"])))
     if floats["_LayerBlendHeight"] != 0:
+        base_height = _sample(material, record, "_BaseHeightMap", textures, coords, "Non-Color", pack)
         inverse = _math(tree, "Base coverage", "SUBTRACT", 1, factor)
-        heights = (_math(tree, "Base weighted height", "MULTIPLY", inverse, _component(tree, mask.rgb, 0)),
+        heights = (_math(tree, "Base weighted height", "MULTIPLY", inverse, _component(tree, base_height.rgb, 0)),
                    _math(tree, "Layer weighted height", "MULTIPLY", factor, layer.alpha))
         peak = _math(tree, "Height peak", "MAXIMUM", *heights)
         weights = []
@@ -200,7 +214,14 @@ def apply_top_layer(material: bpy.types.Material, principled: bpy.types.Node, re
                  min(1, max(0, floats["_Layer1Saturation"] + 1)))
     color = _vec(tree, "Layer tint", "MULTIPLY", color, tuple(colors["_Layer1TintColor"][:3]))
     color = _scale(tree, "Layer brightness", color, floats["_Layer1ColorBrighterScale"])
-    tree.links.new(_mix(tree, "Top layer albedo", base, color, factor), base_input)
+    mode = floats["_Layer1BaseColorBlendMode"]
+    additive = 1 + mode * (floats["_Layer1BaseColorAdditiveIntensity"] - 1)
+    layer_color = _scale(tree, "Layer source color contribution", color,
+                         _math(tree, "Layer source color weight", "MULTIPLY", factor, additive))
+    base_weight = _math(tree, "Layer source base weight", "SUBTRACT", 1,
+                        _math(tree, "Layer source base replacement", "MULTIPLY", factor, 1 - mode))
+    tree.links.new(_vec(tree, "Top layer albedo", "ADD",
+                       _scale(tree, "Base source color contribution", base, base_weight), layer_color), base_input)
     for name, layer_value in (("Metallic", layer.alpha if floats["_LayerMetallicType"] != 0 else floats["_Layer1Metallic"]),
                               ("Roughness", _component(tree, bump.rgb, 2))):
         socket = principled.inputs[name]
@@ -226,6 +247,6 @@ def apply_top_layer(material: bpy.types.Material, principled: bpy.types.Node, re
     blended = _mix(tree, "Top layer tangent normal", base_ts, layered, factor)
     tree.links.new(_world_normal(tree, blended), normal_input)
     material["endfield_top_layer_contract"] = "HGRPLitTopLayer/1"
-    material["endfield_top_layer_limitations"] = "Runtime terrain atlas and runtime UV injection are not reconstructed; source-absent UV streams use audited zero reference."
+    material["endfield_top_layer_limitations"] = "; ".join(top_layer_runtime_limitations(record))
     for node in set(tree.nodes) - existing:
         node["endfield_layout_section"] = "Source Top Layer"

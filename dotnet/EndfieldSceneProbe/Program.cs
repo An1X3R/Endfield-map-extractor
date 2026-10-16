@@ -192,6 +192,7 @@ internal static partial class Program
                 GameObjectActive = SceneNodeBoolean(go, "m_IsActive"),
                 IsRoot = transform == null || transform.m_Father.IsNull,
                 TransformPathId = transform?.m_PathID,
+                TransformAsset = transform == null ? null : ToRef(transform),
                 Parent = transform == null ? null : ToRef(transform.m_Father, transform.assetsFile),
                 Children = transform?.m_Children.Select(p => ToRef(p, transform.assetsFile)).ToList(),
                 LocalPosition = transform == null ? null : new[] { transform.m_LocalPosition.X, transform.m_LocalPosition.Y, transform.m_LocalPosition.Z },
@@ -200,6 +201,8 @@ internal static partial class Program
                 RendererType = renderer?.type.ToString(),
                 RendererAsset = renderer == null ? null : ToRef(renderer),
                 RendererEnabled = renderer == null ? null : SceneNodeBoolean(renderer, "m_Enabled"),
+                RendererRole = renderer == null ? null : ReadSceneRendererRole(renderer),
+                Skin = renderer is SkinnedMeshRenderer skinned ? ReadSceneSkin(skinned) : null,
                 Mesh = mesh == null ? null : ToRef(mesh),
                 Materials = materials.Count == 0 ? null : materials,
             });
@@ -268,6 +271,16 @@ internal static partial class Program
             var ok = WriteObj(mesh, path);
             string? shapeGeometryFile = null;
             string? shapeGeometryError = null;
+            string? skinGeometryFile = null;
+            string? skinGeometryError = null;
+            try
+            {
+                skinGeometryFile = ok ? WriteSceneMeshSkin(mesh, meshDir, output) : null;
+            }
+            catch (InvalidDataException error)
+            {
+                skinGeometryError = error.Message;
+            }
             if (shapeMeshes.Contains(mesh))
             {
                 try
@@ -293,6 +306,8 @@ internal static partial class Program
                 Uv2File = ok ? WriteMeshUv(mesh, mesh.m_UV2, "uv2", meshDir, output) : null,
                 ShapeGeometryFile = shapeGeometryFile,
                 ShapeGeometryError = shapeGeometryError,
+                SkinGeometryFile = skinGeometryFile,
+                SkinGeometryError = skinGeometryError,
             });
             if (meshRecords.Count % 100 == 0)
                 telemetry.Publish("mesh_export", meshRecords.Count, meshTotal);
@@ -327,6 +342,7 @@ internal static partial class Program
         {
             Format = "EndfieldSceneProbe/1",
             MeshUvStreamVersion = 2,
+            MeshSkinStreamVersion = 1,
             InputFiles = files.Select(Path.GetFullPath).ToArray(),
             SerializedFiles = manager.assetsFileList.Select(f => new SerializedFileRecord
             {
@@ -337,6 +353,8 @@ internal static partial class Program
                 ObjectCount = f.Objects.Count,
             }).ToList(),
             Nodes = nodes,
+            MeshBounds = allMeshes.Select(ReadSceneMeshBounds).ToList(),
+            LodGroups = allObjects.Where(obj => obj.type == ClassIDType.LODGroup).Select(ReadSceneLodGroup).ToList(),
             Particles = particleExtraction.Records,
             DecalProjectors = projectors,
             Water = waterRecords,
@@ -356,6 +374,8 @@ internal static partial class Program
                 ["selectedShapeMeshes"] = shapeMeshes.Count,
                 ["shapeMeshGeometries"] = meshRecords.Count(record => record.ShapeGeometryFile is not null),
                 ["shapeMeshGeometryErrors"] = meshRecords.Count(record => record.ShapeGeometryError is not null),
+                ["skinMeshGeometries"] = meshRecords.Count(record => record.SkinGeometryFile is not null),
+                ["skinMeshGeometryErrors"] = meshRecords.Count(record => record.SkinGeometryError is not null),
                 ["allMaterials"] = allMaterials.Count,
                 ["selectedMaterials"] = materialRefs.Count,
                 ["allTextures"] = allTextures.Count,
@@ -539,14 +559,17 @@ internal sealed class SceneReport
 {
     public required string Format { get; init; }
     public required int MeshUvStreamVersion { get; init; }
+    public required int MeshSkinStreamVersion { get; init; }
     public required string[] InputFiles { get; init; }
     public required List<SerializedFileRecord> SerializedFiles { get; init; }
     public required List<NodeRecord> Nodes { get; init; }
+    public required List<SceneLodGroupRecord> LodGroups { get; init; }
     public required ParticleRecords Particles { get; init; }
     public required List<DecalProjectorRecord> DecalProjectors { get; init; }
     public required WaterRecords Water { get; init; }
     public required List<MaterialRecord> Materials { get; init; }
     public required List<ExportRecord> MeshExports { get; init; }
+    public required List<SceneMeshBoundsRecord> MeshBounds { get; init; }
     public required List<ExportRecord> TextureExports { get; init; }
     public required List<TextureArrayExportBatch> TextureArrayExports { get; init; }
     public required List<ExportRecord> MetadataExports { get; init; }
@@ -571,6 +594,7 @@ internal sealed class NodeRecord
     public required bool GameObjectActive { get; init; }
     public required bool IsRoot { get; init; }
     public long? TransformPathId { get; init; }
+    public AssetRef? TransformAsset { get; init; }
     public AssetRef? Parent { get; init; }
     public List<AssetRef>? Children { get; init; }
     public float[]? LocalPosition { get; init; }
@@ -579,6 +603,8 @@ internal sealed class NodeRecord
     public string? RendererType { get; init; }
     public AssetRef? RendererAsset { get; init; }
     public bool? RendererEnabled { get; init; }
+    public SceneRendererRoleRecord? RendererRole { get; init; }
+    public SceneSkinnedRendererRecord? Skin { get; init; }
     public AssetRef? Mesh { get; init; }
     public List<AssetRef>? Materials { get; init; }
 }
@@ -624,5 +650,7 @@ internal sealed record ExportRecord(AssetRef Asset, string? File, string? Error)
     public string? Uv2File { get; init; }
     public string? ShapeGeometryFile { get; init; }
     public string? ShapeGeometryError { get; init; }
+    public string? SkinGeometryFile { get; init; }
+    public string? SkinGeometryError { get; init; }
 }
 internal sealed record ContainerRecord(string Container, AssetRef Asset, string DeclaredBy);

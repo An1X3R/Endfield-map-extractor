@@ -8,12 +8,74 @@ import unittest
 
 from endfield_character_npc_action_adapter import (
     _npc_inspection_source_paths, npc_cpu_reference_document, parse_npc_action_catalog, parse_npc_cpu_action_references, public_npc_failure,
+    parse_enemy_action_catalog,
 )
 from endfield_character_cache import CharacterDataCache
 from endfield_character_selection import CharacterSelection
+from endfield_character_enemy_animation import EMPTY_ENEMY_CLIP_EVIDENCE_FIELDS, empty_enemy_clip_evidence
 
 
 class NpcActionCatalogTests(unittest.TestCase):
+    def test_enemy_controller_action_authenticates_clip_kind_and_source_generation(self) -> None:
+        action = {"action_id": "4cd473848e34a6c5ef716be661d019c4a078a3a52d80d8a267db8d2976752a5e",
+                  "state_name": "controller_override_clip_0", "name": "source_idle", "resource_path": "assets/source.overridecontroller",
+                  "logical_provider": "main/clip.ab", "clip_cab": "CAB-clip", "clip_path_id": "31",
+                  "clip_raw_data_sha256": "c" * 64, "controller_clip_index": 0, "controller_clip_kind": "override",
+                  "binding_status": "exact_enemy_controller_clip_reference_requires_final_clip_binding"}
+        document = {"format": "EndfieldEnemyAnimationSource/1", "status": "source_enemy_controller_clip_references",
+                    "source_identity": self.selection.catalog_identity, "npc_id": self.selection.character_id,
+                    "template_id": self.selection.template_id, "part_name": self.selection.part_name,
+                    "model_resource_path": self.selection.resource_path, "model_provider": self.selection.logical_provider,
+                    "enemy_data": {"template_id": "template", "animation_config_path": "Data/Json/AnimationConfig/source.json", "raw_data_sha256": "d" * 64},
+                    "animation_config": {"virtual_path": "Data/Json/AnimationConfig/source.json", "sha256": "e" * 64},
+                    "controller": {"type": "AnimatorOverrideController", "raw_data_sha256": "f" * 64},
+                    "base_controller": {}, "selected_avatar": {"cab": "CAB-avatar", "path_id": "17"},
+                    "actions": [action], "unsupported_actions": [], "runtime_animator_reconstructed": False,
+                    "coverage_counts": {"source_reference_count": 1, "effective_action_references": 1,
+                        "available_action_count": 1, "empty_placeholder_count": 0, "unsupported_action_count": 0}}
+        parsed = parse_enemy_action_catalog(document, self.selection)
+        self.assertEqual(parsed.status, "source_enemy_controller_clip_references")
+        self.assertEqual(parsed.actions[0].action_id, action["action_id"])
+        with self.assertRaisesRegex(ValueError, "ID, pointer or source binding"):
+            parse_enemy_action_catalog({**document, "actions": [{**action, "controller_clip_kind": "base"}]}, self.selection)
+        with self.assertRaisesRegex(ValueError, "exact base controller"):
+            parse_enemy_action_catalog({**document, "base_controller": None}, self.selection)
+        with self.assertRaisesRegex(ValueError, "exact selected prefab"):
+            parse_enemy_action_catalog(document, replace(self.selection, part_name="other"))
+        rejected = {"state_name": "controller_override_clip_1", "clip_name": "source_placeholder",
+            "resource_path": "assets/source.overridecontroller", "logical_provider": "main/clip.ab",
+            "clip_cab": "CAB-clip", "clip_path_id": "32", "clip_raw_data_sha256": "d" * 64,
+            "binding_status": "source_enemy_controller_empty_clip_placeholder", "reason": "Source ACL buffers and all source curves are empty",
+            "controller_clip_kind": "override", "controller_clip_index": 1, "original_clip": {"cab": "CAB-original", "path_id": "33"},
+            "empty_clip_evidence": dict.fromkeys(EMPTY_ENEMY_CLIP_EVIDENCE_FIELDS, 0)}
+        partial = {**document, "unsupported_actions": [rejected], "coverage_counts": {
+            "source_reference_count": 2, "effective_action_references": 2, "available_action_count": 1,
+            "empty_placeholder_count": 1, "unsupported_action_count": 1}}
+        parsed = parse_enemy_action_catalog(partial, self.selection)
+        self.assertEqual(parsed.unsupported_actions[0].clip_name, "source_placeholder")
+        self.assertEqual(parsed.unsupported_actions[0].controller_clip_index, 1)
+        for changed in ({"action_id": "a" * 64}, {"controller_clip_index": 0},
+                        {"empty_clip_evidence": {**rejected["empty_clip_evidence"], "acl_root_tracks": 1}}):
+            with self.subTest(changed=changed), self.assertRaises(ValueError):
+                parse_enemy_action_catalog({**partial, "unsupported_actions": [{**rejected, **changed}]}, self.selection)
+        with self.assertRaisesRegex(ValueError, "coverage"):
+            parse_enemy_action_catalog({**partial, "coverage_counts": document["coverage_counts"]}, self.selection)
+
+    def test_empty_enemy_placeholder_requires_zero_acl_and_legacy_source_data(self) -> None:
+        clip = {"m_AclCompressedBuffer": {"OutputTrackCount": 0, "RootTrackCount": 0, "FloatCurveCount": 0,
+                    "TransformBufferData": "", "RootMotionBufferData": "", "FloatBufferData": "", "m_ConstantValues": []},
+            "m_ClipBindingConstant": {"genericBindings": []}, "m_MuscleClip": {"m_Clip": {
+                "m_StreamedClip": {"curveCount": 0, "data": []},
+                "m_DenseClip": {"m_FrameCount": 0, "m_CurveCount": 0, "m_SampleArray": [], "m_ACLArray": ""},
+                "m_ConstantClip": {"data": []}, "m_ACLClip": {"IsSet": False}}},
+            **{field: [] for field in ("m_RotationCurves", "m_CompressedRotationCurves", "m_EulerCurves", "m_PositionCurves",
+                                      "m_ScaleCurves", "m_FloatCurves", "m_PPtrCurves")}}
+        self.assertEqual(empty_enemy_clip_evidence(clip), dict.fromkeys(EMPTY_ENEMY_CLIP_EVIDENCE_FIELDS, 0))
+        for changed in ({"RootTrackCount": 7}, {"TransformBufferData": "AA=="}, {"m_ConstantValues": [0.0]}):
+            with self.subTest(changed=changed):
+                self.assertIsNone(empty_enemy_clip_evidence({**clip, "m_AclCompressedBuffer": {**clip["m_AclCompressedBuffer"], **changed}}))
+        self.assertIsNone(empty_enemy_clip_evidence({**clip, "m_FloatCurves": [{"source": "curve"}]}))
+
     def setUp(self) -> None:
         self.selection = CharacterSelection("a" * 64, "miner", "template", "body", "npc", "assets/source.asset", "main/source.ab")
         self.receipt = {"format": "EndfieldNpcAnimationCatalog/1", "source_identity": "a" * 64,
@@ -105,6 +167,54 @@ class NpcActionCatalogTests(unittest.TestCase):
                 parse_npc_action_catalog({key: item for key, item in value.items() if key != field}, self.selection, ("body",))
         with self.assertRaisesRegex(ValueError, "Humanoid"):
             parse_npc_action_catalog({**value, "template_namespace": "Generic"}, self.selection, ("body",))
+
+    def test_generic_cross_avatar_requires_driven_path_and_pose_evidence(self) -> None:
+        action = {**self.receipt["actions"][0],
+            "binding_status": "source_generic_equivalent_avatar_base_clip_reference_requires_final_clip_binding"}
+        evidence = {"format": "NpcGenericAvatarEquivalence/1", "tolerance": 1e-6,
+            "source_avatar_sha256": "d" * 64, "target_avatar_sha256": "e" * 64,
+            "clip_count": 1, "transform_binding_count": 6, "driven_path_count": 2, "validated_path_count": 4,
+            "max_default_pose_delta": 1e-7, "max_avatar_skeleton_pose_delta": 0.0}
+        value = {**self.receipt, "status": "source_generic_equivalent_avatar_base_clip_references",
+            "avatar_identity_matches": False, "cpu_avatar": {"cab": "CAB-source", "path_id": "19"},
+            "avatar_binding_status": "source_generic_equivalent_avatar", "template_namespace": "Generic",
+            "cpu_avatar_source_sha256": "d" * 64, "target_avatar_source_sha256": "e" * 64,
+            "generic_avatar_equivalence": evidence, "actions": [action], "unsupported_actions": []}
+        parsed = parse_npc_action_catalog(value, self.selection, ("body",))
+        self.assertEqual(parsed.status, value["status"])
+        for field in ("generic_avatar_equivalence", "cpu_avatar_source_sha256", "target_avatar_source_sha256"):
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                parse_npc_action_catalog({key: item for key, item in value.items() if key != field}, self.selection, ("body",))
+        for changed in ({"format": "other"}, {"tolerance": 1e-3}, {"clip_count": True},
+                        {"source_avatar_sha256": "f" * 64}, {"target_avatar_sha256": "f" * 64},
+                        {"clip_count": 2}, {"transform_binding_count": 0}, {"driven_path_count": 0},
+                        {"validated_path_count": 1}, {"max_default_pose_delta": 1e-5},
+                        {"max_avatar_skeleton_pose_delta": float("nan")}):
+            with self.subTest(changed=changed), self.assertRaises(ValueError):
+                parse_npc_action_catalog({**value, "generic_avatar_equivalence": {**evidence, **changed}}, self.selection, ("body",))
+        with self.assertRaisesRegex(ValueError, "Generic"):
+            parse_npc_action_catalog({**value, "template_namespace": "Humanoid"}, self.selection, ("body",))
+        with self.assertRaisesRegex(ValueError, "source binding"):
+            parse_npc_action_catalog({**value, "actions": self.receipt["actions"]}, self.selection, ("body",))
+        rejected = [{"state_name": "Bump" + direction, "clip_name": "source_rejected_" + direction,
+            "resource_path": "assets/source_rejected.fbx", "logical_provider": "main/rejected.ab",
+            "clip_cab": "CAB-rejected", "clip_path_id": "32", "clip_raw_data_sha256": "f" * 64,
+            "binding_status": "source_generic_equivalent_avatar_rejected", "reason": "Exact driven Transform path is absent"}
+            for direction in ("F", "B", "L", "R")]
+        partial = {**value, "unsupported_actions": rejected}
+        parsed = parse_npc_action_catalog(partial, self.selection, ("body",))
+        self.assertEqual(len(parsed.actions), 1)
+        self.assertEqual(tuple(item.state_name for item in parsed.unsupported_actions), ("BumpF", "BumpB", "BumpL", "BumpR"))
+        self.assertEqual(parsed.unsupported_actions[0].reason, rejected[0]["reason"])
+        self.assertEqual(parsed.unsupported_actions[0].clip_raw_data_sha256, "f" * 64)
+        for changed in ({"state_name": "IdleLoop"}, {"clip_raw_data_sha256": "bad"},
+                        {"binding_status": "supported"}, {"action_id": "a" * 64}, {"reason": ""}):
+            with self.subTest(changed=changed), self.assertRaises(ValueError):
+                parse_npc_action_catalog({**value, "unsupported_actions": [{**rejected[0], **changed}]}, self.selection, ("body",))
+        with self.assertRaisesRegex(ValueError, "duplicate rejected"):
+            parse_npc_action_catalog({**value, "unsupported_actions": rejected * 2}, self.selection, ("body",))
+        with self.assertRaisesRegex(ValueError, "explicit unsupported"):
+            parse_npc_action_catalog({key: item for key, item in value.items() if key != "unsupported_actions"}, self.selection, ("body",))
 
     def test_full_source_slot_tuple_is_authenticated_without_independent_mount_actions(self) -> None:
         names = ("body", "face", "ear")

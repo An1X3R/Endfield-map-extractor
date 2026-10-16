@@ -190,7 +190,7 @@ def index_controller_graph(tree: dict[str, object], references: dict[str, object
 
 def export_controller_graph(native: Path) -> Path | None:
     verification = _obj(json.loads((native / 'animator_parameter_verification.json').read_text(encoding='utf-8-sig')), 'parameter verification')
-    if verification['status'] != 'exact_controller_clip_reference_and_tos_verified':
+    if verification['status'] not in ('exact_controller_clip_reference_and_tos_verified', 'character_controller_dynamic_clip_and_tos_verified'):
         return None
     source = native / 'controller_type_tree.json'
     references = native / 'controller_source_references.json'

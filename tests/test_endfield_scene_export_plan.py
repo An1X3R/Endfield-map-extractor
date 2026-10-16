@@ -23,6 +23,173 @@ from webui_source_contract import selected_static_categories
 
 
 class PortableScenePlanTests(unittest.TestCase):
+    def test_static_mesh_parts_preserve_entity_identity_and_require_the_complete_source_set(self) -> None:
+        from copy import deepcopy
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            mesh = root / "part.obj"
+            mesh.write_text("o part\nv 0 0 0\nv 1 0 0\nv 0 0 1\nf 1 2 3\n", encoding="utf-8")
+            sidecar = root / "sidecar.json"
+            sidecar.write_text("{}", encoding="utf-8")
+            paths = ["assets/a_lod0.fbx##a_lod0", "assets/b_lod0.fbx##b_lod0"]
+            source = [{"mesh_path": path, "material_path": "assets/surface.mat", "material_id": "01",
+                       "mesh_id": str(index + 2), "submesh": 0, "flags": 134217728,
+                       "reference_component": 69, "source_draw_index": index,
+                       "lod_max_squared": 1000., "lod_min_squared": .7} for index, path in enumerate(paths)]
+            fields = ("mesh_path", "material_path", "material_id", "mesh_id", "submesh", "flags")
+            rows = [{"entity_id": 7, "entity_base": "P_source", "category": "vegetation",
+                     "source_path": "InitChunkData", "source_sha256": "0" * 64, "group_index": 0, "entity_index": 0,
+                     "matrix": [1.] * 16, "mesh_path": path, "mesh_file": str(mesh),
+                     "mesh_asset": {"Source": "cab", "PathId": index + 1, "Name": f"part{index}"},
+                     "renderer_pairs": [{field: source[index][field] for field in fields}],
+                     "submesh_slot_indices": [0], "material_refs": [None], "undrawn_submeshes": [],
+                     "mesh_part_key": f"InitChunkData:entity:7/mesh:{source[index]['mesh_id']}",
+                     "source_renderer_pairs": source, "source_draw_indices": [index], "selected_mesh_paths": paths,
+                     "lod_selection": "coauthored_highest_detail_source_interval"} for index, path in enumerate(paths)]
+            payload = {"format": "EndfieldPortableScenePlan/1", "map_id": "map01",
+                       "bounds": {"xmin": 0, "xmax": 1, "zmin": 0, "zmax": 1},
+                       "scene_manifests": [], "terrain_surfaces": [], "category_filter": [],
+                       "decal_manifest": str(sidecar), "decal_materials": str(sidecar),
+                       "instances": rows, "pending": [], "source_sha256": {"InitChunkData": "0" * 64},
+                       "summary": {"selected_static": 1, "ready_static": 2, "ready_static_entities": 1,
+                                   "partial_static_entities": 0, "complete_static_entities": 1,
+                                   "selected_decals": 0, "ready_decals": 0, "pending": 0}}
+            path = root / "plan.json"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            loaded = load_scene_export_plan(path)
+            self.assertEqual([7, 7], [row["entity_id"] for row in loaded["instances"]])
+            for changed, message in (
+                ({**payload, "instances": rows[:1]}, "part set is incomplete"),
+                ({**payload, "instances": [rows[0], rows[0]]}, "identity is repeated"),
+                ({**payload, "summary": {**payload["summary"], "ready_static_entities": 2}}, "unique static source entities"),
+                ({**payload, "summary": {**payload["summary"], "complete_static_entities": 0}}, "partial/complete static source entities"),
+            ):
+                path.write_text(json.dumps(changed), encoding="utf-8")
+                with self.subTest(message=message), self.assertRaisesRegex(ValueError, message):
+                    load_scene_export_plan(path)
+            for field, value, message in (("source_draw_indices", [0], "draws differ"),
+                    ("mesh_part_key", "invented", "key differs"),
+                    ("matrix", [2.] * 16, "original entity evidence"),
+                    ("selected_mesh_paths", paths[:1], "co-authored source mesh set")):
+                changed = deepcopy(payload)
+                changed["instances"][1][field] = value
+                path.write_text(json.dumps(changed), encoding="utf-8")
+                with self.subTest(field=field), self.assertRaisesRegex(ValueError, message):
+                    load_scene_export_plan(path)
+
+    def test_static_shadow_only_exclusions_keep_source_evidence_and_reject_visible_draws(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sidecar = root / "sidecar.json"
+            sidecar.write_text("{}", encoding="utf-8")
+            exclusion = {"entity_id": 7, "entity_base": "source_shadow_shell", "source_path": "InitChunkData",
+                         "source_sha256": "0" * 64, "group_index": 1, "entity_index": 2, "role": "shadow_only",
+                         "source_draws": [{"mesh_path": "source_lod6.fbx##source_lod6", "material_path": "shadow.mat",
+                            "mesh_id": "01", "material_id": "02", "submesh": 0, "flags": 1024,
+                            "reference_component": 68, "source_draw_index": 0,
+                            "lod_max_squared": 1000., "lod_min_squared": -.0004}]}
+            payload = {"format": "EndfieldPortableScenePlan/1", "map_id": "map01",
+                "bounds": {"xmin": 0, "xmax": 1, "zmin": 0, "zmax": 1},
+                "scene_manifests": [], "terrain_surfaces": [], "category_filter": [],
+                "decal_manifest": str(sidecar), "decal_materials": str(sidecar),
+                "instances": [], "pending": [], "source_sha256": {"InitChunkData": "0" * 64},
+                "static_role_exclusions": [exclusion],
+                "summary": {"selected_static": 0, "ready_static": 0, "selected_decals": 0,
+                            "ready_decals": 0, "pending": 0, "excluded_static_shadow_only": 1}}
+            plan = root / "plan.json"
+            plan.write_text(json.dumps(payload), encoding="utf-8")
+            self.assertEqual(load_scene_export_plan(plan)["static_role_exclusions"], [exclusion])
+            for changed, message in (({**exclusion, "source_sha256": "1" * 64}, "source SHA-256"),
+                ({**exclusion, "source_draws": [*exclusion["source_draws"],
+                   {**exclusion["source_draws"][0], "flags": 0}]}, "validated shadow-only draws")):
+                plan.write_text(json.dumps({**payload, "static_role_exclusions": [changed]}), encoding="utf-8")
+                with self.subTest(message=message), self.assertRaisesRegex(ValueError, message):
+                    load_scene_export_plan(plan)
+            plan.write_text(json.dumps({**payload, "summary": {**payload["summary"],
+                                       "excluded_static_shadow_only": 0}}), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "summary differs from static role exclusions"):
+                load_scene_export_plan(plan)
+
+    def test_static_submesh_pending_keeps_the_unknown_slot_out_of_ready_rows(self) -> None:
+        from copy import deepcopy
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sidecar = root / "sidecar.json"
+            sidecar.write_text("{}", encoding="utf-8")
+            mesh_file = root / "machine.obj"
+            mesh_file.write_text("o machine\nv 0 0 0\nv 1 0 0\nv 0 0 1\nf 1 2 3\n", encoding="utf-8")
+            mesh_path = "assets/machine_lod0.fbx##machine_lod0"
+            ordinary_draw = {"mesh_path": mesh_path, "material_path": "assets/m_machine.mat",
+                "material_id": "01", "mesh_id": "02", "submesh": 0, "flags": 134217728,
+                "reference_component": 69, "source_draw_index": 0,
+                "lod_max_squared": 1000.0, "lod_min_squared": 0.04}
+            proxy_draw = {"mesh_path": mesh_path, "material_path": "assets/m_shadowproxy_static_opaque.mat",
+                "material_id": "03", "mesh_id": "02", "submesh": 1, "flags": 134217728,
+                "reference_component": 69, "source_draw_index": 1,
+                "lod_max_squared": 1000.0, "lod_min_squared": 0.04}
+            pair_fields = ("material_id", "material_path", "mesh_id", "mesh_path", "submesh", "flags")
+            ordinary_ref = {"Source": "cab-machine", "PathId": 1, "Name": "M_machine"}
+            proxy_ref = {"Source": "cab-machine", "PathId": 2, "Name": "M_shadowproxy_static_opaque"}
+            row = {"entity_id": 7, "entity_base": "P_mod_map02_machine+1_002_01", "category": "building",
+                "source_path": "InitChunkData_0_0_0_0", "source_sha256": "0" * 64,
+                "group_index": 0, "entity_index": 4, "matrix": [1.0] * 16,
+                "mesh_path": mesh_path, "mesh_file": str(mesh_file),
+                "mesh_asset": {"Source": "cab-machine", "PathId": 3, "Name": "machine_lod0"},
+                "renderer_pairs": [{field: ordinary_draw[field] for field in pair_fields},
+                    {field: proxy_draw[field] for field in pair_fields}],
+                "source_draw_evidence": [ordinary_draw, proxy_draw],
+                "submesh_slot_indices": [0, 1], "material_refs": [ordinary_ref, proxy_ref],
+                "undrawn_submeshes": [], "selected_submeshes": [0]}
+            pending = {"entity_id": 7, "entity_base": row["entity_base"],
+                "component": "static_mesh_submesh", "reason": "source_surface_role_unverified",
+                "detail": "Material role is not validated for ordinary surface export: M_shadowproxy_static_opaque",
+                "source_path": row["source_path"], "source_sha256": row["source_sha256"],
+                "group_index": 0, "entity_index": 4, "mesh_path": mesh_path, "submesh": 1,
+                "material_name": "M_shadowproxy_static_opaque", "material_path": proxy_draw["material_path"],
+                "material_id": proxy_draw["material_id"], "mesh_id": proxy_draw["mesh_id"],
+                "source_draw": proxy_draw}
+            payload = {"format": "EndfieldPortableScenePlan/1", "map_id": "map02",
+                "bounds": {"xmin": 0, "xmax": 1, "zmin": 0, "zmax": 1},
+                "scene_manifests": [], "terrain_surfaces": [], "category_filter": [],
+                "decal_manifest": str(sidecar), "decal_materials": str(sidecar),
+                "instances": [row], "pending": [pending],
+                "source_sha256": {row["source_path"]: row["source_sha256"]},
+                "summary": {"selected_static": 1, "ready_static": 1, "ready_static_entities": 1,
+                    "partial_static_entities": 1, "complete_static_entities": 0,
+                    "selected_decals": 0, "ready_decals": 0, "pending": 1}}
+            plan = root / "plan.json"
+            plan.write_text(json.dumps(payload), encoding="utf-8")
+            loaded = load_scene_export_plan(plan)
+            self.assertEqual(loaded["instances"][0]["selected_submeshes"], [0])
+            self.assertEqual(loaded["pending"][0]["source_draw"], proxy_draw)
+            self.assertEqual(loaded["summary"]["ready_static_entities"], 1)
+            self.assertEqual(loaded["summary"]["partial_static_entities"], 1)
+            self.assertEqual(loaded["summary"]["complete_static_entities"], 0)
+            for changed, message in (
+                ({**row, "selected_submeshes": [0, 1]}, "selects a pending source submesh"),
+                ({**pending, "source_draw": {**proxy_draw, "source_draw_index": 0}}, "differs from ready source draw evidence"),
+            ):
+                invalid = deepcopy(payload)
+                if "selected_submeshes" in changed:
+                    invalid["instances"] = [changed]
+                else:
+                    invalid["pending"] = [changed]
+                plan.write_text(json.dumps(invalid), encoding="utf-8")
+                with self.subTest(message=message), self.assertRaisesRegex(ValueError, message):
+                    load_scene_export_plan(plan)
+            for summary, message in (
+                ({**payload["summary"], "partial_static_entities": 0}, "partial/complete static source entities"),
+                ({**payload["summary"], "complete_static_entities": 1}, "partial/complete static source entities"),
+                ({**payload["summary"], "complete_static_entities": -1}, "Invalid scene summary count: complete_static_entities"),
+                ({key: value for key, value in payload["summary"].items()
+                 if key != "ready_static_entities"}, "requires ready_static_entities"),
+            ):
+                plan.write_text(json.dumps({**payload, "summary": summary}), encoding="utf-8")
+                with self.subTest(message=message), self.assertRaisesRegex(ValueError, message):
+                    load_scene_export_plan(plan)
+
     def test_manifest_mesh_duplicates_keep_canonical_identity_and_reject_multiple_files(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -150,6 +317,7 @@ class PortableScenePlanTests(unittest.TestCase):
                             "ready_decals": 0, "pending": 0},
             }), encoding="utf-8")
             loaded = load_scene_export_plan(plan)
+            self.assertEqual(loaded["static_role_exclusions"], [])
             self.assertEqual(loaded["water_geometry"], [])
             self.assertEqual(loaded["water_materials"], [])
             self.assertEqual(loaded["water_depth_surfaces"], [])
@@ -344,6 +512,9 @@ class PortableScenePlanTests(unittest.TestCase):
             output = selected_export / "plan.json"
             actual = load_scene_export_plan(prepare_scene_export_plan(config, canonical, output, None))
             self.assertEqual(actual["instances"], [])
+            self.assertEqual(actual["summary"]["ready_static_entities"], 0)
+            self.assertEqual(actual["summary"]["partial_static_entities"], 0)
+            self.assertEqual(actual["summary"]["complete_static_entities"], 0)
             self.assertEqual(actual["water_geometry"], [])
             self.assertEqual(actual["water_materials"], [])
             self.assertNotIn("water_transport_lighting", actual)

@@ -7,13 +7,18 @@ import struct
 import tempfile
 import unittest
 
+from lz4.block import compress
+
 from endfield_instanced_catalog import (
     InstancedSceneError, _absolute_inputs, _art_owner, _assemble_catalog,
+    _chunk_source_evidence,
     _prepared_from_marker, _validate_catalog,
 )
-from endfield_scene_io import SceneInputChangedError
+from endfield_scene_io import SceneInputChangedError, _file_stamp
 from endfield_scene_resources import describe_file
 from extractor_core.scene_tables import SceneTableError, read_scene_table
+from extractor_core.scene_string_pool import SceneStringPoolError, _pool_lz4, read_scene_string_pool
+from extractor_core.vfs import VfsFile
 
 
 def string_table(name: str, rows: tuple[tuple[str, str], ...]) -> bytes:
@@ -32,6 +37,52 @@ def string_table(name: str, rows: tuple[tuple[str, str], ...]) -> bytes:
 
 
 class InstancedSceneCatalogTests(unittest.TestCase):
+    def test_chunk_source_identity_uses_existing_vfs_and_file_stamp_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            group = root / "C3442D43"
+            group.mkdir()
+            source = group / ("c" * 32 + ".chk")
+            source.write_bytes(b"first")
+            item = VfsFile("Data/Streaming/PC/indie_one/Streaming/InitChunkData_0_0_0_0.bytes",
+                           "a" * 32, "c" * 32, "b" * 32, 0, 5, 0, False, None)
+            first = _chunk_source_evidence(root, "C3442D43", (item,), {source: _file_stamp(source)})
+            source.write_bytes(b"other")
+            second = _chunk_source_evidence(root, "C3442D43", (item,), {source: _file_stamp(source)})
+            self.assertNotEqual(first, second)
+            self.assertEqual(first[0]["data_md5"], "B" * 32)
+            self.assertEqual(first[0]["virtual_path"], item.file_name)
+
+    def test_current_pool_wire_format_and_rejected_corruption(self) -> None:
+        entries = tuple(struct.pack("<i", len(value)) + value for value in
+                        (b"indie_test/indie_test_art_streaming.asset", b"", b"another"))
+        offsets = (0, len(entries[0]), len(entries[0]) + len(entries[1]))
+        clear = struct.pack("<4i", 3, *offsets) + b"".join(entries)
+        packed = compress(clear, store_size=False)
+        header = struct.pack("<4s5i", b"USPC", 1, 1, 3, len(clear), len(packed))
+        source = struct.pack("<i", 0) + header + packed
+        result = read_scene_string_pool({"Data/Json/StringPool/StringPool0.byte": source}.__getitem__)
+        self.assertEqual(result, {0: "indie_test/indie_test_art_streaming.asset", 1: "", 2: "another"})
+        self.assertEqual(_art_owner(b"\x12\x03" + struct.pack("<i", 0), "pooled", result), "indie_test")
+        for damaged in (source[:-1], source[:8] + struct.pack("<i", 99) + source[12:]):
+            with self.assertRaisesRegex(SceneStringPoolError, "header"):
+                read_scene_string_pool({"Data/Json/StringPool/StringPool0.byte": damaged}.__getitem__)
+        invalid_clear = clear[:4] + struct.pack("<i", -1) + clear[8:]
+        invalid_packed = compress(invalid_clear, store_size=False)
+        invalid = struct.pack("<i4s5i", 0, b"USPC", 1, 1, 3, len(invalid_clear), len(invalid_packed)) + invalid_packed
+        with self.assertRaisesRegex(SceneStringPoolError, "offsets"):
+            read_scene_string_pool({"Data/Json/StringPool/StringPool0.byte": invalid}.__getitem__)
+
+    def test_source_pool_terminal_lz4_match_and_strict_bounds(self) -> None:
+        self.assertEqual(_pool_lz4(b"\x13a\x01\x00", 8), b"aaaaaaaa")
+        self.assertEqual(_pool_lz4(b"\x13a\x01\x00\x30bbb", 11), b"aaaaaaaabbb")
+        with self.assertRaisesRegex(SceneStringPoolError, "match exceeds bounds"):
+            _pool_lz4(b"\x13a\x00\x00", 8)
+        with self.assertRaisesRegex(SceneStringPoolError, "match exceeds bounds"):
+            _pool_lz4(b"\x13a\x01\x00", 7)
+        with self.assertRaisesRegex(SceneStringPoolError, "Truncated"):
+            _pool_lz4(b"\xf0\xff", 8)
+
     def test_native_table_roundtrip_and_wrong_root_offset_duplicate_failures(self) -> None:
         payload = string_table("Names", (("office", "总桩办公室"), ("room", "地下空间")))
         self.assertEqual(read_scene_table(payload, "Names"), {"office": "总桩办公室", "room": "地下空间"})
@@ -45,9 +96,12 @@ class InstancedSceneCatalogTests(unittest.TestCase):
 
     def test_art_root_reference_and_relocated_inputs_preserve_original(self) -> None:
         reference = b"indie_test/indie_test_art_streaming.asset"
-        self.assertEqual(_art_owner(b"\x12\x03" + struct.pack("<i", len(reference)) + reference, "config"), "indie_test")
+        self.assertEqual(_art_owner(b"\x12\x03" + struct.pack("<i", len(reference)) + reference, "config", None), "indie_test")
         with self.assertRaisesRegex(InstancedSceneError, "art reference length"):
-            _art_owner(b"\x12\x03" + struct.pack("<i", -1), "config")
+            _art_owner(b"\x12\x03" + struct.pack("<i", -1), "config", None)
+        self.assertEqual(_art_owner(b"\x12\x03" + struct.pack("<i", 35744), "pooled", {35744: reference.decode()}), "indie_test")
+        with self.assertRaisesRegex(InstancedSceneError, "string ID is absent"):
+            _art_owner(b"\x12\x03" + struct.pack("<i", 35744), "pooled", {})
         source = {"format": "EndfieldRuntimeConfig/1", "map": {"instances": "instances.sqlite", "terrainSurfaces": ["terrain"]}}
         with tempfile.TemporaryDirectory() as temporary:
             copied = _absolute_inputs(source, Path(temporary), "")
@@ -95,6 +149,18 @@ class InstancedSceneCatalogTests(unittest.TestCase):
             self.assertEqual(result.runtime_path, root / "runtime")
             self.assertEqual(result.limitations, ("whole scene",))
             self.assertIsNone(_prepared_from_marker(marker, "indie_one", "a" * 64, "changed inputs", lambda: None))
+
+            original = json.loads(marker.read_text(encoding="utf-8"))
+            invalid_bounds = (
+                {"xmin": 0.5, "xmax": 128, "zmin": 0, "zmax": 128},
+                {"xmin": float("nan"), "xmax": 128, "zmin": 0, "zmax": 128},
+                {"xmin": 10 ** 400, "xmax": 128, "zmin": 0, "zmax": 128},
+            )
+            for bounds in invalid_bounds:
+                marker.write_text(json.dumps({**original, "bounds": bounds}), encoding="utf-8")
+                with self.assertRaisesRegex(InstancedSceneError, "bounds"):
+                    _prepared_from_marker(marker, "indie_one", "a" * 64, "inputs", lambda: None)
+            marker.write_text(json.dumps(original), encoding="utf-8")
 
             def cancel() -> None:
                 raise InterruptedError("cancelled cache hit")

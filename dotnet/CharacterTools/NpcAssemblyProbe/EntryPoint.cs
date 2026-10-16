@@ -583,20 +583,9 @@ internal static class EntryPoint
         var rootBoneMatches = avatarIds.Select((id, index) => (Index: index, Path: avatar.FindBonePath(id)))
             .Where(row => string.Equals(row.Path?.Split('/').Last(), rootBoneName, StringComparison.Ordinal))
             .Select(row => row.Index).ToArray();
-        int rootBoneId;
-        if (usesSelfAvatar)
-        {
-            if (rootBoneMatches.Length != 1)
-                throw new InvalidDataException($"Self-avatar rootBoneName must resolve to one bone in its source Avatar: renderer={meshName}, name={rootBoneName}, matches={rootBoneMatches.Length}.");
-            rootBoneId = rootBoneMatches[0];
-        }
-        else
-        {
-            rootBoneId = configuredRootBoneId;
-            if (rootBoneId < 0 || rootBoneId >= avatarIds.Length ||
-                !string.Equals(avatar.FindBonePath(avatarIds[rootBoneId])?.Split('/').Last(), rootBoneName, StringComparison.Ordinal))
-                throw new InvalidDataException($"AvatarMesh rootBoneID/name does not match the host Avatar bone table: renderer={meshName}, index={rootBoneId}, name={rootBoneName}.");
-        }
+        if (rootBoneMatches.Length != 1)
+            throw new InvalidDataException($"AvatarMesh rootBoneName must resolve to one bone in the renderer rig Avatar: renderer={meshName}, name={rootBoneName}, matches={rootBoneMatches.Length}.");
+        int rootBoneId = rootBoneMatches[0];
 
         var configuredDisabledValue = RequireInt32(input, "configured_renderer_disabled", "renderer input");
         var configuredActive = RequireInt32(input, "configured_is_active", "renderer input");
@@ -797,6 +786,7 @@ internal static class EntryPoint
                 {
                     id = renderer.ConfiguredRootBoneId,
                     name = renderer.RootBoneName,
+                    mapping_method = "unique_terminal_name_match_in_renderer_rig_avatar",
                     avatar_bone_index = renderer.RootBoneId,
                     path = renderer.RigAvatar.FindBonePath(renderer.RigAvatar.m_Avatar.m_AvatarSkeleton.m_ID[renderer.RootBoneId])
                 },

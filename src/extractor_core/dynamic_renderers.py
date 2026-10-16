@@ -6,7 +6,7 @@ import hashlib
 import math
 import re
 import struct
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from io import BytesIO
 from pathlib import Path
 from typing import Callable, Literal
@@ -126,6 +126,15 @@ class _RawRenderer:
     references_offset: int
     runtime_offset: int
     bounds: tuple[float, ...] | None
+
+
+@dataclass(frozen=True)
+class _RawDynamicSceneRendererInventory:
+    scene_id: str
+    sources: tuple[DynamicRendererSource, ...]
+    references: tuple[DynamicEcsReference, ...]
+    groups: tuple[DynamicRendererGroup, ...]
+    records: tuple[_RawRenderer, ...]
 
 
 def _read_source(root: Path, group: vfs.VfsGroup, item: vfs.VfsFile) -> tuple[bytes, str]:
@@ -258,9 +267,9 @@ def _renderer_record(row: _RawRenderer, paths: dict[bytes, tuple[str, ...]]) -> 
     )
 
 
-def _decode_dynamic_scene_renderers_for_scene(
+def _read_raw_dynamic_scene_renderers(
     vfs_root: Path, string_path_hash: Path, scene_id: str, check_cancelled: Callable[[], None],
-) -> DynamicSceneRendererInventory:
+) -> _RawDynamicSceneRendererInventory:
     """Inventory only init groups selected by actual main field-9 references."""
     scene = validate_scene_id(scene_id)
     root = validate_vfs_root(vfs_root)
@@ -321,21 +330,79 @@ def _decode_dynamic_scene_renderers_for_scene(
                 raise DynamicRendererDecodeError(f"Dynamic ECS group decode failed: path={item.file_name}, group={index}, error={error}") from error
             groups.append(decoded_group)
             raw_rows.extend(rows)
-    wanted: set[bytes] = set()
     for row in raw_rows:
         try:
             decode_draws(row.runtime, row.references)
         except ValueError as error:
             raise DynamicRendererDecodeError(f"Dynamic ECS draw decode failed: path={row.group.source_virtual_path}, group={row.group.group_index}, record={row.record_index}, error={error}") from error
+    return _RawDynamicSceneRendererInventory(scene, tuple(sources), tuple(refs), tuple(groups), tuple(raw_rows))
+
+
+def _resolve_dynamic_scene_renderers(
+    inventory: _RawDynamicSceneRendererInventory, hash_path: Path, check_cancelled: Callable[[], None],
+) -> DynamicSceneRendererInventory:
+    wanted: set[bytes] = set()
+    for row in inventory.records:
         for index in range(struct.unpack_from("<Q", row.references)[0]):
             offset = 8 + 40 * index
             wanted.update((row.references[offset:offset + 8], row.references[offset + 8:offset + 16]))
     paths = {key: (value,) for key, value in _resolve_hashes(hash_path, frozenset(wanted), check_cancelled, ("assets/", "data/", "packages/")).items()} if wanted else {}
     records: list[DynamicRendererRecord] = []
-    for row in raw_rows:
+    for row in inventory.records:
         check_cancelled()
         records.append(_renderer_record(row, paths))
-    return DynamicSceneRendererInventory(scene, tuple(sources), tuple(refs), tuple(groups), tuple(records))
+    return DynamicSceneRendererInventory(inventory.scene_id, inventory.sources, inventory.references, inventory.groups, tuple(records))
+
+
+def _decode_dynamic_scene_renderers_for_scene(
+    vfs_root: Path, string_path_hash: Path, scene_id: str, check_cancelled: Callable[[], None],
+) -> DynamicSceneRendererInventory:
+    inventory = _read_raw_dynamic_scene_renderers(vfs_root, string_path_hash, scene_id, check_cancelled)
+    return _resolve_dynamic_scene_renderers(inventory, string_path_hash.expanduser().resolve(), check_cancelled)
+
+
+def _renderer_intersects_bounds(row: _RawRenderer, bounds: tuple[float, float, float, float]) -> bool:
+    """Include source footprints crossing a selection edge, even with outside anchors."""
+    matrix = struct.unpack_from("<16f", row.common)
+    if not all(math.isfinite(value) for value in matrix):
+        raise DynamicRendererDecodeError(f"Dynamic ECS matrix is non-finite: path={row.group.source_virtual_path}, record={row.record_index}")
+    xmin, xmax, zmin, zmax = bounds
+    if xmin <= matrix[12] < xmax and zmin <= matrix[14] < zmax:
+        return True
+    if row.bounds is None:
+        return False
+    return row.bounds[0] < xmax and row.bounds[1] > xmin and row.bounds[4] < zmax and row.bounds[5] > zmin
+
+
+def read_dynamic_scene_renderers_for_bounds(
+    vfs_root: Path, string_path_hash: Path, scene_id: str, bounds: tuple[float, float, float, float],
+    check_cancelled: Callable[[], None],
+) -> DynamicSceneRendererInventory:
+    """Validate every source draw, then resolve only records intersecting the requested scope.
+
+    Group provenance remains complete. Records are a spatial selection and must
+    never be written into the complete-inventory persistent cache.
+    """
+    if (len(bounds) != 4 or any(type(value) not in (int, float) or not math.isfinite(value) for value in bounds)
+            or bounds[0] >= bounds[1] or bounds[2] >= bounds[3]):
+        raise ValueError(f"Dynamic ECS selection bounds are invalid: bounds={bounds}")
+    check_cancelled()
+    scene = validate_scene_id(scene_id)
+    root = validate_vfs_root(vfs_root)
+    hash_path = string_path_hash.expanduser().resolve()
+    sources = _dynamic_inventory_sources(root, hash_path)
+
+    def decode() -> DynamicSceneRendererInventory:
+        raw = _read_raw_dynamic_scene_renderers(root, hash_path, scene, check_cancelled)
+        selected = replace(raw, records=tuple(row for row in raw.records if _renderer_intersects_bounds(row, bounds)))
+        result = _resolve_dynamic_scene_renderers(selected, hash_path, check_cancelled)
+        _require_dynamic_inventory_sources(root, hash_path, sources)
+        return result
+
+    qualifiers = _dynamic_inventory_qualifiers((scene, "bounded", *(str(value) for value in bounds)), sources)
+    result = cached_scene_source_value(_RENDERER_INVENTORY_CACHE, sources, qualifiers, decode)
+    check_cancelled()
+    return result
 
 
 def read_dynamic_scene_renderers_for_scene(

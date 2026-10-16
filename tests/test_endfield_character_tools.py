@@ -4,13 +4,17 @@ from __future__ import annotations
 
 import hashlib
 import json
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+import shutil
+import subprocess
+import sys
 import tempfile
 import unittest
 import xml.etree.ElementTree as ET
 
 from endfield_character_tools import CharacterToolsError, ROOT, TOOL_PROJECTS, _relative, _verify_file, _verify_snapshot, character_tool_source_identity
 from setup_character_tools import setup_character_tools
+from assemble_corresponding_source import is_source_package_path
 
 
 class CharacterToolTests(unittest.TestCase):
@@ -49,6 +53,35 @@ class CharacterToolTests(unittest.TestCase):
             with self.assertRaisesRegex(CharacterToolsError, "PATH_OUTSIDE_ROOT"):
                 _relative(root, "../escape.cs", "source")
             self.assertEqual(_relative(root, "source.cs", "source"), source)
+
+    def test_public_source_inventory_keeps_character_identity_after_relocation(self) -> None:
+        expected = character_tool_source_identity()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            candidates = {ROOT / "global.json"}
+            for directory in (ROOT / "src", ROOT / "dotnet", ROOT / "patches", ROOT / "third_party"):
+                candidates.update(path for path in directory.rglob("*") if path.is_file()
+                                  and is_source_package_path(PurePosixPath(path.relative_to(ROOT).as_posix())))
+            for source in candidates:
+                destination = root / source.relative_to(ROOT)
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(source, destination)
+            command = [sys.executable, "-B", "-c",
+                       "import sys; sys.path.insert(0, 'src'); "
+                       "from endfield_character_tools import character_tool_source_identity; "
+                       "print(character_tool_source_identity())"]
+            clean = subprocess.run(command, cwd=root, capture_output=True, text=True, check=True, timeout=30)
+            self.assertEqual(clean.stdout.strip(), expected)
+            unused = "third_party/character-nuget/AnimeStudio.FBXWrapper/packages.lock.json"
+            destination = root / unused
+            destination.parent.mkdir(parents=True)
+            shutil.copyfile(ROOT / "third_party/character-nuget/AnimeStudio/packages.lock.json", destination)
+            with_unused_lock = subprocess.run(command, cwd=root, capture_output=True, text=True, check=True, timeout=30)
+            self.assertEqual(with_unused_lock.stdout.strip(), expected)
+            project = root / "dotnet/CharacterTools/CharacterModel/CharacterModel.csproj"
+            project.write_bytes(project.read_bytes() + b"\n")
+            changed = subprocess.run(command, cwd=root, capture_output=True, text=True, check=True, timeout=30)
+            self.assertNotEqual(changed.stdout.strip(), expected)
 
     def test_setup_rejects_existing_or_overlapping_output_before_acquisition(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

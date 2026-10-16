@@ -1,7 +1,7 @@
 using System.Text.Json;
 using AnimeStudio;
 
-internal sealed record AnimationRequest(string Format, string CharacterId, string AvatarBundle, string AvatarCab, long AvatarPathId, string ClipBundle, string ResourcePath, string SourceAudit, string AnimatorRootPath, string? ControllerBundle, string UnityVersion, int MaximumStoredFrames, string Output);
+internal sealed record AnimationRequest(string Format, string CharacterId, string AvatarBundle, string AvatarCab, long AvatarPathId, string ClipBundle, string ResourcePath, string SourceAudit, string AnimatorRootPath, string? ControllerBundle, string UnityVersion, int MaximumStoredFrames, string Output, string? ControllerSelectionReceipt);
 
 internal static class AnimationReader
 {

@@ -21,6 +21,36 @@ class TerrainVertexNormals(TypedDict):
     max_storage_error: float
     max_storage_angle_degrees: float
     max_roundtrip_error: float
+    partitioned_vertices: int
+    partitioned_edges: int
+
+
+class TerrainNormalFanPartition(TypedDict):
+    blender_version: str
+    corners: list[int]
+    vertices: list[int]
+    edges: list[int]
+    faces: list[int]
+    minimum_face_area: float
+
+
+def partition_zero_normal_fans(mesh: bpy.types.Mesh, expected: NDArray[np.float64],
+                              corners: NDArray[np.int64]) -> TerrainNormalFanPartition:
+    """Partition only invalid native encoding fans, retaining every source corner normal."""
+    vertices = {mesh.loops[int(index)].vertex_index for index in corners}
+    faces = [polygon for polygon in mesh.polygons if any(vertex in vertices for vertex in polygon.vertices)]
+    areas = np.array([polygon.area for polygon in faces], dtype=np.float64)
+    if not len(areas) or not np.isfinite(areas).all() or np.any(areas < 1e-12):
+        raise ValueError(f"Terrain zero normal touches degenerate geometry: {mesh.name}, corners={corners[:12].tolist()}")
+    edges = [edge for edge in mesh.edges if any(vertex in vertices for vertex in edge.vertices)]
+    # Blender can return an all-zero normal space when a smooth fan's reference edge
+    # aligns with its automatic normal. Separate that fan before encoding the same source.
+    for edge in edges:
+        edge.use_edge_sharp = True
+    mesh.normals_split_custom_set(expected.tolist())
+    return {"blender_version": bpy.app.version_string, "corners": corners.tolist(),
+            "vertices": sorted(vertices), "edges": [edge.index for edge in edges],
+            "faces": [polygon.index for polygon in faces], "minimum_face_area": float(areas.min())}
 
 
 def normal_atlas_binding(material: bpy.types.Material) -> tuple[bpy.types.ShaderNodeTexImage, str, NDArray[np.float64], NDArray[np.float64]]:
@@ -143,6 +173,13 @@ def adapt_terrain_mesh_normals(obj: bpy.types.Object,
     mesh.corner_normals.foreach_get("vector", actual)
     if not np.isfinite(actual).all() or not np.isfinite(expected).all():
         raise ValueError(f"Terrain source or stored normals are nonfinite: {obj.name}")
+    zero_corners = np.flatnonzero(np.linalg.norm(actual.reshape(-1, 3), axis=1) < 1e-12)
+    if len(zero_corners):
+        partition = partition_zero_normal_fans(mesh, expected, zero_corners)
+        mesh.corner_normals.foreach_get("vector", actual)
+        if not np.isfinite(actual).all() or np.any(np.linalg.norm(actual.reshape(-1, 3), axis=1) < 1e-12):
+            raise ValueError(f"Terrain native normal encoding remains invalid after fan partition: {obj.name}, corners={zero_corners[:12].tolist()}")
+        mesh["endfield_terrain_normal_fan_partition"] = json.dumps(partition, sort_keys=True)
     error = float(np.max(np.abs(actual.reshape(-1, 3)-expected)))
     actual_unit = actual.reshape(-1, 3).astype(np.float64)
     lengths = np.linalg.norm(actual_unit, axis=1)
@@ -160,11 +197,14 @@ def adapt_terrain_mesh_normals(obj: bpy.types.Object,
         bpy.data.meshes.remove(reference)
     roundtrip_error = float(np.max(np.abs(actual-encoded)))
     if (not mesh.has_custom_normals or any(not polygon.use_smooth for polygon in mesh.polygons)
-            or not np.isfinite(encoded).all() or roundtrip_error > 1e-6):
+            or not np.isfinite(encoded).all() or np.any(np.linalg.norm(encoded.reshape(-1, 3), axis=1) < 1e-12)
+            or roundtrip_error > 1e-6):
         raise ValueError(f"Terrain stored normals disagree with native source encoding: {obj.name}, max_roundtrip_error={roundtrip_error}")
     status = "source_updated" if source_changed else "already_adapted" if contract else "adapted"
+    partition_audit = json.loads(mesh.get("endfield_terrain_normal_fan_partition", '{"vertices": [], "edges": []}'))
     return {"object": obj.name, "status": status, "corners": len(mesh.loops),
-            "max_storage_error": error, "max_storage_angle_degrees": angle, "max_roundtrip_error": roundtrip_error}
+            "max_storage_error": error, "max_storage_angle_degrees": angle, "max_roundtrip_error": roundtrip_error,
+            "partitioned_vertices": len(partition_audit["vertices"]), "partitioned_edges": len(partition_audit["edges"])}
 
 
 def adapt_scene_terrain_mesh_normals(scene: bpy.types.Scene) -> list[TerrainVertexNormals]:

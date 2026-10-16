@@ -76,7 +76,7 @@ _EFFECT_NONEXPORT_STATUSES = frozenset((
 ))
 _DECAL_STATUSES = frozenset(("restored", "no_receiver_surface", "unsupported_decal_feature"))
 _WATER_STATUSES = frozenset((
-    "restored", "outside_clipped_mesh", "covered_by_terrain", "bottom_geometry_incomplete",
+    "restored", "partially_restored", "surface_restored_depth_unverified", "outside_clipped_mesh", "covered_by_terrain", "bottom_geometry_incomplete",
     "bottom_geometry_missing",
 ))
 _LIGHT_STATUSES = frozenset((
@@ -88,6 +88,9 @@ _PENDING_EXPLANATIONS = {
     "decal_material_incomplete": "贴花材质或纹理依赖不完整",
     "renderer_material_missing": "缺少特效渲染器的材质证据",
     "mesh_export_missing": "缺少该组件所需的网格导出数据",
+    "prefab_hierarchy_missing": "该预制资源的对象层级尚未完整提取",
+    "prefab_lod_evidence_missing": "缺少该预制资源的源精度分级信息，未叠放多个精度模型",
+    "effect_renderer_role_requires_separate_support": "该对象属于特效，暂未还原；不计入普通模型缺失",
     "prefab_container_missing": "当前 SceneProbe 目录中缺少该特效预制体容器",
     "prefab_root_ambiguous": "特效预制体对应多个来源根对象，无法唯一确定",
     "particle_component_invalid": "特效预制体中的粒子组件配对不完整",
@@ -102,6 +105,8 @@ _PENDING_EXPLANATIONS = {
     "source_formula_preview_runtime_unresolved": "材质源公式对应的运行时行为尚未完整还原",
     "source_formula_preview_partial": "材质源公式仅部分还原",
     "bottom_geometry_incomplete": "水体底部几何未完整还原",
+    "partially_restored": "已导出有有效底面的水面部分，其余面仍缺少水底",
+    "surface_restored_depth_unverified": "源水面已完整保留；未测得水底的部分使用光学深水近似，深度效果仍待验证",
     "bottom_geometry_missing": "缺少水体底部几何",
     "unsupported_decal_feature": "贴花包含当前导出器不支持的特性",
     "unsupported_light_type_or_shape": "光源类型或形状尚未支持",
@@ -229,7 +234,7 @@ def _identity_value(value: object) -> str | None:
 def _issue_identity(row: dict[str, object]) -> str:
     fields = (
         ("object", "对象"), ("material", "材质"), ("entity_id", "实体 ID"),
-        ("component", "构件"), ("source_key", "源记录"), ("prefab_path", "FX 资源"),
+        ("component", "构件"), ("source_key", "源记录"), ("prefab_path", "预制资源"),
         ("map_id", "场景"),
     )
     labels: list[str] = []
@@ -379,6 +384,7 @@ def _audit_pending_count(plan_rows: dict[str, list[dict[str, object]]],
     return (
         active_plan_pending + len(plan_rows["direct_effect_pending"])
         + len(plan_rows["dynamic_geometry_pending"])
+        + len(plan_rows["prefab_geometry_pending"])
         + sum(row.get("status") != "restored" for row in audit_rows["decals"])
         + sum(row.get("status") not in ("restored", "outside_clipped_mesh", "covered_by_terrain")
               for row in audit_rows["water"])
@@ -387,6 +393,11 @@ def _audit_pending_count(plan_rows: dict[str, list[dict[str, object]]],
         ) for row in audit_rows["effects"])
         + len(audit_rows["lights"]) + len(audit_rows["material_pending"])
     )
+
+
+def _prefab_pending_group(row: dict[str, object]) -> ExportGroup:
+    """Keep known effect roles out of ordinary missing-geometry counts."""
+    return "effects" if row.get("reason") == "effect_renderer_role_requires_separate_support" else "unknown"
 
 
 def _collect_pending(source_path: str, plan_rows: dict[str, list[dict[str, object]]],
@@ -442,6 +453,9 @@ def _collect_pending(source_path: str, plan_rows: dict[str, list[dict[str, objec
         _add_keyed_pending(issues, source_path, "dynamic_geometry", row, "unknown", "dynamic_geometry",
                            ("source_key", "component", "reason"),
                            f"audit.dynamic_geometry_pending[{index}]")
+    for index, row in enumerate(audit_rows["prefab_geometry_pending"]):
+        _add_keyed_pending(issues, source_path, "prefab_geometry", row, _prefab_pending_group(row), "prefab_geometry",
+                           ("source_key", "component", "reason"), f"audit.prefab_geometry_pending[{index}]")
     for index, row in enumerate(audit_rows["water_depth_context_pending"]):
         component = _text(row.get("component"), f"audit.water_depth_context_pending[{index}].component")
         reason = _text(row.get("reason"), f"audit.water_depth_context_pending[{index}].reason")
@@ -464,6 +478,9 @@ def _collect_pending(source_path: str, plan_rows: dict[str, list[dict[str, objec
         _add_keyed_pending(issues, source_path, "dynamic_geometry", row, "unknown", "dynamic_geometry",
                            ("source_key", "component", "reason"),
                            f"plan.dynamic_geometry_pending[{index}]")
+    for index, row in enumerate(plan_rows["prefab_geometry_pending"]):
+        _add_keyed_pending(issues, source_path, "prefab_geometry", row, _prefab_pending_group(row), "prefab_geometry",
+                           ("source_key", "component", "reason"), f"plan.prefab_geometry_pending[{index}]")
     for index, row in enumerate(plan_rows["water_depth_pending"]):
         component = _text(row.get("component"), f"plan.water_depth_pending[{index}].component")
         reason = _text(row.get("reason"), f"plan.water_depth_pending[{index}].reason")
@@ -519,13 +536,37 @@ def _effect_group_for_row(row: dict[str, object], effect_groups: dict[int, Expor
     return group_id
 
 
+def _source_categories(rows: list[dict[str, object]], identity_field: str, field: str) -> dict[str, str]:
+    """Count authored sources once while retaining distinct mesh parts."""
+    categories: dict[str, str] = {}
+    parts: dict[str, set[str | None]] = {}
+    for index, row in enumerate(rows):
+        context = f"plan.{field}[{index}]"
+        entity = _row_id(row, identity_field, context)
+        category = _text(row.get("category"), f"{context}.category")
+        part = _text(row["mesh_part_key"], f"{context}.mesh_part_key") if "mesh_part_key" in row else None
+        if entity in categories:
+            if categories[entity] != category:
+                raise ValueError(f"{context}: mesh parts have conflicting categories for source {entity}")
+            if part is None or None in parts[entity] or part in parts[entity]:
+                raise ValueError(f"{context}: repeated source requires distinct mesh part identities: {entity}")
+            parts[entity].add(part)
+        else:
+            categories[entity] = category
+            parts[entity] = {part}
+    return categories
+
+
 def _collect_exported(plan_rows: dict[str, list[dict[str, object]]],
                       audit_rows: dict[str, list[dict[str, object]]]) -> dict[ExportGroup, int | None]:
     counts: dict[ExportGroup, int | None] = {group_id: 0 for group_id in _GROUPS}
-    for field in ("instances", "dynamic_geometry_instances"):
-        for row in plan_rows[field]:
-            category = _text(row.get("category"), f"plan.{field}.category")
-            _add_exported(counts, _group(category), 1)
+    for category in _source_categories(plan_rows["instances"], "entity_id", "instances").values():
+        _add_exported(counts, _group(category), 1)
+    for category in _source_categories(plan_rows["dynamic_geometry_instances"], "source_key", "dynamic_geometry_instances").values():
+        _add_exported(counts, _group(category), 1)
+    for row in plan_rows["prefab_geometry_instances"]:
+        category = _text(row.get("category"), "plan.prefab_geometry_instances.category")
+        _add_exported(counts, _group(category), 1)
     _add_exported(counts, "terrain", len(plan_rows["terrain_surfaces"]))
     _add_exported(counts, "effects", len(plan_rows["surface_effect_instances"]))
 
@@ -537,7 +578,7 @@ def _collect_exported(plan_rows: dict[str, list[dict[str, object]]],
             _mark_exported_unknown(counts, "effects")
     for index, row in enumerate(audit_rows["water"]):
         status = _text(row.get("status"), f"audit.water[{index}].status")
-        if status == "restored":
+        if status in ("restored", "partially_restored", "surface_restored_depth_unverified"):
             _add_exported(counts, "water", 1)
         elif status not in _WATER_STATUSES:
             _mark_exported_unknown(counts, "water")
@@ -580,6 +621,14 @@ def _scene_rows(plan: dict[str, object], audit: dict[str, object],
     plan_rows["terrain_surfaces"] = _path_rows(plan, "terrain_surfaces", f"{context}.plan")
     plan_rows["terrain_details"] = _path_rows(plan, "terrain_details", f"{context}.plan")
     audit_rows = {field: _rows(audit, field, f"{context}.audit") for field in audit_fields}
+    # Older scene artifacts predate the ordinary streamed-prefab branch.
+    for field in ("prefab_geometry_instances", "prefab_geometry_pending"):
+        plan_rows[field] = _rows(plan, field, f"{context}.plan") if field in plan else []
+    audit_rows["prefab_geometry_pending"] = (
+        _rows(audit, "prefab_geometry_pending", f"{context}.audit") if "prefab_geometry_pending" in audit else []
+    )
+    if audit_rows["prefab_geometry_pending"] != plan_rows["prefab_geometry_pending"]:
+        raise ValueError(f"{context}: audit prefab_geometry_pending differs from its source plan")
     for audit_field, plan_field in (
         ("direct_effect_pending", "direct_effect_pending"),
         ("dynamic_geometry_pending", "dynamic_geometry_pending"),
@@ -645,7 +694,22 @@ def build_instanced_scene_export_result(output_root: Path,
             raise ValueError(f"{context}: SceneArtifact pending count differs from audit")
 
         plan_rows, audit_rows = _scene_rows(plan, audit, context)
-        expected_instances = len(plan_rows["instances"]) + len(plan_rows["dynamic_geometry_instances"])
+        static_entities = len(_source_categories(plan_rows["instances"], "entity_id", "instances"))
+        if any("mesh_part_key" in row for row in plan_rows["instances"]) and "static_source_entities" not in audit:
+            raise ValueError(f"{context}: multipart static audit requires a source entity count")
+        for field, expected in (("static_source_entities", static_entities),
+                                ("static_mesh_parts", len(plan_rows["instances"]))):
+            if field in audit and _count(audit[field], f"{context}.audit.{field}") != expected:
+                raise ValueError(f"{context}: audit {field} differs from source plan")
+        dynamic_records = len(_source_categories(plan_rows["dynamic_geometry_instances"], "source_key", "dynamic_geometry_instances"))
+        if any("mesh_part_key" in row for row in plan_rows["dynamic_geometry_instances"]) and "dynamic_source_records" not in audit:
+            raise ValueError(f"{context}: multipart dynamic audit requires a source record count")
+        for field, expected in (("dynamic_source_records", dynamic_records),
+                                ("dynamic_mesh_parts", len(plan_rows["dynamic_geometry_instances"]))):
+            if field in audit and _count(audit[field], f"{context}.audit.{field}") != expected:
+                raise ValueError(f"{context}: audit {field} differs from source plan")
+        expected_instances = (len(plan_rows["instances"]) + len(plan_rows["dynamic_geometry_instances"])
+                              + len(plan_rows["prefab_geometry_instances"]))
         if expected_instances != audit_instances:
             raise ValueError(f"{context}: audit instance count differs from plan rows")
         derived_pending = _audit_pending_count(plan_rows, audit_rows)

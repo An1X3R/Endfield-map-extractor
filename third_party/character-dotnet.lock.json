@@ -8,11 +8,11 @@
     "commit": "5bb936ca1d3662fe9b956ec669ab7ebea08bfd07",
     "license": "MIT",
     "patch": "patches/animestudio-character-texture-provider.patch",
-    "patchSha256": "2f5d13855bd6128ff96f827d656ea18f4d61a168faf57dc0d4c7bcc495e6c940",
+    "patchSha256": "8152fda2c15b5c28fa9df7410c2249bb4380c208c0d97b420e2a59bb54d2bb89",
     "compiledFiles": [
       {
         "path": "AnimeStudio.Utility/ModelConverter.cs",
-        "sha256": "2a2c003f19c4600308a62c88c87783ffc3f480480cf50fda3bdf8a05dfe60e98"
+        "sha256": "3deeba89b1e82903fb9b5d2c80d39158e1a104e6837019545d366a5eaee6350d"
       },
       {
         "path": "AnimeStudio/AnimeStudio.csproj",

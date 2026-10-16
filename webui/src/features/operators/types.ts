@@ -10,6 +10,7 @@ export type CharacterDiagnostic = {
 }
 
 export type CharacterEntryKind = 'playable' | 'independent_npc'
+export type CharacterAssetCategory = 'playable' | 'npc' | 'animal' | 'creature' | 'object'
 export type CharacterJobKind = 'preparation' | 'export'
 export type CharacterNameStatus = 'resolved' | 'missing' | 'ambiguous'
 export type CharacterNpcSourceKind = 'prefab' | 'config_assembled' | 'unresolved'
@@ -32,7 +33,7 @@ export type CharacterVariant = {
 }
 
 export type CharacterNameSource = {
-  table: 'NpcTemplateGroupTable' | 'NpcTable'
+  table: 'NpcTemplateGroupTable' | 'NpcTable' | 'EnemyTemplateDisplayInfoTable' | 'EnemyDisplayInfoTable'
   row_key: string
   field: string
   text_id: string
@@ -44,6 +45,7 @@ export type PlayableCharacterSummary = {
   name: string
   english_name: string | null
   entry_kind: 'playable'
+  asset_category: CharacterAssetCategory
   variants: CharacterVariant[]
   capabilities: CharacterCapabilities
   optional_tools_reason: string | null
@@ -56,6 +58,7 @@ export type IndependentNpcSummary = {
   name: string | null
   english_name: null
   entry_kind: 'independent_npc'
+  asset_category: CharacterAssetCategory
   name_status: CharacterNameStatus
   source_kind: CharacterNpcSourceKind
   name_source: CharacterNameSource | null
@@ -109,6 +112,22 @@ export type CharacterAnimation = {
   ordinary_replays?: CharacterReplay[]
   native_expression_replays?: CharacterReplay[]
   finalik_replays?: CharacterReplay[]
+}
+
+export type CharacterUnsupportedAction = {
+  state_name: string
+  clip_name: string
+  binding_status: string
+  reason: string
+}
+
+export type CharacterAnimationCoverage = {
+  scope: string
+  available_action_count: number
+  unsupported_action_count: number
+  source_state_count?: number
+  source_reference_count?: number
+  runtime_state_machine_reconstructed?: false
 }
 
 export type CharacterCpuActionReference = {
@@ -167,6 +186,8 @@ export type CharacterAnimationCatalog = {
   binding_status?: string
   unavailable_reason?: string | null
   source_cpu_action_references?: CharacterCpuActionReferences
+  unsupported_actions?: CharacterUnsupportedAction[]
+  coverage_counts?: CharacterAnimationCoverage
 }
 
 export type CharacterPreparationSource = {

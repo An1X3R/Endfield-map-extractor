@@ -41,6 +41,258 @@ class NpcCpuBinding:
     actions: tuple[NpcCpuAction, ...]
 
 
+NPC_GENERIC_AVATAR_POSE_TOLERANCE = 1e-6
+
+
+@dataclass(frozen=True)
+class NpcAvatarLocalPose:
+    translation: tuple[float, float, float]
+    rotation: tuple[float, float, float, float]
+    scale: tuple[float, float, float]
+
+
+@dataclass(frozen=True)
+class NpcAvatarRigNode:
+    path: str
+    parent_path: str | None
+    default_pose: NpcAvatarLocalPose
+    avatar_skeleton_pose: NpcAvatarLocalPose
+
+
+@dataclass(frozen=True)
+class NpcGenericAvatarEquivalence:
+    source_avatar_sha256: str
+    target_avatar_sha256: str
+    clip_count: int
+    transform_binding_count: int
+    driven_path_count: int
+    validated_path_count: int
+    max_default_pose_delta: float
+    max_avatar_skeleton_pose_delta: float
+
+    def to_document(self) -> dict[str, str | int | float]:
+        """Return the bounded proof fields consumed by the action catalog."""
+        return {
+            "format": "NpcGenericAvatarEquivalence/1",
+            "source_avatar_sha256": self.source_avatar_sha256,
+            "target_avatar_sha256": self.target_avatar_sha256,
+            "tolerance": NPC_GENERIC_AVATAR_POSE_TOLERANCE,
+            "clip_count": self.clip_count,
+            "transform_binding_count": self.transform_binding_count,
+            "driven_path_count": self.driven_path_count,
+            "validated_path_count": self.validated_path_count,
+            "max_default_pose_delta": self.max_default_pose_delta,
+            "max_avatar_skeleton_pose_delta": self.max_avatar_skeleton_pose_delta,
+        }
+
+
+def _generic_object(value: object, field: str) -> dict[str, object]:
+    if not isinstance(value, dict) or any(not isinstance(key, str) for key in value):
+        raise NpcAnimationBindingError(f"Expected source object: field={field}")
+    return value
+
+
+def _generic_rows(value: object, field: str) -> tuple[dict[str, object], ...]:
+    if not isinstance(value, list):
+        raise NpcAnimationBindingError(f"Expected source array: field={field}")
+    return tuple(_generic_object(row, field) for row in value)
+
+
+def _generic_integer(value: object, field: str) -> int:
+    if type(value) is not int:
+        raise NpcAnimationBindingError(f"Expected source integer: field={field}, value={value!r}")
+    return value
+
+
+def _generic_text(value: object, field: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise NpcAnimationBindingError(f"Expected nonempty source text: field={field}")
+    return value
+
+
+def _generic_finite_number(value: object, field: str) -> float:
+    if type(value) not in (int, float) or not math.isfinite(value):
+        raise NpcAnimationBindingError(f"Expected finite source number: field={field}")
+    return float(value)
+
+
+def _generic_local_pose(value: dict[str, object], field: str) -> NpcAvatarLocalPose:
+    def vector(name: str, axes: str) -> tuple[float, ...]:
+        row = _generic_object(value.get(name), f"{field}.{name}")
+        return tuple(_generic_finite_number(row.get(axis), f"{field}.{name}.{axis}") for axis in axes)
+
+    translation = vector("t", "XYZ")
+    rotation = vector("q", "XYZW")
+    scale = vector("s", "XYZ")
+    return NpcAvatarLocalPose(
+        (translation[0], translation[1], translation[2]),
+        (rotation[0], rotation[1], rotation[2], rotation[3]),
+        (scale[0], scale[1], scale[2]),
+    )
+
+
+def _generic_avatar_rig(avatar: NpcSourceObject, role: str) -> tuple[dict[str, NpcAvatarRigNode], str]:
+    if avatar.metadata.get("type") != "Avatar":
+        raise NpcAnimationBindingError(f"{role} source must resolve to an actual Avatar")
+    digest = _generic_text(avatar.metadata.get("rawDataSha256"), f"{role}.rawDataSha256").casefold()
+    if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
+        raise NpcAnimationBindingError(f"{role} Avatar has an invalid source SHA-256")
+    data = _generic_object(avatar.value.get("m_Avatar"), f"{role}.m_Avatar")
+    skeleton = _generic_object(data.get("m_AvatarSkeleton"), f"{role}.m_AvatarSkeleton")
+    raw_ids = skeleton.get("m_ID")
+    if not isinstance(raw_ids, list):
+        raise NpcAnimationBindingError(f"{role} Avatar skeleton IDs are absent")
+    ids = tuple(_generic_integer(value, f"{role}.m_ID[{index}]") for index, value in enumerate(raw_ids))
+    nodes = _generic_rows(skeleton.get("m_Node"), f"{role}.m_Node")
+    default_poses = _generic_rows(_generic_object(data.get("m_DefaultPose"), f"{role}.m_DefaultPose").get("m_X"),
+                                  f"{role}.m_DefaultPose.m_X")
+    skeleton_poses = _generic_rows(_generic_object(data.get("m_AvatarSkeletonPose"), f"{role}.m_AvatarSkeletonPose").get("m_X"),
+                                   f"{role}.m_AvatarSkeletonPose.m_X")
+    tos = _generic_object(avatar.value.get("m_TOS"), f"{role}.m_TOS")
+    if not ids or len(set(ids)) != len(ids) or len(ids) != len(nodes) or len(nodes) != len(default_poses) or len(nodes) != len(skeleton_poses):
+        raise NpcAnimationBindingError(f"{role} Avatar skeleton, path IDs and local poses disagree")
+
+    paths: list[str] = []
+    parent_indices: list[int] = []
+    for index, (path_id, node) in enumerate(zip(ids, nodes, strict=True)):
+        key = str(path_id)
+        raw_path = tos.get(key)
+        if path_id == 0 and raw_path in (None, ""):
+            path = ""
+        else:
+            path = _generic_text(raw_path, f"{role}.m_TOS[{key}]")
+        if path and (path.startswith("/") or path.endswith("/") or "//" in path
+                     or any(component in (".", "..") for component in path.split("/"))):
+            raise NpcAnimationBindingError(f"{role} Avatar has a malformed transform path: path={path!r}")
+        paths.append(path)
+        parent_indices.append(_generic_integer(node.get("m_ParentId"), f"{role}.m_Node[{index}].m_ParentId"))
+    if len(set(paths)) != len(paths) or paths.count("") != 1:
+        raise NpcAnimationBindingError(f"{role} Avatar transform paths are duplicated or lack one root path")
+
+    result: dict[str, NpcAvatarRigNode] = {}
+    root_count = 0
+    for index, path in enumerate(paths):
+        parent_index = parent_indices[index]
+        if parent_index == -1:
+            parent_path: str | None = None
+            root_count += 1
+            if path != "":
+                raise NpcAnimationBindingError(f"{role} Avatar root path is not the empty transform path")
+        else:
+            if parent_index < 0 or parent_index >= len(paths) or parent_index == index:
+                raise NpcAnimationBindingError(f"{role} Avatar has an invalid parent index: path={path!r}")
+            parent_path = paths[parent_index]
+            if path.rpartition("/")[0] != parent_path or not path:
+                raise NpcAnimationBindingError(f"{role} Avatar path and parent disagree: path={path!r}, parent={parent_path!r}")
+        result[path] = NpcAvatarRigNode(path, parent_path,
+            _generic_local_pose(default_poses[index], f"{role}.defaultPose[{path}]"),
+            _generic_local_pose(skeleton_poses[index], f"{role}.avatarSkeletonPose[{path}]"))
+    if root_count != 1:
+        raise NpcAnimationBindingError(f"{role} Avatar has an invalid root count: count={root_count}")
+    return result, digest
+
+
+def _generic_clip_transform_paths(clips: tuple[NpcSourceObject, ...], avatar_paths: frozenset[str],
+                                  source_tos: dict[str, str], target_tos: dict[str, str]) -> tuple[frozenset[str], int]:
+    driven_paths: set[str] = set()
+    binding_count = 0
+    if not clips:
+        raise NpcAnimationBindingError("Generic Avatar equivalence requires exact selected AnimationClip sources")
+    for clip_index, clip in enumerate(clips):
+        if clip.metadata.get("type") != "AnimationClip":
+            raise NpcAnimationBindingError(f"Generic source clip is not an AnimationClip: index={clip_index}")
+        digest = _generic_text(clip.metadata.get("rawDataSha256"), f"clip[{clip_index}].rawDataSha256").casefold()
+        if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
+            raise NpcAnimationBindingError(f"Generic source clip has an invalid source SHA-256: index={clip_index}")
+        clip_data = _generic_object(clip.value.get("m_ClipBindingConstant"), f"clip[{clip_index}].m_ClipBindingConstant")
+        rows = _generic_rows(clip_data.get("genericBindings"), f"clip[{clip_index}].genericBindings")
+        clip_paths: set[str] = set()
+        for row_index, binding in enumerate(rows):
+            type_id = _generic_text(binding.get("typeID"), f"clip[{clip_index}].genericBindings[{row_index}].typeID")
+            if type_id != "Transform":
+                continue
+            path_id = _generic_integer(binding.get("path"), f"clip[{clip_index}].genericBindings[{row_index}].path")
+            if not 0 <= path_id <= 0xffffffff:
+                raise NpcAnimationBindingError(f"Generic Transform binding path hash is outside uint32: clip={clip_index}, row={row_index}")
+            key = str(path_id)
+            source_path = source_tos.get(key)
+            target_path = target_tos.get(key)
+            if source_path is None or target_path is None or source_path != target_path:
+                raise NpcAnimationBindingError(
+                    f"Generic Transform binding hash does not resolve to one exact path in both Avatars: clip={clip_index}, row={row_index}, path_hash={path_id}")
+            if source_path not in avatar_paths:
+                raise NpcAnimationBindingError(f"Generic Transform binding path is absent from the source rig: path={source_path!r}")
+            clip_paths.add(source_path)
+            binding_count += 1
+        if not clip_paths:
+            raise NpcAnimationBindingError(f"Generic AnimationClip has no Transform path bindings: index={clip_index}")
+        driven_paths.update(clip_paths)
+    return frozenset(driven_paths), binding_count
+
+
+def _generic_pose_delta(source: NpcAvatarLocalPose, target: NpcAvatarLocalPose) -> float:
+    translation_delta = max(abs(left - right) for left, right in zip(source.translation, target.translation, strict=True))
+    scale_delta = max(abs(left - right) for left, right in zip(source.scale, target.scale, strict=True))
+    direct_rotation_delta = max(abs(left - right) for left, right in zip(source.rotation, target.rotation, strict=True))
+    opposite_rotation_delta = max(abs(left + right) for left, right in zip(source.rotation, target.rotation, strict=True))
+    rotation_delta = min(direct_rotation_delta, opposite_rotation_delta)
+    return max(translation_delta, scale_delta, rotation_delta)
+
+
+def validate_npc_generic_target(source_avatar: NpcSourceObject, target_avatar: NpcSourceObject,
+                                clips: tuple[NpcSourceObject, ...]) -> NpcGenericAvatarEquivalence:
+    """Admit Generic cross-Avatar clips only when driven paths and ancestors share source poses."""
+    source_nodes, source_digest = _generic_avatar_rig(source_avatar, "CPU")
+    target_nodes, target_digest = _generic_avatar_rig(target_avatar, "target")
+    source_paths = frozenset(source_nodes)
+    target_paths = frozenset(target_nodes)
+    if source_paths != target_paths:
+        missing_target = tuple(sorted(source_paths - target_paths)[:8])
+        missing_source = tuple(sorted(target_paths - source_paths)[:8])
+        raise NpcAnimationBindingError(
+            f"Generic Avatar transform path sets differ: source_only={missing_target}, target_only={missing_source}")
+    parent_mismatches = tuple(path for path in sorted(source_paths)
+        if source_nodes[path].parent_path != target_nodes[path].parent_path)
+    if parent_mismatches:
+        raise NpcAnimationBindingError(f"Generic Avatar parent paths differ: paths={parent_mismatches[:8]}")
+
+    source_tos = _generic_object(source_avatar.value.get("m_TOS"), "CPU.m_TOS")
+    target_tos = _generic_object(target_avatar.value.get("m_TOS"), "target.m_TOS")
+    source_path_ids = {key: ("" if key == "0" and value == "" else _generic_text(value, f"CPU.m_TOS[{key}]"))
+                       for key, value in source_tos.items()}
+    target_path_ids = {key: ("" if key == "0" and value == "" else _generic_text(value, f"target.m_TOS[{key}]"))
+                       for key, value in target_tos.items()}
+    source_path_ids.setdefault("0", "")
+    target_path_ids.setdefault("0", "")
+    driven_paths, binding_count = _generic_clip_transform_paths(clips, source_paths, source_path_ids, target_path_ids)
+    validated_paths: set[str] = set()
+    for driven_path in driven_paths:
+        path: str | None = driven_path
+        while path is not None:
+            validated_paths.add(path)
+            path = source_nodes[path].parent_path
+
+    maximum_default_delta = 0.0
+    maximum_skeleton_delta = 0.0
+    for path in sorted(validated_paths):
+        source_node = source_nodes[path]
+        target_node = target_nodes[path]
+        for pose_name, source_pose, target_pose in (
+            ("default pose", source_node.default_pose, target_node.default_pose),
+            ("Avatar skeleton pose", source_node.avatar_skeleton_pose, target_node.avatar_skeleton_pose),
+        ):
+            delta = _generic_pose_delta(source_pose, target_pose)
+            if pose_name == "default pose":
+                maximum_default_delta = max(maximum_default_delta, delta)
+            else:
+                maximum_skeleton_delta = max(maximum_skeleton_delta, delta)
+            if delta > NPC_GENERIC_AVATAR_POSE_TOLERANCE:
+                raise NpcAnimationBindingError(
+                    f"Generic Avatar {pose_name} differs on a driven path or ancestor: path={path!r}, max_delta={delta:.9g}, tolerance={NPC_GENERIC_AVATAR_POSE_TOLERANCE}")
+    return NpcGenericAvatarEquivalence(source_digest, target_digest, len(clips), binding_count,
+        len(driven_paths), len(validated_paths), maximum_default_delta, maximum_skeleton_delta)
+
+
 def _cpu_animation_template(template: str) -> tuple[Literal["Humanoid", "Generic"], str]:
     humanoid = re.fullmatch(r"NPC/AnimationConfig/Humanoid/([A-Za-z0-9_]+)/([A-Za-z0-9_]+)", template)
     if humanoid is not None:

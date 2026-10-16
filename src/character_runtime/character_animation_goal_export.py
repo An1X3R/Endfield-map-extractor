@@ -216,6 +216,58 @@ def validate_sample_times(frames_value: object, samples_value: object, hierarchy
     return frames, samples
 
 
+def independent_buffer_samples(value: object, domain_value: object, name: str) -> list[dict[str, object]]:
+    """Validate one complete decoded buffer without borrowing another buffer's timeline."""
+    values = array_value(value, name + ' samples')
+    domain = object_value(domain_value, name + ' frame domain')
+    count = integer_value(field_value(domain, 'original_frame_count', name), name + ' frame count')
+    excluded = integer_value(field_value(domain, 'excluded_tail_frames', name), name + ' excluded tail count')
+    if not values or len(values) != count or excluded != 0:
+        raise ValueError('Independent Generic buffer must retain every source sample: ' + name)
+    samples: list[dict[str, object]] = []
+    prior: float | None = None
+    for index, value in enumerate(values):
+        sample = object_value(value, name + ' sample ' + str(index))
+        timestamp = number_value(field_value(sample, 'time', name), name + ' sample time')
+        if prior is not None and timestamp <= prior:
+            raise ValueError('Independent Generic timestamps are duplicate or decreasing: ' + name + ' frame ' + str(index))
+        prior = timestamp
+        samples.append(sample)
+    for field, sample in (('source_start_time', samples[0]), ('source_end_time', samples[-1])):
+        if number_value(field_value(domain, field, name), name + ' ' + field) != number_value(sample['time'], name + ' endpoint'):
+            raise ValueError('Independent Generic buffer endpoint differs from its source samples: ' + name + '.' + field)
+    return samples
+
+
+def validate_generic_qvvf_sample_times(frames_value: object, transform_value: object, root_value: object,
+                                      float_value: object, hierarchy_count: int,
+                                      time_domain_value: object) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    """Retain the full authenticated Generic QVVF timeline; other buffers remain independent."""
+    domain = object_value(time_domain_value, 'Generic frame domain')
+    if domain.get('status') != 'generic_full_qvvf_timestamp_domain_verified':
+        raise ValueError('Generic QVVF export requires its explicit independent frame-domain status')
+    transforms = independent_buffer_samples(transform_value, field_value(domain, 'transform', 'Generic frame domain'), 'transform')
+    independent_buffer_samples(root_value, field_value(domain, 'root_motion', 'Generic frame domain'), 'root_motion')
+    samples = independent_buffer_samples(float_value, field_value(domain, 'float', 'Generic frame domain'), 'float')
+    raw_frames = array_value(frames_value, 'Generic source local frames')
+    if (len(raw_frames) != len(transforms)
+            or integer_value(field_value(domain, 'frame_count', 'Generic frame domain'), 'Generic frame count') != len(raw_frames)
+            or integer_value(field_value(domain, 'exported_frame_count', 'Generic frame domain'), 'Generic exported frame count') != len(raw_frames)):
+        raise ValueError('Generic merged frame count differs from the complete source QVVF timeline')
+    frames: list[dict[str, object]] = []
+    for index, (raw_frame, transform) in enumerate(zip(raw_frames, transforms, strict=True)):
+        frame = object_value(raw_frame, 'Generic source frame ' + str(index))
+        if number_value(field_value(frame, 'time', 'Generic source frame'), 'Generic frame time') != number_value(transform['time'], 'transform sample time'):
+            raise ValueError('Generic merged timestamp differs from its source QVVF sample: frame ' + str(index))
+        if len(array_value(field_value(frame, 'locals', 'Generic source frame'), 'Generic frame locals')) != hierarchy_count:
+            raise ValueError('Generic source local count differs from its authenticated hierarchy: frame ' + str(index))
+        frames.append(frame)
+    for field, sample in (('exported_start_time', frames[0]), ('exported_end_time', frames[-1])):
+        if number_value(field_value(domain, field, 'Generic frame domain'), field) != number_value(sample['time'], 'Generic frame endpoint'):
+            raise ValueError('Generic exported endpoint differs from its complete QVVF timeline: ' + field)
+    return frames, samples
+
+
 def mapped_source_index(path_value: object, animator_root_path: str, path_to_index: dict[str, int], context: str) -> tuple[int, str]:
     path = text_value(path_value, context + ' Avatar TOS path')
     full_path = animator_root_path.rstrip('/') + '/' + path
@@ -426,18 +478,25 @@ def export_source_goals(output: Path, character_id: str, avatar_cab: str, avatar
     base_frames_value = read_json(base_frames_path, 'base source-local frames')
     base_unapplied_value = read_json(base_unapplied_path, 'base unapplied channels')
     time_domain = object_value(read_json(time_domain_path, 'frame-domain verification'), 'frame-domain verification')
-    common_count = integer_value(field_value(time_domain, 'common_frame_count', 'frame-domain verification'), 'common frame count')
-    if common_count != len(array_value(base_frames_value, 'base source-local frames')):
-        raise ValueError('Frame-domain verification does not match merged frame count')
     goal_tracks = resolve_goal_tracks(bindings_value)
     maximum_track = max((track for _, track in goal_tracks.tracks), default=-1)
-    frames, samples = validate_sample_times(base_frames_value, samples_value, len(hierarchy), maximum_track + 1, time_domain)
+    additional_inputs: list[Path] = []
+    if time_domain.get('status') == 'generic_full_qvvf_timestamp_domain_verified':
+        if goal_tracks.applied:
+            raise ValueError('Source-goal channels require the strict shared-buffer frame domain; independent Generic QVVF cannot consume them')
+        transform_samples_path = output / 'native/transform_samples.json'
+        root_samples_path = output / 'native/root_motion_samples.json'
+        frames, samples = validate_generic_qvvf_sample_times(base_frames_value,
+            read_json(transform_samples_path, 'transform samples'), read_json(root_samples_path, 'root-motion samples'),
+            samples_value, len(hierarchy), time_domain)
+        additional_inputs.extend((transform_samples_path, root_samples_path))
+    else:
+        frames, samples = validate_sample_times(base_frames_value, samples_value, len(hierarchy), maximum_track + 1, time_domain)
     sidecar_dir = output / 'source_goal_ik'
     sidecar_receipt_path = sidecar_dir / 'receipt.json'
     source_path = base_frames_path
     unapplied_path = base_unapplied_path
     output_paths: list[Path] = [sidecar_receipt_path]
-    additional_inputs: list[Path] = []
     status = 'not_applicable_no_goal_channels'
     summary: dict[str, object] = {'status': status, 'character_id': character_id, 'avatar_cab': avatar_cab, 'avatar_path_id': str(avatar_path_id),
                                   'frame_count': len(frames), 'goal_channel_count': 0, 'missing_goal_channels': list(GOAL_FIELDS),

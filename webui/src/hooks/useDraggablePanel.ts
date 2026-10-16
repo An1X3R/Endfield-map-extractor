@@ -51,6 +51,7 @@ export function useDraggablePanel(
 
     const workspaceBounds = workspace.getBoundingClientRect()
     const panelBounds = panel.getBoundingClientRect()
+    if (workspaceBounds.width === 0 || workspaceBounds.height === 0 || panelBounds.width === 0 || panelBounds.height === 0) return
     const baseLeft = panelBounds.left - workspaceBounds.left - offsetRef.current.x
     const baseTop = panelBounds.top - workspaceBounds.top - offsetRef.current.y
     const nextOffset = {
@@ -129,9 +130,15 @@ export function useDraggablePanel(
       else movePanel(offsetRef.current.x, offsetRef.current.y)
     }
     window.addEventListener('resize', handleResize)
+    const observer = new ResizeObserver(handleResize)
+    if (workspaceRef.current) observer.observe(workspaceRef.current)
+    if (panelRef.current) observer.observe(panelRef.current)
     if (disabled) reset()
-    return () => window.removeEventListener('resize', handleResize)
-  }, [disabled, movePanel, reset])
+    return () => {
+      window.removeEventListener('resize', handleResize)
+      observer.disconnect()
+    }
+  }, [disabled, movePanel, reset, workspaceRef])
 
   return {
     panelRef,

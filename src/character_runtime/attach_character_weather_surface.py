@@ -163,9 +163,20 @@ def create_weather_instance(tree: bpy.types.ShaderNodeTree, kernel: bpy.types.Sh
         tree.links.new(math_node(tree, 'SUBTRACT', 1., geometry.outputs['Backfacing'], 'Weather front-facing surface', section), instance.inputs['Front Facing'])
     if 'Base Texture Alpha' in instance.inputs:
         base = tuple(item for item in tree.nodes if item.get('source_slot') == '_BaseMap')
-        if len(base) != 1:
-            raise ValueError(f'Weather needs one actual base-map alpha: {tree.name}')
-        tree.links.new(base[0].outputs['Alpha'], instance.inputs['Base Texture Alpha'])
+        if len(base) == 1 and base[0].type == 'TEX_IMAGE' and base[0].image is not None and base[0].image.packed_file is not None:
+            tree.links.new(base[0].outputs['Alpha'], instance.inputs['Base Texture Alpha'])
+        elif not base:
+            defaults = json.loads(tree.get('source_null_texture_defaults', '{}'))
+            default = defaults.get('_BaseMap') if isinstance(defaults, dict) else None
+            if not isinstance(default, dict) or default.get('default') != 'white':
+                raise ValueError(f'Weather BaseMap alpha requires its exact source image or verified white Shader default: {tree.name}')
+            alpha = by_label(tree, 'Exact Shader default _BaseMap alpha: one')
+            if alpha.type != 'VALUE' or alpha.outputs[0].default_value != 1.0:
+                raise ValueError(f'Weather source white Shader alpha node changed: {tree.name}')
+            tree.links.new(alpha.outputs[0], instance.inputs['Base Texture Alpha'])
+            instance['source_base_alpha'] = 'Exact material-referenced Shader white default alpha; no source image synthesized.'
+        else:
+            raise ValueError(f'Weather BaseMap alpha is ambiguous or has no packed source image: {tree.name}')
     for label, value in (('Orientation Flag', projection.orientation), ('Global Tiling', projection.tiling), ('Disable Weather', disable)):
         instance.inputs[label].default_value = value
     for label, port in (('Albedo', ports.albedo), ('Shadow Color', ports.shadow), ('Roughness', ports.roughness), ('Metallic', ports.metallic)):

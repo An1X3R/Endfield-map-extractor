@@ -9,6 +9,7 @@ from pathlib import Path
 from endfield_character_bundle_inputs import prepare_provider_bundles
 from endfield_character_cache import CharacterDataCache
 from endfield_character_npc_catalog import read_independent_npc_catalog
+from endfield_character_enemy_index import enemy_index_from_catalog
 from endfield_character_sources import CharacterSourceContext
 
 
@@ -18,7 +19,8 @@ def prepare(args: argparse.Namespace) -> None:
     cache_root = args.cache_dir
     if cache_root is None:
         raise ValueError("Independent NPC preparation requires an explicit cache directory")
-    npc = read_independent_npc_catalog(args.game_root, provider_index, CharacterDataCache(cache_root), lambda: None)
+    npc = read_independent_npc_catalog(args.game_root, provider_index, CharacterDataCache(cache_root),
+                                     enemy_index_from_catalog(catalog, cache_root), lambda: None)
     entries = [entry for entry in npc.entries if entry.npc_id == args.character_id and entry.source_kind == "prefab"
                and entry.resource_reference.template_id == args.template_id]
     providers = [provider for entry in entries for part in entry.resource_reference.prefab_parts

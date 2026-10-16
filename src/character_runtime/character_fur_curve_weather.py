@@ -306,9 +306,10 @@ def verify_fur_curve_snow(receipt: dict[str, object]) -> dict[str, object]:
     mask = linked_source(instance.inputs['Metallic Gloss B'])
     if mask.name != 'Blue' or linked_source(mask.node.inputs['Color']).node.get('source_slot') != '_MetallicGlossMap':
         raise AssertionError('Saved Fur snow packed B mask is disconnected')
+    from character_material_authoring import relocated_source_output
     for label in ('Base Color', 'Roughness', 'Metallic'):
         output = {'Base Color': 'Albedo', 'Roughness': 'Roughness', 'Metallic': 'Metallic'}[label]
-        if linked_source(surface.inputs[label]) != instance.outputs[output]:
+        if linked_source(surface.inputs[label]) != relocated_source_output(instance, instance.outputs[output]):
             raise AssertionError('Saved Fur snow live consumer is disconnected: ' + label)
     final = linked_source(surface.inputs['Normal']).node
     if final.label != 'Native weather normal to HGRP surface frame result':

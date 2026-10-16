@@ -1,6 +1,6 @@
 """Build editable, evidence-bound character surface approximations in a research blend.
 
-Source CAB/PathID identities select five observed shader families. Engine-specific
+Source CAB/PathID identities select observed shader families. Engine-specific
 lighting, stencil passes, rain, and snow are not claimed to match the game.
 """
 from __future__ import annotations
@@ -13,7 +13,7 @@ import math
 from pathlib import Path
 import sys
 from types import MappingProxyType
-from typing import Callable, Mapping, Sequence, cast
+from typing import TYPE_CHECKING, Callable, Mapping, Sequence, cast
 
 sys.dont_write_bytecode = True
 import bpy
@@ -23,9 +23,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from character_windows_paths import extended_path, io_path
 from character_node_graph import node, math_node, color_mix, input_socket
 from character_npr_nodes import ArtistLighting, make_artist_lighting, apply_diffuse_response
+from character_npr_vfx import CHARACTER_VFX_SHADER, MESH_EFFECT_SHADERS, validate_character_vfx_shader
 
 Identity = tuple[str, int]
-SUPPORTED_SHADERS = frozenset(("HGRP/CharacterNPR", "HGRP/CharacterNPR_Skin", "HGRP/CharacterNPR_Hair", "HGRP/CharacterNPR_Eye", "HGRP/CharacterNPR_OverlayShadow"))
+SUPPORTED_SHADERS = frozenset(("HGRP/CharacterNPR", "HGRP/CharacterNPR_Skin", "HGRP/CharacterNPR_Hair", "HGRP/CharacterNPR_Eye", "HGRP/CharacterNPR_OverlayShadow", "HGRP/LitEffect", *MESH_EFFECT_SHADERS))
+
+if TYPE_CHECKING:
+    from character_mesh_effect import MeshColorSource
 
 
 @dataclass(frozen=True)
@@ -61,6 +65,9 @@ class MaterialSource:
     source_json: str
     tree_json: str
     null_texture_defaults: Mapping[str, str]
+    shader_property_types: Mapping[str, int]
+    alpha_test_keyword: str | None
+    uv2_color_keyword: str | None
 
 
 @dataclass(frozen=True)
@@ -162,21 +169,45 @@ def read_material_sources(
     """
     shader_names: dict[Identity, str] = {}
     shader_texture_defaults: dict[Identity, dict[str, str]] = {}
+    shader_property_types: dict[Identity, Mapping[str, int]] = {}
+    shader_alpha_keywords: dict[Identity, str | None] = {}
+    shader_uv2_keywords: dict[Identity, str | None] = {}
     for row in array_value(shader_document["shaders"], "shaders"):
         record = object_value(row, "shader")
         ref = object_value(record["shader"], "shader.ref")
         name = string_value(ref["name"], "shader.name")
+        if name == CHARACTER_VFX_SHADER:
+            validate_character_vfx_shader(record)
         key = identity(ref, "shader.ref")
         if key in shader_names:
             raise ValueError(f"Duplicate Shader identity: {key}")
         shader_names[key] = name
         defaults: dict[str, str] = {}
+        property_types: dict[str, int] = {}
+        alpha_keyword: str | None = None
+        uv2_keyword: str | None = None
+        uv2_mask_layout = False
         if "property_defaults" in record:
             for raw_property in array_value(record["property_defaults"], "shader.property_defaults"):
                 property_row = object_value(raw_property, "shader.property")
-                if int_value(property_row["m_Type"], "shader.property.m_Type") != 4:
-                    continue
                 property_name = string_value(property_row["m_Name"], "shader.property.m_Name")
+                property_type = int_value(property_row["m_Type"], "shader.property.m_Type")
+                if property_name in property_types:
+                    raise ValueError(f"Duplicate source Shader property: {key}, {property_name}")
+                property_types[property_name] = property_type
+                if property_name == "_ExtraAlphaMask" and property_type == 4:
+                    description = property_row.get("m_Description")
+                    uv2_mask_layout = isinstance(description, str) and "UV1 Alpha/Root/Depth/ID" in description
+                if property_name == "_EnableAlphaTest" and property_type == 2:
+                    attributes = array_value(property_row.get("m_Attributes", []), "_EnableAlphaTest.m_Attributes")
+                    if "Toggle(_ALPHATEST_ON)" in attributes:
+                        alpha_keyword = "_ALPHATEST_ON"
+                if property_name == "_UseUV2Color" and property_type == 2:
+                    attributes = array_value(property_row.get("m_Attributes", []), "_UseUV2Color.m_Attributes")
+                    if "Toggle(_UV2_COLOR)" in attributes:
+                        uv2_keyword = "_UV2_COLOR"
+                if property_type != 4:
+                    continue
                 texture_default = object_value(property_row["m_DefTexture"], "shader.property.m_DefTexture")
                 if int_value(texture_default["m_TexDim"], "shader.property.m_TexDim") != 2:
                     continue
@@ -187,6 +218,9 @@ def read_material_sources(
                     raise TypeError(f"Expected source Shader texture default string: {key}, {property_name}")
                 defaults[property_name] = default_name
         shader_texture_defaults[key] = defaults
+        shader_property_types[key] = MappingProxyType(property_types)
+        shader_alpha_keywords[key] = alpha_keyword
+        shader_uv2_keywords[key] = uv2_keyword if uv2_mask_layout else None
     trees: dict[Identity, dict[str, object]] = {}
     for row in array_value(read_json(source_dir / "material_sources.json"), "material_sources"):
         record = object_value(row, "material_tree")
@@ -248,7 +282,11 @@ def read_material_sources(
         floats = {string_value(object_value(entry, "float")["name"], "float.name"): float_value(object_value(entry, "float")["value"], "float.value") for entry in array_value(material["floats"], "material.floats")}
         colors = {string_value(object_value(entry, "color")["name"], "color.name"): cast(tuple[float, float, float, float], numeric_tuple(object_value(entry, "color")["rgba"], 4, "color.rgba")) for entry in array_value(material["colors"], "material.colors")}
         keywords = tuple(string_value(keyword, "keyword") for keyword in array_value(tree["m_ValidKeywords"], "m_ValidKeywords"))
-        materials.append(MaterialSource(key, string_value(object_value(material["object"], "material.object")["name"], "material.name"), shader_name, MappingProxyType(floats), MappingProxyType(colors), tuple(bindings), keywords, json.dumps(material, ensure_ascii=True, sort_keys=True), json.dumps(tree, ensure_ascii=True, sort_keys=True), MappingProxyType(null_texture_defaults)))
+        source = MaterialSource(key, string_value(object_value(material["object"], "material.object")["name"], "material.name"), shader_name, MappingProxyType(floats), MappingProxyType(colors), tuple(bindings), keywords, json.dumps(material, ensure_ascii=True, sort_keys=True), json.dumps(tree, ensure_ascii=True, sort_keys=True), MappingProxyType(null_texture_defaults), shader_property_types[shader_key], shader_alpha_keywords[shader_key], shader_uv2_keywords[shader_key])
+        if shader_name == "HGRP/LitEffect":
+            from character_lit_effect import validate_lit_effect_source
+            validate_lit_effect_source(source, textures)
+        materials.append(source)
     if len({material.identity for material in materials}) != len(materials):
         raise ValueError("Duplicate source material identity")
     return tuple(materials), MappingProxyType(textures)
@@ -343,8 +381,145 @@ def decode_normal(tree: bpy.types.NodeTree, sample: bpy.types.Node, strength: bp
 def texture_colorspace(binding: TextureBinding, texture: TextureSource) -> str:
     if texture.color_space not in (0, 1):
         raise ValueError(f"Unsupported source texture color space: {texture.identity}, {texture.color_space}")
-    color_role = binding.name in {"_BaseMap", "_EmissionMap", "_MatcapTex", "_EmotionMap", "_ShadowLutTex"}
+    color_role = binding.name in {"_BaseMap", "_BaseColorMap", "_EmissionMap", "_EmissiveMap", "_MatcapTex", "_EmotionMap", "_ShadowLutTex", "_FurDyeMap"}
     return "sRGB" if color_role and texture.color_space == 1 else "Non-Color"
+
+
+def fur_coverage_sample(tree: bpy.types.ShaderNodeTree, original: bpy.types.Node,
+                        slot: str) -> bpy.types.Node:
+    """Share the packed image without changing the canonical source-slot sampler."""
+    if original.type != "TEX_IMAGE" or original.image is None or original.image.packed_file is None:
+        raise ValueError(f"Fur coverage requires its actual packed source image: {slot}")
+    sample = node(tree, "ShaderNodeTexImage", "Fur coverage sampling " + slot, "Approx Fur Coverage")
+    sample.image = original.image
+    sample.interpolation = original.interpolation
+    sample.extension = original.extension
+    sample.projection = original.projection
+    sample.projection_blend = original.projection_blend
+    sample["source_coverage_slot"] = slot
+    sample["source_identity"] = original["source_identity"]
+    sample["source_sha256"] = original["source_sha256"]
+    return sample
+
+
+def fur_shell_coverage(tree: bpy.types.ShaderNodeTree, source: MaterialSource,
+                       samples: Mapping[str, bpy.types.Node]) -> bpy.types.NodeSocket:
+    """Interpret the reference shell fragment mask with actual source UVs and inputs."""
+    section = "Approx Fur Coverage"
+    names = ("_FurDirMapEnable", "_FurFlowBaseStrength", "_FurNoise", "_FurCutoffStart",
+             "_FurCutoffEnd", "_FurSharpen", "_FurEdgeFade")
+    values = {name: source_float(source, name) for name in names}
+    if (values["_FurDirMapEnable"] not in (0.0, 1.0)
+            or not 0.0 <= values["_FurCutoffStart"] <= values["_FurCutoffEnd"] <= 1.0
+            or not 0.0 <= values["_FurSharpen"] <= 1.0):
+        raise ValueError(f"Unsupported source Fur coverage parameters: material={source.identity}, values={values}")
+    bindings = {binding.name: binding for binding in source.textures}
+    if "_FurMap" not in samples or "_BaseMap" not in samples:
+        raise ValueError(f"Source Fur coverage requires actual FurMap and BaseMap bindings: {source.identity}")
+    fur = bindings["_FurMap"]
+    base = bindings["_BaseMap"]
+    if fur.uv_index != 0 or base.uv_index != 0:
+        raise ValueError(f"Source Fur reference requires UV0 for BaseMap and FurMap: {source.identity}")
+    uv = node(tree, "ShaderNodeUVMap", "Source shell layer from imported TEXCOORD1.x", section)
+    uv.uv_map = "UV1"
+    split = node(tree, "ShaderNodeSeparateXYZ", "Unmodified source shell layer", section)
+    tree.links.new(uv.outputs[0], split.inputs[0])
+    layer = split.outputs["X"]
+    noise = math_node(tree, "MULTIPLY", layer, 12.9898 + 78.233, "Shell noise dot", section)
+    noise = math_node(tree, "SINE", noise, 0.0, "Shell noise sine", section)
+    noise = math_node(tree, "MULTIPLY", noise, 43758.5469, "Shell noise hash", section)
+    noise = math_node(tree, "FRACT", noise, 0.0, "Shell noise fraction", section)
+    noise = math_node(tree, "SUBTRACT", math_node(tree, "MULTIPLY", noise, 2.0, "Signed noise scale", section), 1.0, "Signed shell noise", section)
+    noise = math_node(tree, "MULTIPLY", noise, values["_FurNoise"] * 0.05, "Source Fur noise amplitude", section)
+    if "_FurDirMap" in samples:
+        direction = fur_coverage_sample(tree, samples["_FurDirMap"], "_FurDirMap")
+        raw_uv = node(tree, "ShaderNodeUVMap", "Source direction uses pre-BaseMap UV0", section)
+        raw_uv.uv_map = "UV0"
+        tree.links.new(raw_uv.outputs[0], direction.inputs["Vector"])
+        channels = node(tree, "ShaderNodeSeparateColor", "Source direction RG and coverage B", section)
+        tree.links.new(direction.outputs["Color"], channels.inputs[0])
+        direction_xy: tuple[bpy.types.NodeSocket | float, bpy.types.NodeSocket | float] = (channels.outputs["Red"], channels.outputs["Green"])
+        direction_blue: bpy.types.NodeSocket | float = channels.outputs["Blue"]
+    elif source.null_texture_defaults.get("_FurDirMap") == "bump" and values["_FurDirMapEnable"] == 0.0:
+        direction_xy, direction_blue = (0.5, 0.5), 1.0
+    else:
+        raise ValueError(f"Source Fur direction image/default is unproven for coverage: {source.identity}")
+    base_vector = samples["_BaseMap"].inputs["Vector"].links
+    if len(base_vector) != 1:
+        raise ValueError(f"Source Fur BaseMap coordinate input is ambiguous: {source.identity}")
+    base_uv = node(tree, "ShaderNodeSeparateXYZ", "Actual transformed BaseMap UV for Fur sampling", section)
+    tree.links.new(base_vector[0].from_socket, base_uv.inputs[0])
+    mapped = node(tree, "ShaderNodeCombineXYZ", "Reference FurMap coordinates use ST.x on both axes", section)
+    for axis, component, offset in zip(("X", "Y"), direction_xy, fur.offset, strict=True):
+        flow = math_node(tree, "SUBTRACT", math_node(tree, "MULTIPLY", component, 2.0, "Direction signed scale " + axis, section), 1.0, "Direction signed offset " + axis, section)
+        flow = math_node(tree, "MULTIPLY", flow, values["_FurDirMapEnable"] * values["_FurFlowBaseStrength"], "Source flow strength " + axis, section)
+        flow = math_node(tree, "ADD", flow, noise, "Direction plus shell noise " + axis, section)
+        flow = math_node(tree, "MULTIPLY", layer, flow, "Layer-scaled Fur offset " + axis, section)
+        coordinate = math_node(tree, "SUBTRACT", base_uv.outputs[axis], flow, "Offset actual BaseMap UV " + axis, section)
+        coordinate = math_node(tree, "ADD", math_node(tree, "MULTIPLY", coordinate, fur.scale[0], "Reference Fur tiling " + axis, section), offset, "Reference Fur offset " + axis, section)
+        tree.links.new(coordinate, mapped.inputs[axis])
+    fur_sample = fur_coverage_sample(tree, samples["_FurMap"], "_FurMap")
+    tree.links.new(mapped.outputs[0], fur_sample.inputs["Vector"])
+    fur_channels = node(tree, "ShaderNodeSeparateColor", "Actual FurMap red coverage sample", section)
+    tree.links.new(fur_sample.outputs["Color"], fur_channels.inputs[0])
+    cutoff = math_node(tree, "ADD", math_node(tree, "MULTIPLY", layer, values["_FurCutoffEnd"] - values["_FurCutoffStart"], "Layer cutoff range", section), values["_FurCutoffStart"], "Source layer cutoff", section)
+    sharp = math_node(tree, "SQRT", cutoff, 0.0, "Square-root shell cutoff", section)
+    sharp = math_node(tree, "ADD", math_node(tree, "MULTIPLY", cutoff, 1.0 - values["_FurSharpen"], "Unsharpened cutoff weight", section), math_node(tree, "MULTIPLY", sharp, values["_FurSharpen"], "Sharpened cutoff weight", section), "Source sharpened cutoff", section)
+    low = math_node(tree, "MAXIMUM", math_node(tree, "SUBTRACT", sharp, 0.25, "Lower cutoff bound", section), 0.0, "Clamp lower cutoff", section)
+    high = math_node(tree, "MINIMUM", math_node(tree, "ADD", sharp, 0.25, "Upper cutoff bound", section), 1.0, "Clamp upper cutoff", section)
+    density = math_node(tree, "MULTIPLY", fur_channels.outputs["Red"], direction_blue, "Direction B times FurMap R", section)
+    raw = math_node(tree, "DIVIDE", math_node(tree, "SUBTRACT", density, low, "Coverage above lower cutoff", section), math_node(tree, "SUBTRACT", high, low, "Coverage cutoff width", section), "Normalized shell coverage", section)
+    raw = math_node(tree, "MINIMUM", math_node(tree, "MAXIMUM", raw, 0.0, "Clamp coverage low", section), 1.0, "Clamp coverage high", section)
+    smooth = math_node(tree, "MULTIPLY", math_node(tree, "MULTIPLY", raw, raw, "Coverage squared", section), math_node(tree, "SUBTRACT", 3.0, math_node(tree, "MULTIPLY", raw, 2.0, "Coverage doubled", section), "Smoothstep factor", section), "Smooth shell coverage", section)
+    base_layer = math_node(tree, "SUBTRACT", 1.0, math_node(tree, "GREATER_THAN", layer, 0.01, "Non-base shell layer", section), "Source base-layer preservation", section)
+    smooth = math_node(tree, "ADD", smooth, math_node(tree, "MULTIPLY", base_layer, math_node(tree, "SUBTRACT", 1.0, smooth, "Base layer uncovered fraction", section), "Preserve base-layer coverage", section), "Coverage including base shell", section)
+    geometry = node(tree, "ShaderNodeNewGeometry", "Host shading normal and view direction", section)
+    facing = node(tree, "ShaderNodeVectorMath", "Host normal dot incoming view", section)
+    facing.operation = "DOT_PRODUCT"
+    tree.links.new(geometry.outputs["Normal"], facing.inputs[0])
+    tree.links.new(geometry.outputs["Incoming"], facing.inputs[1])
+    cube = math_node(tree, "POWER", layer, 3.0, "Shell layer cubed", section)
+    edge = math_node(tree, "SUBTRACT", math_node(tree, "ADD", math_node(tree, "SUBTRACT", 1.0, cube, "Layer edge retention", section), facing.outputs["Value"], "View-facing shell edge", section), values["_FurEdgeFade"], "Source shell edge fade", section)
+    alpha = math_node(tree, "MINIMUM", math_node(tree, "MAXIMUM", math_node(tree, "MULTIPLY", smooth, edge, "Coverage times edge fade", section), 0.0, "Clamp shell alpha low", section), 1.0, "Clamp shell alpha high", section)
+    alpha = math_node(tree, "ADD", math_node(tree, "MULTIPLY", math_node(tree, "CEIL", layer, 0.0, "Reference shell ceil", section), math_node(tree, "SUBTRACT", alpha, 1.0, "Shell alpha minus one", section), "Non-base shell alpha", section), 1.0, "Reference shell alpha", section)
+    alpha = math_node(tree, "MULTIPLY", alpha, math_node(tree, "SUBTRACT", 1.0, math_node(tree, "LESS_THAN", alpha, 0.003, "Reference Fur fragment clip", section), "Keep surviving shell fragments", section), "Host Fur shell coverage", section)
+    tree["source_fur_shell_coverage"] = json.dumps({"status": "source_inputs_host_coverage_approximation", "reference": "Ruri_Endfield_Uber.glsl:2215-2233,2349-2350 Shell_SampleSurface", "uv_layer": "UV1", "layer_component": "X", "parameters": values, "fur_map_identity": fur.identity, "fur_map_scale": fur.scale, "fur_map_offset": fur.offset, "direction_default": source.null_texture_defaults.get("_FurDirMap"), "native_shader_semantics_verified": False, "scope": "Reference fragment arithmetic on retained source shells; Blender shading normal/view, implicit texture derivatives, hash precision and dithering are host approximations. No native vertex expansion or depth-prepass equivalence is claimed."}, sort_keys=True)
+    return alpha
+
+
+def uv2_alpha_mask(tree: bpy.types.ShaderNodeTree, source: MaterialSource,
+                   samples: Mapping[str, bpy.types.Node]) -> bpy.types.NodeSocket:
+    """Interpret the source UV1 Alpha/Root/Depth/ID texture's first channel as coverage."""
+    enabled = source_float(source, "_UseUV2Color")
+    if (source.uv2_color_keyword != "_UV2_COLOR" or enabled != 1.0
+            or source.shader_property_types.get("_ExtraAlphaMask") != 4
+            or "_ExtraAlphaMask" not in samples):
+        raise ValueError(f"Source UV2 alpha requires its enabled Shader toggle and actual mask: material={source.identity}, enabled={enabled}")
+    binding = next(item for item in source.textures if item.name == "_ExtraAlphaMask")
+    original = samples["_ExtraAlphaMask"]
+    sample = node(tree, "ShaderNodeTexImage", "Source UV1 alpha mask host sampling", "Approx UV1 Alpha Mask")
+    sample.image = original.image
+    sample.interpolation = original.interpolation
+    sample.extension = original.extension
+    sample["source_coverage_slot"] = "_ExtraAlphaMask"
+    sample["source_identity"] = original["source_identity"]
+    sample["source_sha256"] = original["source_sha256"]
+    uv = node(tree, "ShaderNodeUVMap", "Source UV2 Color feature uses UV1", "Approx UV1 Alpha Mask")
+    uv.uv_map = "UV1"
+    mapping = node(tree, "ShaderNodeMapping", "Source ExtraAlphaMask scale and offset", "Approx UV1 Alpha Mask")
+    mapping.vector_type = "POINT"
+    mapping.inputs["Scale"].default_value = (*binding.scale, 1.0)
+    mapping.inputs["Location"].default_value = (*binding.offset, 0.0)
+    tree.links.new(uv.outputs[0], mapping.inputs["Vector"])
+    tree.links.new(mapping.outputs[0], sample.inputs["Vector"])
+    channels = node(tree, "ShaderNodeSeparateColor", "UV1 Alpha/Root/Depth/ID first channel", "Approx UV1 Alpha Mask")
+    tree.links.new(sample.outputs["Color"], channels.inputs[0])
+    tree["source_uv2_alpha_mask"] = json.dumps({"status": "source_contract_host_coverage_approximation",
+        "keyword": source.uv2_color_keyword, "property": "_UseUV2Color", "value": enabled,
+        "slot": "_ExtraAlphaMask", "image": sample.image.name, "uv_layer": "UV1", "channel": "Red",
+        "scale": binding.scale, "offset": binding.offset, "native_shader_semantics_verified": False,
+        "scope": "Source Shader property describes UV1 Alpha/Root/Depth/ID; the first channel supplies a host alpha mask multiplied before source alpha thresholding. Native program channel arithmetic and sampling equivalence are unverified."}, sort_keys=True)
+    return channels.outputs["Red"]
 
 
 def load_images(packet: SourcePacket) -> Mapping[tuple[Identity, str], bpy.types.Image]:
@@ -353,15 +528,23 @@ def load_images(packet: SourcePacket) -> Mapping[tuple[Identity, str], bpy.types
         for binding in source.textures:
             texture = packet.textures[binding.identity]
             colorspace = texture_colorspace(binding, texture)
+            alpha_mode = "CHANNEL_PACKED"
+            if source.shader in MESH_EFFECT_SHADERS:
+                colorspace = "Non-Color" if texture.color_space == 0 else "sRGB"
+                alpha_mode = "STRAIGHT"
             key = (texture.identity, colorspace)
+            if key in images and images[key].alpha_mode != alpha_mode:
+                raise ValueError(f"Source image roles require conflicting alpha modes: identity={texture.identity}, colorspace={colorspace}, existing={images[key].alpha_mode}, required={alpha_mode}")
             if key not in images:
                 image = bpy.data.images.load(extended_path(texture.path), check_existing=False)
                 image.name = "EFCHAR " + texture.name + " " + colorspace
                 image.colorspace_settings.name = colorspace
-                image.alpha_mode = "CHANNEL_PACKED"
+                image.alpha_mode = alpha_mode
                 if tuple(image.size) != (texture.width, texture.height):
                     raise ValueError(f"Decoded image dimensions differ from source: {texture.path}")
                 image.pack()
+                image.use_fake_user = True
+                image["source_retention"] = "Declared source material input; retained even when its source feature is inactive in the host preview."
                 images[key] = image
     return MappingProxyType(images)
 
@@ -405,6 +588,7 @@ def archived_material_group(source: MaterialSource, packet: SourcePacket, images
     tree = bpy.data.node_groups.new("EF Archived Character " + source.name, "ShaderNodeTree")
     tree["source_shader"] = source.shader
     tree["source_identity"] = json.dumps(source.identity)
+    tree["source_shader_property_types"] = json.dumps(dict(source.shader_property_types), sort_keys=True)
     tree["source_floats"] = json.dumps(dict(source.floats), sort_keys=True)
     tree["source_colors"] = json.dumps(dict(source.colors), sort_keys=True)
     tree["archived_unsupported_shader"] = True
@@ -430,13 +614,22 @@ def archived_material_group(source: MaterialSource, packet: SourcePacket, images
     return tree
 
 
-def material_group(source: MaterialSource, packet: SourcePacket, environment: bpy.types.ShaderNodeTree, images: Mapping[tuple[Identity, str], bpy.types.Image], lighting: bpy.types.ShaderNodeTree, layout: Callable[[bpy.types.NodeTree], None]) -> bpy.types.ShaderNodeTree:
+def material_group(source: MaterialSource, packet: SourcePacket, environment: bpy.types.ShaderNodeTree, images: Mapping[tuple[Identity, str], bpy.types.Image], lighting: bpy.types.ShaderNodeTree, layout: Callable[[bpy.types.NodeTree], None], color_source: MeshColorSource | None) -> bpy.types.ShaderNodeTree:
     if source.shader not in SUPPORTED_SHADERS:
         return archived_material_group(source, packet, images, layout)
+    if source.shader == "HGRP/LitEffect":
+        from character_lit_effect import build_lit_effect_group
+        tree = bpy.data.node_groups.new("EF Static LitEffect " + source.name, "ShaderNodeTree")
+        samples = {binding.name: image_node(tree, binding, packet.textures[binding.identity], images) for binding in source.textures}
+        return build_lit_effect_group(source, tree, samples, layout)
+    if source.shader in MESH_EFFECT_SHADERS:
+        from character_mesh_effect import material_group as build_mesh_effect_group
+        return build_mesh_effect_group(source, packet, images, color_source, layout)
     family = source.shader.split("/")[1]
     tree = bpy.data.node_groups.new("EF Character " + source.name, "ShaderNodeTree")
     tree["source_shader"] = source.shader
     tree["source_identity"] = json.dumps(source.identity)
+    tree["source_shader_property_types"] = json.dumps(dict(source.shader_property_types), sort_keys=True)
     tree["source_floats"] = json.dumps(dict(source.floats), sort_keys=True)
     tree["source_colors"] = json.dumps(dict(source.colors), sort_keys=True)
     input_socket(tree, "Base Tint", "NodeSocketColor", source_color(source, "_BaseColor"), "Exact source _BaseColor")
@@ -481,6 +674,20 @@ def material_group(source: MaterialSource, packet: SourcePacket, environment: bp
         input_socket(tree, "Preview Hair Anisotropy", "NodeSocketFloat", 0.5 if family == "CharacterNPR_Hair" else 0.0, "Artist anisotropy approximation; source strand dual-normal lighting is not matched")
         input_socket(tree, "Preview Eye Coat", "NodeSocketFloat", 0.0, "Optional artist eye approximation; source matcap/parallax lighting is not matched")
         color = color_mix(tree, "MULTIPLY", 1.0, base_color, entry.outputs["Base Tint"], "Source base sample times BaseColor", "Source Surface Channels")
+        if family == "CharacterNPR" and "_CHARACTER_FUR_DYE" in source.keywords:
+            expected = {"_FurDyeEnable": 2, "_FurDyeIntensity": 3, "_FurDyeMap": 4}
+            if any(source.shader_property_types.get(name) != kind for name, kind in expected.items()):
+                raise ValueError(f"Source Fur dye property/type contract is incompatible: material={source.identity}")
+            enabled, intensity = source_float(source, "_FurDyeEnable"), source_float(source, "_FurDyeIntensity")
+            if enabled != 1.0 or not 0.0 <= intensity <= 1.0 or "_FurDyeMap" not in samples:
+                raise ValueError(f"Source Fur dye requires enabled bounded intensity and its actual map: material={source.identity}, enabled={enabled}, intensity={intensity}")
+            color = color_mix(tree, "SCREEN", intensity, color, samples["_FurDyeMap"].outputs["Color"],
+                              "Source Fur dye ScreenBlend host approximation", "Source Surface Channels")
+            tree["source_fur_dye"] = json.dumps({"intensity": intensity, "slot": "_FurDyeMap",
+                "reference": "Ruri_Endfield_Uber.glsl:2205-2212 Shell_DyeBlend",
+                "formula": "mix(albedo,1-(1-albedo)*(1-dye),FurDyeIntensity)",
+                "native_shader_semantics_verified": False,
+                "scope": "Source map, ST and scalar consumed by an explicit host approximation; current compiled program equivalence is unverified."}, sort_keys=True)
         if family == "CharacterNPR" and "_CUSTOMIZE_AVATAR" in source.keywords:
             customize_enabled = source_float(source, "_AvatarCustomizeEnable")
             if customize_enabled not in (0.0, 1.0):
@@ -499,7 +706,7 @@ def material_group(source: MaterialSource, packet: SourcePacket, environment: bp
                 "formula": "sampled=BaseMap*BaseColor; tint=mix(AddTint,BaseTint,sampled.g); tint=mix(tint,CustomizeBaseColor,sampled.b); result=sampled.r*tint",
                 "scope": "Generic CharacterNPR only; source sample assignment in the extracted compiled branch is absent, so BaseMap sampling dataflow is not fully verified.",
             }, sort_keys=True)
-            channels = node(tree, "ShaderNodeSeparateColor", "Avatar customization masks after BaseMap × BaseColor", "Source Avatar Customization")
+            channels = node(tree, "ShaderNodeSeparateColor", "Avatar customization masks after BaseMap 脳 BaseColor", "Source Avatar Customization")
             tree.links.new(color, channels.inputs[0])
             tint = color_mix(tree, "MIX", channels.outputs["Green"], entry.outputs["Customize Add Tint Color"], entry.outputs["Customize Base Tint Color"], "Source green mask: AddTint to BaseTint", "Source Avatar Customization")
             tint = color_mix(tree, "MIX", channels.outputs["Blue"], tint, entry.outputs["Customize Base Color"], "Source blue mask: tint to BaseColor", "Source Avatar Customization")
@@ -593,7 +800,24 @@ def material_group(source: MaterialSource, packet: SourcePacket, environment: bp
             tree.links.new(emission, bsdf.inputs["Emission Color"])
             tree.links.new(entry.outputs["Emission Brightness"], bsdf.inputs["Emission Strength"])
         alpha = math_node(tree, "MULTIPLY", base_alpha, entry.outputs["Base Tint Alpha"], "Source base alpha times tint alpha", "Source Alpha Rules")
-        if source_float(source, "_AlphaClip") == 1.0:
+        if source.shader == "HGRP/CharacterNPR" and "_UV2_COLOR" in source.keywords:
+            alpha = math_node(tree, "MULTIPLY", alpha, uv2_alpha_mask(tree, source, samples),
+                              "Source base alpha times UV1 alpha mask", "Source Alpha Rules")
+        feature_alpha_test = False
+        if (source.shader == "HGRP/CharacterNPR" and "_ALPHATEST_ON" in source.keywords
+                and source_float(source, "_AlphaClip") != 1.0):
+            enabled = source_float(source, "_EnableAlphaTest")
+            if (source.alpha_test_keyword != "_ALPHATEST_ON" or enabled != 1.0
+                    or source.shader_property_types.get("_AlphaClipThreshold") != 3):
+                raise ValueError(f"Source alpha-test keyword requires its explicit enabled Shader toggle/threshold contract: material={source.identity}, enabled={enabled}")
+            feature_alpha_test = True
+            tree["source_alpha_test_feature"] = json.dumps({"keyword": source.alpha_test_keyword,
+                "property": "_EnableAlphaTest", "value": enabled, "threshold": source_float(source, "_AlphaClipThreshold"),
+                "legacy_alpha_clip": source_float(source, "_AlphaClip"), "native_shader_semantics_verified": False,
+                "scope": "Explicit Shader Toggle attribute, active material keyword and enabled source value select the host BaseMap alpha threshold; current native shader program equivalence is unverified."}, sort_keys=True)
+        if source.shader == "HGRP/CharacterNPR" and "_CHARACTER_FUR" in source.keywords:
+            alpha = fur_shell_coverage(tree, source, samples)
+        elif feature_alpha_test or source_float(source, "_AlphaClip") == 1.0:
             input_socket(tree, "Alpha Clip Threshold", "NodeSocketFloat", source_float(source, "_AlphaClipThreshold"), "Exact source alpha clip threshold")
             alpha = math_node(tree, "SUBTRACT", 1.0, math_node(tree, "LESS_THAN", alpha, entry.outputs["Alpha Clip Threshold"], "Discard alpha below source threshold", "Source Alpha Rules"), "Keep alpha at or above source threshold", "Source Alpha Rules")
         elif source_float(source, "_SurfaceType") == 0.0:
@@ -623,7 +847,30 @@ def surface_stack(sources: tuple[MaterialSource, ...], groups: Mapping[Identity,
     material.surface_render_method = "DITHERED"
     material.use_transparency_overlap = False
     if sources[0].shader in SUPPORTED_SHADERS:
-        material.diffuse_color = source_color(sources[0], "_BaseColor")
+        tint_name = "_TintColor" if sources[0].shader in MESH_EFFECT_SHADERS else "_BaseColor"
+        material.diffuse_color = source_color(sources[0], tint_name)
+    vfx_sources = tuple(source for source in sources if source.shader in MESH_EFFECT_SHADERS)
+    if vfx_sources:
+        surface_types = {source_float(source, "_SurfaceType") for source in vfx_sources}
+        if len(surface_types) != 1:
+            raise ValueError(f"A Blender material stack cannot preserve conflicting VFX surface modes: identities={[source.identity for source in vfx_sources]}, surface_types={sorted(surface_types)}")
+        surface_type = next(iter(surface_types))
+        if surface_type not in (0.0, 1.0):
+            raise ValueError(f"Unsupported VFX source surface type in character material stack: surface_type={surface_type}")
+        material.surface_render_method = "BLENDED" if surface_type == 1.0 else "DITHERED"
+        material.use_transparency_overlap = True
+        render_states: list[dict[str, object]] = []
+        for source in vfx_sources:
+            group = groups[source.identity]
+            for property_name in ("source_floats", "source_render_state"):
+                if property_name not in group:
+                    raise ValueError(f"VFX source metadata is missing from its character group: material={source.identity}, property={property_name}")
+            render_states.append({
+                "identity": source.identity,
+                "floats": group["source_floats"],
+                "render_state": group["source_render_state"],
+            })
+        material["source_vfx_render_state"] = json.dumps(render_states, sort_keys=True)
     material["source_shader"] = sources[0].shader
     material["source_material_stack"] = json.dumps([source.identity for source in sources])
     material["fidelity"] = "Editable source-sampling approximation; game lighting, stencil and render queues are not reproduced"
@@ -697,6 +944,14 @@ def bind_sources(packet: SourcePacket, groups: Mapping[Identity, bpy.types.Shade
         if submesh_count < 1 or len(obj.material_slots) != submesh_count:
             raise ValueError(f"FBX/source submesh slot count mismatch: {name}, FBX={len(obj.material_slots)}, source={submesh_count}")
         refs = tuple(identity(object_value(pointer, "material.pointer")["resolved"], "material.resolved") for pointer in array_value(renderer["materials"], "renderer.materials"))
+        if any("source_fur_shell_coverage" in groups[ref] for ref in refs):
+            layer = obj.data.uv_layers.get("UV1")
+            if layer is None or len(layer.data) != len(obj.data.loops) or not layer.data:
+                raise ValueError(f"Source Fur coverage requires imported TEXCOORD1 as UV1: {name}")
+            if any(not math.isfinite(corner.uv.x) or not 0.0 <= corner.uv.x <= 1.0 for corner in layer.data):
+                raise ValueError(f"Source Fur shell layer UV1.x is not finite within [0,1]: {name}")
+        if any("source_uv2_alpha_mask" in groups[ref] for ref in refs) and "UV1" not in obj.data.uv_layers:
+            raise ValueError(f"Source UV2 alpha feature requires imported UV1: {name}")
         if len(refs) < submesh_count:
             raise ValueError(f"Source renderer has fewer materials than submeshes: {name}")
         for index in range(submesh_count):
@@ -788,7 +1043,9 @@ def build_loaded_materials(packet: SourcePacket, lighting_settings: ArtistLighti
     environment = make_environment(layout_shader_node_tree)
     lighting = make_artist_lighting(lighting_settings, layout_shader_node_tree)
     image_cache = load_images(packet)
-    groups = {source.identity: material_group(source, packet, environment, image_cache, lighting, layout_shader_node_tree) for source in packet.materials}
+    from character_mesh_effect import collect_character_mesh_color_sources
+    color_sources = collect_character_mesh_color_sources(packet)
+    groups = {source.identity: material_group(source, packet, environment, image_cache, lighting, layout_shader_node_tree, color_sources.get(source.identity)) for source in packet.materials}
     for source in packet.materials:
         text = bpy.data.texts.new("SOURCE MATERIAL " + source.name + ".json")
         text.write(source.source_json)
@@ -856,7 +1113,7 @@ def build_material_sample(argv: Sequence[str], render_samples: Callable[[Path, V
     actual_images = {identity for identity, _colorspace in image_cache}
     if actual_images != expected_images or any(image.packed_file is None for image in image_cache.values()):
         raise ValueError("Referenced source image packing is incomplete")
-    report = {"format": "EndfieldCharacterMaterialRebuild/1", "status": "approximation_smoke_passed", "game_material_fidelity_complete": False, "source_blend": str(args.blend.resolve()), "source_blend_sha256": file_hash(args.blend), "input_hashes": dict(packet.input_hashes), "script_sha256": file_hash(Path(__file__)), "layout_helper_sha256": file_hash(args.scene_source_dir / "blender_scene_materials.py"), "reference_glsl": str(args.ruri_glsl.resolve()), "reference_glsl_sha256": file_hash(args.ruri_glsl), "source_materials": len(packet.materials), "actual_shader_families": sorted({source.shader for source in packet.materials}), "verified_texture_identities": len(actual_images), "packed_image_roles": len(image_cache), "source_geometry_counts_preserved": True, "visible_renderer_count": len(visible), "renderers": renderer_rows, "extra_material_passes_connected": sum(cast(int, row["extra_pass_count"]) for row in renderer_rows), "source_parameters": "All original float/color/texture fields and complete material and renderer TypeTrees retained in blend Text datablocks; active basic parameters exposed on source material groups", "pipeline_support": {"integrated": ["Exact five source Shader identities and CAB/PathID material/texture bindings", "Base tint, UV0/ST sampling, RG/R*A-G packed normal channels, metallic/gloss/spec/AO and keyword-gated emission", "Source opaque/transparent alpha distinction and source alpha-clip threshold", "Ordered extra source material references retained as adjustable Blender composition", "Native LOD0/active/enabled/shadows-only visibility inherited from the audited preview", "Connected source 32-slice skin shadow LUT sampling and source-enabled diffuse ramp RGB/alpha with local chroma normalization; shared artist lighting composition"], "preserved_not_integrated": ["SpecRampMap, native hair strand lobes and skin SDF lighting", "Character light loop types, main/additional-light parameters and game exposure", "Native rendering-layer masks including 258; no equivalent HGRP light filtering implemented", "Per-renderer lighting enable, offset, anchor, light-mode mask and probe anchor", "Stencil/depth, render queues, fog and screen-space overlay multiply/culling", "Global wet/rain binding and response; controls remain artist approximations", "Global snow consumption formula is unknown; no fabricated snow nodes"]}, "control_entry_points": {"source_parameters": "Select mesh material; top-level EF Character <source material name> group inputs; Tab into group for verified texture channels", "artist_lighting": lighting.name + " internal Value nodes (Light Direction X/Y/Z, Direct Intensity, Ambient Intensity, Ramp Bias, Wrap, Response Weight, Shadow LUT Weight)", "wetness": environment.name + " internal Value nodes (Wetness, Rain Wetness, Water Height Meters, Submersion Strength, Wet Darkening, Wet Roughness)", "extra_passes": "Composite EFCHAR material top-level Approx Extra Pass 1 Enable (0 / 1) Value node", "complete_source_parameters": "Blend Text datablocks SOURCE MATERIAL / SOURCE TYPETREE / SOURCE RENDERER"}, "renders": renders, "output_blend": str(blend), "output_blend_bytes": io_path(blend).stat().st_size, "output_blend_sha256": file_hash(blend), "limitations": ["Source ramp/LUT sampling and local chroma arithmetic are connected; their diffuse composition and shared artist light are approximate, with unknown game global uniforms, screen shadows, SDF, matcap/parallax, light loops and outlines unimplemented", "Hair uses source split-normal RG for diffuse normal; source BA specular normal and exact strand lobes are preserved but not reconstructed", "Additional native material passes use adjustable single-surface composition on the final submesh; stencil, depth, fog and render queue semantics are not replicated", "OverlayShadow uses original red/alpha mask and source tint with transparency; framebuffer multiply is approximated by an unlit translucent surface", "Wetness controls are explicitly approximate artist inputs; original wet/rain fields are preserved without an unverified binding", "Snow has no recovered consumption formula and no artificial snow control or node", "Source _EnableAlphaTest is retained but not equated to the independently verified _AlphaClip formula", "Only source UV0 is supported; missing required texture/parameter and other UV indices fail explicitly"]}
+    report = {"format": "EndfieldCharacterMaterialRebuild/1", "status": "approximation_smoke_passed", "game_material_fidelity_complete": False, "source_blend": str(args.blend.resolve()), "source_blend_sha256": file_hash(args.blend), "input_hashes": dict(packet.input_hashes), "script_sha256": file_hash(Path(__file__)), "layout_helper_sha256": file_hash(args.scene_source_dir / "blender_scene_materials.py"), "reference_glsl": str(args.ruri_glsl.resolve()), "reference_glsl_sha256": file_hash(args.ruri_glsl), "source_materials": len(packet.materials), "actual_shader_families": sorted({source.shader for source in packet.materials}), "verified_texture_identities": len(actual_images), "packed_image_roles": len(image_cache), "source_geometry_counts_preserved": True, "visible_renderer_count": len(visible), "renderers": renderer_rows, "extra_material_passes_connected": sum(cast(int, row["extra_pass_count"]) for row in renderer_rows), "source_parameters": "All original float/color/texture fields and complete material and renderer TypeTrees retained in blend Text datablocks; active basic parameters exposed on source material groups", "pipeline_support": {"integrated": ["Exact five source Shader identities and CAB/PathID material/texture bindings", "Base tint, UV0/ST sampling, RG/R*A-G packed normal channels, metallic/gloss/spec/AO and keyword-gated emission", "Source opaque/transparent alpha distinction and source alpha-clip threshold", "Ordered extra source material references retained as adjustable Blender composition", "Native LOD0/active/enabled/shadows-only visibility inherited from the audited preview", "Connected source 32-slice skin shadow LUT sampling and source-enabled diffuse ramp RGB/alpha with local chroma normalization; shared artist lighting composition"], "preserved_not_integrated": ["SpecRampMap, native hair strand lobes and skin SDF lighting", "Character light loop types, main/additional-light parameters and game exposure", "Native rendering-layer masks including 258; no equivalent HGRP light filtering implemented", "Per-renderer lighting enable, offset, anchor, light-mode mask and probe anchor", "Stencil/depth, render queues, fog and screen-space overlay multiply/culling", "Global wet/rain binding and response; controls remain artist approximations", "Global snow consumption formula is unknown; no fabricated snow nodes"]}, "control_entry_points": {"source_parameters": "Select mesh material; top-level EF Character <source material name> group inputs; Tab into group for verified texture channels", "artist_lighting": lighting.name + " internal Value nodes (Light Direction X/Y/Z, Direct Intensity, Ambient Intensity, Ramp Bias, Wrap, Response Weight, Shadow LUT Weight)", "wetness": environment.name + " internal Value nodes (Wetness, Rain Wetness, Water Height Meters, Submersion Strength, Wet Darkening, Wet Roughness)", "extra_passes": "Composite EFCHAR material top-level Approx Extra Pass 1 Enable (0 / 1) Value node", "complete_source_parameters": "Blend Text datablocks SOURCE MATERIAL / SOURCE TYPETREE / SOURCE RENDERER"}, "renders": renders, "output_blend": str(blend), "output_blend_bytes": io_path(blend).stat().st_size, "output_blend_sha256": file_hash(blend), "limitations": ["Source ramp/LUT sampling and local chroma arithmetic are connected; their diffuse composition and shared artist light are approximate, with unknown game global uniforms, screen shadows, SDF, matcap/parallax, light loops and outlines unimplemented", "Hair uses source split-normal RG for diffuse normal; source BA specular normal and exact strand lobes are preserved but not reconstructed", "Additional native material passes use adjustable single-surface composition on the final submesh; stencil, depth, fog and render queue semantics are not replicated", "OverlayShadow uses original red/alpha mask and source tint with transparency; framebuffer multiply is approximated by an unlit translucent surface", "Wetness controls are explicitly approximate artist inputs; original wet/rain fields are preserved without an unverified binding", "Snow has no recovered consumption formula and no artificial snow control or node", "Standard source Toggle(_ALPHATEST_ON), active keyword and explicit _EnableAlphaTest=1 select host BaseMap alpha thresholding; legacy _AlphaClip remains supported. Current native shader program equivalence is unverified", "General source textures require UV0; Fur shell coverage reads source UV1.x as the layer, and explicit _UV2_COLOR uses the source UV1 Alpha/Root/Depth/ID red mask with its original ST before alpha thresholding. Missing required inputs or unsupported UV indices fail explicitly"]}
     report["material_support"] = {"visible_supported": [{"identity": list(source.identity), "shader": source.shader} for source in packet.materials if source.identity in packet.visible_materials], "inactive_unsupported": [{"identity": list(source.identity), "shader": source.shader, "status": "archived_unsupported_shader"} for source in packet.materials if source.shader not in SUPPORTED_SHADERS]}
     report["research_modules"] = {name: file_hash(Path(__file__).with_name(name)) for name in ("character_npr_nodes.py", "character_node_graph.py")}
     report["artist_lighting"] = {"direction": list(lighting_settings.direction), "direct_intensity": lighting_settings.direct_intensity, "ambient_intensity": lighting_settings.ambient_intensity, "ramp_bias": lighting_settings.ramp_bias, "wrap": lighting_settings.wrap, "response_weight": lighting_settings.response_weight, "shadow_lut_weight": 1.0}

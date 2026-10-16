@@ -178,6 +178,50 @@ def alpha_clip(
     return tree
 
 
+def multiply_clip_mask(tree: bpy.types.NodeTree, packed_image: bpy.types.Image,
+                       uv_layer: str, uv_scale: tuple[float, float],
+                       uv_offset: tuple[float, float]) -> None:
+    """Multiply the explicit UV1 mask red channel before the existing clip comparison."""
+    if tree.get("alpha_mode") != "clip":
+        raise ValueError(f"Extra alpha mask requires an existing clip kernel: {tree.name}")
+    sx, sy, ox, oy, _ = _validate_common(tree.name, packed_image, uv_layer, uv_scale,
+                                        uv_offset, 1.0, tree["subdivision_level"])
+    matches = tuple(node for node in tree.nodes if node.label == "Delete where alpha is below threshold")
+    if len(matches) != 1 or len(matches[0].inputs[0].links) != 1:
+        raise ValueError(f"Existing caster clip alpha consumer is absent or ambiguous: {tree.name}")
+    target = matches[0].inputs[0]
+    alpha = target.links[0].from_socket
+    uv = _node(tree, "GeometryNodeInputNamedAttribute", "Read UV1 alpha mask coordinates", -1000.0, -500.0)
+    uv.data_type = "FLOAT_VECTOR"
+    uv.inputs["Name"].default_value = uv_layer
+    scale = _node(tree, "ShaderNodeVectorMath", "Extra alpha mask source scale", -760.0, -500.0)
+    scale.operation = "MULTIPLY"
+    scale.inputs[1].default_value = (sx, sy, 1.0)
+    tree.links.new(uv.outputs["Attribute"], scale.inputs[0])
+    offset = _node(tree, "ShaderNodeVectorMath", "Extra alpha mask source offset", -520.0, -500.0)
+    offset.operation = "ADD"
+    offset.inputs[1].default_value = (ox, oy, 0.0)
+    tree.links.new(scale.outputs[0], offset.inputs[0])
+    sample = _node(tree, "GeometryNodeImageTexture", "Sample packed UV1 alpha mask", -280.0, -500.0)
+    sample.interpolation = "Linear"
+    sample.extension = "REPEAT"
+    sample.inputs["Image"].default_value = packed_image
+    tree.links.new(offset.outputs[0], sample.inputs["Vector"])
+    channels = _node(tree, "ShaderNodeSeparateXYZ", "UV1 Alpha/Root/Depth/ID red", -40.0, -500.0)
+    tree.links.new(sample.outputs["Color"], channels.inputs[0])
+    product = _node(tree, "ShaderNodeMath", "Source alpha times UV1 mask red", 200.0, -500.0)
+    product.operation = "MULTIPLY"
+    tree.links.new(alpha, product.inputs[0])
+    tree.links.new(channels.outputs["X"], product.inputs[1])
+    tree.links.new(product.outputs[0], target)
+    tree["extra_alpha_mask_image"] = packed_image.name
+    tree["extra_alpha_mask_uv"] = uv_layer
+    tree["extra_alpha_mask_scale"] = [sx, sy]
+    tree["extra_alpha_mask_offset"] = [ox, oy]
+    tree["coverage_formula"] = "BaseMap.a * BaseColor.a * ExtraAlphaMask(UV1).r >= threshold"
+    tree["extra_alpha_mask_scope"] = "Source UV1 Alpha/Root/Depth/ID host interpretation; native program equivalence unverified."
+
+
 def alpha_dither(
     name: str,
     packed_image: bpy.types.Image,

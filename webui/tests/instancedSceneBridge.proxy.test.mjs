@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { createServer as createHttpServer } from 'node:http'
+import { createServer as createHttpServer, request as httpRequest } from 'node:http'
 import { createServer as createViteServer } from 'vite'
 
 const envKeys = [
@@ -11,6 +11,7 @@ const envKeys = [
 ]
 const previousEnvironment = new Map(envKeys.map((key) => [key, process.env[key]]))
 const forwardedRequests = []
+const levelMapImageBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0xff, 0x00, 0xc3, 0x28, 0x80])
 const bridge = createHttpServer((request, response) => {
   let body = ''
   request.setEncoding('utf8')
@@ -23,6 +24,36 @@ const bridge = createHttpServer((request, response) => {
       body,
     })
     if (request.method === 'GET') {
+      const requestUrl = new URL(request.url ?? '/', 'http://127.0.0.1')
+      if (requestUrl.pathname === '/characters/redirect') {
+        response.writeHead(302, { Location: '/health' })
+        response.end()
+        return
+      }
+      if (requestUrl.pathname === '/level-maps') {
+        if (requestUrl.searchParams.has('failure')) {
+          response.statusCode = 409
+          response.setHeader('Content-Type', 'application/json; charset=utf-8')
+          response.end('{"error":"level_maps_not_prepared"}')
+          return
+        }
+        response.statusCode = 200
+        response.setHeader('Content-Type', 'application/json; charset=utf-8')
+        response.end('{"format":"EndfieldLevelMaps/1","status":"prepared","entries":[]}')
+        return
+      }
+      if (requestUrl.pathname === '/level-maps/map02_lv010/image') {
+        response.statusCode = 200
+        response.setHeader('Content-Type', 'image/png')
+        response.end(levelMapImageBytes)
+        return
+      }
+      if (requestUrl.pathname === '/level-maps/map99_lv999/image') {
+        response.statusCode = 409
+        response.setHeader('Content-Type', 'application/json; charset=utf-8')
+        response.end('{"error":"level_map_source_invalid"}')
+        return
+      }
       response.statusCode = 418
       response.setHeader('Content-Type', 'text/plain; charset=utf-8')
       response.end('upstream error is preserved')
@@ -66,12 +97,12 @@ try {
   if (!viteAddress || typeof viteAddress === 'string') throw new Error('Vite dev server did not expose a TCP address.')
   const origin = `http://127.0.0.1:${viteAddress.port}`
 
-  const getResponse = await fetch(`${origin}/api/v2/instanced-scenes/scene-001?catalog_id=cat-01&after=12`)
+  const getResponse = await fetch(`${origin}/api/v2/instanced-scenes/scene_001?catalog_id=cat-01&after=12`)
   assert.equal(getResponse.status, 418)
   assert.equal(await getResponse.text(), 'upstream error is preserved')
   assert.deepEqual(forwardedRequests[0], {
     method: 'GET',
-    url: '/instanced-scenes/scene-001?catalog_id=cat-01&after=12',
+    url: '/instanced-scenes/scene_001?catalog_id=cat-01&after=12',
     token: 'instanced-scene-test-token',
     body: '',
   })
@@ -108,7 +139,7 @@ try {
   assert.equal(crossSiteMetadataResponse.status, 403)
   assert.equal(forwardedRequests.length, 2)
 
-  const sameOriginResponse = await fetch(`${origin}/api/v2/instanced-scenes`, {
+  const sameOriginResponse = await fetch(`${origin}/api/v2/instanced-scene-jobs`, {
     method: 'POST',
     headers: { Origin: origin, 'Sec-Fetch-Site': 'same-origin', 'Content-Type': 'application/json' },
     body: '{"source":"same-origin"}',
@@ -118,7 +149,7 @@ try {
 
   const oversizedBody = 'é'.repeat(786433)
   assert.ok(oversizedBody.length < 1024 * 1024)
-  const oversizedResponse = await fetch(`${origin}/api/v2/instanced-scenes`, {
+  const oversizedResponse = await fetch(`${origin}/api/v2/instanced-scene-jobs`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: oversizedBody,
@@ -150,6 +181,119 @@ try {
   assert.equal(preparation.status, 202)
   assert.equal(forwardedRequests.at(-1).url, '/character-preparation/validate')
   assert.equal(forwardedRequests.at(-1).body, '{"format":"CharacterPreparationRequest/1"}')
+  for (const route of ['/api/v2/level-map-preparation', `/api/v2/level-map-preparation/${'a'.repeat(32)}`]) {
+    const response = await fetch(`${origin}${route}`)
+    assert.equal(response.status, 418)
+    assert.equal(forwardedRequests.at(-1).url, route.slice('/api/v2'.length))
+    assert.equal(forwardedRequests.at(-1).token, 'instanced-scene-test-token')
+  }
+  for (const route of ['/api/v2/level-map-preparation', `/api/v2/level-map-preparation/${'a'.repeat(32)}/cancel`]) {
+    const response = await fetch(`${origin}${route}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
+    assert.equal(response.status, 202)
+    assert.equal(forwardedRequests.at(-1).url, route.slice('/api/v2'.length))
+  }
+  const deniedMapCount = forwardedRequests.length
+  for (const [route, method, status] of [
+    ['/api/v2/level-map-preparation/validate', 'POST', 404],
+    ['/api/v2/level-map-preparation/unsafe-id', 'GET', 404],
+    [`/api/v2/level-map-preparation/${'a'.repeat(32)}`, 'POST', 405],
+    [`/api/v2/level-map-preparation/${'a'.repeat(32)}/cancel`, 'GET', 405],
+  ]) {
+    assert.equal((await fetch(`${origin}${route}`, { method })).status, status)
+  }
+  assert.equal(forwardedRequests.length, deniedMapCount)
+
+  const levelMapsResponse = await fetch(`${origin}/api/v2/level-maps?catalog_id=cat-02`)
+  assert.equal(levelMapsResponse.status, 200)
+  assert.equal(levelMapsResponse.headers.get('content-type'), 'application/json; charset=utf-8')
+  assert.equal(levelMapsResponse.headers.get('x-endfield-path-picker-token'), null)
+  const levelMapsPayload = await levelMapsResponse.text()
+  assert.equal(levelMapsPayload.includes('instanced-scene-test-token'), false)
+  assert.deepEqual(JSON.parse(levelMapsPayload), { format: 'EndfieldLevelMaps/1', status: 'prepared', entries: [] })
+  assert.deepEqual(forwardedRequests.at(-1), {
+    method: 'GET',
+    url: '/level-maps?catalog_id=cat-02',
+    token: 'instanced-scene-test-token',
+    body: '',
+  })
+
+  const levelMapsFailure = await fetch(`${origin}/api/v2/level-maps?failure=not-prepared`)
+  assert.equal(levelMapsFailure.status, 409)
+  assert.equal(levelMapsFailure.headers.get('content-type'), 'application/json; charset=utf-8')
+  assert.equal(await levelMapsFailure.text(), '{"error":"level_maps_not_prepared"}')
+
+  const levelMapImageResponse = await fetch(`${origin}/api/v2/level-maps/map02_lv010/image`)
+  assert.equal(levelMapImageResponse.status, 200)
+  assert.equal(levelMapImageResponse.headers.get('content-type'), 'image/png')
+  assert.equal(levelMapImageResponse.headers.get('x-endfield-path-picker-token'), null)
+  assert.deepEqual(Buffer.from(await levelMapImageResponse.arrayBuffer()), levelMapImageBytes)
+  assert.deepEqual(forwardedRequests.at(-1), {
+    method: 'GET',
+    url: '/level-maps/map02_lv010/image',
+    token: 'instanced-scene-test-token',
+    body: '',
+  })
+
+  const levelMapImageFailure = await fetch(`${origin}/api/v2/level-maps/map99_lv999/image`)
+  assert.equal(levelMapImageFailure.status, 409)
+  assert.equal(levelMapImageFailure.headers.get('content-type'), 'application/json; charset=utf-8')
+  assert.equal(await levelMapImageFailure.text(), '{"error":"level_map_source_invalid"}')
+
+  const levelMapUnknownPathCount = forwardedRequests.length
+  const levelMapUnknownPath = await fetch(`${origin}/api/v2/level-maps/map02_lv010/other`)
+  assert.equal(levelMapUnknownPath.status, 404)
+  assert.equal(forwardedRequests.length, levelMapUnknownPathCount)
+  const levelMapInvalidId = await fetch(`${origin}/api/v2/level-maps/not-a-level/image`)
+  assert.equal(levelMapInvalidId.status, 404)
+  assert.equal(forwardedRequests.length, levelMapUnknownPathCount)
+
+  for (const [publicPath, method, expectedStatus] of [
+    ['/api/v2/characters', 'POST', 405],
+    ['/api/v2/instanced-scenes/scene_001/unknown', 'GET', 404],
+    ['/api/v2/character-jobs/job-001/events', 'POST', 405],
+    ['/api/v2/character-jobs/job-001/cancel', 'GET', 405],
+    ['/api/v2/export-jobs/validate', 'GET', 405],
+    ['/api/v2/export-jobs/job-001/unknown', 'POST', 404],
+    ['/api/v2/first-run/unknown', 'POST', 404],
+    ['/api/v2/first-run/events', 'DELETE', 405],
+  ]) {
+    const rejected = await fetch(`${origin}${publicPath}`, { method })
+    assert.equal(rejected.status, expectedStatus, `${method} ${publicPath}`)
+    assert.equal(forwardedRequests.length, levelMapUnknownPathCount)
+  }
+  for (const rawPath of [
+    '/api/v2/characters/%2e%2e/health',
+    '/api/v2/characters/..%2f..%2fhealth',
+    '/api/v2/characters/test%5c..%5chealth',
+    '/api/v2/characters/%252e%252e',
+    '/api/v2/characters/%zz',
+  ]) {
+    const rejected = await new Promise((resolve, reject) => {
+      const request = httpRequest(origin, { path: rawPath, method: 'GET' }, response => {
+        response.resume()
+        response.on('end', () => resolve(response.statusCode))
+      })
+      request.on('error', reject)
+      request.end()
+    })
+    assert.equal(rejected, 400, rawPath)
+    assert.equal(forwardedRequests.length, levelMapUnknownPathCount)
+  }
+  const redirected = await fetch(`${origin}/api/v2/characters/redirect`)
+  assert.equal(redirected.status, 502)
+  assert.equal(forwardedRequests.length, levelMapUnknownPathCount + 1, 'Credentialed bridge requests must not follow redirects.')
+  assert.equal(forwardedRequests.at(-1).url, '/characters/redirect')
+
+  const bridgeUrl = process.env.ENDFIELD_PATH_PICKER_URL
+  process.env.ENDFIELD_PATH_PICKER_URL = bridgeUrl.replace('http://', 'http://untrusted:credentials@')
+  const credentialedOrigin = await fetch(`${origin}/api/v2/characters`)
+  assert.equal(credentialedOrigin.status, 503)
+  assert.equal(forwardedRequests.length, levelMapUnknownPathCount + 1)
+  process.env.ENDFIELD_PATH_PICKER_URL = bridgeUrl
+  const levelMapWrongMethod = await fetch(`${origin}/api/v2/level-maps`, { method: 'POST' })
+  assert.equal(levelMapWrongMethod.status, 405)
+  assert.equal(levelMapWrongMethod.headers.get('allow'), 'GET')
+  assert.equal(forwardedRequests.length, levelMapUnknownPathCount + 1)
 
   await close(bridge)
   bridgeStarted = false

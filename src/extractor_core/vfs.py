@@ -230,7 +230,7 @@ def parse_blc(
         name_length = struct.unpack_from("<H", decrypted, BLOCK_HEAD_LEN + 8)[0]
         name_start = BLOCK_HEAD_LEN + 10
         name_end = name_start + name_length
-        if marker == 4 and 0 < name_length <= 128 and name_end <= len(decrypted):
+        if marker in (4, 5) and 0 < name_length <= 128 and name_end <= len(decrypted):
             try:
                 decoded_name = decrypted[name_start:name_end].decode("utf-8")
                 formal_release_layout = bool(decoded_name and decoded_name.isprintable())
@@ -289,7 +289,7 @@ def parse_blc(
         chunk_length = r.i64()
         chunk_block_type = r.u8()
         if formal_release_layout:
-            r.take(4)
+            r.take(8 if marker == 5 else 4)
         item_count = r.i32()
         if item_count < 0 or item_count > 10_000_000:
             raise ProbeError(f"Implausible file count in chunk: {item_count}")
@@ -304,11 +304,11 @@ def parse_blc(
             item_block_type = r.u8()
             use_encrypt = bool(r.u8())
             iv_seed = r.i64() if use_encrypt else None
-            # Formal release records append four reserved bytes after the
-            # optional IV.  Reading them before the IV keeps record alignment
+            # Layout 4 appends four bytes after the optional IV; layout 5
+            # widens this field to eight. Reading it before the IV keeps alignment
             # intact but silently produces a bogus nonce (commonly 2**32).
             if formal_release_layout:
-                r.take(4)
+                r.take(8 if marker == 5 else 4)
             if offset < 0 or length < 0 or offset + length > chunk_length:
                 raise ProbeError(
                     f"Invalid range for {file_name!r}: offset={offset}, length={length}, "

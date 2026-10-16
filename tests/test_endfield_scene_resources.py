@@ -21,8 +21,10 @@ from endfield_scene_resources import (
     resource_cache_root,
     supplemental_manifests,
     validate_scan,
+    _prefab_bounds_game_generation,
 )
 from endfield_scene_io import scene_io_session
+from endfield_scene_prefab_geometry_plan import observed_prefab_geometry_paths, prefab_candidates
 from extractor_core.resources import BundleProviderIssue, read_bundle_provider_names_for_paths
 
 
@@ -30,6 +32,92 @@ FINGERPRINT = "a1" * 32
 
 
 class SceneResourceIntegrationTests(unittest.TestCase):
+    def test_partial_skin_refresh_uses_latest_container_and_ordinary_readiness(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runtime_path, runtime = self._runtime(root)
+            mesh = {"Source": "CAB-shared", "PathId": 10, "Name": "mesh", "Type": "Mesh"}
+            paths = ("assets/skin.prefab", "assets/static.prefab")
+            roots = [{"Source": "CAB-shared", "PathId": index, "Type": "GameObject"} for index in (1, 2)]
+            nodes = [{**asset, "TransformPathId": 100 + index,
+                      "Parent": {"Source": "CAB-shared", "PathId": 0, "Type": "Transform"},
+                      "RendererType": kind, "RendererRole": {"CastShadows": 1, "PlatformCastShadows": 1},
+                      "Mesh": mesh, "Materials": [{"Source": "CAB-shared", "PathId": 0, "Type": "Material"}]}
+                     for index, (asset, kind) in enumerate(zip(roots, ("SkinnedMeshRenderer", "MeshRenderer")))]
+            old, new = root / "old.json", root / "new.json"
+            (root / "mesh.obj").write_text("o mesh\nv 0 0 0\n", encoding="utf-8")
+            payload = {"Format": "EndfieldSceneProbe/1", "Materials": [], "TextureExports": [], "LodGroups": [],
+                       "Nodes": nodes, "MeshExports": [{"Asset": mesh, "File": "mesh.obj"}],
+                       "Containers": [{"Container": path, "Asset": asset} for path, asset in zip(paths, roots)]}
+            old.write_text(json.dumps(payload), encoding="utf-8")
+            self.assertEqual(observed_prefab_geometry_paths((old,), frozenset(paths), {}, {}), frozenset({paths[1]}))
+            (root / "mesh.skin.json").write_text('{"Format":"EndfieldSceneMeshSkin/1"}', encoding="utf-8")
+            new.write_text(json.dumps({**payload, "MeshSkinStreamVersion": 1,
+                "Containers": payload["Containers"][:1], "Nodes": [{**nodes[0], "Skin": {"Bones": []}}],
+                "MeshExports": [{"Asset": mesh, "File": "mesh.obj", "SkinGeometryFile": "mesh.skin.json"}]}), encoding="utf-8")
+            manifests = (old, new)
+            candidates = prefab_candidates(manifests, frozenset(paths))
+            self.assertEqual(candidates[paths[0]].manifest, new)
+            self.assertEqual(candidates[paths[1]].manifest, old)
+            self.assertEqual(observed_prefab_geometry_paths(manifests, frozenset(paths), {}, {}), frozenset(paths))
+            cache = root / "selected-cache"
+            self.assertEqual(ready_requested_resource_paths(manifests, frozenset(paths), cache), frozenset())
+            plan = root / "plan.json"
+            plan.write_text(json.dumps({"required_resource_paths": list(paths), "required_prefab_geometry_paths": list(paths),
+                                        "scene_manifests": [str(path) for path in manifests]}), encoding="utf-8")
+            result = ensure_scene_resources(runtime_path, plan, lambda: None, lambda _value, _message: None)
+            self.assertEqual(result, {"status": "ready", "requested": 2, "missing": []})
+            self.assertFalse(resource_cache_root(runtime_path, runtime).exists())
+
+    def test_prefab_bounds_generation_changes_with_game_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            game = Path(temporary)
+            vfs = game / "Endfield_Data/StreamingAssets/VFS/group"
+            vfs.mkdir(parents=True)
+            executable, header, chunk = game / "Endfield.exe", vfs / "source.blc", vfs / "source.chk"
+            for path in (executable, header, chunk):
+                path.write_bytes(b"original")
+            identity, stamps = _prefab_bounds_game_generation(game)
+            self.assertEqual(len(stamps), 3)
+            self.assertEqual(_prefab_bounds_game_generation(game)[0], identity)
+            for path in (chunk, header, executable):
+                path.write_bytes(b"updated source generation")
+                changed, changed_stamps = _prefab_bounds_game_generation(game)
+                self.assertNotEqual(changed, identity)
+                self.assertNotEqual(changed_stamps, stamps)
+                identity, stamps = changed, changed_stamps
+            chunk.unlink()
+            self.assertNotEqual(_prefab_bounds_game_generation(game)[0], identity)
+
+    def test_terrain_metadata_requires_its_exact_existing_serialized_source(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            metadata = "assets/beyond/dynamicassets/scenes/pc/map02/terrain/hgterrainsurfacesdata.asset"
+            unrelated = "assets/beyond/dynamicassets/scenes/pc/map02/terrain/other.asset"
+            manifest = root / "manifest.json"
+            manifest.write_text(json.dumps({
+                "Format": "EndfieldSceneProbe/1", "Materials": [], "MeshExports": [], "TextureExports": [],
+                "Containers": [
+                    {"Container": name, "Asset": {"Source": "CAB-terrain", "PathId": 1, "Type": "MonoBehaviour"}}
+                    for name in (metadata, unrelated)
+                ],
+                "SerializedFiles": [
+                    {"Name": "CAB-terrain", "OriginalPath": "terrain.bundle"},
+                    {"Name": "CAB-unrelated", "OriginalPath": "unused/\u0000bundle"},
+                ],
+            }), encoding="utf-8")
+            requested = frozenset({metadata, unrelated})
+            bundle = root / "terrain.bundle"
+            for present in (False, True, False):
+                if present:
+                    bundle.write_bytes(b"serialized terrain metadata source")
+                else:
+                    bundle.unlink(missing_ok=True)
+                with scene_io_session():
+                    self.assertEqual(ready_resource_paths((manifest,)), frozenset({metadata}) if present else frozenset())
+                    self.assertEqual(ready_requested_resource_paths((manifest,), requested, root / "cache"),
+                                     frozenset({metadata}) if present else frozenset())
+
     def test_selected_readiness_matches_full_catalog_as_payloads_change(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

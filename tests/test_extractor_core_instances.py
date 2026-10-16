@@ -2,10 +2,21 @@
 
 from __future__ import annotations
 
+import hashlib
+import sqlite3
 import struct
+import tempfile
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
-from extractor_core.instances import iter_entities
+from extractor_core.instances import (
+    InstanceSourceGenerationError,
+    build_instance_database,
+    iter_entities,
+    validate_instance_source_generation,
+)
+from extractor_core.vfs import VfsChunk, VfsFile, VfsGroup
 
 
 def chunk_with_components(components: tuple[tuple[int, bytes], ...]) -> bytes:
@@ -58,6 +69,61 @@ class InstanceWorldBoundsTests(unittest.TestCase):
         ):
             with self.subTest(message=message), self.assertRaisesRegex(ValueError, message):
                 list(iter_entities(chunk_with_components(tuple(components))))
+
+    def test_source_generation_matches_current_vfs_without_writing_database(self) -> None:
+        map_id = "map02"
+        virtual_path = "Data/Streaming/PC/map02/Streaming/InitChunkData_-10_-1_0_0.bytes"
+        matrix = struct.pack("<16f", 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, -6.2, 203, 216.96, 1)
+        values = (-46.0, 259.0, 283.0, 26.0, 57.0, 31.0)
+        clear = chunk_with_components((*tuple((type_id, struct.pack("<f", value))
+                                            for type_id, value in enumerate(values)), (18, matrix)))
+        self.assertEqual(len(clear), 512)
+        packed = struct.pack("<I", len(clear)) + b"\x33\xff\xf2" + clear
+        item = VfsFile(virtual_path, "a" * 32, "b" * 32,
+                       hashlib.md5(packed).hexdigest().upper(), 0, len(packed), 11, False, None)
+        group = VfsGroup(1, "static", "C3442D43", 1, len(packed), 11,
+                         [VfsChunk("b" * 32, "c" * 32, len(packed), 11, [item])])
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            game_root = root / "Game"
+            vfs_root = game_root / "Endfield_Data" / "StreamingAssets" / "VFS"
+            group_dir = vfs_root / "C3442D43"
+            group_dir.mkdir(parents=True)
+            (group_dir / ("b" * 32 + ".chk")).write_bytes(packed)
+            database_path = root / "instances.sqlite"
+            with patch("extractor_core.instances.load_group", return_value=group):
+                build_instance_database(map_id, vfs_root, database_path)
+            original_hash = hashlib.sha256(database_path.read_bytes()).hexdigest()
+
+            with patch("extractor_core.instances.load_group", return_value=group):
+                self.assertIsNone(validate_instance_source_generation(game_root, map_id, database_path))
+
+            self.assertEqual(hashlib.sha256(database_path.read_bytes()).hexdigest(), original_hash)
+
+            changed_item = VfsFile(virtual_path, "a" * 32, "d" * 32, "e" * 32, 0, len(packed), 11, False, None)
+            changed_group = VfsGroup(1, "static", "C3442D43", 1, len(packed), 11,
+                                     [VfsChunk("d" * 32, "e" * 32, len(packed), 11, [changed_item])])
+            with patch("extractor_core.instances.load_group", return_value=changed_group):
+                with self.assertRaises(InstanceSourceGenerationError) as caught:
+                    validate_instance_source_generation(game_root, map_id, database_path)
+            self.assertEqual(caught.exception.reason, "source_changed")
+
+    def test_legacy_instance_database_is_explicitly_unverifiable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database_path = Path(temporary) / "instances.sqlite"
+            connection = sqlite3.connect(database_path)
+            connection.executescript(
+                "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);"
+                "CREATE TABLE chunks (virtual_path TEXT PRIMARY KEY, compressed_bytes INTEGER NOT NULL, "
+                "clear_bytes INTEGER NOT NULL, parsed_instances INTEGER NOT NULL);"
+            )
+            connection.commit()
+            connection.close()
+            with patch("extractor_core.instances.load_group") as load_group:
+                with self.assertRaises(InstanceSourceGenerationError) as caught:
+                    validate_instance_source_generation(Path(temporary), "map02", database_path)
+            self.assertEqual(caught.exception.reason, "legacy")
+            load_group.assert_not_called()
 
 
 if __name__ == "__main__":

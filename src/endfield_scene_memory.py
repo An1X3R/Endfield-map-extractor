@@ -262,7 +262,7 @@ def _png_float_rgba_bytes(path: Path) -> int:
 
 def scene_memory_workload(plan: Path, catalog: SceneMemoryCatalog) -> SceneMemoryWorkload:
     """Inspect selected resources, source variants and actual Python catalog storage."""
-    data = require_object(json.loads(plan.read_text(encoding="utf-8-sig")), "scene memory plan")
+    data = {"prefab_geometry_instances": [], **require_object(json.loads(plan.read_text(encoding="utf-8-sig")), "scene memory plan")}
     if data.get("format") != "EndfieldPortableScenePlan/1":
         raise ValueError(f"Unsupported scene memory plan: path={plan}, format={data.get('format')!r}")
     dependencies: set[Path] = {resolve_export_path(plan)}
@@ -284,11 +284,12 @@ def scene_memory_workload(plan: Path, catalog: SceneMemoryCatalog) -> SceneMemor
                 "terrain_surface_count": len(_array(data, "terrain_surfaces")),
                 "depth_terrain_surface_count": len(_array(data, "water_depth_surfaces")),
                 "dynamic_geometry_count": len(_array(data, "dynamic_geometry_instances")),
+                "prefab_geometry_count": len(_array(data, "prefab_geometry_instances")),
                 "surface_effect_count": len(_array(data, "surface_effect_instances")),
                 "direct_effect_count": len(_array(data, "direct_effect_renderers")),
                 "uv_source_bytes": 0}
     selected_refs = _references(data)
-    for field in ("instances", "dynamic_geometry_instances", "water_depth_instances", "surface_effect_instances"):
+    for field in ("instances", "dynamic_geometry_instances", "prefab_geometry_instances", "water_depth_instances", "surface_effect_instances"):
         variants: dict[str, Path] = {}
         rows = _array(data, field)
         features["instance_count"] += len(rows)

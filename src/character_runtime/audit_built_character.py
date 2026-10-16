@@ -48,6 +48,10 @@ def main(args: argparse.Namespace) -> None:
         raise AssertionError(f'Built file differs from its receipt: {blend}')
     bpy.ops.wm.open_mainfile(filepath=extended_path(blend), use_scripts=False)
     refresh()
+    workspace_audit = None
+    if 'authoring_workspace' in receipt:
+        from character_authoring_workspace import verify_authoring_workspace
+        workspace_audit = verify_authoring_workspace(object_value(receipt['authoring_workspace'], 'authoring workspace'))
     from character_emotion_atlas import verify_emotion_atlases
     emotion_atlas_audit = verify_emotion_atlases(receipt['emotion_atlas']) if 'emotion_atlas' in receipt else None
     late_materials_audit = (verify_late_materials(receipt['late_materials'])
@@ -174,6 +178,7 @@ def main(args: argparse.Namespace) -> None:
               'special_lights': special_lights_audit,
               'scripts_enabled_on_reopen': False, 'render_count': 0, 'save_count': 0,
               'authoring': authoring_audit,
+              'authoring_workspace': workspace_audit,
               'build_receipt_sha256': hashlib.sha256(io_path(args.build_receipt).read_bytes()).hexdigest()}
     io_path(args.output).write_text(json.dumps(report, indent=2), encoding='utf-8')
     print(json.dumps({'status': 'passed', 'source_renderers': len(names), 'packed_image_roles': len(images)}))

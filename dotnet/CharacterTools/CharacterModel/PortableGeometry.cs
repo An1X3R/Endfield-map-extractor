@@ -128,11 +128,14 @@ public static class PortableGeometry
                 if (indices.Any(index => index < 0 || index >= vertices.Count)) throw new InvalidDataException($"Out-of-range portable triangle: {mesh.Path}");
                 return indices;
             }), 3))).ToArray();
-        var bones = mesh.BoneList.Select(bone =>
+        if ((mesh.BoneList == null || mesh.BoneList.Count == 0)
+            && vertices.Any(vertex => vertex.Weights != null && vertex.Weights.Any(weight => weight != 0)))
+            throw new InvalidDataException($"Portable mesh has skin weights without bones: {mesh.Path}");
+        var bones = mesh.BoneList?.Select(bone =>
         {
             if (bone.Path == null || !paths.Contains(bone.Path)) throw new InvalidDataException($"Unresolved portable bone: {mesh.Path}/{bone.Path}");
             return new GeometryBone(bone.Path, Enumerable.Range(0, 16).Select(index => bone.Matrix[index / 4, index % 4]).ToArray());
-        }).ToArray();
+        }).ToArray() ?? Array.Empty<GeometryBone>();
         var skin = bones.Length == 0 ? null : Skin(writer, mesh);
         return new(mesh.Path, mesh.Path.Split('/').Last(), vertices.Count, positions, normals, tangents, colors, uvs, submeshes, bones, skin);
     }

@@ -7,10 +7,12 @@ from dataclasses import dataclass
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import shutil
 import subprocess
 from typing import Mapping
+
+from assemble_corresponding_source import is_source_package_path
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -180,6 +182,7 @@ def character_tool_source_identity() -> str:
                       ROOT / "third_party" / "source-overrides", ROOT / "third_party" / "licenses"):
         files.update(path for path in directory.rglob("*") if path.is_file()
                      and not {"bin", "obj"}.intersection(path.relative_to(directory).parts)
+                     and is_source_package_path(PurePosixPath(path.relative_to(ROOT).as_posix()))
                      and path.suffix in {".cs", ".csproj", ".props", ".targets", ".json", ".txt", ".md"})
     for name in ("animeStudio", "ruri"):
         entry = _object(_lock()[name], name)

@@ -245,7 +245,7 @@ def resolve_controller(request: ControllerRequest) -> dict[str, object]:
     verify_game_source(request.game_root, before, check_cancelled)
     if tuple(source_stamp(path) for path in inputs) != stamps:
         raise ControllerSourceError("Controller resolver source indexes or tools changed during execution")
-    result = {"format": "EndfieldCharacterControllerReceipt/1", "status": "source_normal_controller_selected_clip_verified" if references else "no_static_clip_reference",
+    result = {"format": "EndfieldCharacterControllerReceipt/1", "status": "source_normal_controller_selected_clip_verified" if references else "source_normal_controller_dynamic_clip_verified",
         "scope": "source_normal_controller_not_runtime", "runtime_state_reconstructed": False, "dependencies_extracted": False,
         "character_id": request.character_id, "template_id": request.template_id, "part_name": request.part_name,
         "resource_path": request.resource_path, "catalog_source_identity": catalog.source_identity,
@@ -254,9 +254,9 @@ def resolve_controller(request: ControllerRequest) -> dict[str, object]:
         "character_data_source": source_identity(characters[0].metadata), "animation_component": animation,
         "animation_config_virtual_path": config_path, "animation_config_sha256": hashlib.sha256(payload).hexdigest(),
         "controller_resource_path": controller_path, "controller_bundle": str(bundle), "controller_bundle_sha256": sha(bundle),
-        "reader_controller_bundle": str(bundle) if references else None,
+        "reader_controller_bundle": str(bundle),
         "controller": receipt, "selected_clip_source": source_identity(clips[0].metadata), "clip_reference": references[0] if references else None,
-        "boundary": "Normal source controller is proven through selected CharacterData components. Optional controller, active state/layers/montage and runtime parameter writes remain unresolved. An absent static clip pointer keeps raw scalar hashes; it does not establish that the action cannot play."}
+        "boundary": "Normal source controller is proven through selected CharacterData components independently of static clip membership. Dynamic clips may use its exact parameter names and source-authored clothing layers. Optional controller, active state/layers/montage and runtime parameter writes remain unresolved."}
     (request.output / "receipt.json").write_text(json.dumps(result, indent=2, allow_nan=False), encoding="utf-8")
     return result
 

@@ -81,11 +81,8 @@ def _matrix(value: object) -> Matrix:
     return result
 
 
-def _rig(nodes: tuple[GeometryNode, ...], worlds: dict[str, Matrix], meshes: tuple[dict[str, object], ...]) -> tuple[bpy.types.Object, dict[str, str], dict[str, Matrix]]:
-    roots = tuple(node for node in nodes if node.parent is None)
-    if len(roots) != 1:
-        raise ValueError(f'Geometry must have one explicit root: {len(roots)}')
-    lookup = {node.path: node for node in nodes}
+def geometry_bind_worlds(worlds: dict[str, Matrix], meshes: tuple[dict[str, object], ...]) -> tuple[dict[str, Matrix], dict[str, Matrix]]:
+    """Resolve the canonical source skin bind space used by geometry import."""
     binds: dict[str, Matrix] = {}
     mesh_worlds: dict[str, Matrix] = {}
     for mesh in meshes:
@@ -112,6 +109,15 @@ def _rig(nodes: tuple[GeometryNode, ...], worlds: dict[str, Matrix], meshes: tup
         mesh_worlds[mesh_path] = world
     if not binds:
         raise ValueError('Character geometry contains no skin bones')
+    return binds, mesh_worlds
+
+
+def _rig(nodes: tuple[GeometryNode, ...], worlds: dict[str, Matrix], meshes: tuple[dict[str, object], ...]) -> tuple[bpy.types.Object, dict[str, str], dict[str, Matrix]]:
+    roots = tuple(node for node in nodes if node.parent is None)
+    if len(roots) != 1:
+        raise ValueError(f'Geometry must have one explicit root: {len(roots)}')
+    lookup = {node.path: node for node in nodes}
+    binds, mesh_worlds = geometry_bind_worlds(worlds, meshes)
     paths = set(binds)
     for path in tuple(paths):
         while path is not None:

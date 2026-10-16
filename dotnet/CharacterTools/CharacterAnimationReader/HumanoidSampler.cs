@@ -132,7 +132,7 @@ internal static class HumanoidProgram
             manager.LoadPreparedFiles([Path.GetFullPath(request.AvatarBundle), Path.GetFullPath(request.ClipBundle)]);
             logger.RequireSuccess();
             Avatar avatar = manager.assetsFileList.SelectMany(file => file.Objects.OfType<Avatar>()).Single(value => value.m_PathID == request.AvatarPathId && value.assetsFile.fileName.Equals(request.AvatarCab, StringComparison.OrdinalIgnoreCase));
-            AnimationClip clip = manager.assetsFileList.SelectMany(file => file.Objects.OfType<AnimationClip>()).Single(value => value.assetsFile.Objects.OfType<AssetBundle>().Any(bundle => bundle.m_Container.Any(entry => entry.Key.Equals(request.ResourcePath, StringComparison.OrdinalIgnoreCase) && entry.Value.asset.TryGet(out var asset) && ReferenceEquals(asset, value))));
+            AnimationClip clip = AnimationClipSelector.Select(request, manager.assetsFileList);
             AvatarRigInput rig = Rig(avatar);
             AvatarMuscleReferential solver = AvatarMuscleReferential.TryCreate(rig) ?? throw new InvalidDataException("Real Avatar did not produce muscle referential.");
             Dictionary<string, int> channelIndex = bindings.Where(binding => binding.CustomType == 8).ToDictionary(binding => binding.AttributeName, binding => binding.Track, StringComparer.Ordinal);

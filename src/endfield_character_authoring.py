@@ -211,6 +211,7 @@ def prepare_character_authoring(context: CharacterSourceContext, selection: Char
         root_path = required_text(transforms[0].get("path"), "Animator root path")
         controller = json_object(animator.get("controller"), "Animator controller").get("resolved")
         controller_bundle: str | None = None
+        controller_selection_receipt: str | None = None
         if controller is not None:
             controller_cab = required_text(json_object(controller, "resolved controller").get("source"), "controller CAB")
             controller_paths = [payload / "prepared/bundles" / name for name in dict(cab_index.providers).get(controller_cab.casefold(), ())
@@ -247,16 +248,15 @@ def prepare_character_authoring(context: CharacterSourceContext, selection: Char
                 "part_name": selection.part_name, "resource_path": selection.resource_path}
             if any(controller_receipt.get(key) != value for key, value in expected_selection.items()):
                 raise ValueError("Source controller receipt does not match the selected character template and model")
-            if controller_receipt.get("status") == "source_normal_controller_selected_clip_verified":
+            if controller_receipt.get("status") in ("source_normal_controller_selected_clip_verified", "source_normal_controller_dynamic_clip_verified"):
                 controller_path = Path(required_text(controller_receipt.get("reader_controller_bundle"), "verified controller bundle")).resolve(strict=True)
                 if not controller_path.is_relative_to(controller_output.resolve()):
                     raise ValueError("Resolved source controller escapes its prepared output")
                 if _file_record(controller_path, controller_output, "controller")["sha256"] != controller_receipt.get("controller_bundle_sha256"):
                     raise ValueError("Resolved source controller hash differs from its verified receipt")
                 controller_bundle = str(controller_path)
-                pending.append({"code": "source_controller_runtime_scope", "message": "动作参数名称已通过角色配置、源控制器和片段引用核对；游戏实时控制器切换、层混合及 IK 状态仍未复现。"})
-            elif controller_receipt.get("status") == "no_static_clip_reference" and controller_receipt.get("reader_controller_bundle") is None:
-                pending.append({"code": "controller_dynamic_clip_reference", "message": "所选动作未在源普通控制器中找到静态引用；保留原始参数曲线和哈希，运行时 montage 绑定待还原。"})
+                controller_selection_receipt = str(controller_output / "receipt.json")
+                pending.append({"code": "source_controller_runtime_scope", "message": "角色配置中的源控制器和所选片段已分别核对，可读取参数及支持的衣物层；游戏实时控制器切换、montage 混合及 IK 状态仍未复现。"})
             else:
                 raise ValueError("Source controller resolver did not return a verified selection or an explicit missing static reference")
         animation_options = json_object(options["animation"], "animation options")
@@ -266,6 +266,7 @@ def prepare_character_authoring(context: CharacterSourceContext, selection: Char
             "avatar_bundle": str(bundle_paths[0]), "avatar_cab": cab, "avatar_path_id": avatar["path_id"],
             "clip_bundle": clips[0], "resource_path": action.resource_path, "source_audit": str(audit_path),
             "animator_root_path": root_path, "controller_bundle": controller_bundle,
+            "controller_selection_receipt": controller_selection_receipt,
             "unity_version": defaults["unity_version"], "maximum_stored_frames": animation_options["maximum_stored_frames"],
             "output": str(animation_output), "dotnet": str(tools["dotnet"]), "reader": str(tools["animation_reader"])}
         if ordinary_replay is not None:
@@ -285,6 +286,16 @@ def prepare_character_authoring(context: CharacterSourceContext, selection: Char
                     "cab_inventory": str(context.cab_inventory), "sampler": str(tools["auxiliary_sampler"]),
                     "prepared_bundle_root": str(payload / "prepared/bundles")}})
             animation_request["ordinary_layer_replay_template"] = str(template_path)
+        elif controller_bundle is not None:
+            if "auxiliary_sampler" not in tools:
+                raise ValueError("Source clothing layers require authoring_tools.auxiliary_sampler; repair the character tool bundle.")
+            sampling_path = output_dir / "default_clothing_sampling.json"
+            write_index(sampling_path, {
+                "repository_src": defaults["repository_src"], "game_root": str(context.game_root),
+                "cache_root": str(context.cache_root), "resource_database": str(context.resource_database),
+                "cab_inventory": str(context.cab_inventory), "sampler": str(tools["auxiliary_sampler"]),
+                "prepared_bundle_root": str(payload / "prepared/bundles")})
+            animation_request["default_clothing_sampling"] = str(sampling_path)
         if finalik_replay is not None:
             verify_finalik_snapshot(finalik_replay)
             finalik_template = output_dir / "server_finalik_template.json"
@@ -303,6 +314,18 @@ def prepare_character_authoring(context: CharacterSourceContext, selection: Char
         receipt = _read(animation_output / "receipt.json")
         if receipt.get("status") != "decoded_bound_and_merged_candidate" or receipt.get("character_id") != character_id:
             raise ValueError("Animation reader did not bind the selected clip to its source Avatar")
+        if "default_clothing_sampling" in animation_request:
+            clothing = json_object(receipt.get("default_clothing"), "default clothing result")
+            if clothing.get("status") == "applied":
+                replay_path = Path(required_text(receipt.get("ordinary_layer_replay"), "default clothing receipt")).resolve(strict=True)
+                if not replay_path.is_relative_to(animation_output.resolve()):
+                    raise ValueError("Default clothing receipt escapes the selected animation output")
+                pending.append({"code": "default_clothing_scope", "message": "已随动作自动应用源控制器支持的衣物辅助层；使用所选动作曲线与源默认参数，尚不包含实时布料碰撞和完整状态机。"})
+            elif clothing.get("status") == "unsupported":
+                reason = required_text(clothing.get("reason"), "unsupported default clothing reason")
+                pending.append({"code": "default_clothing_unsupported", "message": "该动作的衣物辅助层尚不支持自动应用：" + reason})
+            else:
+                raise ValueError("Default clothing export did not report applied or an explicit unsupported reason")
         if finalik_replay is not None:
             verify_finalik_snapshot(finalik_replay)
             finalik_receipt_path = Path(required_text(receipt.get("finalik_replay"), "FinalIK replay receipt")).resolve(strict=True)

@@ -1,4 +1,4 @@
-import type { CharacterAnimation, CharacterCatalog, CharacterSummary } from './types'
+import type { CharacterAnimation, CharacterAssetCategory, CharacterCatalog, CharacterSummary } from './types'
 import { getOperatorPortrait } from './portraits'
 import type { OperatorReport } from './OperatorCompletion'
 
@@ -51,8 +51,10 @@ export type OperatorDevelopmentPreview = {
 /** Explicit visual fixtures never call the extraction service. */
 export function createOperatorDevelopmentPreview(): OperatorDevelopmentPreview {
   const characters: CharacterSummary[] = ENTRIES.map(entry => {
+    const assetCategory: CharacterAssetCategory = entry.npc ? 'npc' : 'playable'
     const common = {
       selection_id: `${entry.npc ? 'npc' : 'chr'}_demo_${entry.code}`,
+      asset_category: assetCategory,
       name: entry.name,
       variants: Array.from({ length: entry.variants }, (_, index) => ({ variant_id: `demo_${entry.code}_${index}`, label: index ? '备用装束 · 演示' : entry.npc ? '基础模型' : '默认装束', variant: index ? 'ALT_02' : 'DEFAULT_01', geometry_status: 'not_verified' as const })),
       capabilities: { bundle_prepare: entry.ready, blend_export: entry.ready, animation: entry.actions.length > 0, raw_expressions: !entry.npc, basic_mmd: !entry.npc },

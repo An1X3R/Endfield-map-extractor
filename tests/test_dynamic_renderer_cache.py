@@ -17,7 +17,8 @@ from extractor_core.dynamic_renderer_cache import (
     DynamicRendererCacheCorruptError, _BOUNDS, _HEADER, _LENGTH, _RECORD, _STRING_COUNT, _identity,
     read_dynamic_scene_renderers_cached,
 )
-from extractor_core.dynamic_renderers import DynamicRendererDecodeError, DynamicSceneRendererInventory, read_dynamic_scene_renderers_for_scene
+from extractor_core.dynamic_renderers import (DynamicRendererDecodeError, DynamicSceneRendererInventory,
+                                              read_dynamic_scene_renderers_for_bounds, read_dynamic_scene_renderers_for_scene)
 from extractor_core.effects import GROUP_HASH, EffectDecodeError, _dynamic_inventory_sources
 from tests.test_dynamic_scene_inventory import _write_path_hash
 from tests.test_extractor_core_instances import chunk_with_components
@@ -134,6 +135,36 @@ def _mutate_binary(path: Path, offset: int, raw: bytes) -> None:
 
 
 class PersistentDynamicRendererCacheTests(unittest.TestCase):
+    def test_bounded_selection_retains_crossing_source_footprints(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            game, path_hash, _cache = _write_vfs(Path(directory), ((_MAIN, _main()), (_INIT, _init())))
+            selected = read_dynamic_scene_renderers_for_bounds(game, path_hash, "map01", (99998., 99999.5, -1., 1.), _check_cancelled)
+            self.assertEqual(1, len(selected.records))
+            self.assertEqual(100000., selected.records[0].matrix[12])
+            outside = read_dynamic_scene_renderers_for_bounds(game, path_hash, "map01", (99998., 99999., -1., 1.), _check_cancelled)
+            self.assertEqual((), outside.records)
+            self.assertEqual(selected.sources, outside.sources)
+            self.assertEqual(selected.groups, outside.groups)
+
+    def test_unknown_hash_outside_selection_stays_strict_in_selected_and_full_reads(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            game, path_hash, _cache = _write_vfs(Path(directory), ((_MAIN, _main()), (_INIT, _init())))
+            _write_path_hash(path_hash, ((b"12345678", "assets/unrelated.mat"),))
+            selected = read_dynamic_scene_renderers_for_bounds(game, path_hash, "map01", (-1., 1., -1., 1.), _check_cancelled)
+            self.assertEqual((), selected.records)
+            with self.assertRaisesRegex(EffectDecodeError, "unresolvedCount=2"):
+                read_dynamic_scene_renderers_for_bounds(game, path_hash, "map01", (99998., 99999.5, -1., 1.), _check_cancelled)
+            with self.assertRaisesRegex(EffectDecodeError, "unresolvedCount=2"):
+                read_dynamic_scene_renderers_for_scene(game, path_hash, "map01", _check_cancelled)
+
+    def test_bounded_selection_still_validates_outside_draw_layouts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            references = struct.pack("<Q", 1) + _MATERIAL + _MESH
+            invalid = _init().replace(references, struct.pack("<Q", 2) + _MATERIAL + _MESH)
+            game, path_hash, _cache = _write_vfs(Path(directory), ((_MAIN, _main()), (_INIT, invalid)))
+            with self.assertRaisesRegex(DynamicRendererDecodeError, "draw count mismatch"):
+                read_dynamic_scene_renderers_for_bounds(game, path_hash, "map01", (-1., 1., -1., 1.), _check_cancelled)
+
     def test_real_roundtrip_preserves_all_records_and_aliasing(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             game, path_hash, cache = _write_vfs(Path(directory), ((_MAIN, _main()), (_INIT, _init())))

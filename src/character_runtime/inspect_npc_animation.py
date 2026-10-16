@@ -70,7 +70,8 @@ def inspect_npc_cpu_action_references(request: NpcAnimationCatalogRequest) -> di
     from endfield_character_npc_catalog import read_independent_npc_catalog
     from endfield_character_npc_assembly import NpcSourceObject, _config_object, _config_provider
     from endfield_character_npc_assembly import read_npc_source_objects, selected_npc_renderers
-    from endfield_character_npc_animation import _source_pointer, bind_npc_cpu_actions, npc_cpu_animation_resource_path, validate_npc_humanoid_target
+    from endfield_character_npc_animation import _source_pointer, bind_npc_cpu_actions, npc_cpu_animation_resource_path
+    from endfield_character_npc_animation import validate_npc_humanoid_target
     from endfield_character_sources import game_source_stamps, validate_character_storage, verify_game_source
     from endfield_scene_export import run_scene_process
     from extractor_core.resources import extract_candidate_bundles
@@ -85,9 +86,21 @@ def inspect_npc_cpu_action_references(request: NpcAnimationCatalogRequest) -> di
     paths = (request.provider_index, request.resource_database, request.cab_inventory, request.json_reader)
     stamps = tuple(source_stamp(path) for path in paths)
     cache = CharacterDataCache(request.cache_root)
-    catalog = read_independent_npc_catalog(request.game_root, request.provider_index, cache, check_cancelled)
+    from endfield_character_enemy_index import prepare_enemy_model_index_from_paths
+    enemy_index = prepare_enemy_model_index_from_paths(
+        request.game_root, request.provider_index, request.resource_database,
+        request.cab_inventory, request.cache_root, request.json_reader,
+        request.unity_version, check_cancelled,
+    )
+    catalog = read_independent_npc_catalog(request.game_root, request.provider_index, cache, enemy_index, check_cancelled)
     if catalog.source_identity != request.source_identity:
         raise ValueError("NPC source catalog changed; select the NPC again")
+    from endfield_character_npc_catalog import npc_entity_category
+    enemy_entries = tuple(row for row in catalog.entries if row.npc_id == request.npc_id
+        and row.resource_reference.template_id == request.template_id and row.source_kind == "prefab"
+        and npc_entity_category(row).source_field == "enemyModelPrefab")
+    if enemy_entries:
+        raise ValueError("Enemy controller clips use the Action catalog endpoint; they are not NPC CPU references")
     matches = tuple(row for row in catalog.entries if row.npc_id == request.npc_id
         and row.resource_reference.template_id == request.template_id and row.source_kind == "prefab"
         and request.part_name in {part.part_name for part in row.resource_reference.prefab_parts})
@@ -199,7 +212,8 @@ def inspect_npc_animation(request: NpcAnimationCatalogRequest) -> dict[str, obje
     from endfield_character_npc_catalog import read_independent_npc_catalog
     from endfield_character_npc_assembly import NpcSourceObject, _config_object, _config_provider
     from endfield_character_npc_assembly import read_npc_source_objects
-    from endfield_character_npc_animation import _source_pointer, bind_npc_cpu_actions, npc_cpu_animation_resource_path, validate_npc_humanoid_target
+    from endfield_character_npc_animation import _source_pointer, bind_npc_cpu_actions, npc_cpu_animation_resource_path
+    from endfield_character_npc_animation import NpcAnimationBindingError, validate_npc_generic_target, validate_npc_humanoid_target
     from endfield_character_sources import game_source_stamps, validate_character_storage, verify_game_source
     from endfield_scene_export import run_scene_process
     from extractor_core.resources import extract_candidate_bundles
@@ -213,9 +227,37 @@ def inspect_npc_animation(request: NpcAnimationCatalogRequest) -> dict[str, obje
     paths = (request.provider_index, request.resource_database, request.cab_inventory, request.json_reader)
     stamps = tuple(source_stamp(path) for path in paths)
     cache = CharacterDataCache(request.cache_root)
-    catalog = read_independent_npc_catalog(request.game_root, request.provider_index, cache, check_cancelled)
+    from endfield_character_enemy_index import prepare_enemy_model_index_from_paths
+    enemy_index = prepare_enemy_model_index_from_paths(
+        request.game_root, request.provider_index, request.resource_database,
+        request.cab_inventory, request.cache_root, request.json_reader,
+        request.unity_version, check_cancelled,
+    )
+    catalog = read_independent_npc_catalog(request.game_root, request.provider_index, cache, enemy_index, check_cancelled)
     if catalog.source_identity != request.source_identity:
         raise ValueError("NPC source catalog changed; select the NPC again")
+    from endfield_character_npc_catalog import npc_entity_category
+    enemy_entries = tuple(row for row in catalog.entries if row.npc_id == request.npc_id
+        and row.resource_reference.template_id == request.template_id and row.source_kind == "prefab"
+        and npc_entity_category(row).source_field == "enemyModelPrefab")
+    if enemy_entries:
+        from endfield_character_enemy_animation import inspect_enemy_animation
+        from endfield_character_enemy_index import read_enemy_model_index
+        from endfield_character_selection import CharacterSelection
+        from endfield_character_sources import CharacterSourceContext
+        parts = tuple(part for row in enemy_entries for part in row.resource_reference.prefab_parts if part.part_name == request.part_name)
+        bindings = tuple(row for row in read_enemy_model_index(enemy_index).bindings
+                         if row.template_id == request.template_id and row.model_id == request.part_name)
+        if len(parts) != 1 or len(parts[0].providers) != 1 or len(bindings) != 1:
+            raise ValueError("Enemy action request must identify one exact prefab/model/provider")
+        if request.part_names is not None and request.part_names != (request.part_name,):
+            raise ValueError("Enemy action request must preserve the exact selected prefab part")
+        context = CharacterSourceContext(request.game_root, Path(), request.cache_root, request.output.parent,
+                                         request.provider_index, request.resource_database, request.cab_inventory)
+        selection = CharacterSelection(catalog.source_identity, request.npc_id, request.template_id, request.part_name,
+                                        "npc", parts[0].resource_path, parts[0].providers[0].logical_name)
+        return inspect_enemy_animation(context, selection, bindings[0], request.json_reader,
+                                        request.unity_version, request.output, check_cancelled)
     matches = tuple(row for row in catalog.entries if row.npc_id == request.npc_id
         and row.resource_reference.template_id == request.template_id and row.source_kind == "config_assembled"
         and request.part_name in {part.part_name for part in row.resource_reference.prefab_parts})
@@ -266,9 +308,12 @@ def inspect_npc_animation(request: NpcAnimationCatalogRequest) -> dict[str, obje
     cpu_binding = bind_npc_cpu_actions(template, cpu, cpu_avatar)
     identities_match = selected_avatar.cab.casefold() == cpu_avatar.cab.casefold() and selected_avatar.path_id == cpu_avatar.path_id
     actions: list[dict[str, object]] = []
+    unsupported_actions: list[dict[str, object]] = []
     retarget = not identities_match and cpu_binding.template_namespace == "Humanoid"
+    generic_retarget = not identities_match and cpu_binding.template_namespace == "Generic"
     avatar_evidence: dict[str, str] = {}
-    if identities_match or retarget:
+    generic_avatar_equivalence: dict[str, str | int | float] | None = None
+    if identities_match or retarget or generic_retarget:
         cab_index, _ = cache.read_character_cab_index(request.cab_inventory, check_cancelled)
         cab_providers = dict(cab_index.providers)
         avatar_providers = cab_providers.get(selected_avatar.cab.casefold(), ())
@@ -300,6 +345,13 @@ def inspect_npc_animation(request: NpcAnimationCatalogRequest) -> dict[str, obje
             validate_npc_humanoid_target(cpu_avatars[0], avatars[0])
             avatar_evidence = {"cpu_avatar_source_sha256": str(cpu_avatars[0].metadata["rawDataSha256"]),
                 "target_avatar_source_sha256": str(avatars[0].metadata["rawDataSha256"])}
+        elif generic_retarget:
+            cpu_avatars = tuple(row for row in assets if row.metadata.get("type") == "Avatar"
+                and str(row.metadata.get("sourceFile")).casefold() == cpu_avatar.cab.casefold()
+                and row.metadata.get("pathId") == cpu_avatar.path_id)
+            if len(cpu_avatars) != 1:
+                raise ValueError("Exact CPU Avatar source object is absent or ambiguous")
+        resolved_clips: dict[str, NpcSourceObject] = {}
         for action in cpu_binding.actions:
             clips = tuple(row for row in assets if row.metadata.get("type") == "AnimationClip"
                 and str(row.metadata.get("sourceFile")).casefold() == action.pointer.cab.casefold()
@@ -307,6 +359,44 @@ def inspect_npc_animation(request: NpcAnimationCatalogRequest) -> dict[str, obje
             if len(clips) != 1:
                 raise ValueError(f"CPU clip PPtr does not resolve to one actual source object: state={action.state_name}")
             clip = clips[0]
+            resource = clip.metadata.get("container")
+            if not isinstance(resource, str) or not resource:
+                raise ValueError(f"Exact CPU clip has no resource container: state={action.state_name}")
+            resolved_clips[action.state_name] = clip
+        generic_supported_states: frozenset[str] | None = None
+        if generic_retarget:
+            generic_validated_clips: list[NpcSourceObject] = []
+            generic_validated_states: list[str] = []
+            for action in cpu_binding.actions:
+                clip = resolved_clips[action.state_name]
+                resource = clip.metadata.get("container")
+                if not isinstance(resource, str) or not resource:
+                    raise ValueError(f"Exact CPU clip has no resource container: state={action.state_name}")
+                try:
+                    validate_npc_generic_target(cpu_avatars[0], avatars[0], (clip,))
+                except NpcAnimationBindingError as error:
+                    unsupported_actions.append({
+                        "state_name": action.state_name, "clip_name": clip.metadata.get("name"),
+                        "resource_path": resource, "logical_provider": clip_roots[action.pointer.cab.casefold()],
+                        "clip_cab": action.pointer.cab, "clip_path_id": str(action.pointer.path_id),
+                        "clip_raw_data_sha256": clip.metadata["rawDataSha256"],
+                        "binding_status": "source_generic_equivalent_avatar_rejected", "reason": str(error),
+                    })
+                else:
+                    generic_validated_clips.append(clip)
+                    generic_validated_states.append(action.state_name)
+            if not generic_validated_clips:
+                reasons = tuple(sorted({str(row["reason"]) for row in unsupported_actions}))
+                raise NpcAnimationBindingError(f"No Generic CPU action passed source Avatar equivalence: reasons={reasons[:4]}")
+            generic_proof = validate_npc_generic_target(cpu_avatars[0], avatars[0], tuple(generic_validated_clips))
+            generic_avatar_equivalence = generic_proof.to_document()
+            generic_supported_states = frozenset(generic_validated_states)
+            avatar_evidence = {"cpu_avatar_source_sha256": generic_proof.source_avatar_sha256,
+                "target_avatar_source_sha256": generic_proof.target_avatar_sha256}
+        for action in cpu_binding.actions:
+            if generic_retarget and generic_supported_states is not None and action.state_name not in generic_supported_states:
+                continue
+            clip = resolved_clips[action.state_name]
             resource = clip.metadata.get("container")
             if not isinstance(resource, str) or not resource:
                 raise ValueError(f"Exact CPU clip has no resource container: state={action.state_name}")
@@ -318,20 +408,23 @@ def inspect_npc_animation(request: NpcAnimationCatalogRequest) -> dict[str, obje
                 "resource_path": resource, "logical_provider": clip_roots[action.pointer.cab.casefold()],
                 "clip_cab": action.pointer.cab, "clip_path_id": str(action.pointer.path_id),
                 "clip_raw_data_sha256": clip.metadata["rawDataSha256"],
-                "binding_status": "exact_cpu_avatar_base_clip_reference_requires_final_clip_binding"})
+                "binding_status": "source_generic_equivalent_avatar_base_clip_reference_requires_final_clip_binding"
+                    if generic_retarget else "exact_cpu_avatar_base_clip_reference_requires_final_clip_binding"})
     verify_game_source(request.game_root, before, check_cancelled)
     if tuple(source_stamp(path) for path in paths) != stamps:
         raise ValueError("NPC source indexes or JSON reader changed during action inspection")
-    result = {"format": "EndfieldNpcAnimationCatalog/2", "status": "exact_avatar_base_clip_references" if identities_match else "source_humanoid_target_avatar_base_clip_references" if retarget else "avatar_mismatch",
+    result = {"format": "EndfieldNpcAnimationCatalog/2", "status": "exact_avatar_base_clip_references" if identities_match else "source_humanoid_target_avatar_base_clip_references" if retarget else "source_generic_equivalent_avatar_base_clip_references" if generic_retarget else "avatar_mismatch",
         "npc_id": request.npc_id, "template_id": request.template_id, "part_name": request.part_name,
         "part_names": list(part_names), **slot_scope,
         "source_identity": catalog.source_identity, "cpu_animation_template": template,
         "template_namespace": cpu_binding.template_namespace, **avatar_evidence,
+        **({"generic_avatar_equivalence": generic_avatar_equivalence} if generic_avatar_equivalence is not None else {}),
         "cpu_source_sha256": cpu.metadata["rawDataSha256"], "avatar_templet_source_sha256": templet.metadata["rawDataSha256"],
         "selected_avatar": {"cab": selected_avatar.cab, "path_id": str(selected_avatar.path_id)},
         "cpu_avatar": {"cab": cpu_avatar.cab, "path_id": str(cpu_avatar.path_id)},
-        "avatar_identity_matches": identities_match, "avatar_binding_status": "source_humanoid_to_selected_avatar" if retarget else "exact_avatar", "actions": actions, "runtime_animator_reconstructed": False,
-        "reason": None if identities_match or retarget else "CPU Avatar differs from AvatarTemplet.sizeAvatar; cross-Avatar retargeting is not verified.",
+        "avatar_identity_matches": identities_match, "avatar_binding_status": "source_humanoid_to_selected_avatar" if retarget else "source_generic_equivalent_avatar" if generic_retarget else "exact_avatar", "actions": actions,
+        "unsupported_actions": unsupported_actions, "runtime_animator_reconstructed": False,
+        "reason": None if identities_match or retarget or generic_retarget else "CPU Avatar differs from AvatarTemplet.sizeAvatar; cross-Avatar retargeting is not verified.",
         "limitations": ["Exact base-clip references do not prove compatible transform CRCs, supported materials or live Animator state; final reader and saved Action validation remain mandatory.",
                         "The CPU clip drives the selected host Avatar; mounted self-Avatar slots retain calibrated static local poses and follow their source parent. Independent mounted-slot actions and live visibility are not reconstructed. Generic clip layouts still require the existing exact reader admission."]}
     (request.output / "receipt.json").write_text(json.dumps(result, indent=2, allow_nan=False), encoding="utf-8")
@@ -350,5 +443,5 @@ if __name__ == "__main__":
                    "execution_available": result["execution_available"]}
     else:
         summary = {"status": result["status"], "actions": len(result["actions"]),
-                   "avatar_identity_matches": result["avatar_identity_matches"]}
+                   "avatar_identity_matches": result.get("avatar_identity_matches")}
     print(json.dumps(summary), flush=True)

@@ -9,7 +9,10 @@ from pathlib import Path
 from endfield_scene_slot_contract import load_slot_plans, load_retained_mesh_slot_plans
 from endfield_scene_slot_contract import AmbiguousSubmeshSlots, static_submesh_slots
 from endfield_scene_slot_contract import mesh_lod_index
-from endfield_scene_slot_contract import RuntimeDraw, primary_visible_mesh, runtime_submesh_slots
+from endfield_scene_slot_contract import (
+    RuntimeDraw, RuntimeLodDraw, highest_detail_visible_meshes, primary_visible_mesh,
+    runtime_submesh_slots, runtime_submesh_passes, validate_ordered_surface_passes,
+)
 
 
 def write_inputs(root: Path, sequences: list[list[list[str]]], failures: list[dict[str, str]]) -> tuple[Path, Path]:
@@ -27,6 +30,57 @@ def write_inputs(root: Path, sequences: list[list[list[str]]], failures: list[di
 
 
 class SceneMaterialSlotTests(unittest.TestCase):
+    def test_coauthored_base_parts_require_matching_native_lod_intervals(self) -> None:
+        a, b = "assets/a_lod0.fbx##a_lod0", "assets/b_lod0.fbx##b_lod0"
+        high = RuntimeLodDraw(0, 134217728, 3.4028234663852886e38, .7225000262260437)
+        lower = RuntimeLodDraw(0, 134217728, high.lod_min_squared, .25)
+        shadow = RuntimeLodDraw(0, 200803328, high.lod_max_squared, high.lod_min_squared)
+        pairs = ((a, high), (b, high), ("assets/a_lod1.fbx##a_lod1", lower),
+                 ("assets/b_lod1.fbx##b_lod1", lower), ("assets/proxy.fbx##proxy", shadow))
+        self.assertEqual((a, b), highest_detail_visible_meshes(pairs))
+        self.assertEqual((a, b), highest_detail_visible_meshes(tuple(reversed(pairs))))
+        for changed in (
+            ((a, high), (b, high._replace(lod_min_squared=.8)), *pairs[2:]),
+            (*pairs[:2], (pairs[2][0], lower._replace(lod_max_squared=.9)), *pairs[3:]),
+            (*pairs, (a, lower)),
+            ((a, high), (b, high._replace(lod_max_squared=float("inf")))),
+        ):
+            with self.subTest(changed=changed), self.assertRaises(AmbiguousSubmeshSlots):
+                highest_detail_visible_meshes(changed)
+        self.assertEqual((a,), highest_detail_visible_meshes(((a, high), pairs[2], pairs[-1])))
+        sole = "assets/sole_lod1.fbx##sole_lod1"
+        self.assertEqual((sole,), highest_detail_visible_meshes(((sole, high),)))
+
+    def test_ordered_draws_preserve_every_visible_material_on_the_same_submesh(self) -> None:
+        mapping = runtime_submesh_passes(3, ("tower", "wall", "metal_b", "shadow", "metal_a"),
+            (RuntimeDraw(0, 200802304), RuntimeDraw(1, 200802304), RuntimeDraw(1, 200802304),
+             RuntimeDraw(1, 200803328), RuntimeDraw(1, 200802304)))
+        self.assertEqual(((0,), (1, 2, 4), ()), mapping.indices)
+        self.assertEqual((2,), mapping.undrawn_submeshes)
+        self.assertEqual((3,), mapping.shadow_only_draws)
+
+    def test_ordered_surface_contract_rejects_unverified_depth_alpha_and_stencil(self) -> None:
+        from copy import deepcopy
+
+        record = {"Source": "CAB", "PathId": 1, "Name": "ordinary", "Colors": {}, "Textures": [],
+                  "Shader": {"Source": "CAB", "PathId": 3, "Name": "HGRP/Lit", "PassNames": ["HGBuffer"]},
+                  "RenderState": {"CustomRenderQueue": 2000, "DisabledShaderPasses": [], "ValidKeywords": []},
+                  "Floats": {"_EnableAlphaTest": 0, "_DisableZWrite": 0, "_ZTestGBuffer": 4,
+                             "_ZWriteGBuffer": 1, "_CullMode": 2, "_DitherTransparentAlpha": 1,
+                             "_StencilRef": 0, "_StencilOpGBuffer": 2, "_StencilOpPreZ": 0}}
+        overlay = {**record, "PathId": 2}
+        validate_ordered_surface_passes((record, overlay))
+        for field, value in (("_EnableAlphaTest", 1), ("_ZTestGBuffer", 8), ("_ZWriteGBuffer", 0),
+                             ("_CullMode", 0), ("_EnableAlphaBlend", 1), ("_StencilRef", 4)):
+            changed = deepcopy(overlay)
+            changed["Floats"][field] = value
+            with self.subTest(field=field), self.assertRaisesRegex(AmbiguousSubmeshSlots, "explicit compatible opaque"):
+                validate_ordered_surface_passes((record, changed))
+        missing = deepcopy(overlay)
+        del missing["Floats"]["_ZWriteGBuffer"]
+        with self.assertRaises(AmbiguousSubmeshSlots):
+            validate_ordered_surface_passes((record, missing))
+
     def test_native_draw_roles_preserve_undrawn_groups_and_separate_shadow_materials(self) -> None:
         lamp = runtime_submesh_slots(3, ("lamp02", "lamp01"),
                                      (RuntimeDraw(0, 200802304), RuntimeDraw(1, 200802304)))
@@ -62,10 +116,27 @@ class SceneMaterialSlotTests(unittest.TestCase):
             (lod0, RuntimeDraw(0, 256)))))
         for pairs in (((base, RuntimeDraw(0, 256)),
                        ("assets/tree_card.fbx##tree_card", RuntimeDraw(0, 256))),
-                      (("assets/tree_lod1.fbx##tree_lod1", RuntimeDraw(0, 256)),),
+                      (("assets/tree_lod1.fbx##tree_lod1", RuntimeDraw(0, 256)),
+                       ("assets/tree_lod2.fbx##tree_lod2", RuntimeDraw(0, 256))),
                       ((base, RuntimeDraw(0, 1024)),)):
             with self.subTest(pairs=pairs), self.assertRaisesRegex(AmbiguousSubmeshSlots, "No unique visible base mesh"):
                 primary_visible_mesh(pairs)
+
+    def test_visible_primary_mesh_uses_container_lod_for_generic_subassets(self) -> None:
+        paths = tuple(f"assets/machine_lod{lod}.fbx##mesh" for lod in (0, 1, 2))
+        self.assertEqual(paths[0], primary_visible_mesh(tuple((path, RuntimeDraw(0, 256)) for path in paths)))
+        self.assertEqual(paths[1], primary_visible_mesh(((paths[1], RuntimeDraw(0, 256)),)))
+        with self.assertRaisesRegex(AmbiguousSubmeshSlots, "LOD disagree"):
+            primary_visible_mesh((("assets/machine_lod0.fbx##machine_lod1", RuntimeDraw(0, 256)),))
+
+    def test_single_authored_lod_mesh_keeps_draws_without_adding_other_lods(self) -> None:
+        mesh = "assets/rock_lod1.fbx##rock_lod1"
+        shadow = "assets/rock_shadow.fbx##rock_shadow"
+        self.assertEqual(mesh, primary_visible_mesh(((mesh, RuntimeDraw(0, 200802304)),
+                                                    (mesh, RuntimeDraw(1, 200802304)),
+                                                    (shadow, RuntimeDraw(0, 1024)))))
+        with self.assertRaisesRegex(AmbiguousSubmeshSlots, "No unique visible base mesh"):
+            primary_visible_mesh(((mesh, RuntimeDraw(0, 1024)),))
 
     def test_static_repetitions_preserve_material_choices_and_reject_conflicts(self) -> None:
         for count, references, expected in (

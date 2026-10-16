@@ -93,6 +93,8 @@ def vector(value: object, length: int) -> tuple[float, ...]:
 def material_source_uv_channels(material: bpy.types.Material | None) -> frozenset[int]:
     if material is None or not material.use_nodes or material.node_tree is None:
         return frozenset()
+    from blender_scene_material_passes import effective_opaque_surface
+    material = effective_opaque_surface(material)
     layer_channels = {"EF_SOURCE_UV1": 1, "EF_SOURCE_UV2": 2}
     return frozenset(
         layer_channels[node.uv_map]
@@ -299,6 +301,9 @@ def preserve_receiver_alpha(material: bpy.types.Material, source: bpy.types.Mate
 
 
 def projected_material(source: bpy.types.Material, spec: MaterialSpec) -> bpy.types.Material:
+    from blender_scene_material_passes import effective_opaque_surface
+    receiver = source
+    source = effective_opaque_surface(source)
     if source.get("endfield_runtime_role") == "no_non_shadow_draw_for_submesh":
         # Retain the same non-drawing role as the receiver, including its geometry.
         # A projected layer must never turn an unsubmitted submesh into a surface.
@@ -415,6 +420,10 @@ def projected_material(source: bpy.types.Material, spec: MaterialSpec) -> bpy.ty
             links.new(normal.outputs["Normal"], bsdf.inputs["Normal"])
     material["projected_decal_material"] = spec.container
     material["receiver_material"] = source.name
+    if receiver != source:
+        material["receiver_material"] = receiver.name
+        material["receiver_effective_source_material"] = source.name
+        material["receiver_ordered_material_refs"] = receiver["endfield_ordered_material_refs"]
     preserve_receiver_alpha(material, source)
     from blender_hgrp_emission import preserve_projected_sweep_origin
     preserve_projected_sweep_origin(material)

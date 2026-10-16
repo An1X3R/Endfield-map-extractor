@@ -20,10 +20,12 @@ from endfield_character_authoring import (CharacterActionSource, PreparedCharact
     prepare_character_authoring, finish_character_authoring)
 from endfield_character_animation_families import CharacterAnimationFamilyError, resolve_animation_family_prefixes
 from endfield_character_selection import CharacterSelection, parse_character_selection
-from endfield_character_npc_catalog import IndependentNpcCatalog, read_independent_npc_catalog
+from endfield_character_npc_catalog import IndependentNpcCatalog, read_independent_npc_catalog, npc_entity_category
+from endfield_character_enemy_index import enemy_index_from_catalog, prepare_enemy_model_index, read_enemy_model_index
 from endfield_character_npc_animation import resolve_npc_animation_prefixes
 from endfield_character_npc_action_adapter import (
     NpcActionCatalog, npc_cpu_reference_document, public_npc_failure, read_npc_action_catalog, read_npc_cpu_action_references,
+    read_enemy_animation_catalog, parse_enemy_action_catalog, enemy_animation_selection_document,
 )
 from endfield_character_npc_prefab_action import run_prefab_npc_action
 from endfield_character_replay import (ReplaySelectionBinding,
@@ -65,6 +67,10 @@ class CharacterServiceError(CharacterRequestError):
 
 
 def _no_cancel() -> None:
+    return None
+
+
+def _no_progress(stage: str, fraction: float, message: str) -> None:
     return None
 
 
@@ -165,6 +171,7 @@ class CharacterService:
     def __init__(self, config_path: Path | None) -> None:
         self.config_path = config_path.resolve() if config_path is not None else None
         self._prepare_lock = threading.Lock()
+        self._enemy_index_lock = threading.Lock()
         self._npc_action_bindings: dict[tuple[str, str], str] = {}
         self.config = _read(self.config_path) if self.config_path is not None else None
         if self.config is not None and self.config.get("format") not in {"EndfieldCharacterRuntime/1", "EndfieldCharacterRuntime/2"}:
@@ -228,11 +235,17 @@ class CharacterService:
             raise CharacterServiceError("角色工具或材质组件未安装完整，请检查角色运行配置。")
         return exporter, defaults
 
+    def prepared_source_context(self) -> CharacterSourceContext:
+        """Expose verified shared indexes to image-only consumers without model export."""
+        context, _ = self._current()
+        return context
+
     def _catalog_source(self) -> tuple[CharacterSourceContext, CharacterCatalog, IndependentNpcCatalog, str]:
         context, record = self._current()
         cache = CharacterDataCache(context.cache_root)
         catalog = read_character_catalog_cached(context.game_root, context.provider_index, cache, _no_cancel)
-        npc = read_independent_npc_catalog(context.game_root, context.provider_index, cache, _no_cancel)
+        enemy_index = self._enemy_model_index(context, _no_cancel, _no_progress)
+        npc = read_independent_npc_catalog(context.game_root, context.provider_index, cache, enemy_index, _no_cancel)
         verify_game_source(context.game_root, cast(list[dict[str, object]], record["game_stamps"]), _no_cancel)
         for name in ("provider_index", "resource_database", "cab_inventory"):
             if asdict(source_stamp(getattr(context, name))) != json_object(record["index_stamps"], "index_stamps").get(name):
@@ -388,7 +401,7 @@ class CharacterService:
         if override is not None:
             return override
         npc = read_independent_npc_catalog(context.game_root, context.provider_index,
-                                           CharacterDataCache(context.cache_root), _no_cancel)
+                                           CharacterDataCache(context.cache_root), self._enemy_model_index(context, _no_cancel, _no_progress), _no_cancel)
         matches = tuple(row for row in npc.entries if row.npc_id == selection.character_id
                         and row.resource_reference.template_id == selection.template_id)
         if len(matches) == 1:
@@ -406,6 +419,26 @@ class CharacterService:
         if not path.is_file():
             raise CharacterServiceError("独立 NPC 准备工具未安装，请检查 npc_prepare_script。")
         return path
+
+    def _enemy_model_index(self, context: CharacterSourceContext, check_cancelled: Callable[[], None],
+                           progress: Callable[[str, float, str], None]) -> Path | None:
+        """Use the configured source reader even when optional export tools are absent."""
+        config, parent = self._require_config()
+        section = config.get("npc_assembly_tools")
+        if section is None:
+            return None
+        raw = json_object(section, "npc_assembly_tools")
+        reader = _path(raw.get("json_reader"), parent, "npc_assembly_tools.json_reader")
+        defaults = json_object(config.get("export_defaults"), "export_defaults")
+        version = defaults.get("unity_version")
+        if not isinstance(version, str):
+            raise CharacterServiceError("敌人资源索引需要配置 unity_version。")
+        while not self._enemy_index_lock.acquire(timeout=.2):
+            check_cancelled()
+        try:
+            return prepare_enemy_model_index(context, reader, version, check_cancelled, progress)
+        finally:
+            self._enemy_index_lock.release()
 
     def _npc_assembly_tools(self) -> dict[str, Path]:
         config, parent = self._require_config()
@@ -491,6 +524,20 @@ class CharacterService:
             readers[field] = reader
         return {**tools, **readers,
                 "prefab_action_builder": builder}
+
+    def _enemy_actions(self, context: CharacterSourceContext, selection: CharacterSelection,
+                       identity: str, variant_id: str, check_cancelled: CheckCancelled) -> dict[str, object]:
+        """Authenticate controller-referenced clips for one exact enemy prefab."""
+        tools = self._npc_prefab_animation_tools()
+        _, defaults = self._runtime_defaults()
+        try:
+            document = read_enemy_animation_catalog(context, selection, tools, defaults, check_cancelled)
+            source = parse_enemy_action_catalog(document, selection)
+        except (ValueError, OSError, RuntimeError) as error:
+            check_cancelled()
+            raise CharacterServiceError("敌人精确控制器动作读取失败：" + public_npc_failure(error)) from error
+        self._npc_action_bindings[(identity, variant_id)] = source.status if source.actions else "source_enemy_controller_only_unsupported_references"
+        return document
 
     def _npc_cpu_reference_runtime(self) -> tuple[dict[str, Path], dict[str, object]] | None:
         config, parent = self._require_config()
@@ -592,6 +639,7 @@ class CharacterService:
             ready = bool(choices) and runtime_reason is None
             rows.append({"selection_id": selection_id, "character_id": character.character_id, "name": character.name,
                          "english_name": character.english_name, "entry_kind": "playable", "variants": choices,
+                         "asset_category": "playable",
                          "capabilities": {"bundle_prepare": bool(choices), "blend_export": ready,
                                           "animation": ready and animation_ready, "raw_expressions": ready and expression_ready,
                                           "basic_mmd": ready and basic_ready},
@@ -604,6 +652,7 @@ class CharacterService:
         }
         for entry in npc.entries:
             reference = entry.resource_reference
+            category = npc_entity_category(entry)
             provider_found = (any(part.provider_found for part in reference.prefab_parts)
                               or any(value is not None and value.provider_found for value in
                                      (reference.avatar_mesh, reference.avatar_templet)))
@@ -619,28 +668,58 @@ class CharacterService:
             ready = bool(choices) and runtime_reason is None and source_ready
             rows.append({"selection_id": "independent-npc-" + entry.npc_id, "npc_id": entry.npc_id,
                          "name": entry.name, "english_name": None, "entry_kind": "independent_npc",
+                         "asset_category": category.category, "category_source": asdict(category),
+                         "template_id": reference.template_id,
                          "name_status": entry.name_status, "source_kind": entry.source_kind,
                          "name_source": ({key: getattr(name_source, key) for key in ("table", "row_key", "field", "text_id")}
                                          if name_source is not None else None),
                          "variants": choices, "capabilities": {"bundle_prepare": bool(choices) and source_ready,
                              "blend_export": ready, "animation": (ready and bool(npc_animation_tools)
                                  and any(self._npc_action_bindings.get((identity, str(choice["variant_id"])))
-                                         in ("exact_avatar_base_clip_references", "source_humanoid_target_avatar_base_clip_references") for choice in choices)) if configured else
+                                         in ("exact_avatar_base_clip_references", "source_humanoid_target_avatar_base_clip_references", "source_generic_equivalent_avatar_base_clip_references", "source_enemy_controller_clip_references") for choice in choices)) if configured or category.source_field == "enemyModelPrefab" else
                                  ready and animation_ready and bool(self._family_override(entry.npc_id)
                                      or reference.cpu_animation_template and reference.cpu_animation_template.casefold().startswith("npc/animationconfig/humanoid/")),
                              "raw_expressions": False, "basic_mmd": False},
                          "expression_unavailable_reason": "独立 NPC 尚未接入确切的面部或耳部表情模板引用；当前不支持原始表情表或基础 MMD。",
                          "cpu_animation_template": reference.cpu_animation_template,
-                         "animation_scope": "source_cpu_template_and_selected_target_avatar_require_final_clip_and_material_audit" if configured else "source_family_candidates_require_avatar_binding",
-                         "animation_catalog_available": ready and bool(npc_animation_tools) if configured else ready and animation_ready,
+                         "animation_scope": "source_enemy_controller_clips_require_final_avatar_binding_and_saved_action_audit" if category.source_field == "enemyModelPrefab" else "source_cpu_template_and_selected_target_avatar_require_final_clip_and_material_audit" if configured else "source_family_candidates_require_avatar_binding",
+                         "animation_catalog_available": ready and bool(npc_animation_tools) if configured or category.source_field == "enemyModelPrefab" else ready and animation_ready,
                          "provider_found": provider_found, "optional_tools_reason": optional_reason,
                          "unavailable_reason": None if ready else runtime_reason or (assembly_reason if configured else optional_reason) or reasons[entry.source_kind],
                          "assembly_scope": ("exact_prefab_info_slot_group_lod0" if configured else "one_exact_prefab_part") if choices else None})
+        enemy_index_path = (enemy_index_from_catalog(asdict(npc), context.cache_root)
+                            if any(source.source_name == "EnemyModelIndex" for source in npc.sources) else None)
+        enemy_coverage: dict[str, object] = {"status": "reader_not_configured", "bound_template_count": 0,
+                                           "scope": "Exact source bindings; per-export geometry, rig and materials still require validation."}
+        if enemy_index_path is not None:
+            enemy_index = read_enemy_model_index(enemy_index_path)
+            represented = {part.part_name for entry in npc.entries for part in entry.resource_reference.prefab_parts
+                           if entry.source_kind in ("prefab", "config_assembled")}
+            bound = tuple(binding for binding in enemy_index.bindings if binding.model_id in represented)
+            unsupported = [{"template_id": binding.template_id, "reason": "exact_model_prefab_not_bound",
+                            "model_id": binding.model_id, "resource_path": binding.resource_path}
+                           for binding in enemy_index.bindings if binding.model_id not in represented]
+            unsupported.extend(asdict(row) for row in enemy_index.unavailable)
+            enemy_coverage = {**enemy_coverage, "status": "indexed", "source_identity": enemy_index.source_identity,
+                              "template_count": len(enemy_index.bindings) + len(enemy_index.unavailable),
+                              "model_component_count": len(enemy_index.bindings), "bound_template_count": len(bound),
+                              "unsupported": unsupported}
         return {"format": "CharacterCatalog/1", "catalog_id": _digest((identity, "catalog/1")), "source_identity": identity,
                 "availability": {"ready": True, "reason": None}, "characters": rows,
+                "enemy_model_coverage": enemy_coverage,
                 "profiles": [{"profile_id": "hgrp-preview", "name": "HGRP 可编辑材质", "engines": ["EEVEE", "CYCLES"]}],
                 "limitations": ["资源绑定不等于逐角色完整度验收；动作候选在导出时由所选 Avatar 验证。",
                                  "独立 NPC 每个变体为确切预制体部件或 PrefabInfo 同时配置的完整源槽组；配置动作需逐变体核对 CPU Avatar，最终轨道和材质在导出时验收。"]}
+
+    def creature_catalog(self) -> dict[str, object]:
+        """Offer source-classified creatures through the existing export contract."""
+        catalog = self.catalog()
+        rows = cast(list[dict[str, object]], catalog['characters'])
+        creatures = [row for row in rows if row.get('asset_category') in ('animal', 'creature')]
+        return {**catalog, 'catalog_scope': 'creatures', 'characters': creatures,
+                'category_counts': {category: sum(row['asset_category'] == category for row in creatures)
+                                    for category in ('animal', 'creature')},
+                'scope_note': 'Exact NPC/environmental Animal/Monster configurations and EnemyData model prefab providers. Shared NPC templates retain distinct source IDs; combat variants collapse to canonical enemy templates.'}
 
     def detail(self, selection_id: str) -> dict[str, object]:
         catalog = self.catalog()
@@ -659,15 +738,35 @@ class CharacterService:
             raise CharacterServiceError("动作目录的角色变体不属于当前选择，请刷新目录。")
         entries = tuple(row for row in npc.entries if row.npc_id == match[1].character_id
                         and row.resource_reference.template_id == match[1].template_id)
+        if len(entries) == 1 and npc_entity_category(entries[0]).source_field == "enemyModelPrefab":
+            document = self._enemy_actions(context, match[1], identity, variant_id, _no_cancel)
+            source = parse_enemy_action_catalog(document, match[1])
+            return {"format": "CharacterAnimationCatalog/1", "source_identity": identity, "selection_id": selection_id,
+                "variant_id": variant_id, "offset": offset, "limit": limit, "total": len(source.actions),
+                "binding_status": source.status, "unavailable_reason": source.reason,
+                "coverage_counts": document["coverage_counts"],
+                "unsupported_actions": [asdict(action) for action in source.unsupported_actions],
+                "animations": [{"action_id": action.action_id, "name": action.name, "state_name": action.state_name,
+                    "binding_status": "exact_enemy_controller_clip_reference_requires_final_clip_binding"}
+                    for action in source.actions[offset:offset + limit]],
+                "limitations": ["动作来自 EnemyData 动作配置及确切控制器片段指针；目录不证明完整 Animator 状态机还原。",
+                                "所选动作仍需 Avatar/轨道校准、材质保留及逐帧保存重开验收。"]}
         if selection_id.startswith("independent-npc-") and len(entries) == 1 and entries[0].source_kind == "config_assembled":
             source = self._npc_actions(context, match[1], identity, variant_id, _no_cancel)
             return {"format": "CharacterAnimationCatalog/1", "source_identity": identity, "selection_id": selection_id,
                 "variant_id": variant_id, "offset": offset, "limit": limit, "total": len(source.actions),
                 "binding_status": source.status, "unavailable_reason": source.reason,
+                "unsupported_actions": [asdict(action) for action in source.unsupported_actions],
+                "coverage_counts": {"scope": "exact_cpu_base_state_references",
+                    "source_state_count": len(source.actions) + len(source.unsupported_actions),
+                    "available_action_count": len(source.actions), "unsupported_action_count": len(source.unsupported_actions)},
                 "animations": [{"action_id": action.action_id, "name": action.name, "state_name": action.state_name,
-                    "binding_status": "source_humanoid_target_avatar_requires_final_clip_binding" if source.status == "source_humanoid_target_avatar_base_clip_references" else "exact_cpu_avatar_base_clip_reference_requires_final_clip_binding"}
+                    "binding_status": ("source_generic_equivalent_avatar_requires_final_clip_binding" if source.status == "source_generic_equivalent_avatar_base_clip_references" else
+                        "source_humanoid_target_avatar_requires_final_clip_binding" if source.status == "source_humanoid_target_avatar_base_clip_references" else "exact_cpu_avatar_base_clip_reference_requires_final_clip_binding")}
                     for action in source.actions[offset:offset + limit]],
-                "limitations": ["确切 CPU 模板和配置 Avatar 已核对；完整轨道、可见材质及保存重开仍在选定动作导出时验收。"]}
+                "limitations": ["Generic 跨 Avatar 动作仅在实际驱动路径及祖先骨架通过源数据比较时开放；不包含任意骨架重定向。" if source.status == "source_generic_equivalent_avatar_base_clip_references" else
+                                "确切 CPU 模板和配置 Avatar 已按来源证据核对。",
+                                "所选动作的完整轨道、可见材质及逐帧保存重开仍需导出验收。"]}
         actions = read_character_actions(context, identity, variant_id, match[1].character_id,
                                          self._families(context, match[1]), _no_cancel)
         result = {"format": "CharacterAnimationCatalog/1", "source_identity": identity, "selection_id": selection_id,
@@ -775,6 +874,13 @@ class CharacterService:
                 raise CharacterServiceError("独立 NPC 预制体导出需要配置 npc_prepare_script。")
             if options.get("animation"):
                 animation = json_object(options["animation"], "animation options")
+                if npc_entity_category(entries[0]).source_field == "enemyModelPrefab":
+                    if "reference_id" in animation:
+                        raise CharacterServiceError("敌人控制器片段请使用 action_id；reference_id 仅用于 NPC CPU 来源引用。")
+                    document = self._enemy_actions(context, match[1], identity, str(request["variant_id"]), _no_cancel)
+                    selected = enemy_animation_selection_document(document, match[1], str(animation["action_id"]))
+                    return {**request, "selection": asdict(match[1]), "context": _context_row(context),
+                            "enemy_animation_selection": selected}
                 if "reference_id" in animation:
                     if entries[0].source_kind != "prefab":
                         raise CharacterServiceError("reference_id 需要精确预制体 NPC 来源。")
@@ -864,7 +970,8 @@ class CharacterService:
                             for name in ("provider_index", "resource_database", "cab_inventory")}
             cache = CharacterDataCache(context.cache_root)
             catalog = read_character_catalog_cached(context.game_root, context.provider_index, cache, check_cancelled)
-            npc = read_independent_npc_catalog(context.game_root, context.provider_index, cache, check_cancelled)
+            npc = read_independent_npc_catalog(context.game_root, context.provider_index, cache,
+                self._enemy_model_index(context, check_cancelled, progress), check_cancelled)
             weather_state: dict[str, object] = {}
             if config.get("format") == "EndfieldCharacterRuntime/2":
                 from endfield_character_weather_prepare import prepare_character_weather_textures
@@ -932,7 +1039,7 @@ class CharacterService:
                 return self._export_npc_assembly(canonical, output_dir, context, npc.source_identity,
                                                  identity, part_names, defaults, check_cancelled, progress)
         catalog_path = output_dir / "source_catalog.json"
-        write_index(catalog_path, asdict(catalog))
+        write_index(catalog_path, asdict(npc) if str(canonical["selection_id"]).startswith("independent-npc-") else asdict(catalog))
         payload = output_dir / "payload"
         request = {"format": "EndfieldCharacterExportRequest/1", **defaults,
                    "game_root": str(context.game_root), "blender": str(context.blender), "catalog": str(catalog_path),
@@ -967,7 +1074,7 @@ class CharacterService:
         stop_preparation = threading.Event()
         pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="character-source-authoring")
         overlap_started: float | None = None
-        overlap_eligible = any(selected_options.get(name) for name in ("raw_expressions", "basic_mmd", "animation")) and "npc_cpu_reference" not in canonical
+        overlap_eligible = any(selected_options.get(name) for name in ("raw_expressions", "basic_mmd", "animation")) and "npc_cpu_reference" not in canonical and "enemy_animation_selection" not in canonical
 
         def preparation_cancel() -> None:
             check_cancelled()
@@ -1027,7 +1134,14 @@ class CharacterService:
                                             "role": "character", "bytes": blend.stat().st_size, "sha256": digest}]
             authoring_pending: list[dict[str, str]] = []
             if options.get("raw_expressions") or options.get("basic_mmd") or options.get("animation"):
-                if "npc_cpu_reference" in canonical:
+                if "enemy_animation_selection" in canonical:
+                    from endfield_character_enemy_action import run_enemy_prefab_action
+                    with _character_memory(str(canonical["request_id"]), check_cancelled):
+                        files, authoring_pending = run_enemy_prefab_action(context, parse_character_selection(selection),
+                            json_object(canonical["enemy_animation_selection"], "enemy animation selection"), payload, output_dir,
+                            defaults, self._npc_prefab_animation_tools(), json_object(options["animation"], "enemy animation options"),
+                            check_cancelled, progress)
+                elif "npc_cpu_reference" in canonical:
                     with _character_memory(str(canonical["request_id"]), check_cancelled):
                         files, authoring_pending = run_prefab_npc_action(context, parse_character_selection(selection),
                             json_object(canonical["npc_cpu_reference"], "NPC CPU reference"), payload, output_dir,
@@ -1220,6 +1334,17 @@ class CharacterService:
              "动作来自确切 CPU 基础状态并逐帧保存重开验收；跨槽动作重定向、运行时 Animator 和原生 IK 仍未还原。" if animated else
              "配置装配型 NPC 的表情尚未接入；可选动作需精确 CPU/Avatar 绑定和完整轨道验收。"}]
         unresolved = receipt.get("unresolved_archives")
+        adapters = receipt.get("material_adapters", [])
+        if not isinstance(adapters, list):
+            raise ValueError("NPC configuration receipt requires material adapter records")
+        if any(json_object(adapter, "material adapter").get("adapter") == "EndfieldStaticLitEffect/1"
+               for adapter in adapters):
+            pending.append({"code": "creature_static_liteffect_scope", "message":
+                "LitEffect 已绑定源贴图和可编辑参数；Blender 光照、粗糙度和透明裁剪为近似，动态溶解等分支尚未还原。"})
+        if any(json_object(adapter, "material adapter").get("adapter") == "scene.make_mesh_effect_material / bpy.ops.node.group_make"
+               for adapter in adapters):
+            pending.append({"code": "creature_mesh_effect_snapshot_scope", "message":
+                "已复用场景 VFX 的源贴图和 UV 公式，当前为时间快照；源采样设置、软交界和运行时顶点色衰减仍为近似，完整动画尚未还原。"})
         if type(unresolved) is not int or unresolved < 0:
             raise ValueError("NPC configuration receipt requires an exact unresolved-material archive count")
         if unresolved:

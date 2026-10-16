@@ -14,7 +14,7 @@ import re
 import sys
 import zlib
 
-from character_animation_parameters import (_controller_names, _integer, _number,
+from character_animation_parameters import (VERIFIED_CONTROLLER_STATUSES, _controller_names, _integer, _number,
     _record, _rows, _text)
 from character_animator_graph import _names
 from character_cloth_curve_parameters import (ClothCurveInputs, ClothRuntimeInputs,
@@ -152,7 +152,12 @@ def map_cloth_curve_sources(channels: tuple[SourceFloatChannel, ...],
 
 def source_input_paths(decoded_root: Path, source_frames: Path) -> dict[str, Path]:
     native = decoded_root / 'native'
+    reader = _record(read_json(decoded_root / 'request.json'), 'reader request')
+    selection = reader.get('controller_selection_receipt')
+    selection_paths = ({'controller_selection_receipt': (decoded_root / _text(selection, 'controller selection receipt')).resolve(strict=True)}
+                       if selection is not None else {})
     return {'reader_request': decoded_root / 'request.json', 'source_local_frames': source_frames,
+        **selection_paths,
         **{name: native / filename for name, filename in (
             ('clip_audit', 'clip_audit.json'), ('scalar_bindings', 'scalar_bindings.json'),
             ('float_samples', 'float_samples.json'), ('float_header', 'float_header.json'),
@@ -161,6 +166,17 @@ def source_input_paths(decoded_root: Path, source_frames: Path) -> dict[str, Pat
             ('controller_type_tree', 'controller_type_tree.json'),
             ('controller_source_references', 'controller_source_references.json'),
             ('frame_domain', 'frame_domain_verification.json'))}}
+
+
+def validate_parameter_source_identity(reader: dict[str, object], clip: dict[str, object],
+                                       references: dict[str, object], identity: TraceSourceIdentity) -> None:
+    """Reject mismatched sources even when their layer layout is unsupported."""
+    actual = TraceSourceIdentity(_text(reader['character_id'], 'character_id'), _text(reader['avatar_cab'], 'avatar_cab'),
+        _integer(reader['avatar_path_id'], 'avatar_path_id'), _text(clip['source'], 'clip.source'),
+        _integer(clip['path_id'], 'clip.path_id'), _text(references['source'], 'controller.source'),
+        _integer(references['controller_path_id'], 'controller.path_id'))
+    if identity != actual:
+        raise ValueError(f'Decoded parameter source identity mismatch: expected={identity}, actual={actual}')
 
 
 def read_decoded_parameter_source(decoded_root: Path, source_frames: Path,
@@ -177,21 +193,17 @@ def read_decoded_parameter_source(decoded_root: Path, source_frames: Path,
     reader = _record(read_json(paths['reader_request']), 'reader request')
     clip = _record(read_json(paths['clip_audit']), 'clip audit')
     references = _record(read_json(paths['controller_source_references']), 'controller references')
-    actual = TraceSourceIdentity(_text(reader['character_id'], 'character_id'), _text(reader['avatar_cab'], 'avatar_cab'),
-        _integer(reader['avatar_path_id'], 'avatar_path_id'), _text(clip['source'], 'clip.source'),
-        _integer(clip['path_id'], 'clip.path_id'), _text(references['source'], 'controller.source'),
-        _integer(references['controller_path_id'], 'controller.path_id'))
-    if identity != actual:
-        raise ValueError(f'Decoded parameter source identity mismatch: expected={identity}, actual={actual}')
+    validate_parameter_source_identity(reader, clip, references, identity)
     tree = _record(read_json(paths['controller_type_tree']), 'controller tree')
     declarations = declarations_from_controller(tree)
     evidence = _record(read_json(paths['parameter_verification']), 'parameter verification')
-    if evidence['status'] != 'exact_controller_clip_reference_and_tos_verified':
+    if evidence['status'] not in VERIFIED_CONTROLLER_STATUSES:
         raise ValueError(f'Trace currently requires the real reader exact controller/clip verification: status={evidence["status"]}')
     names, _ = _controller_names(decoded_root / 'native', reader, clip)
     if evidence['source'] != identity.controller_cab or evidence['controller_path_id'] != identity.controller_path_id:
         raise ValueError('Controller parameter evidence differs from the exact selected controller')
-    scope = 'exact_controller_static_clip_reference_and_tos'
+    scope = ('exact_controller_static_clip_reference_and_tos' if evidence['status'] == VERIFIED_CONTROLLER_STATUSES[0]
+             else 'character_controller_dynamic_clip_and_tos')
     raw_bindings = tuple(_record(row, 'binding') for row in _rows(clip['bindings'], 'bindings'))
     scalar_rows = tuple(_record(row, 'scalar') for row in _rows(read_json(paths['scalar_bindings']), 'scalar_bindings'))
     count = _integer(clip['output_track_count'], 'output_track_count')
@@ -240,7 +252,7 @@ def read_decoded_parameter_source(decoded_root: Path, source_frames: Path,
         if raw['path'] != 0 or raw['script_file_id'] != 0 or raw['script_path_id'] != 0 or raw['is_p_ptr_curve'] != 0 or raw['is_int_curve'] != 0:
             raise ValueError(f'Unsupported source-root Animator float binding: track={track}')
         key = uint32(raw['attribute'], 'float.attribute')
-        if scope == 'exact_controller_static_clip_reference_and_tos' and key not in names:
+        if key not in names:
             raise ValueError(f'Verified controller parameter table is missing sampled hash: hash={key}')
         channels.append(SourceFloatChannel(track, start + track, key, names.get(key), tuple(row[track] for row in values[:common])))
     curve_sources = map_cloth_curve_sources(tuple(channels), declarations)
@@ -273,6 +285,25 @@ def source_curves_at_frame(source: DecodedParameterSource, frame: int, gate: boo
         else:
             values[origin.field] = float(declarations[origin.name_hash].default_value)
     return ClothCurveInputs(**values)
+
+
+def required_parameter_names(routes: list[object],
+                             declarations: tuple[DeclaredParameter, ...]) -> dict[str, int]:
+    """Resolve exact declared float inputs used by ordinary Direct routes."""
+    declared = {row.name_hash: row for row in declarations}
+    required: dict[str, int] = {}
+    for route in routes:
+        row = _record(route, 'ordinary route')
+        for spec in _rows(row['weights'], 'weights') + _rows(row['pose_times'], 'pose_times'):
+            parameter = _record(spec, 'route.parameter')
+            key = uint32(parameter['hash'], 'route.hash')
+            if key == 0xffffffff:
+                continue
+            name = _text(parameter['name'], 'route.parameter.name')
+            if crc(name) != key or key not in declared or declared[key].kind != 1:
+                raise ValueError(f'Ordinary route requires an exact declared source float: name={name}, hash={key}')
+            required[name] = key
+    return required
 
 
 def produce_parameter_trace(source: DecodedParameterSource, tree: dict[str, object],
@@ -311,17 +342,7 @@ def produce_parameter_trace(source: DecodedParameterSource, tree: dict[str, obje
         raise ValueError('Explicit runtime frame count differs from source scalar domain')
     hashes = tuple(uint32(value, 'layer_binding_hash') for value in _rows(scenario['layer_binding_hashes'], 'layer_binding_hashes'))
     routes = select_ordinary_routes(assess_ordinary_layers(tree, references), hashes)
-    required: dict[str, int] = {}
-    for route in routes:
-        for spec in _rows(_record(route, 'route')['weights'], 'weights') + _rows(_record(route, 'route')['pose_times'], 'pose_times'):
-            parameter = _record(spec, 'route.parameter')
-            key = uint32(parameter['hash'], 'route.hash')
-            if key == 0xffffffff:
-                continue
-            name = _text(parameter['name'], 'route.parameter.name')
-            if crc(name) != key or key not in declared or declared[key].kind != 1:
-                raise ValueError(f'Ordinary route requires an exact declared source float: name={name}, hash={key}')
-            required[name] = key
+    required = required_parameter_names(routes, source.declarations)
     registry = empty_dynamic_registry()
     snapshot = {name: float(declared[key].default_value) for name, key, _ in sources}
     frames: list[object] = []

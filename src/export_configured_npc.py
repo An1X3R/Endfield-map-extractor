@@ -14,6 +14,7 @@ import time
 from endfield_character_cache import CharacterDataCache, CharacterSourceStamp, source_stamp
 from endfield_character_npc_assembly import NpcAssemblyPreparationError, prepare_npc_assembly, prepare_npc_assembly_group
 from endfield_character_npc_catalog import read_independent_npc_catalog
+from endfield_character_enemy_index import prepare_enemy_model_index
 from endfield_character_npc_action_adapter import NpcActionSource
 from endfield_character_sources import CharacterSourceContext, game_source_stamps, validate_character_storage, verify_game_source
 from endfield_scene_export import run_scene_process
@@ -177,8 +178,10 @@ def export_npc(request: NpcExportRequest) -> dict[str, object]:
     before = game_source_stamps(request.context.game_root)
     indexes = (request.context.provider_index, request.context.resource_database, request.context.cab_inventory)
     index_stamps = tuple(source_stamp(path) for path in indexes)
+    enemy_index = prepare_enemy_model_index(request.context, request.tools["json_reader"], request.unity_version,
+                                           lambda: None, lambda _stage, _fraction, _message: None)
     catalog = read_independent_npc_catalog(request.context.game_root, request.context.provider_index,
-        CharacterDataCache(request.context.cache_root), lambda: None)
+        CharacterDataCache(request.context.cache_root), enemy_index, lambda: None)
     if catalog.source_identity != request.source_identity:
         raise NpcAssemblyPreparationError("NPC source catalog changed after selection; refresh the catalog")
     selections = tuple(row for row in catalog.entries if row.npc_id == request.npc_id
@@ -262,6 +265,7 @@ def export_npc(request: NpcExportRequest) -> dict[str, object]:
         "resolved_materials": verification["resolved_materials"],
         "unresolved_archives": len(verification["unresolved_archives"]),
         "actual_shader_families": verification["actual_shader_families"],
+        "material_adapters": verification.get("material_adapters", []),
         "runtime_renderer_fields_known": False, "animation_exported": False,
         "tools_sha256": tools_before, "timings": timings, "seconds": time.perf_counter() - started,
         "limitations": ["Static source LOD0 configuration; runtime platform, visibility and cloth remain unverified.",
@@ -269,6 +273,59 @@ def export_npc(request: NpcExportRequest) -> dict[str, object]:
                         "Self-avatar slots use their exact mesh-provider Avatar and recorded parent transform; game runtime visibility and Animator binding remain unverified."]}
     (request.output / "npc_export_receipt.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
     return result
+
+
+def validate_npc_action_avatar_binding(receipt: dict[str, object], source: dict[str, object]) -> None:
+    """Admit cross-Avatar Generic actions only after rechecking their exact source proof."""
+    status = receipt.get("avatar_binding_status")
+    if status != source.get("avatar_binding_status"):
+        raise NpcAssemblyPreparationError("NPC Action Avatar binding status differs from its source evidence")
+    if receipt.get("avatar_identity_matches") is True and status == "exact_avatar":
+        return
+    if receipt.get("avatar_identity_matches") is not False:
+        raise NpcAssemblyPreparationError("NPC Action Avatar identity flag is inconsistent with its binding status")
+    if status == "source_humanoid_to_selected_avatar":
+        if receipt.get("template_namespace") == source.get("template_namespace") == "Humanoid":
+            return
+        raise NpcAssemblyPreparationError("Cross-Avatar Humanoid Action requires its authenticated template namespace")
+    if (status != "source_generic_equivalent_avatar"
+            or receipt.get("template_namespace") != "Generic" or source.get("template_namespace") != "Generic"):
+        raise NpcAssemblyPreparationError("NPC Action has no supported authenticated cross-Avatar binding")
+    from endfield_character_npc_animation import validate_npc_generic_target
+    from endfield_character_npc_assembly import NpcSourceObject
+
+    evidence = receipt["source"]
+    if (not isinstance(evidence, dict) or _sha(Path(evidence["path"])) != evidence.get("sha256")
+            or _read(Path(evidence["path"])) != source or source.get("format") != "EndfieldNpcAnimationSource/1"):
+        raise NpcAssemblyPreparationError("Generic Action source receipt differs from its authenticated JSON")
+    objects: list[NpcSourceObject] = []
+    for field in ("cpu_avatar_source", "avatar_source", "clip_source"):
+        item = source.get(field)
+        if not isinstance(item, dict) or _sha(Path(item["path"])) != item.get("sha256"):
+            raise NpcAssemblyPreparationError(f"Generic Action source object differs from its authenticated JSON: field={field}")
+        path = Path(item["path"])
+        value = _read(path)
+        metadata = value.get("$animestudio")
+        if not isinstance(metadata, dict):
+            raise NpcAssemblyPreparationError(f"Generic Action source object lacks exact identity: field={field}")
+        objects.append(NpcSourceObject(path, value, metadata))
+    cpu_avatar, target_avatar, clip = objects
+    proof = validate_npc_generic_target(cpu_avatar, target_avatar, (clip,)).to_document()
+    if receipt.get("generic_avatar_equivalence") != proof or source.get("generic_avatar_equivalence") != proof:
+        raise NpcAssemblyPreparationError("Generic Action equivalence proof differs from the actual selected clip and source Avatars")
+    for field, proof_field in (("cpu_avatar_source_sha256", "source_avatar_sha256"),
+                               ("target_avatar_source_sha256", "target_avatar_sha256")):
+        if receipt.get(field) != proof[proof_field] or source.get(field) != proof[proof_field]:
+            raise NpcAssemblyPreparationError(f"Generic Action Avatar hash differs from its source proof: field={field}")
+    identities: list[tuple[str, int]] = []
+    for field, avatar in (("cpu_avatar", cpu_avatar), ("selected_avatar", target_avatar)):
+        pointer = receipt.get(field)
+        if (not isinstance(pointer, dict) or str(pointer.get("cab")).casefold() != str(avatar.metadata.get("sourceFile")).casefold()
+                or int(str(pointer.get("path_id"))) != avatar.metadata.get("pathId")):
+            raise NpcAssemblyPreparationError(f"Generic Action Avatar pointer differs from its source object: field={field}")
+        identities.append((str(pointer["cab"]).casefold(), int(str(pointer["path_id"]))))
+    if identities[0] == identities[1]:
+        raise NpcAssemblyPreparationError("Generic Action claims different source Avatars for identical pointers")
 
 
 def export_npc_action(request: NpcExportRequest, assembly_input: Path, source: Path,
@@ -298,11 +355,8 @@ def export_npc_action(request: NpcExportRequest, assembly_input: Path, source: P
     npc = _read(animation_output / "receipt.json")
     evidence = _read(Path(npc["source"]["path"]))
     clip = _read(Path(evidence["clip_source"]["path"]))["$animestudio"]
+    validate_npc_action_avatar_binding(npc, evidence)
     if (npc.get("status") != "exact_cpu_base_clip_exported"
-            or not (npc.get("avatar_identity_matches") is True or
-                (npc.get("avatar_identity_matches") is False
-                 and npc.get("avatar_binding_status") == "source_humanoid_to_selected_avatar"
-                 and evidence.get("avatar_binding_status") == "source_humanoid_to_selected_avatar"))
             or npc.get("state_name") != action.state_name or clip.get("sourceFile", "").casefold() != action.clip_cab.casefold()
             or str(clip.get("pathId")) != action.clip_path_id or clip.get("rawDataSha256") != action.clip_raw_data_sha256
             or str(clip.get("container")).casefold() != action.resource_path.casefold()):
@@ -348,6 +402,7 @@ def export_npc_action(request: NpcExportRequest, assembly_input: Path, source: P
                    "bytes": blend.stat().st_size, "sha256": _sha(blend)}],
         "source_mesh_instances": len(verification["source_meshes"]), "actual_shader_families": verification["actual_shader_families"],
         "unresolved_archives": verification["unresolved_archives"], "runtime_renderer_fields_known": False, "animation_exported": True,
+        "material_adapters": verification.get("material_adapters", []),
         "action_id": action.action_id, "state_name": action.state_name, "frames": binding["frames"],
         "reopened_frames": len(reopen["checked_frames"]), "maximum_matrix_error": reopen["maximum_matrix_error"],
         "bind_world_calibration": calibration,

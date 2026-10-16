@@ -88,13 +88,26 @@ def validate_shader_texture_defaults(value: object, context: str) -> list[Shader
     return result
 
 
-def has_shader_white_texture_default(record: MaterialRecord, property_name: str) -> bool:
-    """Recognize only an explicitly declared two-dimensional white source texture."""
+def shader_constant_texture_default(record: MaterialRecord, property_name: str) -> tuple[float, float, float, float] | None:
+    """Decode white and the consumed height red; grey alpha is not established."""
     defaults = record["Shader"].get("TextureDefaults")
     if defaults is None:
-        return False
-    return any(row["Property"] == property_name and row["Name"] == "white" and row["Dimension"] == 2
-               for row in validate_shader_texture_defaults(defaults, f"material={record['Name']}"))
+        return None
+    for row in validate_shader_texture_defaults(defaults, f"material={record['Name']}"):
+        if row["Property"] == property_name and row["Dimension"] == 2:
+            if row["Name"] == "white":
+                return (1.0, 1.0, 1.0, 1.0)
+            if property_name == "_BaseHeightMap" and row["Name"] in ("grey", "gray"):
+                # ShaderLab grey is sRGB; linearGrey is a distinct built-in.
+                linear_grey = ((0.5 + 0.055) / 1.055) ** 2.4
+                # Only height red is consumed; the other components are host placeholders.
+                return (linear_grey, linear_grey, linear_grey, 1.0)
+    return None
+
+
+def has_shader_white_texture_default(record: MaterialRecord, property_name: str) -> bool:
+    """Recognize only an explicitly declared two-dimensional white source texture."""
+    return shader_constant_texture_default(record, property_name) == (1.0, 1.0, 1.0, 1.0)
 
 
 def mesh_material_requires_uv1(material: MaterialRecord) -> bool:
@@ -365,11 +378,13 @@ def supported_slots(record: MaterialRecord) -> tuple[TextureSlot, ...]:
     if not uses_normal_map(record):
         properties.remove("_NormalMap")
     required: set[str] = set()
+    defaults: set[str] = set()
     if has_verified_lit_top_layer(record):
-        required.update(("_NormalMap", "_Layer1BaseMap", "_Layer1BumpMap", "_LayerBlendMaskMap"))
+        required.update(("_NormalMap", "_Layer1BaseMap", "_Layer1BumpMap"))
+        if floats["_LayerBlendHeight"] != 0:
+            required.add("_BaseHeightMap")
         bound = {slot["Property"] for slot in record["Textures"] if slot["Texture"] is not None}
-        defaults = {name for name in ("_Layer1BaseMap", "_LayerBlendMaskMap")
-                    if has_shader_white_texture_default(record, name)}
+        defaults = {name for name in required if shader_constant_texture_default(record, name) is not None}
         if required - bound - defaults:
             raise ValueError(f"Top layer requires bound textures or verified shader defaults: material={record['Name']}, properties={sorted(required - bound - defaults)}")
     if floats.get("_EnableTriChannelMask", 0) > 0.5:
@@ -392,20 +407,30 @@ def supported_slots(record: MaterialRecord) -> tuple[TextureSlot, ...]:
             ):
                 raise ValueError(f"Unsupported emissive mask selection: material={record['Name']}, channel={channel}; shader semantics require verification")
     # Serialized null references are authored empty slots, not missing exports.
-    present = authored_properties
+    present = authored_properties | defaults
     if required - present:
         raise ValueError(f"Enabled surface feature lacks authored texture: material={record['Name']}, properties={sorted(required - present)}")
     properties.update(required)
     return tuple(slot for slot in record["Textures"] if slot["Property"] in properties and slot["Texture"] is not None)
 
 
+def top_layer_runtime_limitations(record: MaterialRecord) -> tuple[str, ...]:
+    """Describe unresolved program inputs independently of audited source UV streams."""
+    if not has_verified_lit_top_layer(record):
+        return ()
+    keywords = (record.get("RenderState") or {}).get("ValidKeywords", [])
+    if "_TERRAIN_BLEND" in keywords:
+        return ("terrain_blend_source_screen_depth_not_reconstructed",
+                "terrain_blend_source_camera_constants_not_reconstructed",
+                "terrain_blend_source_virtual_texture_sampling_not_reconstructed")
+    return ("top_layer_current_program_equivalence_not_verified",)
+
+
 def surface_limitations(record: MaterialRecord) -> tuple[str, ...]:
     flags = {"_LayerBlend": "layer_blend", "_EnableTop": "top_layer", "_UseSubsurfaceProfile": "subsurface_profile"}
     procedural = ("procedural_foliage_glow_not_reconstructed",) if has_procedural_foliage_emission(record) else ()
     top = has_verified_lit_top_layer(record)
-    partial = (("top_layer_runtime_uv_feed_unverified",) +
-               (("terrain_blend_runtime_atlas_not_reconstructed",)
-                if record["Floats"].get("_EnableTerrainBlend", 0) > 0.5 else ())) if top else ()
+    partial = top_layer_runtime_limitations(record)
     return ("game_lighting_not_reconstructed", "occlusion_retained_not_applied") + procedural + partial + tuple(
         label for flag, label in flags.items() if record["Floats"].get(flag, 0) > 0.5 and not (top and flag == "_LayerBlend")
     )

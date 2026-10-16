@@ -6,6 +6,7 @@ Unsupported surface graphs are reported rather than guessed to be opaque.
 from __future__ import annotations
 
 from collections import Counter
+from bisect import bisect_left, bisect_right
 from dataclasses import dataclass
 import math
 
@@ -34,6 +35,67 @@ class DepthHit:
 
 
 @dataclass(frozen=True)
+class BoundarySegment:
+    axis: int
+    position: float
+    start: tuple[float, float]
+    end: tuple[float, float]
+    source: BottomSource
+    polygon: int
+
+
+def boundary_segments(points: tuple[Vector, ...], source: BottomSource, polygon: int,
+                      low: tuple[float, ...], high: tuple[float, ...]) -> tuple[BoundarySegment, ...]:
+    """Retain exact closed edges of nonvertical accepted bottom triangles."""
+    a, b, c = points
+    area = ((float(b.x) - a.x) * (float(c.y) - a.y)
+            - (float(b.y) - a.y) * (float(c.x) - a.x))
+    if area == 0:
+        return ()
+    segments: list[BoundarySegment] = []
+    for axis in (0, 1):
+        other = 1 - axis
+        for left, right in ((a, b), (b, c), (c, a)):
+            if left[axis] == right[axis] and left[axis] in (low[axis], high[axis]):
+                start, end = sorted(((float(left[other]), float(left.z)),
+                                     (float(right[other]), float(right.z))))
+                segments.append(BoundarySegment(axis, float(left[axis]), start, end, source, polygon))
+    return tuple(segments)
+
+
+def boundary_segment_candidates(segments: tuple[BoundarySegment, ...], points: tuple[Vector, ...],
+                                low: tuple[float, ...], high: tuple[float, ...]) -> dict[tuple[float, float], tuple[BoundarySegment, ...]]:
+    """Index only queried edge positions, once, using closed interval searches."""
+    queries: dict[tuple[int, float], set[float]] = {}
+    for point in points:
+        for axis in (0, 1):
+            if point[axis] in (low[axis], high[axis]):
+                queries.setdefault((axis, float(point[axis])), set()).add(float(point[1 - axis]))
+    ordered = {key: sorted(values) for key, values in queries.items()}
+    candidates: dict[tuple[float, float], list[BoundarySegment]] = {}
+    for segment in segments:
+        values = ordered.get((segment.axis, segment.position), [])
+        for value in values[bisect_left(values, segment.start[0]):bisect_right(values, segment.end[0])]:
+            key = (segment.position, value) if segment.axis == 0 else (value, segment.position)
+            candidates.setdefault(key, []).append(segment)
+    return {key: tuple(values) for key, values in candidates.items()}
+
+
+def boundary_depth_hit(point: Vector, segments: tuple[BoundarySegment, ...],
+                       maximum_depth: float, surface_offset: float) -> DepthHit | None:
+    """Intersect an unshifted vertical ray with authenticated source edges."""
+    nearest: DepthHit | None = None
+    for segment in segments:
+        value = float(point[1 - segment.axis])
+        fraction = (value - segment.start[0]) / (segment.end[0] - segment.start[0])
+        height = segment.start[1] + fraction * (segment.end[1] - segment.start[1])
+        depth = float(point.z) - height
+        if surface_offset <= depth <= maximum_depth and (nearest is None or depth < nearest.depth):
+            nearest = DepthHit(depth, segment.source, segment.polygon)
+    return nearest
+
+
+@dataclass(frozen=True)
 class WaterDepthResult:
     object_name: str
     hits: tuple[DepthHit | None, ...]
@@ -51,6 +113,10 @@ def bottom_surface_exclusion(material: bpy.types.Material | None) -> str | None:
     """Accept proven opaque surfaces independently of object/material names."""
     if material is None:
         return None
+    if "endfield_ordered_material_refs" in material:
+        from blender_scene_material_passes import effective_opaque_surface
+
+        material = effective_opaque_surface(material)
     if material.get("endfield_shader_family") in ("leaf", "card"):
         return "foliage_surface"
     if "endfield_alpha_clip_threshold" in material or material.get("endfield_alpha_blend"):
@@ -88,6 +154,7 @@ def sample_water_depths(depsgraph: bpy.types.Depsgraph, waters: tuple[bpy.types.
     vertices: list[Vector] = []
     polygons: list[tuple[int, ...]] = []
     provenance: list[tuple[BottomSource, int]] = []
+    segments: list[BoundarySegment] = []
     reasons: Counter[str] = Counter()
     material_cache: dict[int, str | None] = {}
     sources = 0
@@ -130,22 +197,34 @@ def sample_water_depths(depsgraph: bpy.types.Depsgraph, waters: tuple[bpy.types.
                                   item.is_instance, tuple(tuple(row) for row in matrix))
             polygons.extend(tuple(start + i for i in face) for _, face in accepted)
             provenance.extend((source, index) for index, _ in accepted)
+            boundary_vertices = {i for i in range(len(mesh.vertices))
+                                 if (vertices[start + i].x in (low[0], high[0])
+                                     or vertices[start + i].y in (low[1], high[1]))}
+            if boundary_vertices:
+                for index, face in accepted:
+                    if sum(i in boundary_vertices for i in face) >= 2:
+                        segments.extend(boundary_segments(tuple(vertices[start + i] for i in face), source, index, low, high))
             sources += 1
         finally:
             obj.to_mesh_clear()
     if not polygons:
         raise WaterBottomGeometryMissing(f"No opaque bottom geometry overlaps the selected water: exclusions={dict(reasons)}")
     tree = BVHTree.FromPolygons(vertices, polygons, all_triangles=True)
+    edge_candidates = boundary_segment_candidates(tuple(segments), points, low, high)
     rows: list[WaterDepthResult] = []
     for obj, positions in zip(waters, water_points, strict=True):
         hits: list[DepthHit | None] = []
         for point in positions:
             _, _, index, distance = tree.ray_cast(point - Vector((0, 0, surface_offset)),
                                                  Vector((0, 0, -1)), maximum_depth - surface_offset)
-            if index is None:
-                hits.append(None)
-            else:
+            hit = None
+            if index is not None:
                 source, polygon = provenance[index]
-                hits.append(DepthHit(distance + surface_offset, source, polygon))
+                hit = DepthHit(distance + surface_offset, source, polygon)
+            edge_hit = boundary_depth_hit(point, edge_candidates.get((float(point.x), float(point.y)), ()),
+                                          maximum_depth, surface_offset)
+            if edge_hit is not None and (hit is None or edge_hit.depth < hit.depth):
+                hit = edge_hit
+            hits.append(hit)
         rows.append(WaterDepthResult(obj.name, tuple(hits)))
     return WaterDepthAudit(tuple(rows), sources, len(polygons), tuple(sorted(reasons.items())))

@@ -17,6 +17,7 @@ from character_material_profile import (
     create_export_material_profile,
     profile_shader_identity,
     read_weather_textures,
+    validate_shadow_alpha_compatibility,
     validate_profile_shader_identities,
 )
 
@@ -122,6 +123,8 @@ class CharacterMaterialProfileTests(unittest.TestCase):
             self.assertEqual(hashlib.sha256(copied.read_bytes()).hexdigest(), row['sha256'])
         alpha_audit = json.loads(result['alpha_audit'].read_text(encoding='utf-8'))
         self.assertEqual(alpha_audit['shaderIdentity']['serializedObjectSha256'], VERIFIED_STANDARD_SHADER_SHA256.upper())
+        self.assertEqual(alpha_audit['compatibility']['status'], 'verified_reference_object')
+        self.assertTrue(alpha_audit['compatibility']['native_shader_semantics_verified'])
         combined = '\n'.join(path.read_text(encoding='utf-8') for path in (result['profile'], result['alpha_audit'], result['receipt']))
         self.assertNotIn(str(self.template_path), combined)
         self.assertNotIn('ruri_glsl', combined)
@@ -149,14 +152,85 @@ class CharacterMaterialProfileTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'differ from the current per-export identity file|artifact changed'):
             validate_profile_shader_identities(result['profile'], self.shader_identity_path)
 
-    def test_rejects_unverified_standard_shader_before_creating_output(self) -> None:
+    def test_rejects_changed_standard_shader_without_source_contract_before_creating_output(self) -> None:
         document = json.loads(self.shader_identity_path.read_text(encoding='utf-8'))
         document['shaders'][0]['object_sha256'] = '1' * 64
         self.shader_identity_path.write_text(json.dumps(document, indent=2) + '\n', encoding='utf-8')
-        with self.assertRaisesRegex(ValueError, 'pinned verified object'):
+        with self.assertRaisesRegex(ValueError, 'requires its source property contract'):
             create_export_material_profile(
                 self.shader_identity_path, self.weather_manifest_path, self.output, self.template_path)
         self.assertFalse(self.output.exists())
+
+
+    def _changed_shader_document(self) -> dict[str, object]:
+        document = json.loads(self.shader_identity_path.read_text(encoding='utf-8'))
+        document['shaders'][0].update({
+            'object_sha256': '1' * 64,
+            'property_defaults': [
+                {'m_Name': '_BaseMap', 'm_Type': 4, 'm_DefTexture': {'m_TexDim': 2}},
+                {'m_Name': '_BaseColor', 'm_Type': 0},
+                {'m_Name': '_SurfaceType', 'm_Type': 2},
+                {'m_Name': '_EnableAlphaTest', 'm_Type': 2, 'm_Attributes': ['Toggle(_ALPHATEST_ON)']},
+                {'m_Name': '_AlphaClipThreshold', 'm_Type': 3},
+            ],
+        })
+        return document
+
+    def test_changed_shader_contract_preserves_source_identity_without_native_semantic_claim(self) -> None:
+        document = self._changed_shader_document()
+        self.shader_identity_path.write_text(json.dumps(document), encoding='utf-8')
+        result = create_export_material_profile(
+            self.shader_identity_path, self.weather_manifest_path, self.output, self.template_path)
+        profile = json.loads(result['profile'].read_text(encoding='utf-8'))
+        alpha = json.loads(result['alpha_audit'].read_text(encoding='utf-8'))
+        receipt = json.loads(result['receipt'].read_text(encoding='utf-8'))
+        compatibility = validate_shadow_alpha_compatibility(alpha, document['shaders'][0])
+        self.assertEqual(compatibility['status'], 'host_approximation_source_contract')
+        self.assertFalse(compatibility['native_shader_semantics_verified'])
+        self.assertTrue(compatibility['property_contract_verified'])
+        self.assertIn('have not been audited', compatibility['provenance'])
+        self.assertEqual(profile['standard_shader_compatibility'], compatibility)
+        self.assertEqual(receipt['standard_shader_compatibility'], compatibility)
+        self.assertEqual(profile_shader_identity(result['profile'], STANDARD_SHADER)['object_sha256'], '1' * 64)
+        self.assertEqual(alpha['shaderIdentity']['serializedObjectSha256'], '1' * 64)
+
+    def test_rejects_incompatible_changed_shader_contract_before_creating_output(self) -> None:
+        for case in ('missing', 'type', 'duplicate', 'dimension', 'keyword'):
+            with self.subTest(case=case):
+                document = self._changed_shader_document()
+                properties = document['shaders'][0]['property_defaults']
+                if case == 'missing':
+                    properties.pop()
+                elif case == 'type':
+                    properties[1]['m_Type'] = 1
+                elif case == 'duplicate':
+                    properties.append(properties[0].copy())
+                elif case == 'dimension':
+                    properties[0]['m_DefTexture']['m_TexDim'] = 3
+                else:
+                    properties[3]['m_Attributes'] = ['Toggle(_OTHER_KEYWORD)']
+                self.shader_identity_path.write_text(json.dumps(document), encoding='utf-8')
+                with self.assertRaisesRegex(ValueError, 'property|2D source texture|source toggle'):
+                    create_export_material_profile(
+                        self.shader_identity_path, self.weather_manifest_path, self.output, self.template_path)
+                self.assertFalse(self.output.exists())
+
+    def test_legacy_alpha_evidence_accepts_only_the_reference_object(self) -> None:
+        document = json.loads(self.shader_identity_path.read_text(encoding='utf-8'))
+        compatibility = validate_shadow_alpha_compatibility({}, document['shaders'][0])
+        self.assertEqual(compatibility['status'], 'verified_reference_object')
+        changed = self._changed_shader_document()
+        with self.assertRaisesRegex(ValueError, 'requires explicit host approximation'):
+            validate_shadow_alpha_compatibility({}, changed['shaders'][0])
+
+    def test_changed_shader_cannot_claim_verified_native_semantics(self) -> None:
+        document = self._changed_shader_document()
+        audit = {'compatibility': {
+            'status': 'verified_reference_object', 'native_shader_semantics_verified': True,
+            'property_contract_verified': True, 'provenance': 'Claimed verification',
+        }}
+        with self.assertRaisesRegex(ValueError, 'differs from the actual Shader'):
+            validate_shadow_alpha_compatibility(audit, document['shaders'][0])
 
 
 if __name__ == '__main__':

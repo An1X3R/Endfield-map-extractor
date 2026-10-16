@@ -8,7 +8,7 @@ from pathlib import Path
 
 from endfield_scene_material_contract import load_catalog, supported_slots, validate_material, surface_limitations
 from endfield_scene_material_contract import resolve_export_path
-from endfield_scene_material_contract import merge_material_evidence
+from endfield_scene_material_contract import merge_material_evidence, top_layer_runtime_limitations, shader_constant_texture_default
 
 
 def material_record() -> dict[str, object]:
@@ -20,6 +20,27 @@ def material_record() -> dict[str, object]:
 
 
 class SceneMaterialTests(unittest.TestCase):
+    def test_top_layer_runtime_inputs_follow_the_compiled_keyword_branch(self) -> None:
+        row = validate_material({**material_record(),
+            "Shader": {"Source": "CAB-93483c2cb844b6b343af0950ad4630ad", "PathId": 5324015590718682574},
+            "Floats": {"_BaseTextureMapCount": 2, "_LayerBlend": 1, "_LayerBlendType": 2,
+                       "_LayerBlendUVType": 0, "_BaseUVSet": 0, "_BasePbrMapUVSet": 0,
+                       "_LayerBlendHeight": 1, "_EnableTerrainBlend": 1},
+            "RenderState": {"DisabledShaderPasses": [], "CustomRenderQueue": 2000,
+                            "ValidKeywords": ["_LAYERBLEND_TOP", "_TWO_BASEMAP"]}})
+        self.assertEqual(top_layer_runtime_limitations(row), ("top_layer_current_program_equivalence_not_verified",))
+        terrain = {**row, "RenderState": {**row["RenderState"],
+                   "ValidKeywords": [*row["RenderState"]["ValidKeywords"], "_TERRAIN_BLEND"]}}
+        expected = ("terrain_blend_source_screen_depth_not_reconstructed",
+                    "terrain_blend_source_camera_constants_not_reconstructed",
+                    "terrain_blend_source_virtual_texture_sampling_not_reconstructed")
+        self.assertEqual(top_layer_runtime_limitations(terrain), expected)
+        self.assertTrue(set(expected) <= set(surface_limitations(terrain)))
+        self.assertFalse(any("uv_feed" in issue for issue in surface_limitations(terrain)))
+        disabled_float = {**terrain, "Floats": {**terrain["Floats"], "_EnableTerrainBlend": 0}}
+        self.assertEqual(top_layer_runtime_limitations(disabled_float), expected)
+        self.assertEqual(top_layer_runtime_limitations(validate_material(material_record())), ())
+
     def test_texture_candidates_stop_after_first_existing_file(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -35,10 +56,10 @@ class SceneMaterialTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "embedded null"):
                 load_catalog((manifest,))
 
-    def test_top_layer_authored_white_mask_is_not_a_missing_resource(self) -> None:
+    def test_top_layer_height_resource_follows_the_consumed_shader_input(self) -> None:
         row = {**material_record(),
                "Shader": {"Source": "CAB-93483c2cb844b6b343af0950ad4630ad", "PathId": 5324015590718682574,
-                          "TextureDefaults": [{"Property": "_LayerBlendMaskMap", "Name": "white", "Dimension": 2}]},
+                          "TextureDefaults": [{"Property": "_BaseHeightMap", "Name": "grey", "Dimension": 2}]},
                "Floats": {"_BaseTextureMapCount": 2, "_LayerBlend": 1, "_LayerBlendType": 2,
                           "_LayerBlendUVType": 0, "_BaseUVSet": 0, "_BasePbrMapUVSet": 0, "_LayerBlendHeight": 1},
                "RenderState": {"DisabledShaderPasses": [], "CustomRenderQueue": 2000,
@@ -49,9 +70,21 @@ class SceneMaterialTests(unittest.TestCase):
                            [{"Property": "_LayerBlendMaskMap", "Texture": None, "Scale": [1, 1], "Offset": [0, 0]}]}
         slots = supported_slots(validate_material(row))
         self.assertEqual({slot["Property"] for slot in slots}, {"_NormalMap", "_Layer1BaseMap", "_Layer1BumpMap"})
+        self.assertAlmostEqual(shader_constant_texture_default(validate_material(row), "_BaseHeightMap")[0],
+                               0.21404114048223255)
+        bound = {**row, "Textures": [*row["Textures"], {"Property": "_BaseHeightMap",
+                 "Texture": {"Source": "CAB-height", "PathId": 7, "ColorSpace": 0},
+                 "Scale": [4, 5], "Offset": [2, 3]}]}
+        self.assertIn("_BaseHeightMap", {slot["Property"] for slot in supported_slots(validate_material(bound))})
         unsupported = {**row, "Shader": {**row["Shader"], "TextureDefaults": []}}
         with self.assertRaisesRegex(ValueError, "verified shader defaults"):
             supported_slots(validate_material(unsupported))
+        disabled = {**unsupported, "Floats": {**row["Floats"], "_LayerBlendHeight": 0}}
+        self.assertEqual(slots, supported_slots(validate_material(disabled)))
+        unknown = {**row, "Shader": {**row["Shader"], "TextureDefaults": [
+            {"Property": "_BaseHeightMap", "Name": "unverified", "Dimension": 2}]}}
+        with self.assertRaisesRegex(ValueError, "_BaseHeightMap"):
+            supported_slots(validate_material(unknown))
 
     def test_alpha_sweep_requires_the_verified_two_map_clip_contract(self) -> None:
         from endfield_shader_contract import has_verified_lit_sweep

@@ -205,11 +205,17 @@ def prepare_cached_detail(map_id: str, metadata: Path, index_path: Path,
     return _prepare_detail(map_id, metadata, index_path, tiles, output, texture_cache, read_page)
 
 
+def terrain_detail_source_paths(map_id: str) -> tuple[str, str]:
+    """Declare the exact global assets required by selected terrain surfaces."""
+    if not re.fullmatch(r"[a-z0-9_]+", map_id):
+        raise ValueError(f"Invalid terrain resource map name: {map_id}")
+    prefix = f"assets/beyond/dynamicassets/scenes/pc/{map_id}/terrain/"
+    return prefix + "hgterrainsurfacesdata.asset", prefix + "splatindexmap.tga"
+
+
 def _scene_sources(manifests: tuple[Path, ...], map_id: str) -> tuple[Path, Path]:
     """Resolve exact source metadata bundle and SplatIndexMap export by AssetRef."""
-    prefix = f"assets/beyond/dynamicassets/scenes/pc/{map_id}/terrain/"
-    metadata_name = prefix + "hgterrainsurfacesdata.asset"
-    index_name = prefix + "splatindexmap.tga"
+    metadata_name, index_name = terrain_detail_source_paths(map_id)
     metadata_refs: set[tuple[str, int]] = set()
     index_refs: set[tuple[str, int]] = set()
     serialized: dict[str, list[tuple[Path, str]]] = {}

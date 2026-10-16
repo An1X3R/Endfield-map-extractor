@@ -1,7 +1,7 @@
 """Bind verified Standard ShadowCaster alpha to copied source caster geometry.
 
-Only the exact Shader object verified by the supplied alpha audit enables the
-clip/dither consumers. Opaque source materials retain their geometry. Blend
+The exact reference Shader enables the audited alpha equations. Changed source
+objects require an explicit property contract and use host approximations. Blend
 coverage uses sqrt(alpha) with stable subdivided-face random sampling, not the
 native SV_Position screen hash. Source materials/images/meshes are not edited.
 """
@@ -16,7 +16,8 @@ import struct
 import bpy
 
 from rebuild_character_materials import array_value, object_value, string_value, int_value, float_value, identity
-from character_shadow_alpha_nodes import alpha_clip, alpha_dither
+from character_shadow_alpha_nodes import alpha_clip, alpha_dither, multiply_clip_mask
+from character_material_profile import ShaderCompatibility, validate_shadow_alpha_compatibility
 
 
 Identity = tuple[str, int]
@@ -31,10 +32,11 @@ class ShadowAlphaEvidence:
     shader_identity_sha256: str
     alpha_audit_sha256: str
     shader_object_sha256: str
+    compatibility: ShaderCompatibility
 
 
 def read_shadow_alpha_evidence(shader_identity_path: Path, alpha_audit_path: Path) -> ShadowAlphaEvidence:
-    """Join actual source material identities to the exact audited Shader object."""
+    """Join exact source identities and retain the declared alpha evidence boundary."""
     shaders = object_value(json.loads(shader_identity_path.read_text(encoding='utf-8')), 'shader identity')
     audit = object_value(json.loads(alpha_audit_path.read_text(encoding='utf-8')), 'alpha audit')
     if shaders['format'] != 'EndfieldCharacterShaderIdentity/1' or audit['schema'] != 'EndfieldShadowCasterAlphaAudit/1':
@@ -45,6 +47,7 @@ def read_shadow_alpha_evidence(shader_identity_path: Path, alpha_audit_path: Pat
     standard: set[Identity] = set()
     resolved: dict[Identity, str] = {}
     matches = 0
+    compatibility: ShaderCompatibility | None = None
     for value in array_value(shaders['shaders'], 'shaders'):
         row = object_value(value, 'shader row')
         shader = object_value(row['shader'], 'shader object')
@@ -58,10 +61,11 @@ def read_shadow_alpha_evidence(shader_identity_path: Path, alpha_audit_path: Pat
             if string_value(shader['source'], 'shader CAB').casefold() != string_value(target['sourceCab'], 'audited CAB').casefold() or str(int_value(shader['path_id'], 'shader PathID')) != target['pathId'] or string_value(row['object_sha256'], 'Shader object SHA').casefold() != string_value(target['serializedObjectSha256'], 'audited Shader SHA').casefold():
                 raise ValueError('Standard Shader object identity/hash differs from the actual alpha consumer audit')
             matches += 1
+            compatibility = validate_shadow_alpha_compatibility(audit, row)
             standard.update(ids)
-    if matches != 1 or not standard:
+    if matches != 1 or not standard or compatibility is None:
         raise ValueError(f'Expected one exact audited Standard Shader with materials: matches={matches}')
-    return ShadowAlphaEvidence(frozenset(standard), tuple(sorted(resolved.items())), hashlib.sha256(shader_identity_path.read_bytes()).hexdigest(), hashlib.sha256(alpha_audit_path.read_bytes()).hexdigest(), string_value(target['serializedObjectSha256'], 'audited Shader SHA'))
+    return ShadowAlphaEvidence(frozenset(standard), tuple(sorted(resolved.items())), hashlib.sha256(shader_identity_path.read_bytes()).hexdigest(), hashlib.sha256(alpha_audit_path.read_bytes()).hexdigest(), string_value(target['serializedObjectSha256'], 'audited Shader SHA'), compatibility)
 
 
 def _group_identity(tree: bpy.types.ShaderNodeTree) -> Identity:
@@ -96,32 +100,32 @@ def _properties(native: dict[str, object], field: str) -> dict[str, object]:
     return result
 
 
-def _sampling(caster: bpy.types.Object, tree: bpy.types.ShaderNodeTree, native: dict[str, object]) -> tuple[bpy.types.Image, str, tuple[float, float], tuple[float, float]]:
-    samples = tuple(n for n in tree.nodes if n.type == 'TEX_IMAGE' and n.get('source_slot') == '_BaseMap')
+def _sampling(caster: bpy.types.Object, tree: bpy.types.ShaderNodeTree, native: dict[str, object], slot: str) -> tuple[bpy.types.Image, str, tuple[float, float], tuple[float, float]]:
+    samples = tuple(n for n in tree.nodes if n.type == 'TEX_IMAGE' and n.get('source_slot') == slot)
     if len(samples) != 1 or samples[0].image is None or samples[0].image.packed_file is None:
-        raise ValueError(f'Caster needs one actual packed BaseMap image: {caster.name}/{tree.name}')
+        raise ValueError(f'Caster needs one actual packed source image: {caster.name}/{tree.name}/{slot}')
     sample = samples[0]
     if sample.image.alpha_mode != 'CHANNEL_PACKED' or min(sample.image.size) < 1 or sample.extension != 'REPEAT' or sample.interpolation != 'Linear':
-        raise ValueError(f'Caster BaseMap has unsupported alpha interpretation/missing pixels: {sample.image.name}')
+        raise ValueError(f'Caster source texture has unsupported alpha interpretation/missing pixels: {slot}/{sample.image.name}')
     # Reopened packed images decode lazily; explicitly load their existing pixels.
     if len(sample.image.pixels) == 0 or not sample.image.has_data:
-        raise ValueError(f'Packed caster BaseMap failed to decode pixel data: {sample.image.name}')
+        raise ValueError(f'Packed caster source texture failed to decode pixel data: {slot}/{sample.image.name}')
     if len(sample.inputs['Vector'].links) != 1:
-        raise ValueError(f'Caster BaseMap mapping is absent/ambiguous: {tree.name}')
+        raise ValueError(f'Caster source texture mapping is absent/ambiguous: {tree.name}/{slot}')
     mapping = sample.inputs['Vector'].links[0].from_node
     if mapping.type != 'MAPPING' or mapping.vector_type != 'POINT' or len(mapping.inputs['Vector'].links) != 1:
-        raise ValueError(f'Caster BaseMap must retain explicit source POINT mapping: {tree.name}')
+        raise ValueError(f'Caster source texture must retain explicit source POINT mapping: {tree.name}/{slot}')
     uv = mapping.inputs['Vector'].links[0].from_node
     if uv.type != 'UVMAP' or uv.uv_map != 'UV0' or uv.uv_map not in caster.data.uv_layers:
-        raise ValueError(f'Caster BaseMap requires actual source UV0: {caster.name}/{tree.name}')
-    tex = object_value(_properties(native, 'm_TexEnvs')['_BaseMap'], 'source BaseMap binding')
-    if int_value(tex['m_UVSetIndex'], 'BaseMap UV index') != 0:
-        raise ValueError(f'Unsupported source caster BaseMap UV set: {tree.name}')
+        raise ValueError(f'Caster canonical source texture requires actual source UV0: {caster.name}/{tree.name}/{slot}')
+    tex = object_value(_properties(native, 'm_TexEnvs')[slot], 'source texture binding')
+    if int_value(tex['m_UVSetIndex'], 'source texture UV index') != 0:
+        raise ValueError(f'Unsupported canonical source caster texture UV set: {tree.name}/{slot}')
     st = tuple(tuple(float_value(object_value(tex[field], field)[axis], field+'.'+axis) for axis in ('x','y')) for field in ('m_Scale','m_Offset'))
     # RNA Mapping sockets store source JSON numbers as IEEE float32.
     stored_st = tuple(tuple(struct.unpack('f',struct.pack('f',value))[0] for value in pair) for pair in st)
     if tuple(mapping.inputs['Scale'].default_value) != (*stored_st[0],1.) or tuple(mapping.inputs['Location'].default_value) != (*stored_st[1],0.) or tuple(mapping.inputs['Rotation'].default_value) != (0.,0.,0.):
-        raise ValueError(f'Caster mapping no longer matches source BaseMap scale/offset: {tree.name}')
+        raise ValueError(f'Caster mapping no longer matches source texture scale/offset: {tree.name}/{slot}')
     return sample.image, uv.uv_map, st[0], st[1]
 
 
@@ -137,6 +141,7 @@ def attach_shadow_proxy_alpha(caster: bpy.types.Object, evidence: ShadowAlphaEvi
     resolved = dict(evidence.resolved_materials)
     rows: list[dict[str, object]] = []
     alpha_inputs: list[tuple[bpy.types.ShaderNodeTree, str, bpy.types.Image, str, tuple[float, float], tuple[float, float], float, float]] = []
+    mask_inputs: dict[str, tuple[bpy.types.Image, str, tuple[float, float], tuple[float, float]]] = {}
     for tree in groups:
         key = _group_identity(tree)
         if key not in resolved or tree['source_shader'] != resolved[key] or resolved[key] not in OPAQUE_FAMILIES:
@@ -153,18 +158,40 @@ def attach_shadow_proxy_alpha(caster: bpy.types.Object, evidence: ShadowAlphaEvi
             raise ValueError(f'Unsupported/ambiguous caster alpha variant: {key}/{keywords}')
         if modes:
             if key not in evidence.standard_materials:
-                raise ValueError(f'Alpha caster Shader object/variant is outside exact Standard audit: {key}/{resolved[key]}')
-            image, uv_layer, scale, offset = _sampling(caster, tree, native)
+                raise ValueError(f'Alpha caster Shader object/variant is outside exact Standard alpha evidence: {key}/{resolved[key]}')
+            if (modes[0] == '_ALPHATEST_ON' and evidence.compatibility['status'] != 'verified_reference_object'
+                    and float_value(floats['_EnableAlphaTest'], 'EnableAlphaTest') != 1.0):
+                raise ValueError(f'Source alpha caster keyword requires its explicit enabled Shader toggle: {key}/_EnableAlphaTest={floats["_EnableAlphaTest"]}')
+            image, uv_layer, scale, offset = _sampling(caster, tree, native, '_BaseMap')
             alpha_inputs.append((tree,modes[0],image,uv_layer,scale,offset,color_alpha,threshold))
+            if '_UV2_COLOR' in keywords:
+                proof = object_value(json.loads(tree.get('source_uv2_alpha_mask', '{}')), 'source UV2 alpha mask proof')
+                if (modes[0] != '_ALPHATEST_ON' or float_value(floats['_UseUV2Color'], 'UseUV2Color') != 1.0
+                        or proof.get('keyword') != '_UV2_COLOR' or proof.get('value') != 1.0
+                        or proof.get('channel') != 'Red' or proof.get('uv_layer') != 'UV1'
+                        or proof.get('native_shader_semantics_verified') is not False
+                        or 'UV1' not in caster.data.uv_layers):
+                    raise ValueError(f'Caster UV2 alpha mask has no matching source feature/UV1 contract: {key}')
+                mask, _, mask_scale, mask_offset = _sampling(caster, tree, native, '_ExtraAlphaMask')
+                if mask.colorspace_settings.name != 'Non-Color':
+                    raise ValueError(f'Caster UV1 alpha mask requires linear source data: {mask.name}')
+                mask_inputs[tree.name] = (mask, 'UV1', mask_scale, mask_offset)
         elif surface != 0.:
             raise ValueError(f'Transparent source caster has no verified alpha keyword: {key}/Surface={surface}')
         rows.append({'material_identity':key,'shader':resolved[key],'keywords':keywords,'mode':modes[0] if modes else 'opaque_preserved','base_map_image':image.name if modes else None,'packed_sha256':hashlib.sha256(image.packed_file.data).hexdigest() if modes else None,'uv_layer':uv_layer if modes else None,'scale':scale if modes else None,'offset':offset if modes else None,'base_color_alpha':color_alpha,'alpha_clip_threshold':threshold})
+        if tree.name in mask_inputs:
+            mask, mask_uv, mask_scale, mask_offset = mask_inputs[tree.name]
+            rows[-1]['extra_alpha_mask'] = {'image': mask.name, 'packed_sha256': hashlib.sha256(mask.packed_file.data).hexdigest(),
+                                          'uv_layer': mask_uv, 'scale': mask_scale, 'offset': mask_offset, 'channel': 'Red',
+                                          'native_shader_semantics_verified': False}
     if alpha_inputs and (len(groups) != 1 or len(caster.material_slots) != 1):
         raise ValueError(f'Alpha proxy needs one verified source material; mixed material face routing is unimplemented: {caster.name}')
     if alpha_inputs:
         tree, mode, image, uv_layer, scale, offset, color_alpha, threshold = alpha_inputs[0]
         kernel = alpha_clip('EF Source Caster Alpha Clip',image,uv_layer,scale,offset,color_alpha,threshold,subdivision_level) if mode == '_ALPHATEST_ON' else alpha_dither('EF Source Caster Alpha Dither',image,uv_layer,scale,offset,color_alpha,dither_seed,subdivision_level)
+        if tree.name in mask_inputs:
+            multiply_clip_mask(kernel, *mask_inputs[tree.name])
         modifier = caster.modifiers.new(MODIFIER,'NODES')
         modifier.node_group = kernel
-        caster['hgrp_alpha_scope'] = 'Source alpha face-domain proxy; native SV_Position screen hash and mip-bias sampling are not reproduced.'
-    return {'caster':caster.name,'source_identity':caster['hgrp_caster_source_identity'],'alpha_modified':bool(alpha_inputs),'modifier_order':[(mod.name,mod.type) for mod in caster.modifiers],'materials':rows,'evidence_sha256':{'shader_identity':evidence.shader_identity_sha256,'alpha_audit':evidence.alpha_audit_sha256},'scope':'Copied caster only; source materials/mesh unchanged. Hard clip or sqrt-alpha subdivided-face stochastic approximation; not native screen-space sampling.'}
+        caster['hgrp_alpha_scope'] = evidence.compatibility['provenance'] + ' Native SV_Position screen hash and mip-bias sampling are not reproduced.'
+    return {'caster':caster.name,'source_identity':caster['hgrp_caster_source_identity'],'alpha_modified':bool(alpha_inputs),'modifier_order':[(mod.name,mod.type) for mod in caster.modifiers],'materials':rows,'compatibility':dict(evidence.compatibility),'evidence_sha256':{'shader_identity':evidence.shader_identity_sha256,'alpha_audit':evidence.alpha_audit_sha256},'scope':'Copied caster only; source materials/mesh unchanged. Hard clip or sqrt-alpha subdivided-face stochastic approximation; not native screen-space sampling.'}

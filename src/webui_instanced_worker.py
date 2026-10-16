@@ -1,6 +1,8 @@
 """Durable independent-scene jobs over the shared portable scene builder."""
 from __future__ import annotations
 
+from contextlib import contextmanager
+import errno
 import hashlib
 import json
 import logging
@@ -11,7 +13,7 @@ from datetime import datetime, timezone
 import tempfile
 import threading
 import time
-from typing import TypedDict, cast
+from typing import BinaryIO, Iterator, TypedDict, cast
 from uuid import uuid4
 
 from webui_instanced_contract import (
@@ -69,6 +71,80 @@ def _no_cancel() -> None:
     return None
 
 
+class _NativeFileLock:
+    """Hold a byte-range lock that the operating system releases on process exit."""
+
+    def __init__(self, path: Path, wait_seconds: float) -> None:
+        self._path = path
+        self._wait_seconds = wait_seconds
+        self._stream: BinaryIO | None = None
+
+    def acquire(self) -> bool:
+        if self._stream is not None:
+            raise RuntimeError(f"Native file lock is already held: path={self._path}")
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        stream = self._path.open("a+b")
+        try:
+            stream.seek(0, os.SEEK_END)
+            if stream.tell() == 0:
+                stream.write(b"\0")
+                stream.flush()
+        except BaseException:
+            stream.close()
+            raise
+        deadline = time.monotonic() + self._wait_seconds
+        while True:
+            stream.seek(0)
+            try:
+                if os.name == "nt":
+                    import msvcrt
+                    msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self._stream = stream
+                return True
+            except OSError as error:
+                if error.errno not in (errno.EACCES, errno.EAGAIN, errno.EDEADLK):
+                    stream.close()
+                    raise
+                if self._wait_seconds <= 0:
+                    stream.close()
+                    return False
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    stream.close()
+                    raise TimeoutError(f"Timed out waiting for native file lock: path={self._path}") from error
+                time.sleep(min(0.02, remaining))
+
+    def release(self) -> None:
+        stream = self._stream
+        if stream is None:
+            return
+        self._stream = None
+        try:
+            stream.seek(0)
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+        finally:
+            stream.close()
+
+
+@contextmanager
+def _record_guard(path: Path) -> Iterator[None]:
+    lock = _NativeFileLock(path.with_name(path.stem + ".record.lock"), 10.0)
+    if not lock.acquire():
+        raise RuntimeError(f"Unable to lock independent scene job record: path={path}")
+    try:
+        yield
+    finally:
+        lock.release()
+
+
 class InstancedSceneCoordinator:
     """Connect HTTP requests, durable external job files and extraction workers."""
 
@@ -78,6 +154,7 @@ class InstancedSceneCoordinator:
         self._execution_lock = threading.Lock()
         self._paths: dict[str, Path] = {}
         self._threads: dict[str, threading.Thread] = {}
+        self._ownership_locks: dict[str, _NativeFileLock] = {}
         self._session = str(uuid4())
         self._closing = False
 
@@ -183,13 +260,28 @@ class InstancedSceneCoordinator:
         self._paths[job_id] = path
         return path
 
-    def _save(self, path: Path, job: InstancedJob, events: list[dict[str, object]]) -> None:
+    def _owner_lock_path(self, path: Path) -> Path:
+        return path.with_name(path.stem + ".owner.lock")
+
+    def _save_unlocked(self, path: Path, job: InstancedJob, events: list[dict[str, object]]) -> None:
         event = {"sequence": len(events) + 1, "timestamp": _utc_now(),
                  **{key: job[key] for key in ("state", "phase", "progress", "message", "cancel_requested")}}
-        _write(path, {"session": self._session, "job": job, "events": [*events, event]})
+        previous = _read(path) if path.is_file() else {}
+        owner = previous.get("owner")
+        session = previous.get("session", self._session)
+        if job["job_id"] in self._ownership_locks:
+            session = self._session
+            owner = {"format": 1, "session": self._session, "pid": os.getpid()}
+        record: dict[str, object] = {"session": session, "job": job, "events": [*events, event]}
+        if owner is not None:
+            record["owner"] = owner
+        _write(path, record)
 
-    def _load(self, job_id: str) -> tuple[Path, InstancedJob, list[dict[str, object]]]:
-        path = self._job_path(job_id)
+    def _save(self, path: Path, job: InstancedJob, events: list[dict[str, object]]) -> None:
+        with _record_guard(path):
+            self._save_unlocked(path, job, events)
+
+    def _load_unlocked(self, job_id: str, path: Path) -> tuple[Path, InstancedJob, list[dict[str, object]]]:
         if not path.is_file():
             raise SceneJobNotFound(f"当前准备目录没有该任务记录: {job_id}")
         record = _read(path)
@@ -197,13 +289,34 @@ class InstancedSceneCoordinator:
         events = cast(list[dict[str, object]], record["events"])
         if job["job_id"] != job_id or job["request"]["request_id"] != job_id:
             raise SceneRequestError("保存的任务身份不一致，不能读取该结果")
-        if record.get("session") != self._session and job["state"] not in TERMINAL:
-            job = {**job, "state": "failed", "phase": "failed", "message": "后端进程曾中断，已保留现有产物，请新建任务重试。",
-                   "error": {"code": "worker_interrupted", "message": "任务所属后端进程已结束，不能冒报仍在运行。",
+        owner_value = record.get("owner")
+        # Version-1 records without owner metadata remain readable because their owner cannot be proven dead.
+        if owner_value is None or job["state"] in TERMINAL or job_id in self._ownership_locks:
+            return path, job, events
+        owner = json_object(owner_value, "stored owner")
+        if type(owner.get("format")) is not int or owner["format"] != 1 or \
+                type(owner.get("pid")) is not int or cast(int, owner["pid"]) <= 0:
+            raise SceneRequestError("保存的任务 owner 元数据无效，不能判定任务存活状态")
+        required_text(owner.get("session"), "stored owner.session")
+        owner_lock = _NativeFileLock(self._owner_lock_path(path), 0.0)
+        if not owner_lock.acquire():
+            return path, job, events
+        try:
+            job = {**job, "state": "failed", "phase": "failed", "message": "任务所属后端进程已退出，已保留现有产物，请新建任务重试。",
+                   "error": {"code": "worker_interrupted", "message": "操作系统 owner 锁已释放，任务工作进程不再存活。",
                              "retryable": True, "stage": job["phase"]}}
-            self._save(path, job, events)
+            self._save_unlocked(path, job, events)
             events = cast(list[dict[str, object]], _read(path)["events"])
+        finally:
+            owner_lock.release()
         return path, job, events
+
+    def _load(self, job_id: str) -> tuple[Path, InstancedJob, list[dict[str, object]]]:
+        path = self._job_path(job_id)
+        if not path.is_file():
+            raise SceneJobNotFound(f"当前准备目录没有该任务记录: {job_id}")
+        with _record_guard(path):
+            return self._load_unlocked(job_id, path)
 
     def get(self, job_id: str) -> InstancedJob:
         with self._lock:
@@ -233,44 +346,98 @@ class InstancedSceneCoordinator:
                 if current["request"] != request:
                     raise SceneRequestError("同一个 request_id 不能提交不同参数；请创建新任务")
                 return current
+            owner_lock = _NativeFileLock(self._owner_lock_path(path), 0.0)
+            if not owner_lock.acquire():
+                if path.exists():
+                    current = self._load(job_id)[1]
+                    if current["request"] != request:
+                        raise SceneRequestError("同一个 request_id 不能提交不同参数；请创建新任务")
+                    return current
+                raise SceneRequestError("同一 request_id 正由另一后端实例启动，请稍后重试")
             job = InstancedJob(format="InstancedSceneJob/1", job_id=job_id, state="queued", phase="queued",
                                progress=0.0, message="独立场景任务已排队", cancel_requested=False,
                                request=request, result=None, error=None)
-            self._save(path, job, [])
-            thread = threading.Thread(target=self._run, args=(job_id, runtime), daemon=True,
-                                      name="endfield-instanced-" + job_id)
-            self._threads[job_id] = thread
             try:
+                with _record_guard(path):
+                    if path.exists():
+                        current = self._load_unlocked(job_id, path)[1]
+                        if current["request"] != request:
+                            raise SceneRequestError("同一个 request_id 不能提交不同参数；请创建新任务")
+                        owner_lock.release()
+                        return current
+                    self._ownership_locks[job_id] = owner_lock
+                    self._save_unlocked(path, job, [])
+                thread = threading.Thread(target=self._run, args=(job_id, runtime), daemon=True,
+                                          name="endfield-instanced-" + job_id)
+                self._threads[job_id] = thread
                 thread.start()
             except RuntimeError as error:
-                self._update(job_id, {"state": "failed", "phase": "failed", "message": "无法启动独立场景任务",
-                                    "error": {"code": "worker_start_failed", "message": str(error),
-                                              "stage": "queued", "retryable": True}})
+                try:
+                    if path.is_file():
+                        self._update(job_id, {"state": "failed", "phase": "failed", "message": "无法启动独立场景任务",
+                                              "error": {"code": "worker_start_failed", "message": str(error),
+                                                        "stage": "queued", "retryable": True}})
+                finally:
+                    self._threads.pop(job_id, None)
+                    self._release_owner_lock(job_id)
+                raise
+            except BaseException:
+                self._threads.pop(job_id, None)
+                self._ownership_locks.pop(job_id, None)
+                owner_lock.release()
                 raise
             return job
 
+    def _release_owner_lock(self, job_id: str) -> None:
+        owner_lock = self._ownership_locks.pop(job_id, None)
+        if owner_lock is not None:
+            owner_lock.release()
+
     def _update(self, job_id: str, changes: Mapping[str, object]) -> None:
         with self._lock:
-            path, job, events = self._load(job_id)
-            if job["state"] in TERMINAL:
-                return
-            updated = cast(InstancedJob, {**job, **changes})
-            if updated["state"] in {"completed", "partial"} and job["cancel_requested"]:
-                updated = {**updated, "state": "cancelled", "phase": "cancelled", "result": None,
-                           "message": "任务已取消，已生成的文件保留"}
-            self._save(path, updated, events)
+            path = self._job_path(job_id)
+            with _record_guard(path):
+                _, job, events = self._load_unlocked(job_id, path)
+                if job["state"] in TERMINAL:
+                    return
+                updated = cast(InstancedJob, {**job, **changes})
+                self._save_unlocked(path, updated, events)
 
     def cancel(self, job_id: str) -> dict[str, object]:
         with self._lock:
-            _, job, _ = self._load(job_id)
-            terminal = job["state"] in TERMINAL
-            if not terminal:
-                changes: dict[str, object] = {"cancel_requested": True, "message": "已请求取消，等待工作进程退出"}
-                if job["state"] == "queued":
-                    changes.update(state="cancelled", phase="cancelled", message="已取消尚未开始的任务")
-                self._update(job_id, changes)
+            path = self._job_path(job_id)
+            with _record_guard(path):
+                _, job, events = self._load_unlocked(job_id, path)
+                terminal = job["state"] in TERMINAL
+                if not terminal:
+                    changes: dict[str, object] = {"cancel_requested": True, "message": "已请求取消，等待工作进程退出"}
+                    if job["state"] == "queued":
+                        changes.update(state="cancelled", phase="cancelled", message="已取消尚未开始的任务")
+                    self._save_unlocked(path, cast(InstancedJob, {**job, **changes}), events)
             return {"format": "InstancedSceneJobCancelAck/1", "job_id": job_id,
                     "accepted": True, "state": "already_terminal" if terminal else "accepted"}
+
+    def _finish_success(self, job_id: str, output: Path, result: dict[str, object]) -> None:
+        with self._lock:
+            path = self._job_path(job_id)
+            with _record_guard(path):
+                _, job, events = self._load_unlocked(job_id, path)
+                if job["state"] in TERMINAL:
+                    return
+                if job["cancel_requested"]:
+                    cancelled = cast(InstancedJob, {**job, "state": "cancelled", "phase": "cancelled",
+                                                    "message": "任务已取消，已生成的部分文件保留", "result": None})
+                    self._save_unlocked(path, cancelled, events)
+                    return
+                state = result.get("status")
+                if state not in {"completed", "partial"}:
+                    raise SceneRequestError(f"Invalid completed scene result status: {state!r}")
+                _write(output / "instanced_result.json", result)
+                (output / "INCOMPLETE").unlink()
+                updated = cast(InstancedJob, {**job, "state": state, "phase": state, "progress": 1.0,
+                                              "message": "导出完成，存在待处理项" if state == "partial" else "导出完成",
+                                              "result": result})
+                self._save_unlocked(path, updated, events)
 
     def _check(self, job_id: str) -> None:
         job = self.get(job_id)
@@ -306,12 +473,7 @@ class InstancedSceneCoordinator:
                 self._progress(job_id, "auditing", 0.94, "核对真实文件、构件统计和待处理项")
                 result = dict(build_instanced_scene_export_result(output, artifacts))
                 self._check(job_id)
-                _write(output / "instanced_result.json", result)
-                (output / "INCOMPLETE").unlink()
-                state = str(result["status"])
-                self._update(job_id, {"state": state, "phase": state, "progress": 1.0,
-                                    "message": "导出完成，存在待处理项" if state == "partial" else "导出完成",
-                                    "result": result})
+                self._finish_success(job_id, output, result)
         except SceneJobCancelled:
             self._update(job_id, {"state": "cancelled", "phase": "cancelled", "message": "任务已取消，已生成的部分文件保留"})
         except Exception as error:
@@ -323,3 +485,4 @@ class InstancedSceneCoordinator:
         finally:
             with self._lock:
                 self._threads.pop(job_id, None)
+                self._release_owner_lock(job_id)

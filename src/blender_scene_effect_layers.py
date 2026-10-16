@@ -314,11 +314,14 @@ def _material_feature_issues(record: MaterialRecord) -> tuple[str, ...]:
             weights = [floats.get(f"{name}UseWeight{r}", 0) for r in range(6)]
             if role in (0, 1, 3, 4, 5) and weights != [int(r == role) for r in range(6)]:
                 issues.append(f"{name}_role_weights")
-            # Authored weights cannot affect the zero offset when distortion is disabled.
-            if floats.get("_UseDisturb", 0) and floats.get(f"{name}UseDisturb", 0) not in (0, 1):
-                issues.append(f"{name}_disturb_mode")
-    if floats.get("_UseDisturb", 0) and floats.get("_MainTexUseDisturb", 0) not in (0, 1):
-        issues.append("main_disturb_mode")
+            disturb_weight = floats.get(f"{name}UseDisturb", 0)
+            if (type(disturb_weight) not in (int, float) or not math.isfinite(disturb_weight) or
+                    not 0 <= disturb_weight <= 1):
+                issues.append(f"{name}_disturb_weight")
+    main_disturb_weight = floats.get("_MainTexUseDisturb", 0)
+    if (type(main_disturb_weight) not in (int, float) or not math.isfinite(main_disturb_weight) or
+            not 0 <= main_disturb_weight <= 1):
+        issues.append("main_disturb_weight")
     return tuple(issues)
 
 
@@ -677,9 +680,12 @@ def _make_vfx_feature_source(tree: bpy.types.NodeTree, record: MaterialRecord,
             source_uv = screen_uv
         if colors.get(f"{name}UVWeights") == [0, 0, 1, 0] and polar_uv is not None:
             source_uv = polar_uv
+        sample_disturb_weight = floats.get(f"{name}UseDisturb", 0)
+        sample_disturbance = (_scale(tree, f"{name} Disturbance Weight", disturbance, sample_disturb_weight)
+                              if sample_disturb_weight not in (0, 1) else
+                              disturbance if sample_disturb_weight == 1 else zero)
         sampled_uv = _uv(tree, record, name, source_uv, snapshot_time,
-                         disturbance if floats.get(f"{name}UseDisturb", 0) else zero,
-                         custom_y)
+                         sample_disturbance, custom_y)
         sample_result = _sample(tree, record, name, textures, sampled_uv)
         sampled = sample_result.rgba
         sampling_limitations.extend(sample_result.limitations)
@@ -709,9 +715,12 @@ def _make_vfx_feature_source(tree: bpy.types.NodeTree, record: MaterialRecord,
         main_source_uv = screen_uv
     if colors.get("_MainTexUVWeights") == [0, 0, 1, 0] and polar_uv is not None:
         main_source_uv = polar_uv
+    main_disturb_weight = floats.get("_MainTexUseDisturb", 0)
+    main_disturbance = (_scale(tree, "_MainTex Disturbance Weight", disturbance, main_disturb_weight)
+                        if main_disturb_weight not in (0, 1) else
+                        disturbance if main_disturb_weight == 1 else zero)
     main_uv = _uv(tree, record, "_MainTex", main_source_uv, snapshot_time,
-                  disturbance if floats.get("_MainTexUseDisturb", 0) else zero,
-                  custom_x)
+                  main_disturbance, custom_x)
     main_result = _sample(tree, record, "_MainTex", textures, main_uv)
     main = main_result.rgba
     sampling_limitations.extend(main_result.limitations)

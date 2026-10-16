@@ -44,7 +44,7 @@ def main(source_dir: Path, shader_identities: Path, selection: Path,
     lighting = make_artist_lighting(ArtistLighting((.7, -1., .6), .9, .15, 0., .25, .75), layout_shader_node_tree)
     rows: list[dict[str, object]] = []
     for source, expected_slot in ((shared[0], '_BumpMap'), (split[0], '_SplitNormalMap')):
-        tree = material_group(source, packet, environment, images, lighting, layout_shader_node_tree)
+        tree = material_group(source, packet, environment, images, lighting, layout_shader_node_tree, None)
         surfaces = tuple(item for item in tree.nodes if item.type == 'BSDF_PRINCIPLED')
         if len(surfaces) != 1 or len(surfaces[0].inputs['Normal'].links) != 1:
             raise AssertionError(f'Expected one connected Hair surface normal: {source.identity}')

@@ -24,6 +24,7 @@ from endfield_scene_material_contract import MaterialRecord, reference_key, reso
 from endfield_scene_material_handoff import load_plan_material_catalog
 from endfield_scene_export_plan import load_scene_export_plan, PlanInstance
 from endfield_scene_dynamic_geometry_plan import DynamicGeometryRow
+from endfield_scene_prefab_geometry_plan import PrefabGeometryRow
 from endfield_scene_mesh_uv_contract import required_uv_channels
 
 TERRAIN_SAMPLER_BUDGET = 24
@@ -47,10 +48,11 @@ def undrawn_material() -> bpy.types.Material:
     return material
 
 
-def mesh_identity(row: PlanInstance | DynamicGeometryRow) -> str:
+def mesh_identity(row: PlanInstance | DynamicGeometryRow | PrefabGeometryRow) -> str:
     selection = row.get("selected_submeshes", list(range(len(row["material_refs"]))))
     return hashlib.sha256(json.dumps([row["mesh_file"], row["material_refs"], selection,
-                                     row.get("source_uv_streams", [])], sort_keys=True).encode()).hexdigest()
+                                     row.get("source_uv_streams", []), row.get("submesh_material_passes", []),
+                                     row.get("source_skin")], sort_keys=True).encode()).hexdigest()
 
 
 _Hash = type(hashlib.sha256())
@@ -167,6 +169,13 @@ def scene_signature() -> dict[str, str]:
         matrix = np.empty(16, dtype=np.float64)
         matrix[:] = [component for row in obj.matrix_world for component in row]
         _signature_array(digest, "matrix_world", matrix.reshape((4, 4)), "<f8")
+        if "endfield_static_mesh_part_key" in obj:
+            for field in ("entity_id", "endfield_static_mesh_part_key", "endfield_static_mesh_part_source_json"):
+                _signature_text(digest, field, obj[field])
+        if "endfield_dynamic_mesh_part_key" in obj:
+            for field in ("endfield_dynamic_geometry_source_key", "endfield_dynamic_mesh_part_key",
+                          "endfield_dynamic_geometry_source_json"):
+                _signature_text(digest, field, obj[field])
         if "endfield_draw_parameters_status" in obj:
             _signature_text(digest, "draw_parameters_status", obj["endfield_draw_parameters_status"])
             if "endfield_serialized_draw_parameters" in obj:
@@ -238,7 +247,7 @@ def image_sampler_count(node_tree: bpy.types.NodeTree) -> int:
 
 
 def audit_terrain_sampler_budget(scene: bpy.types.Scene) -> list[dict[str, int | str]]:
-    """Audit terrain-detail materials used by mesh polygons against the Eevee budget."""
+    """Audit terrain detail and host-contact materials against the Eevee budget."""
     used_materials: dict[int, bpy.types.Material] = {}
     for obj in scene.objects:
         if obj.type != "MESH":
@@ -251,7 +260,8 @@ def audit_terrain_sampler_budget(scene: bpy.types.Scene) -> list[dict[str, int |
 
     audit: list[dict[str, int | str]] = []
     for material in used_materials.values():
-        if material.get("endfield_terrain_detail_contract") != "HGTerrainDetail/1":
+        if (material.get("endfield_terrain_detail_contract") != "HGTerrainDetail/1"
+                and not material.get("endfield_terrain_contact_contract")):
             continue
         if not material.use_nodes or material.node_tree is None:
             raise ValueError(f"Terrain detail material has no shader node tree: {material.name}")
@@ -296,20 +306,23 @@ def project_decals(manifest: Path, materials: Path) -> list[dict[str, object]]:
 
 
 def build_instances(
-    rows: Sequence[PlanInstance | DynamicGeometryRow],
+    rows: Sequence[PlanInstance | DynamicGeometryRow | PrefabGeometryRow],
     collection: bpy.types.Collection,
     materials: dict[tuple[str, int], MaterialRecord],
     textures: dict[tuple[str, int], tuple[Path, str]],
 ) -> None:
     """Reuse exact scene slots for visible assets and temporary water bottoms."""
     material_cache: dict[tuple[str, int], bpy.types.Material] = {}
+    ordered_cache: dict[tuple[tuple[str, int], ...], bpy.types.Material] = {}
     mesh_cache: dict[str, bpy.types.Mesh] = {}
     placements: list[tuple[bpy.types.Object, Matrix]] = []
+    prefab_nodes: dict[str, dict[tuple[str, int], Mapping[str, object]]] = {}
     for row in rows:
-        placement_identity = row.get("source_key", row.get("entity_id"))
+        placement_identity = row.get("mesh_part_key", row.get("source_key", row.get("entity_id")))
         selected = set(row.get("selected_submeshes", range(len(row["material_refs"]))))
-        needed_uv = {channel for index, reference in enumerate(row["material_refs"])
-                     if index in selected and reference is not None
+        material_passes = row.get("submesh_material_passes", [[ref] if ref is not None else [] for ref in row["material_refs"]])
+        needed_uv = {channel for index, references in enumerate(material_passes) if index in selected
+                     for reference in references
                      for channel in required_uv_channels(materials[reference_key(reference)])}
         source_uv = [stream for stream in row.get("source_uv_streams", []) if stream["channel"] in needed_uv]
         if needed_uv != {stream["channel"] for stream in source_uv}:
@@ -332,20 +345,33 @@ def build_instances(
                     from blender_scene_mesh_uvs import apply_source_uv_streams
 
                     apply_source_uv_streams(obj.data, source_uv)
+                if "source_skin" in row:
+                    from blender_scene_skin import apply_scene_skin
+
+                    apply_scene_skin(obj.data, Path(row["mesh_file"]), row["source_skin"])
                 if reference is None:
                     material = undrawn_material()
                 else:
-                    material_key = reference_key(reference)
-                    if material_key not in material_cache:
-                        record = materials[material_key]
-                        if record["Shader"].get("Name") == "HGRP/FogSimple":
-                            from blender_scene_fog_materials import make_fog_material
+                    keys = tuple(reference_key(ref) for ref in material_passes[submesh])
+                    for material_key in keys:
+                        if material_key not in material_cache:
+                            record = materials[material_key]
+                            if record["Shader"].get("Name") == "HGRP/FogSimple":
+                                from blender_scene_fog_materials import make_fog_material
 
-                            material_cache[material_key] = make_fog_material(
-                                record, textures, EFFECT_SNAPSHOT_AGE_SECONDS, None)
-                        else:
-                            material_cache[material_key] = create_material(record, textures, True)
-                    material = material_cache[material_key]
+                                material_cache[material_key] = make_fog_material(
+                                    record, textures, EFFECT_SNAPSHOT_AGE_SECONDS, None)
+                            else:
+                                material_cache[material_key] = create_material(record, textures, True)
+                    if len(keys) > 1:
+                        from blender_scene_material_passes import create_ordered_material
+
+                        if keys not in ordered_cache:
+                            ordered_cache[keys] = create_ordered_material(
+                                tuple(materials[key] for key in keys), tuple(material_cache[key] for key in keys))
+                        material = ordered_cache[keys]
+                    else:
+                        material = material_cache[keys[0]]
                 obj.data.materials.clear()
                 obj.data.materials.append(material)
                 for polygon in obj.data.polygons:
@@ -355,21 +381,50 @@ def build_instances(
             template = join_submeshes(kept)
             mesh_cache[key] = template.data
             bpy.data.objects.remove(template, do_unlink=True)
-        namespace = "DYNAMIC" if "source_key" in row else "ENTITY"
-        obj = bpy.data.objects.new(f"{namespace}_{placement_identity}_{row['entity_base']}", mesh_cache[key])
+        namespace = "PREFAB" if "prefab_path" in row else "DYNAMIC" if "source_key" in row else "ENTITY"
+        object_identity = placement_identity
+        if "mesh_part_key" in row:
+            part_digest = hashlib.sha256(row["mesh_part_key"].encode("utf-8")).hexdigest()[:12]
+            object_identity = f"{row.get('source_key', row.get('entity_id'))}_{part_digest}"
+        obj = bpy.data.objects.new(f"{namespace}_{object_identity}_{row['entity_base']}", mesh_cache[key])
         placements.append((obj, unity_matrix(struct.pack("<16f", *row["matrix"]))))
-        if "source_key" in row:
+        if "prefab_path" in row:
+            from endfield_scene_io import read_scene_manifest
+            from blender_scene_effects import _anchor_matrix, _blender_matrix, _owner_matrix_root_relative
+
+            manifest = row["scene_manifest"]
+            if manifest not in prefab_nodes:
+                data = read_scene_manifest(resolve_export_path(Path(manifest)))
+                prefab_nodes[manifest] = {reference_key(node): {**node, "Parent": {
+                    **node["Parent"], "Source": node["Parent"]["Source"].casefold()}} for node in data["Nodes"]}
+            placements[-1] = (obj, _blender_matrix(_anchor_matrix(row["matrix"]) @ _owner_matrix_root_relative(
+                prefab_nodes[manifest], reference_key(row["prefab_root"]), reference_key(row["renderer_owner"]))))
+            obj["endfield_prefab_geometry_source_key"] = row["source_key"]
+            obj["endfield_prefab_geometry_source_json"] = json.dumps(row)
+            obj["endfield_prefab_geometry_status"] = row["snapshot_status"]
+        elif "source_key" in row:
             obj["endfield_dynamic_geometry_source_key"] = row["source_key"]
             obj["endfield_dynamic_geometry_source_json"] = json.dumps(row)
             obj["endfield_dynamic_geometry_status"] = "source_geometry_preview_activation_and_camera_lod_unverified"
+            if "mesh_part_key" in row:
+                obj["endfield_dynamic_mesh_part_key"] = row["mesh_part_key"]
         else:
             obj["entity_id"] = str(row["entity_id"])
             obj["endfield_static_source_json"] = json.dumps({
                 name: row[name] for name in ("entity_id", "source_path", "source_sha256", "group_index", "entity_index")})
+            if "mesh_part_key" in row:
+                obj["endfield_static_mesh_part_key"] = row["mesh_part_key"]
+                obj["endfield_static_mesh_part_source_json"] = json.dumps({
+                    name: row[name] for name in ("mesh_part_key", "mesh_path", "source_renderer_pairs",
+                                                "source_draw_indices", "selected_mesh_paths", "lod_selection")})
         obj["entity_base"] = row["entity_base"]
         obj["source_asset"] = row["mesh_asset"].get("Name", row["mesh_path"])
         obj["endfield_source_mesh"] = json.dumps(row["mesh_asset"])
         obj["endfield_material_refs"] = json.dumps(row["material_refs"])
+        if "submesh_material_passes" in row:
+            obj["endfield_submesh_material_passes"] = json.dumps(row["submesh_material_passes"])
+            obj["endfield_submesh_pass_indices"] = json.dumps(row["submesh_pass_indices"])
+            obj["endfield_material_pass_status"] = "serialized_order_opaque_overwrite_host_approximation"
         obj["endfield_selected_source_submeshes"] = json.dumps(row.get("selected_submeshes", list(range(len(row["material_refs"])))))
         if source_uv:
             obj["endfield_source_uv_streams_json"] = json.dumps(source_uv)
@@ -476,7 +531,7 @@ def build_effect_previews(plan: Mapping[str, object], materials: dict[tuple[str,
     return audit
 
 
-def main() -> None:
+def _build_prepared_scene() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("plan", "output", "audit"):
         parser.add_argument("--" + name, type=Path, required=True)
@@ -502,8 +557,14 @@ def main() -> None:
     build_instances(plan["instances"], collection, materials, textures)
     dynamic_collection = bpy.data.collections.new("Endfield_Dynamic_Geometry_Reference")
     build_instances(plan["dynamic_geometry_instances"], dynamic_collection, materials, textures)
+    prefab_collection = bpy.data.collections.new("Endfield_Prefab_Geometry_Reference")
+    prefab_collection["endfield_source_placements_json"] = json.dumps(plan["prefab_placements"])
+    prefab_collection["endfield_source_exclusions_json"] = json.dumps(plan["prefab_geometry_exclusions"])
+    prefab_collection["endfield_snapshot_status"] = "source_lod_zero_reference_runtime_visibility_and_animation_unverified"
+    build_instances(plan["prefab_geometry_instances"], prefab_collection, materials, textures)
     bpy.context.scene.collection.children.link(collection)
     bpy.context.scene.collection.children.link(dynamic_collection)
+    bpy.context.scene.collection.children.link(prefab_collection)
     terrain_collection = bpy.data.collections.new("Endfield_Terrain")
     bpy.context.scene.collection.children.link(terrain_collection)
     bounds = tuple(plan["bounds"][key] for key in ("xmin", "xmax", "zmin", "zmax"))
@@ -595,6 +656,10 @@ def main() -> None:
     scene.render.engine = (plan["scene_color_snapshot"]["engine"]
                            if "scene_color_snapshot" in plan else "BLENDER_EEVEE_NEXT")
     environment = setup_environment(scene)
+    from blender_scene_terrain_blend import apply_scene_terrain_contact
+
+    terrain_contact_host = apply_scene_terrain_contact(
+        scene, materials, args.output.parent / "terrain_contact_host")
     scene_color_snapshot = None
     if "scene_color_snapshot" in plan:
         from blender_scene_vfxrefract import finalize_scene_vfxrefract, verify_scene_vfxrefract
@@ -628,6 +693,14 @@ def main() -> None:
                              "status": "source_formula_preview_runtime_unresolved"}
                             for material in used_materials
                             if material.get("endfield_top_layer_contract"))
+    material_pending.extend({"material": material.name, "component": "terrain_blend_native_runtime",
+                             "reason": (material["endfield_terrain_contact_boundary"]
+                                        + (" Context: " + material["endfield_terrain_contact_context_reason"]
+                                           if material.get("endfield_terrain_contact_context_reason") else "")),
+                             "status": "native_terrain_runtime_unresolved",
+                             "host_status": material["endfield_terrain_contact_status"]}
+                            for material in used_materials
+                            if material.get("endfield_terrain_contact_boundary"))
     terrain_sampler_audit = audit_terrain_sampler_budget(bpy.context.scene)
     layout_trees = layout_shader_node_trees(tuple(
         data.node_tree for data in (*bpy.data.materials, *bpy.data.lights, *bpy.data.worlds)
@@ -646,7 +719,7 @@ def main() -> None:
     outside_water = {row["entity_id"] for row in water if row["status"] == "outside_clipped_mesh"}
     active_pending = [row for row in plan["pending"]
                       if row["entity_id"] not in outside_water or row["component"] != "water_materials"]
-    pending = (len(active_pending) + len(plan.get("direct_effect_pending", [])) + len(plan["dynamic_geometry_pending"])
+    pending = (len(active_pending) + len(plan.get("direct_effect_pending", [])) + len(plan["dynamic_geometry_pending"]) + len(plan["prefab_geometry_pending"])
                + sum(row["status"] != "restored" for row in decals)
                + sum(row["status"] not in ("restored", "outside_clipped_mesh", "covered_by_terrain") for row in water)
                + sum(row["status"] not in ("static_preview", "renderer_disabled", "game_object_inactive", "no_alive_particles_at_snapshot") for row in effects)
@@ -674,11 +747,26 @@ def main() -> None:
     missing = [image.name for image in bpy.data.images if image.source == "FILE" and image.users and not image.packed_file]
     if missing:
         raise ValueError(f"Saved scene contains unpacked textures: {missing}")
+    from blender_scene_material_passes import verify_ordered_material
+
+    ordered_materials = [verify_ordered_material(material) for material in bpy.data.materials
+                         if "endfield_ordered_material_refs" in material]
     args.audit.write_text(json.dumps({"format": "EndfieldPortableSceneAudit/1", "reopen_verified": True,
-        "instances": len(plan["instances"]) + len(plan["dynamic_geometry_instances"]),
+        "instances": len(plan["instances"]) + len(plan["dynamic_geometry_instances"]) + len(plan["prefab_geometry_instances"]),
         "static_instances": len(plan["instances"]), "dynamic_geometry_instances": len(plan["dynamic_geometry_instances"]),
+        "static_source_entities": len({row["entity_id"] for row in plan["instances"]}),
+        **({"partial_static_source_entities": plan["summary"]["partial_static_entities"],
+            "complete_static_source_entities": plan["summary"]["complete_static_entities"]}
+           if "partial_static_entities" in plan["summary"] else {}),
+        "static_mesh_parts": len(plan["instances"]),
+        "dynamic_source_records": len({row["source_key"] for row in plan["dynamic_geometry_instances"]}),
+        "dynamic_mesh_parts": len(plan["dynamic_geometry_instances"]),
+        "prefab_geometry_instances": len(plan["prefab_geometry_instances"]),
+        "prefab_placements": plan["prefab_placements"], "prefab_geometry_pending": plan["prefab_geometry_pending"],
+        "prefab_geometry_exclusions": plan["prefab_geometry_exclusions"],
         "surface_effect_instances": len(plan.get("surface_effect_instances", [])), "pending": pending, "objects": len(expected), "empty_selection": empty,
         "terrain_materials": terrain_materials, "terrain_crops": crops, "terrain_normals": terrain_normals,
+        "terrain_contact_host": terrain_contact_host,
         "terrain_details": terrain_details, "terrain_sampler_audit": terrain_sampler_audit,
         "node_layout": {"contract": "EndfieldNodeLayout/2", "trees": layout_trees},
         "decals": decals, "water": water, "water_transport": water_transport,
@@ -686,11 +774,14 @@ def main() -> None:
         "scene_color_snapshot": scene_color_snapshot,
         "direct_effect_pending": plan.get("direct_effect_pending", []),
         "dynamic_geometry_pending": plan["dynamic_geometry_pending"],
+        "static_role_exclusions": plan["static_role_exclusions"],
+        "excluded_static_shadow_only": plan["summary"].get("excluded_static_shadow_only", 0),
         "dynamic_geometry_role_exclusions": [
             {"source_key": row["source_key"], **exclusion}
             for row in plan["dynamic_geometry_instances"] for exclusion in row.get("excluded_source_draw_roles", [])],
         "dynamic_geometry_status": "authored_base_lod_reference_with_unverified_runtime_activation",
         "material_pending": material_pending,
+        "ordered_material_passes": ordered_materials,
         "light_summary": {"source_instances": len(plan["light_instances"]),
                           "preview_lights": sum(row["status"] == "source_light_preview_partial" for row in lights),
                           "pending_includes_uncalibrated_previews": True},
@@ -712,8 +803,17 @@ def main() -> None:
          "Supported water branches include Blender medium optics and source-guided shoreline/foam; native screen buffers, caustics and runtime interactions remain unverified"),
         "Native lights preserve source transforms; intensity units and runtime activation remain uncalibrated previews",
         "Reference environment fill is editable and non-native; disabling it restores the preserved source World fill",
+        "Compatible ordered opaque material passes preserve source groups and coverage-one overwrite order on the original submesh; native depth, stencil and scheduling are not reproduced",
         "Light centers use half-open chunk ownership; off-region light contributors are excluded and directional lights belong to one selection batch",
         "Terrain stochastic projection, POM and cliff C are not reconstructed"]}, indent=2), encoding="utf-8")
+
+
+def main() -> None:
+    """Share source reads across validation and construction of one exported scene."""
+    from endfield_scene_io import scene_io_session
+
+    with scene_io_session():
+        _build_prepared_scene()
 
 
 if __name__ == "__main__":

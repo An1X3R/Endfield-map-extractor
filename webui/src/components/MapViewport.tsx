@@ -39,6 +39,8 @@ import type { LayerState, MapId } from '../types'
 import './map-handoff.css'
 
 type Props = {
+  incomingPainting: SVGSVGElement | null
+  onHandoffChange: (busy: boolean) => void
   mapId: MapId
   layers: LayerState
   chunkMode: ChunkMode
@@ -61,6 +63,7 @@ type RuntimeLayerData = Partial<Record<RuntimeLayerId, RuntimeLayerResponse>>
 type MapHandoff = {
   id: number
   image: string
+  painting: SVGSVGElement | null
   target: MapId
   direction: 'forward' | 'back'
   ready: boolean
@@ -836,6 +839,8 @@ function drawOverviewLoading(
 }
 
 export function MapViewport({
+  incomingPainting,
+  onHandoffChange,
   mapId,
   layers,
   chunkMode,
@@ -875,11 +880,16 @@ export function MapViewport({
   const [overviewState, setOverviewState] = useState<'loading' | 'dev-override' | 'runtime-config' | 'fallback'>('loading')
   const [runtimeLayerState, setRuntimeLayerState] = useState<'loading' | 'ready' | 'partial' | 'offline'>('loading')
   const reducedMotion = useReducedMotion() === true
+  const reducedMotionRef = useRef(reducedMotion)
+  useLayoutEffect(() => { reducedMotionRef.current = reducedMotion }, [reducedMotion])
   const [handoff, setHandoff] = useState<MapHandoff | null>(null)
+  useEffect(() => { onHandoffChange(handoff !== null) }, [handoff, onHandoffChange])
   const handoffRef = useRef<MapHandoff | null>(null)
   const previousMapIdRef = useRef(mapId)
   const handoffSequenceRef = useRef(0)
-  const handoffOldRef = useRef<HTMLImageElement>(null)
+  const handoffOldRef = useRef<HTMLDivElement>(null)
+  const previousPaintingRef = useRef<SVGSVGElement | null>(null)
+  const handoffPaintingRef = useRef<HTMLDivElement>(null)
   const handoffScannerRef = useRef<HTMLDivElement>(null)
   const overviewPhaseRef = useRef<'loading' | 'loaded' | 'fallback'>('loading')
   const overviewRevealRef = useRef(0)
@@ -893,21 +903,30 @@ export function MapViewport({
 
   useLayoutEffect(() => {
     const previousMapId = previousMapIdRef.current
-    if (previousMapId === mapId) return
+    const painting = incomingPainting !== previousPaintingRef.current ? incomingPainting : null
+    previousPaintingRef.current = incomingPainting
+    if (previousMapId === mapId && !painting) return
     previousMapIdRef.current = mapId
     const canvas = appRef.current?.canvas
-    const image = handoffRef.current?.image ?? canvas?.toDataURL('image/png')
-    if (!image) return
+    const image = painting ? '' : handoffRef.current?.image || canvas?.toDataURL('image/png')
+    if (!image && !painting) return
     const next: MapHandoff = {
       id: ++handoffSequenceRef.current,
-      image,
+      image: image ?? '',
+      painting,
       target: mapId,
       direction: mapId === 'map02' ? 'forward' : 'back',
-      ready: false,
+      ready: Boolean(painting && previousMapId === mapId && overviewPhaseRef.current !== 'loading'),
     }
     handoffRef.current = next
     setHandoff(next)
-  }, [mapId])
+  }, [mapId, incomingPainting])
+
+  useLayoutEffect(() => {
+    if (handoff?.painting && handoffPaintingRef.current) {
+      handoffPaintingRef.current.replaceChildren(handoff.painting.cloneNode(true))
+    }
+  }, [handoff])
 
   useEffect(() => {
     if (!handoff?.ready) return
@@ -1428,7 +1447,7 @@ export function MapViewport({
       next.ticker.add((ticker) => {
         elapsed += ticker.deltaMS
         if (targets.overviewSprite && overviewPhaseRef.current === 'loaded') {
-          const revealProgress = Math.min(1, overviewRevealRef.current + ticker.deltaMS / 280)
+          const revealProgress = reducedMotionRef.current ? 1 : Math.min(1, overviewRevealRef.current + ticker.deltaMS / 280)
           overviewRevealRef.current = revealProgress
           const easedReveal = 1 - Math.pow(1 - revealProgress, 3)
           targets.overviewSprite.alpha = easedReveal
@@ -1437,6 +1456,7 @@ export function MapViewport({
             onOverviewSourceChangeRef.current?.(loadedOverviewSource)
           }
         }
+        if (reducedMotionRef.current) return
         if (targets.scanner && app) {
           if (mapId === 'map01') {
             targets.scanner.y =
@@ -1548,7 +1568,9 @@ export function MapViewport({
       <div ref={hostRef} className={`pixi-host ${isPanning ? 'is-panning' : ''}`} aria-label={`${map.title} 上帝视角地图`} />
       {handoff && (
         <div className={`map-handoff map-handoff--${handoff.target} map-handoff--${handoff.direction}`} data-testid="map-handoff" data-ready={handoff.ready} aria-hidden="true">
-          <img className="map-handoff-old" ref={handoffOldRef} src={handoff.image} alt="" />
+          <div className="map-handoff-old" ref={handoffOldRef}>
+            {handoff.painting ? <div ref={handoffPaintingRef} style={{ width: '100%', height: '100%' }} /> : <img src={handoff.image} alt="" style={{ width: '100%', height: '100%', display: 'block' }} />}
+          </div>
           {handoff.ready && <div className="map-handoff-scanner" ref={handoffScannerRef}>
             <i className="map-handoff-wake" />
             <i className="map-handoff-line" />

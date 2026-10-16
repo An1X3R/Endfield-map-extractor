@@ -146,6 +146,39 @@ def selected_sector_keys(bounds: Mapping[str, Any]) -> list[str]:
     ]
 
 
+def load_audited_dataset(stage_root: Path) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
+    if not stage_root.is_dir():
+        raise RuntimeError(
+            f"Stage119 cache directory is missing: {stage_root}. "
+            + path_hint(
+                cli_option="--stage119-root",
+                env_name="ENDFIELD_STAGE119_ROOT",
+                config_key="stage119_root",
+            )
+        )
+    manifest_path = stage_root / "region_map_layer_manifest.json"
+    audit_path = stage_root / "full_audit.json"
+    missing = [path.name for path in (manifest_path, audit_path) if not path.is_file()]
+    if missing:
+        raise RuntimeError(
+            f"Stage119 cache is incomplete at {stage_root}; missing: {', '.join(missing)}. "
+            "Use the audited Stage119 cache root, not a parent log directory."
+        )
+    manifest = read_json(manifest_path)
+    audit = read_json(audit_path)
+    fingerprint = str(manifest.get("datasetFingerprint") or "")
+    if (
+        manifest.get("format") != EXPECTED_MANIFEST_FORMAT
+        or len(fingerprint) != 64
+        or any(character not in "0123456789ABCDEF" for character in fingerprint)
+        or audit.get("status") != "passed"
+        or audit.get("datasetFingerprint") != fingerprint
+    ):
+        raise RuntimeError("Stage119 dataset failed the export worker version gate")
+    return manifest, {}
+
+
+
 class ExportCoordinator:
     def __init__(
         self,
@@ -328,35 +361,7 @@ class ExportCoordinator:
             raise JobCancelled(job_id)
 
     def _load_dataset(self) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
-        if not self.stage119_root.is_dir():
-            raise RuntimeError(
-                f"Stage119 cache directory is missing: {self.stage119_root}. "
-                + path_hint(
-                    cli_option="--stage119-root",
-                    env_name="ENDFIELD_STAGE119_ROOT",
-                    config_key="stage119_root",
-                )
-            )
-        manifest_path = self.stage119_root / "region_map_layer_manifest.json"
-        audit_path = self.stage119_root / "full_audit.json"
-        missing = [path.name for path in (manifest_path, audit_path) if not path.is_file()]
-        if missing:
-            raise RuntimeError(
-                f"Stage119 cache is incomplete at {self.stage119_root}; missing: {', '.join(missing)}. "
-                "Use the audited Stage119 cache root, not a parent log directory."
-            )
-        manifest = read_json(manifest_path)
-        audit = read_json(audit_path)
-        fingerprint = str(manifest.get("datasetFingerprint") or "")
-        if (
-            manifest.get("format") != EXPECTED_MANIFEST_FORMAT
-            or len(fingerprint) != 64
-            or any(character not in "0123456789ABCDEF" for character in fingerprint)
-            or audit.get("status") != "passed"
-            or audit.get("datasetFingerprint") != fingerprint
-        ):
-            raise RuntimeError("Stage119 dataset failed the export worker version gate")
-        return manifest, {}
+        return load_audited_dataset(self.stage119_root)
 
     def _index(self, map_id: str, layer: str, manifest: Mapping[str, Any]) -> dict[str, Any]:
         relative = manifest["maps"][map_id]["layers"][layer]["indexPath"]

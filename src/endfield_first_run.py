@@ -40,6 +40,7 @@ from extractor_core import (
     read_bundle_closure_names_by_map,
     write_bundle_scan_index,
 )
+from extractor_core.instances import InstanceSourceGenerationError, validate_instance_source_generation
 from extractor_core.runtime_manifest import augment_runtime_manifest
 from extractor_core.assets import ASSET_RESOLUTION_POLICY_VERSION
 from endfield_dependency_bootstrap import helper_source_identity
@@ -587,7 +588,26 @@ def run() -> int:
         emitter.emit(phase, value, message, details)
 
     def step_done(name: str) -> bool:
-        return (state.get("steps") or {}).get(name, {}).get("status") == "completed"
+        step = (state.get("steps") or {}).get(name, {})
+        if step.get("status") != "completed":
+            return False
+        if name in {"map01_instances", "map02_instances"}:
+            map_id = name.removesuffix("_instances")
+            instance_path = Path(step["outputs"]["database"]["path"])
+            try:
+                validate_instance_source_generation(game_root, map_id, instance_path)
+            except InstanceSourceGenerationError as exc:
+                if exc.reason not in {"legacy", "source_changed"}:
+                    raise
+                emitter.emit(
+                    name,
+                    0.0,
+                    "Completed instance database requires refresh against current game sources",
+                    {"reason": str(exc), "action": "rebuild_instance_database"},
+                    status="needs_refresh",
+                )
+                return False
+        return True
 
     def complete_step(name: str, outputs: dict[str, Any]) -> None:
         state["steps"][name] = {"status": "completed", "completedAt": utc_now(), "outputs": outputs}

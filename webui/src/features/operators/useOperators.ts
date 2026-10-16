@@ -425,7 +425,7 @@ export function useOperators(options: UseOperatorsOptions): OperatorsController 
   const detailSelectionIdForActions = detail?.selection_id ?? null
   const detailCatalogIdForActions = detail?.catalog_id ?? null
   const detailEntryKindForActions = detail?.entry_kind ?? null
-  const detailSourceKindForActions = detail?.entry_kind === 'independent_npc' ? detail.source_kind : null
+  const animationCatalogAvailable = detail?.entry_kind === 'independent_npc' ? detail.animation_catalog_available : true
   const variantIdForActions = options.variantId
   useEffect(() => {
     actionAbort.current?.abort()
@@ -435,7 +435,7 @@ export function useOperators(options: UseOperatorsOptions): OperatorsController 
     setActionsLoading(false)
     if (!options.enabled || !options.active || !catalogReadyForActions || catalogIdForActions === null ||
       sourceIdentityForActions === null || detailRef.current === null || detailCatalogIdForActions !== catalogIdForActions ||
-      selectedIdForActions === null || detailSelectionIdForActions !== selectedIdForActions || variantIdForActions === null) return
+      selectedIdForActions === null || detailSelectionIdForActions !== selectedIdForActions || variantIdForActions === null || !animationCatalogAvailable) return
     const selectedVariantForRefresh = detailRef.current.variants.find((variant) => variant.variant_id === variantIdForActions)
     if (selectedVariantForRefresh === undefined) return
     const controller = new AbortController()
@@ -452,7 +452,7 @@ export function useOperators(options: UseOperatorsOptions): OperatorsController 
       if (controller.signal.aborted || generation !== actionGeneration.current) return
       animationCatalogRef.current = page
       setAnimationCatalog(page)
-      if (detailEntryKindForActions !== 'independent_npc' || detailSourceKindForActions !== 'config_assembled') return
+      if (detailEntryKindForActions !== 'independent_npc') return
       const refreshedDetail = await getCharacterDetail(selectedIdForActions, catalogIdForActions, controller.signal)
       if (controller.signal.aborted || generation !== actionGeneration.current) return
       detailRef.current = refreshedDetail
@@ -464,8 +464,8 @@ export function useOperators(options: UseOperatorsOptions): OperatorsController 
     }).finally(() => {
       if (generation === actionGeneration.current) setActionsLoading(false)
     })
-  }, [catalogIdForActions, catalogReadyForActions, detailCatalogIdForActions, detailEntryKindForActions,
-    detailSelectionIdForActions, detailSourceKindForActions, options.active, options.enabled, selectedIdForActions,
+  }, [animationCatalogAvailable, catalogIdForActions, catalogReadyForActions, detailCatalogIdForActions, detailEntryKindForActions,
+    detailSelectionIdForActions, options.active, options.enabled, selectedIdForActions,
     sourceIdentityForActions, variantIdForActions])
 
   const persistAndSetOperation = useCallback((operation: StoredCharacterOperation): void => {

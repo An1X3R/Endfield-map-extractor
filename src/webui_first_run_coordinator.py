@@ -269,7 +269,8 @@ class FirstRunCoordinator:
                 payload = json.loads(runtime_path.read_text(encoding="utf-8-sig"))
                 value = (payload.get("paths") or {}).get("stage119_root")
                 if isinstance(value, str) and value.strip():
-                    return Path(value).expanduser().resolve()
+                    configured = Path(value).expanduser()
+                    return (configured if configured.is_absolute() else runtime_path.parent / configured).resolve()
             except (OSError, json.JSONDecodeError, TypeError):
                 pass
         return fallback
@@ -310,14 +311,18 @@ class FirstRunCoordinator:
                 capabilities["asset_resolution"][map_id] = status
         capabilities["map_dataset"] = "ready" if actual_stage.is_dir() else "not_ready"
         if source_status == "completed" and exit_code in (None, 0) and runtime_path.is_file():
-            from endfield_scene_export import scene_runtime
+            from webui_prepared_runtime import validate_prepared_runtime
 
             try:
-                for map_id in ("map01", "map02"):
-                    scene_runtime(runtime_path, Path(str(request["game_root"])), map_id)
+                validate_prepared_runtime(runtime_path, request)
                 capabilities["blender_build"] = "ready"
-            except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+            except (OSError, ValueError, KeyError, TypeError, RuntimeError) as error:
                 capabilities["blender_build"] = "not_ready"
+                validation_error = str(error)
+            else:
+                validation_error = None
+        else:
+            validation_error = None
         reports = sorted(
             paths["log_root"].glob("first_run_report*.json") if paths["log_root"].is_dir() else [],
             key=lambda item: item.stat().st_mtime_ns,
@@ -346,6 +351,9 @@ class FirstRunCoordinator:
         }
         if exit_code is not None:
             result["exit_code"] = exit_code
+        if validation_error is not None:
+            result["error"] = {"code": "prepared_runtime_invalid", "message": validation_error, "retryable": True}
+            result["retryable"] = True
         state_error = state_payload.get("error")
         if state_error:
             result["error"] = {
@@ -407,6 +415,9 @@ class FirstRunCoordinator:
             else "idle"
         )
         result = self._result_summary(paths, state_payload, source_status, request)
+        ready = ready and result["capabilities"]["blender_build"] == "ready"
+        if restored_state == "completed" and not ready:
+            restored_state = "partial"
         self._status = self._decorate_status({
             "format": STATUS_FORMAT,
             "job_id": request["run_name"],
@@ -426,9 +437,30 @@ class FirstRunCoordinator:
             "cancel_requested": False,
             "capabilities": result["capabilities"],
             "result": result,
+            "error": result.get("error"),
         })
         if ready and self.on_ready is not None:
             self.on_ready(paths["runtime"], actual_stage)
+
+    def restore_runtime(self, runtime_path: Path, payload: Mapping[str, object]) -> None:
+        """Import an explicitly selected runtime without inventing first-run state."""
+        request = canonicalize_first_run_request(payload, default_run_name=self.default_run_name)
+        self._request = request
+        self._defaults.update(request)
+        paths = {**self._paths(request), "runtime": runtime_path.resolve(),
+                 "state": runtime_path.resolve().parent / "first_run_state.json"}
+        result = self._result_summary(paths, {}, "completed", request)
+        ready = result["capabilities"]["blender_build"] == "ready"
+        self._set_status(
+            state="completed" if ready else "partial", phase="complete" if ready else "preflight",
+            progress=1.0, ready=ready, restored=True, request=request,
+            request_identity=request_identity(request),
+            message="Validated existing scene runtime" if ready else "Existing scene runtime requires preparation",
+            resume_available=self._paths(request)["state"].is_file(),
+            capabilities=result["capabilities"], result=result, error=result.get("error"),
+        )
+        if ready and self.on_ready is not None:
+            self.on_ready(paths["runtime"], Path(str(result["stage_root"])))
 
     def _set_status(self, **changes: Any) -> None:
         with self._lock:
@@ -618,6 +650,9 @@ class FirstRunCoordinator:
                 final_state = "failed"
                 ready = False
             result = self._result_summary(paths, state_payload, source_status, request, exit_code=exit_code)
+            if ready and result["capabilities"]["blender_build"] != "ready":
+                ready = False
+                final_state = "partial"
             self._set_status(
                 state=final_state,
                 phase="complete" if ready else final_state,

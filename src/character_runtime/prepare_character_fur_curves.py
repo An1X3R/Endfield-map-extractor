@@ -9,6 +9,8 @@ from pathlib import Path
 import subprocess
 from typing import cast
 
+from character_fur_texture_contract import null_fur_direction_alpha
+
 
 SETTINGS_FORMAT = 'EndfieldFurCurvesPreparationSettings/1'
 PREPARATION_FORMAT = 'EndfieldFurCurvesPreparation/1'
@@ -169,9 +171,18 @@ def material_keyword_set(row: dict[str, object], label: str) -> frozenset[str]:
     return frozenset(text_value(value, label + '.keyword') for value in values)
 
 
-def source_material_requirements(row: dict[str, object], label: str) -> tuple[int, dict[str, float]]:
+def source_material_requirements(row: dict[str, object], shader: dict[str, object], label: str) -> tuple[int, dict[str, float]]:
     data = object_value(row.get('data'), label + '.data')
     saved = object_value(data.get('m_SavedProperties'), label + '.m_SavedProperties')
+    floats = array_value(saved.get('m_Floats'), label + '.m_Floats')
+    float_values: dict[str, float] = {}
+    for position, raw in enumerate(floats):
+        item = object_value(raw, f'{label}.m_Floats[{position}]')
+        key = text_value(item.get('Key'), f'{label}.m_Floats.Key')
+        value = item.get('Value')
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        float_values[key] = number_value(value, f'{label}.{key}')
     textures = array_value(saved.get('m_TexEnvs'), label + '.m_TexEnvs')
     texture_rows: dict[str, dict[str, object]] = {}
     for position, raw in enumerate(textures):
@@ -185,21 +196,31 @@ def source_material_requirements(row: dict[str, object], label: str) -> tuple[in
             raise ValueError(f'Fur source material has no required texture slot: {label}/{slot}')
         value = texture_rows[slot]
         texture = object_value(value.get('m_Texture'), f'{label}.{slot}.m_Texture')
-        if isinstance(texture.get('m_PathID'), bool) or not isinstance(texture.get('m_PathID'), int) or texture['m_PathID'] == 0:
+        path_id = texture.get('m_PathID')
+        if isinstance(path_id, bool) or not isinstance(path_id, int):
             raise ValueError(f'Fur source texture is unresolved: {label}/{slot}')
+        if path_id == 0:
+            if slot != '_FurDirMap' or texture.get('m_FileID') != 0:
+                raise ValueError(f'Fur source texture is unresolved: {label}/{slot}')
+            defaults = tuple(object_value(raw, 'Fur Shader property') for raw in array_value(
+                shader.get('property_defaults'), 'Fur Shader property_defaults')
+                if object_value(raw, 'Fur Shader property').get('m_Name') == slot)
+            if len(defaults) != 1 or defaults[0].get('m_Type') != 4:
+                raise ValueError(f'Null FurDirMap requires its exact Shader texture property: {label}')
+            switches = tuple(object_value(raw, 'Fur Shader property') for raw in array_value(
+                shader.get('property_defaults'), 'Fur Shader property_defaults')
+                if object_value(raw, 'Fur Shader property').get('m_Name') == '_FurDirMapEnable')
+            if len(switches) != 1 or switches[0].get('m_Type') != 2:
+                raise ValueError(f'Null FurDirMap requires its exact Shader Float switch: {label}')
+            default = object_value(defaults[0].get('m_DefTexture'), 'Fur Shader texture default')
+            null_fur_direction_alpha(text_value(default.get('m_DefaultName'), 'FurDirMap default'),
+                                     integer_value(default.get('m_TexDim'), 'FurDirMap dimension', 0),
+                                     number_value(float_values.get('_FurDirMapEnable'), '_FurDirMapEnable'))
+            continue
         uv_indices.append(integer_value(value.get('m_UVSetIndex'), f'{label}/{slot}.m_UVSetIndex', 0))
-    if uv_indices[0] != uv_indices[1] or uv_indices[0] > 7:
+    if len(set(uv_indices)) != 1 or uv_indices[0] > 7:
         raise ValueError(f'Fur and Base texture UV sets differ or exceed exported UV0-UV7: {label}; uv_sets={uv_indices}')
 
-    floats = array_value(saved.get('m_Floats'), label + '.m_Floats')
-    float_values: dict[str, float] = {}
-    for position, raw in enumerate(floats):
-        item = object_value(raw, f'{label}.m_Floats[{position}]')
-        key = text_value(item.get('Key'), f'{label}.m_Floats.Key')
-        value = item.get('Value')
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
-            continue
-        float_values[key] = number_value(value, f'{label}.{key}')
     required_floats = ('_FurLengthIntensity', '_FurGravityStrength', '_DisableRainEffectOnMaterial')
     if any(key not in float_values for key in required_floats):
         raise ValueError(f'Fur source material lacks source scalar values: {label}')
@@ -226,18 +247,21 @@ def visibility_table(path: Path, actual_root: tuple[str, str]) -> tuple[dict[tup
     return table, {'path': str(path), 'sha256': file_hash(path)}
 
 
-def export_name_table(source_dir: Path) -> dict[tuple[str, str], frozenset[str]]:
+def export_name_table(source_dir: Path) -> dict[tuple[str, str], tuple[tuple[str, str], str]]:
     path = source_dir / 'renderer_export_map.json'
     document = read_object(path, 'renderer export map')
     if document.get('format') != EXPORT_MAP_FORMAT:
         raise ValueError(f'Unsupported renderer export map: {path}')
-    result: dict[tuple[str, str], set[str]] = {}
+    result: dict[tuple[str, str], tuple[tuple[str, str], str]] = {}
     for position, raw in enumerate(array_value(document.get('renderers'), 'renderer export map.renderers')):
         row = object_value(raw, f'renderer export map.renderers[{position}]')
         mesh = identity(row.get('mesh_identity'), f'renderer export map.renderers[{position}].mesh_identity')
+        renderer = identity(row.get('renderer_identity'), f'renderer export map.renderers[{position}].renderer_identity')
         name = text_value(row.get('export_name'), f'renderer export map.renderers[{position}].export_name')
-        result.setdefault(mesh, set()).add(name)
-    return {key: frozenset(names) for key, names in result.items()}
+        if renderer in result:
+            raise ValueError(f'Renderer export map repeats a source Renderer identity: {renderer}')
+        result[renderer] = mesh, name
+    return result
 
 
 def required_channel(sidecar: dict[str, object], sidecar_path: Path, mesh_id: tuple[str, str], semantic: str) -> bool:
@@ -335,6 +359,9 @@ def prepare(source_dir: Path, input_path: Path, shader_identity_path: Path, sett
             != audit_hash):
         raise ValueError('Shader identities were generated from a different source audit')
     shader_names = shader_name_table(shader_doc)
+    shader_records = {identity(object_value(raw, 'Shader row').get('shader'), 'Shader identity'):
+                      object_value(raw, 'Shader row')
+                      for raw in array_value(shader_doc.get('shaders'), 'Shader rows')}
     material_sources_doc = array_value(json.loads(material_sources_path.read_text(encoding='utf-8-sig')),
                                        'material sources')
     material_sources: dict[tuple[str, str], dict[str, object]] = {}
@@ -369,6 +396,7 @@ def prepare(source_dir: Path, input_path: Path, shader_identity_path: Path, sett
     visibility, visibility_record = visibility_table(visibility_path, actual_root)
     export_names = export_name_table(source_dir)
     candidates_by_mesh: dict[tuple[str, str], dict[str, object]] = {}
+    excluded_shadow_renderers: list[dict[str, object]] = []
     for position, raw in enumerate(array_value(audit.get('renderers'), 'source audit.renderers')):
         renderer = object_value(raw, f'source audit.renderers[{position}]')
         renderer_id = identity(renderer.get('object'), f'source audit.renderers[{position}].object')
@@ -384,22 +412,26 @@ def prepare(source_dir: Path, input_path: Path, shader_identity_path: Path, sett
                 matched_materials.append({**material, 'slot_index': slot})
         if not matched_materials:
             continue
+        visibility_facts = visibility_summary(visibility.get(renderer_id))
+        if visibility_facts.get('is_shadows_only') is True:
+            excluded_shadow_renderers.append({'source_renderer_identity': identity_json(renderer_id),
+                                               'source_mesh_identity': identity_json(mesh_id),
+                                               'reason': 'source_shadows_only', 'visibility': visibility_facts})
+            continue
         group_ids = {cast(tuple[str, str], row['identity']) for row in matched_materials}
         if len(group_ids) != 1:
             raise ValueError(f'One source Fur Mesh has multiple Fur material groups: renderer={renderer_id}; materials={sorted(group_ids)}')
-        if mesh_id not in export_names:
+        if renderer_id not in export_names or export_names[renderer_id][0] != mesh_id:
             raise ValueError(f'Fur Mesh is absent from renderer_export_map: renderer={renderer_id}; mesh={mesh_id}')
-        mesh_export_names = export_names[mesh_id]
-        if len(mesh_export_names) != 1:
-            raise ValueError(f'Fur Mesh has multiple imported names in renderer_export_map: renderer={renderer_id}; mesh={mesh_id}; names={sorted(mesh_export_names)}')
+        mesh_export_name = export_names[renderer_id][1]
         root_material_slot = cast(int, artist['root_material_slot'])
         material_count = len(array_value(renderer.get('materials'), f'renderer {renderer_id}.materials'))
         if root_material_slot >= material_count:
             raise ValueError(f'Configured root material slot is outside selected Fur renderer: renderer={renderer_id}; slot={root_material_slot}; material_count={material_count}')
         material = matched_materials[0]
         source_row = cast(dict[str, object], material['source_row'])
-        uv_index, source_floats = source_material_requirements(source_row, f'Fur material {material["identity"]}')
         shader_id = cast(tuple[str, str], material['shader_identity'])
+        uv_index, source_floats = source_material_requirements(source_row, shader_records[shader_id], f'Fur material {material["identity"]}')
         candidate = candidates_by_mesh.get(mesh_id)
         row = {
             'source_renderer_identity': identity_json(renderer_id),
@@ -409,19 +441,21 @@ def prepare(source_dir: Path, input_path: Path, shader_identity_path: Path, sett
             'source_shader_name': variant['shader_name'],
             'keywords': material['keywords'], 'root_uv_layer': f'UV{uv_index}',
             'source_values': source_floats,
-            'visibility': visibility_summary(visibility.get(renderer_id)),
+            'visibility': visibility_facts,
         }
         if candidate is None:
             candidates_by_mesh[mesh_id] = {
                 'source_mesh_identity': identity_json(mesh_id), 'source_mesh_name': object_value(
                     object_value(renderer.get('mesh'), 'renderer.mesh'), 'renderer.mesh').get('name'),
-                'export_name': next(iter(mesh_export_names)), 'shader_identity': identity_json(shader_id),
+                'export_name': mesh_export_name, 'shader_identity': identity_json(shader_id),
                 'group_identity': identity_json(cast(tuple[str, str], material['identity'])),
                 'group_name': material['material_name'], 'keywords': material['keywords'],
                 'root_uv_layer': f'UV{uv_index}', 'source_values': source_floats,
                 'renderer_rows': [row], 'renderer_identity': renderer_id,
             }
         else:
+            if candidate['export_name'] != mesh_export_name:
+                raise ValueError(f'Shared Fur Mesh has multiple non-shadow imported Renderers: mesh={mesh_id}; names={[candidate["export_name"], mesh_export_name]}')
             if (candidate['group_identity'] != identity_json(cast(tuple[str, str], material['identity']))
                     or candidate['shader_identity'] != identity_json(shader_id)):
                 raise ValueError(f'Shared source Mesh resolves to conflicting Fur materials or shaders: mesh={mesh_id}')
@@ -437,6 +471,7 @@ def prepare(source_dir: Path, input_path: Path, shader_identity_path: Path, sett
                        'settings': {'path': str(settings_path.resolve(strict=True)), 'sha256': file_hash(settings_path)},
                        'preparation_helper': {'path': str(preparation_helper), 'sha256': preparation_helper_hash}},
             'candidate_count': 0, 'profiles': [], 'candidates': [], 'probe_runs': [],
+            'excluded_shadow_renderers': excluded_shadow_renderers,
             'message': 'No selected renderer material has HGRP/CharacterNPR with _CHARACTER_FUR.'}
         (output / 'preparation.json').write_text(json.dumps(receipt, indent=2), encoding='utf-8')
         return receipt
@@ -520,6 +555,7 @@ def prepare(source_dir: Path, input_path: Path, shader_identity_path: Path, sett
             profile = {
                 'format': PROFILE_FORMAT,
                 'source_mesh_identity': candidate['source_mesh_identity'],
+                'source_renderer_identity': identity_json(cast(tuple[str, str], candidate['renderer_identity'])),
                 'source_group_identity': candidate['group_identity'],
                 'raw_channel_sidecar': str(sidecar_path),
                 'raw_channel_sidecar_sha256': file_hash(sidecar_path),
@@ -558,6 +594,7 @@ def prepare(source_dir: Path, input_path: Path, shader_identity_path: Path, sett
         'artist_options': artist,
         'candidate_count': len(candidates_by_mesh), 'profiles': profiles,
         'candidates': candidate_records, 'probe_runs': probe_runs,
+        'excluded_shadow_renderers': excluded_shadow_renderers,
         'visibility_policy': 'Candidates are retained for the Blender builder to filter against the imported object visibility; available source visibility facts are attached as evidence.',
         'shader_binding_limit': 'If the reader reports that serialized vertex subprogram records are unavailable, the requested index/blob is not treated as verified variant admission.',
     }

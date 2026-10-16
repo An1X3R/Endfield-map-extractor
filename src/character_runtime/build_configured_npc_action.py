@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 from pathlib import Path
 import sys
 import time
@@ -24,6 +25,58 @@ from npc_animation_bind_calibration import (
 )
 
 
+def validate_action_avatar_binding(receipt: dict[str, object], source: dict[str, object]) -> None:
+    """Check the authenticated cross-Avatar proof without importing backend VFS dependencies."""
+    status = receipt.get("avatar_binding_status")
+    if status != source.get("avatar_binding_status"):
+        raise ValueError("NPC Action Avatar binding status differs from its source evidence")
+    if receipt.get("avatar_identity_matches") is True and status == "exact_avatar":
+        return
+    if receipt.get("avatar_identity_matches") is not False:
+        raise ValueError("NPC Action Avatar identity flag is inconsistent with its binding status")
+    if status == "source_humanoid_to_selected_avatar":
+        if receipt.get("template_namespace") == source.get("template_namespace") == "Humanoid":
+            return
+        raise ValueError("Cross-Avatar Humanoid Action requires its authenticated template namespace")
+    proof = source.get("generic_avatar_equivalence")
+    if (status != "source_generic_equivalent_avatar"
+            or receipt.get("template_namespace") != "Generic" or source.get("template_namespace") != "Generic"
+            or not isinstance(proof, dict) or proof != receipt.get("generic_avatar_equivalence")
+            or proof.get("format") != "NpcGenericAvatarEquivalence/1" or proof.get("tolerance") != 1e-6
+            or type(proof.get("clip_count")) is not int or proof["clip_count"] != 1):
+        raise ValueError("Generic Action requires one exact clip and matching authenticated equivalence evidence")
+    reference = receipt.get("source")
+    if (not isinstance(reference, dict) or sha(Path(reference["path"])) != reference.get("sha256")
+            or json.loads(Path(reference["path"]).read_text(encoding="utf-8-sig")) != source
+            or source.get("format") != "EndfieldNpcAnimationSource/1"):
+        raise ValueError("Generic Action source receipt differs from its authenticated JSON")
+    counts = tuple(proof.get(field) for field in ("transform_binding_count", "driven_path_count", "validated_path_count"))
+    if any(type(value) is not int or value <= 0 for value in counts) or not counts[1] <= counts[0] or counts[2] < counts[1]:
+        raise ValueError("Generic Action equivalence proof has invalid driven-path counts")
+    for field in ("max_default_pose_delta", "max_avatar_skeleton_pose_delta"):
+        delta = proof.get(field)
+        if type(delta) not in (float, int) or not math.isfinite(delta) or not 0 <= delta <= 1e-6:
+            raise ValueError(f"Generic Action equivalence exceeds its authenticated pose tolerance: field={field}")
+    identities: list[tuple[str, int]] = []
+    for field, receipt_field, proof_field, pointer_field in (
+            ("cpu_avatar_source", "cpu_avatar_source_sha256", "source_avatar_sha256", "cpu_avatar"),
+            ("avatar_source", "target_avatar_source_sha256", "target_avatar_sha256", "selected_avatar")):
+        item = source.get(field)
+        if not isinstance(item, dict) or sha(Path(item["path"])) != item.get("sha256"):
+            raise ValueError(f"Generic Action Avatar source JSON differs from its authenticated evidence: field={field}")
+        metadata = json.loads(Path(item["path"]).read_text(encoding="utf-8-sig"))["$animestudio"]
+        digest = metadata["rawDataSha256"]
+        pointer = receipt.get(pointer_field)
+        if (not isinstance(digest, str) or len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest)
+                or proof.get(proof_field) != digest or receipt.get(receipt_field) != digest or source.get(receipt_field) != digest
+                or not isinstance(pointer, dict) or str(pointer.get("cab")).casefold() != str(metadata["sourceFile"]).casefold()
+                or int(str(pointer.get("path_id"))) != metadata["pathId"]):
+            raise ValueError(f"Generic Action Avatar identity differs from its source proof: field={field}")
+        identities.append((str(pointer["cab"]).casefold(), int(str(pointer["path_id"]))))
+    if identities[0] == identities[1]:
+        raise ValueError("Generic Action claims different source Avatars for identical pointers")
+
+
 def main(request_path: Path) -> None:
     started = time.perf_counter()
     raw = json.loads(request_path.read_text(encoding="utf-8-sig"))
@@ -41,6 +94,8 @@ def main(request_path: Path) -> None:
     from build_npc_material_sample import read_instances, bind_instances, refresh_source_transforms
     from rebuild_character_materials import (read_json, object_value, array_value, read_material_sources,
         SourcePacket, load_images, material_group, surface_stack, make_environment)
+    from character_mesh_effect import (collect_mesh_color_sources, pack_group_images,
+        verify_fractional_disturbance_weights)
     from blender_scene_materials import layout_shader_node_tree
     from character_npr_nodes import ArtistLighting, make_artist_lighting
     from audit_character_fbx import clear_scene_objects, enable_fbx_importer, import_character_fbx, inspect_skin_weights, test_weighted_joint_deformation
@@ -66,8 +121,9 @@ def main(request_path: Path) -> None:
         if object_value(row["shader"], "shader identity")["type"] != "Shader" or row["object_bytes"] != row["type_tree_bytes_read"]:
             raise ValueError("NPC source Shader TypeTree is incomplete")
     probe = object_value(read_json(source / "receipt.json"), "assembly probe receipt")
-    if probe["status"] != "source_geometry_exported" or str(probe["fbx_sha256"]).casefold() != sha(fbx):
-        raise ValueError("NPC FBX bytes differ from authenticated assembly export")
+    geometry_digest_field = "geometry_sha256" if fbx.name.endswith(".geometry.json") else "fbx_sha256"
+    if probe["status"] != "source_geometry_exported" or probe.get(geometry_digest_field, "").casefold() != sha(fbx):
+        raise ValueError(f"NPC geometry differs from authenticated assembly export: path={fbx}, field={geometry_digest_field}")
     calibration_assembly = object_value(read_json(calibration_assembly_path), "NPC bind-world calibration assembly")
     calibration_probe = object_value(read_json(calibration_assembly_path.parent / "receipt.json"),
                                       "NPC bind-world probe receipt")
@@ -76,11 +132,8 @@ def main(request_path: Path) -> None:
     animation = object_value(read_json(animation_path), "animation receipt")
     npc_receipt = object_value(read_json(path("npc_animation_receipt")), "NPC action receipt")
     npc_source = object_value(read_json(Path(npc_receipt["source"]["path"])), "NPC source")
+    validate_action_avatar_binding(npc_receipt, npc_source)
     if (npc_receipt["status"] != "exact_cpu_base_clip_exported"
-            or not (npc_receipt["avatar_identity_matches"] is True or
-                (npc_receipt["avatar_identity_matches"] is False
-                 and npc_receipt.get("avatar_binding_status") == "source_humanoid_to_selected_avatar"
-                 and npc_source.get("avatar_binding_status") == "source_humanoid_to_selected_avatar"))
             or npc_receipt["animation_receipt"]["sha256"] != sha(animation_path)
             or npc_receipt["source"]["sha256"] != sha(Path(npc_receipt["source"]["path"]))
             or npc_receipt["npc_id"] != assembly["selection"]["character_id"]
@@ -127,12 +180,26 @@ def main(request_path: Path) -> None:
     lighting = make_artist_lighting(ArtistLighting((.7, -1., .6), .9, .15, 0., .25, .75), layout_shader_node_tree)
     environment = make_environment(layout_shader_node_tree)
     images = load_images(packet)
-    groups = {material.identity: material_group(material, packet, environment, images, lighting, layout_shader_node_tree) for material in materials}
+    mesh_color_sources = collect_mesh_color_sources(instances, {obj.name: obj for obj in meshes}, sources)
+    groups = {material.identity: material_group(material, packet, environment, images, lighting, layout_shader_node_tree, mesh_color_sources.get(material.identity)) for material in materials}
+    factory_image_names = pack_group_images(groups)
     for material in materials:
         archive = surface_stack((material,), groups, layout_shader_node_tree)
         archive.use_fake_user = True
     objects = bind_instances(instances, 0, sources, groups, layout_shader_node_tree)
     refresh_source_transforms(objects)
+    from character_material_authoring import package_material_authoring, verify_material_authoring
+    editable_materials = tuple({slot.material for obj in objects for slot in obj.material_slots
+                                if slot.material is not None and slot.material.use_nodes})
+    material_authoring = package_material_authoring(editable_materials, layout_shader_node_tree)
+    verify_material_authoring(material_authoring)
+    material_adapters = [{"material": material.name, "shader": material.shader,
+                          "adapter": groups[material.identity]["source_adapter"],
+                          "scope": groups[material.identity]["scope"]}
+                         for material in materials if groups[material.identity].get("source_adapter")]
+    mesh_color_evidence = {json.dumps(identity): json.loads(group["source_mesh_color_evidence"])
+                           for identity, group in groups.items()
+                           if group.get("source_mesh_color_evidence")}
     for material in bpy.data.materials:
         # Preserve imported data-slot materials even when effective object slots override them.
         material.use_fake_user = True
@@ -151,15 +218,32 @@ def main(request_path: Path) -> None:
     output.mkdir(parents=True, exist_ok=False)
     bpy.context.preferences.filepaths.save_version = 0
     target = output / "npc_action.blend"
-    image_names = tuple(image.name for image in images.values())
+    used_cached_image_names = tuple(image.name for image in images.values() if image.users > 0)
+    image_names = tuple(dict.fromkeys((*used_cached_image_names, *factory_image_names)))
     bpy.ops.wm.save_as_mainfile(filepath=str(target))
     bpy.ops.wm.open_mainfile(filepath=str(target), use_scripts=False, load_ui=False)
+    verify_material_authoring(material_authoring)
     validation = validate_attached_animation(bpy.data.objects[binding["armature"]], binding,
                                              tuple(range(1, int(binding["frames"]) + 1)), 2e-4)
     verify_invariants(invariants, names)
     verify_preserved_shapes(shapes, names)
-    if any(bpy.data.images[name].packed_file is None for name in image_names):
-        raise AssertionError("NPC source images are not packed after reopen")
+    unpacked_images = tuple(name for name in image_names
+                            if name not in bpy.data.images or bpy.data.images[name].packed_file is None)
+    if unpacked_images:
+        raise AssertionError(f"NPC source images are not packed after reopen: {unpacked_images}")
+    verified_disturbance_weights: list[dict[str, object]] = []
+    for material in materials:
+        if material.shader != "HGRP/Effect/VFXBaseV2":
+            continue
+        matches = tuple(group for group in bpy.data.node_groups
+                        if group.get("source_identity") == json.dumps(material.identity)
+                        and group.get("source_adapter") == "scene.make_mesh_effect_material / bpy.ops.node.group_make")
+        if len(matches) != 1:
+            raise AssertionError(f"NPC action VFX adapter did not reopen uniquely: material={material.identity}, groups={len(matches)}")
+        weights = verify_fractional_disturbance_weights(matches[0], material)
+        verified_disturbance_weights.append({"material": material.name,
+                                             "identity": list(material.identity),
+                                             "weights": weights})
     if any(sha(Path(artifact)) != digest for artifact, digest in input_hashes.items()):
         raise AssertionError("Read-only NPC source changed during Action attachment")
     report = {"format": "EndfieldNpcActionBuildReceipt/1", "status": "saved_reopened_all_frames_verified",
@@ -167,7 +251,9 @@ def main(request_path: Path) -> None:
         "state_name": npc_receipt["state_name"], "cpu_animation_template": npc_receipt["cpu_animation_template"],
         "source_meshes": names, "actual_shader_families": sorted({material.shader for material in materials}),
         "unresolved_archives": sum(any(binding.identity is None for binding in instance.bindings) for instance in instances),
-        "packed_image_roles": len(images), "geometry_uv_weights_rest_and_original_shapes_preserved": True,
+        "packed_image_roles": len(image_names), "mesh_color_evidence": mesh_color_evidence, "geometry_uv_weights_rest_and_original_shapes_preserved": True,
+        "material_authoring": material_authoring, "material_adapters": material_adapters,
+        "verified_disturbance_weights": verified_disturbance_weights,
         "source_skin_deformation": deformation, "nested_skin_recoveries": recoveries,
         "source_bone_paths": source_bone_paths, "binding": binding, "reopen_validation": validation, "source_input_hashes": input_hashes,
         "bind_world_calibration": bind_world_calibration,

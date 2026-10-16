@@ -86,7 +86,7 @@ def _plan_manifest_paths(plan: Mapping[str, object]) -> tuple[Path, ...]:
 
 def _instance_material_keys(plan: Mapping[str, object]) -> set[tuple[str, int]]:
     keys: set[tuple[str, int]] = set()
-    for field in ("instances", "dynamic_geometry_instances", "surface_effect_instances", "water_depth_instances"):
+    for field in ("instances", "dynamic_geometry_instances", "prefab_geometry_instances", "surface_effect_instances", "water_depth_instances"):
         for value in _array(plan.get(field, []), field):
             row = require_object(value, field)
             refs = _array(row.get("material_refs"), f"{field}.material_refs")
@@ -97,6 +97,12 @@ def _instance_material_keys(plan: Mapping[str, object]) -> set[tuple[str, int]]:
                 ref = refs[index]
                 if ref is not None:
                     keys.add(reference_key(ref))
+                if "submesh_material_passes" in row:
+                    passes = _array(row["submesh_material_passes"], f"{field}.submesh_material_passes")
+                    if len(passes) != len(refs):
+                        raise ValueError(f"Ordered material pass count differs from source submeshes: field={field}")
+                    for value in _array(passes[index], f"{field}.submesh_material_passes[{index}]"):
+                        keys.add(reference_key(value))
     for value in _array(plan.get("direct_effect_renderers", []), "direct_effect_renderers"):
         keys.add(reference_key(require_object(value, "direct effect").get("material_asset")))
     return keys

@@ -8,7 +8,7 @@ import hashlib
 import json
 from pathlib import Path
 import re
-from typing import Literal
+from typing import Literal, cast
 
 from extractor_core import vfs
 from extractor_core.resources import load_group
@@ -36,6 +36,7 @@ from endfield_character_catalog import (
     _read_virtual_payload,
     _virtual_file_index,
 )
+from endfield_character_enemy_index import EnemyModelBinding, read_enemy_model_index
 
 
 class IndependentNpcCatalogError(ValueError):
@@ -43,9 +44,10 @@ class IndependentNpcCatalogError(ValueError):
 
 
 NpcSourceKind = Literal["prefab", "config_assembled", "unresolved"]
-NpcNameTable = Literal["NpcTemplateGroupTable", "NpcTable"]
+NpcNameTable = Literal["NpcTemplateGroupTable", "NpcTable", "EnemyTemplateDisplayInfoTable", "EnemyDisplayInfoTable"]
 NpcNameStatus = Literal["resolved", "missing", "ambiguous"]
 NpcConfigField = Literal["avatarMeshName", "avatarTempletName"]
+NpcEntityCategory = Literal["animal", "creature", "object", "npc"]
 
 
 @dataclass(frozen=True)
@@ -104,6 +106,35 @@ class IndependentNpcRecord:
 
 
 @dataclass(frozen=True)
+class IndependentNpcCategoryEvidence:
+    category: NpcEntityCategory
+    source_field: Literal["avatarMeshName", "avatarTempletName", "enemyModelPrefab"] | None
+    source_value: str | None
+
+
+def npc_entity_category(entry: IndependentNpcRecord) -> IndependentNpcCategoryEvidence:
+    """Classify the primary mesh family; shared animation templates are not taxonomy."""
+    mesh = entry.resource_reference.avatar_mesh
+    if mesh is None:
+        enemy_parts = tuple(part for part in entry.resource_reference.prefab_parts
+                            if part.resource_path.startswith("assets/beyond/dynamicassets/gameplay/actors/postmodels/enemies/"))
+        if len(enemy_parts) == 1:
+            return IndependentNpcCategoryEvidence("creature", "enemyModelPrefab", enemy_parts[0].resource_path)
+        return IndependentNpcCategoryEvidence("npc", None, None)
+    segments = mesh.source_value.replace("\\", "/").casefold().split("/")
+    category: NpcEntityCategory = "npc"
+    if len(segments) >= 4 and segments[:2] == ["npc", "avatarmesh"]:
+        family = segments[2]
+        if family == "animal":
+            category = "animal"
+        elif family == "monster":
+            category = "creature"
+        elif family == "object":
+            category = "object"
+    return IndependentNpcCategoryEvidence(category, mesh.source_field, mesh.source_value)
+
+
+@dataclass(frozen=True)
 class IndependentNpcCatalogSource:
     source_name: str
     virtual_path: str
@@ -151,7 +182,7 @@ class _NpcName:
     status: NpcNameStatus
 
 
-_CATALOG_CACHE_SCHEMA = "independent-npc-catalog/2"
+_CATALOG_CACHE_SCHEMA = "independent-npc-catalog/6"
 _NPC_PROVIDER_SCHEMA = "independent-npc-provider-jsonl/1"
 
 
@@ -244,8 +275,8 @@ def _read_prefab_info(
     if _text(source.get("id"), f"{virtual_path}.id") != template_id:
         raise IndependentNpcCatalogError(f"NPC PrefabInfo ID does not match its path: path={virtual_path}")
     raw_parts = source.get("partNameIdList")
-    if not isinstance(raw_parts, list) or not raw_parts:
-        raise IndependentNpcCatalogError(f"NPC PrefabInfo partNameIdList must be nonempty: path={virtual_path}")
+    if not isinstance(raw_parts, list):
+        raise IndependentNpcCatalogError(f"NPC PrefabInfo partNameIdList must be an array: path={virtual_path}")
     part_names = tuple(
         _safe_component(value, f"{virtual_path}.partNameIdList[{index}]")
         for index, value in enumerate(raw_parts)
@@ -352,6 +383,133 @@ def _resolve_name(
     return _NpcName(None, None, "missing")
 
 
+def _resolve_enemy_name(
+    template_id: str,
+    template_display: dict[str, TableValue],
+    enemy_display: dict[str, TableValue],
+    chinese_texts: dict[str, TableValue],
+) -> _NpcName:
+    """Resolve the canonical enemy name through exact display localization IDs."""
+    candidates: list[tuple[str, IndependentNpcNameSource]] = []
+    for table, values in (("EnemyTemplateDisplayInfoTable", template_display), ("EnemyDisplayInfoTable", enemy_display)):
+        for row_key, value in sorted(values.items()):
+            row = _table_object(value, f"{table}[{row_key}]")
+            if _text(row.get("templateId"), f"{table}[{row_key}].templateId") != template_id:
+                continue
+            name = _table_object(row.get("name"), f"{table}[{row_key}].name")
+            text_id = name.get("id")
+            if type(text_id) is not int:
+                raise IndependentNpcCatalogError(f"Enemy name localization ID is not an integer: table={table}, key={row_key}, value={text_id!r}")
+            localized = _i18n_text(chinese_texts, text_id, f"{table}[{row_key}].name")
+            if localized is not None:
+                candidates.append((localized, IndependentNpcNameSource(cast(NpcNameTable, table), row_key, "name.id", None, str(text_id))))
+        if candidates:
+            break
+    unique_names = {name for name, _source in candidates}
+    if len(unique_names) == 1:
+        name, source = candidates[0]
+        return _NpcName(name, source, "resolved")
+    return _NpcName(None, None, "ambiguous" if unique_names else "missing")
+
+
+def _enemy_template_ids(
+    templates: dict[str, TableValue],
+    enemies: dict[str, TableValue],
+) -> tuple[str, ...]:
+    """Validate canonical enemy templates without treating combat variants as models."""
+    template_ids: set[str] = set()
+    for row_key, value in sorted(templates.items()):
+        row = _table_object(value, f"EnemyTemplateTable[{row_key}]")
+        template_id = _safe_component(row.get("templateId"), f"EnemyTemplateTable[{row_key}].templateId")
+        if template_id != row_key:
+            raise IndependentNpcCatalogError(f"Enemy template key differs from templateId: key={row_key}, templateId={template_id}")
+        template_ids.add(template_id)
+    for row_key, value in sorted(enemies.items()):
+        row = _table_object(value, f"EnemyTable[{row_key}]")
+        if _text(row.get("enemyId"), f"EnemyTable[{row_key}].enemyId") != row_key:
+            raise IndependentNpcCatalogError(f"Enemy key differs from enemyId: key={row_key}")
+        template_id = _text(row.get("templateId"), f"EnemyTable[{row_key}].templateId")
+        if template_id not in template_ids:
+            raise IndependentNpcCatalogError(f"Enemy references an undeclared template: enemy={row_key}, templateId={template_id}")
+    return tuple(sorted(template_ids))
+
+
+def _resolve_enemy_prefab_name(
+    part_names: tuple[str, ...],
+    bindings: tuple[EnemyModelBinding, ...],
+    names: dict[str, _NpcName],
+) -> _NpcName:
+    """Join exact EnemyData model IDs to exact PrefabInfo slots, never NPC ID spelling."""
+    matched = tuple(names[binding.template_id] for binding in bindings if binding.model_id in part_names)
+    resolved = tuple(name for name in matched if name.status == "resolved")
+    unique = {name.value for name in resolved}
+    if len(unique) == 1 and not any(name.status == "ambiguous" for name in matched):
+        return resolved[0]
+    return _NpcName(None, None, "ambiguous" if len(unique) > 1 or any(name.status == "ambiguous" for name in matched) else "missing")
+
+
+def _enemy_model_prefab_paths(
+    provider_path: Path,
+    bindings: tuple[EnemyModelBinding, ...],
+    check_cancelled: Callable[[], None],
+) -> dict[str, tuple[str, ...]]:
+    """Join exact model IDs to existing enemy prefab container filenames."""
+    by_filename = {binding.model_id.casefold() + ".prefab": binding.model_id for binding in bindings}
+    paths: dict[str, set[str]] = {binding.model_id: set() for binding in bindings}
+    with provider_path.open("rb") as stream:
+        for line_number, raw in enumerate(stream, 1):
+            if line_number % 1024 == 0:
+                check_cancelled()
+            try:
+                row = _object(json.loads(raw), f"provider line {line_number}")
+            except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise IndependentNpcCatalogError(f"Invalid enemy provider JSON: path={provider_path}, line={line_number}, error={error}") from error
+            if row.get("kind") != "match":
+                continue
+            containers = row.get("containers")
+            if not isinstance(containers, list):
+                raise IndependentNpcCatalogError(f"Enemy provider containers must be an array: line={line_number}")
+            for container in containers:
+                path = _normalize_container_path(_text(container, f"provider line {line_number}.container"))
+                model_id = by_filename.get(path.rsplit("/", 1)[-1])
+                if model_id is not None and path.startswith("assets/beyond/dynamicassets/gameplay/actors/postmodels/enemies/"):
+                    paths[model_id].add(path)
+    return {model_id: tuple(sorted(values)) for model_id, values in paths.items()}
+
+
+def _enemy_direct_prefab_records(
+    entries: tuple[IndependentNpcRecord, ...],
+    bindings: tuple[EnemyModelBinding, ...],
+    names: dict[str, _NpcName],
+    paths: dict[str, tuple[str, ...]],
+    providers: dict[str, tuple[CharacterResourceProvider, ...]],
+) -> tuple[IndependentNpcRecord, ...]:
+    """Add canonical enemies only when no existing NPC already represents the exact model."""
+    represented = {part.part_name for entry in entries for part in entry.resource_reference.prefab_parts}
+    identities = {entry.npc_id for entry in entries}
+    additions: list[IndependentNpcRecord] = []
+    for binding in bindings:
+        if binding.model_id in represented:
+            continue
+        resources = paths[binding.model_id]
+        if not resources:
+            continue
+        if len(resources) != 1:
+            raise IndependentNpcCatalogError(f"Enemy model matches multiple exact prefabs: template={binding.template_id}, model={binding.model_id}, paths={resources}")
+        resource_path = resources[0]
+        matches = providers.get(resource_path, ())
+        if len(matches) != 1 or len(matches[0].serialized_cabs) != 1:
+            raise IndependentNpcCatalogError(f"Enemy prefab requires one exact provider/CAB: template={binding.template_id}, path={resource_path}, providers={len(matches)}")
+        npc_id = "enemy-" + binding.template_id
+        if npc_id in identities:
+            raise IndependentNpcCatalogError(f"Enemy identity collides with existing NPC ID: npc_id={npc_id}")
+        name = names[binding.template_id]
+        reference = IndependentNpcResourceReference(binding.template_id, binding.resource_path, None,
+            (IndependentNpcPrefabReference(binding.model_id, resource_path, matches),), None, None, None)
+        additions.append(IndependentNpcRecord(npc_id, name.value, name.source, name.status, "prefab", reference))
+    return tuple(additions)
+
+
 def _provider_tuple(
     path: str | None,
     providers_by_path: dict[str, tuple[CharacterResourceProvider, ...]],
@@ -387,9 +545,67 @@ def _summary(
     )
 
 
+def _npc_info_with_environmental_templates(
+    npc_info: dict[str, TableValue],
+    environmental: dict[str, TableValue],
+    linked_templates: set[str],
+) -> dict[str, TableValue]:
+    """Preserve source NPC IDs and add unrepresented environmental template IDs."""
+    represented: set[str] = set()
+    for npc_id, value in npc_info.items():
+        row = _table_object(value, f"NpcInfoTable[{npc_id}]")
+        if _text(row.get("npcId"), f"NpcInfoTable[{npc_id}].npcId") != npc_id:
+            raise IndependentNpcCatalogError(f"NpcInfoTable key differs from npcId: key={npc_id}")
+        template_id = _optional_reference(row.get("templateId"), f"NpcInfoTable[{npc_id}].templateId")
+        if template_id is not None:
+            represented.add(template_id)
+    additions: dict[str, TableValue] = {}
+    for row_key, value in sorted(environmental.items()):
+        row = _table_object(value, f"GameplayAndEnvironmentalNpc[{row_key}]")
+        template_id = _safe_component(row.get("dataKey"), f"GameplayAndEnvironmentalNpc[{row_key}].dataKey")
+        if template_id != row_key:
+            raise IndependentNpcCatalogError(
+                f"Environmental NPC key differs from dataKey: key={row_key}, dataKey={template_id}"
+            )
+        if template_id in represented or template_id in linked_templates:
+            continue
+        npc_id = f"environmental-{template_id}"
+        if npc_id in npc_info:
+            raise IndependentNpcCatalogError(
+                f"Environmental NPC identity collides with source NPC ID: npc_id={npc_id}, template_id={template_id}"
+            )
+        additions[npc_id] = {"npcId": npc_id, "templateId": template_id}
+    return {**npc_info, **additions}
+
+
+def _npc_info_with_monster_prefabs(
+    npc_info: dict[str, TableValue],
+    prefabs: dict[str, _NpcPrefabSource],
+    linked_templates: set[str],
+) -> dict[str, TableValue]:
+    """Add missing exact Monster PrefabInfo templates, retaining existing source IDs."""
+    represented = {
+        _optional_reference(_table_object(value, f"NpcInfoTable[{npc_id}]").get("templateId"), f"NpcInfoTable[{npc_id}].templateId")
+        for npc_id, value in npc_info.items()
+    }
+    additions: dict[str, TableValue] = {}
+    for template_id, source in sorted(prefabs.items()):
+        mesh = source.avatar_mesh_name
+        if mesh is None or mesh.replace("\\", "/").casefold().split("/")[:3] != ["npc", "avatarmesh", "monster"]:
+            continue
+        if template_id in represented or template_id in linked_templates:
+            continue
+        npc_id = "enemy-npc-" + template_id
+        if npc_id in npc_info:
+            raise IndependentNpcCatalogError(f"Monster PrefabInfo identity collides with source NPC ID: npc_id={npc_id}, template_id={template_id}")
+        additions[npc_id] = {"npcId": npc_id, "templateId": template_id}
+    return {**npc_info, **additions}
+
+
 def _read_independent_npc_catalog_sources(
     vfs_root: Path,
     provider_path: Path,
+    enemy_model_index: Path | None,
     check_cancelled: Callable[[], None],
 ) -> IndependentNpcCatalog:
     table_group = load_group(vfs_root, _TABLE_GROUP)
@@ -403,6 +619,11 @@ def _read_independent_npc_catalog_sources(
         "I18nTextTable_CN",
         "NpcTable",
         "NpcPrefabCorrespondingCharTable",
+        "GameplayAndEnvironmentalNpc",
+        "EnemyTable",
+        "EnemyTemplateTable",
+        "EnemyTemplateDisplayInfoTable",
+        "EnemyDisplayInfoTable",
     )
     for table_name in table_names:
         values, source = _read_table(vfs_root, table_group, table_files, table_name, check_cancelled)
@@ -416,6 +637,10 @@ def _read_independent_npc_catalog_sources(
         _text(row.get("correspondingCharId"), f"NpcPrefabCorrespondingCharTable[{key}].correspondingCharId")
         linked_templates.add(template_id)
 
+    npc_info = _npc_info_with_environmental_templates(
+        table_values["NpcInfoTable"], table_values["GameplayAndEnvironmentalNpc"], linked_templates,
+    )
+
     npc_table_by_data_key_lists: dict[str, list[tuple[str, dict[str, TableValue]]]] = defaultdict(list)
     for key, value in sorted(table_values["NpcTable"].items()):
         row = _table_object(value, f"NpcTable[{key}]")
@@ -428,9 +653,43 @@ def _read_independent_npc_catalog_sources(
 
     json_group = load_group(vfs_root, _JSON_GROUP)
     json_files = _virtual_file_index(json_group, _JSON_GROUP)
+    monster_prefabs: dict[str, _NpcPrefabSource] = {}
+    for virtual_path, virtual_file in sorted(json_files.items()):
+        if not virtual_path.startswith("data/json/npc/prefabinfo/") or not virtual_path.endswith(".json"):
+            continue
+        check_cancelled()
+        payload = _read_virtual_payload(vfs_root, _JSON_GROUP, json_group, json_files, virtual_file.file_name)
+        try:
+            source = _object(json.loads(payload), virtual_file.file_name)
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise IndependentNpcCatalogError(f"Invalid NPC PrefabInfo JSON: path={virtual_file.file_name}, error={error}") from error
+        mesh = _optional_reference(source.get("avatarMeshName"), f"{virtual_file.file_name}.avatarMeshName")
+        if mesh is None or mesh.replace("\\", "/").casefold().split("/")[:3] != ["npc", "avatarmesh", "monster"]:
+            continue
+        template_id = _safe_component(virtual_file.file_name.rsplit("/", 1)[1].removesuffix(".json"), "PrefabInfo filename")
+        prefab = _read_prefab_info(vfs_root, json_group, json_files, template_id)
+        if prefab is not None:
+            monster_prefabs[template_id] = prefab
+    npc_info = _npc_info_with_monster_prefabs(npc_info, monster_prefabs, linked_templates)
+    enemy_template_ids = _enemy_template_ids(table_values["EnemyTemplateTable"], table_values["EnemyTable"])
+    enemy_bindings: tuple[EnemyModelBinding, ...] = ()
+    enemy_names: dict[str, _NpcName] = {}
+    if enemy_model_index is not None:
+        index = read_enemy_model_index(enemy_model_index)
+        indexed_ids = {row.template_id for row in index.bindings} | {row.template_id for row in index.unavailable}
+        if indexed_ids != set(enemy_template_ids):
+            raise IndependentNpcCatalogError("Enemy model index template IDs differ from the current EnemyTemplateTable")
+        summary_payload = _read_virtual_payload(vfs_root, _JSON_GROUP, json_group, json_files, "Data/Json/AIConfig/EnemyTemplateDataSummary.json")
+        if hashlib.sha256(summary_payload).hexdigest() != index.summary_sha256:
+            raise IndependentNpcCatalogError("Enemy model index differs from the current EnemyTemplateDataSummary")
+        enemy_bindings = index.bindings
+        enemy_names = {template_id: _resolve_enemy_name(template_id, table_values["EnemyTemplateDisplayInfoTable"],
+                       table_values["EnemyDisplayInfoTable"], table_values["I18nTextTable_CN"]) for template_id in enemy_template_ids}
+        table_sources.append(IndependentNpcCatalogSource("EnemyModelIndex", "EnemyModelIndex/" + index.source_identity + ".json",
+                             hashlib.sha256(enemy_model_index.read_bytes()).hexdigest(), len(indexed_ids)))
     npc_sources: dict[str, _NpcPrefabSource | None] = {}
     requested_paths: set[str] = set()
-    for key, value in sorted(table_values["NpcInfoTable"].items()):
+    for key, value in sorted(npc_info.items()):
         row = _table_object(value, f"NpcInfoTable[{key}]")
         npc_id = _text(row.get("npcId"), f"NpcInfoTable[{key}].npcId")
         if npc_id != key:
@@ -440,7 +699,7 @@ def _read_independent_npc_catalog_sources(
         template_id = _optional_reference(row.get("templateId"), f"NpcInfoTable[{key}].templateId")
         if template_id is None or template_id in linked_templates:
             continue
-        prefab_source = _read_prefab_info(vfs_root, json_group, json_files, template_id)
+        prefab_source = monster_prefabs.get(template_id) or _read_prefab_info(vfs_root, json_group, json_files, template_id)
         npc_sources[npc_id] = prefab_source
         if prefab_source is None:
             continue
@@ -455,6 +714,8 @@ def _read_independent_npc_catalog_sources(
                 if resource_path is not None:
                     requested_paths.add(_normalize_container_path(resource_path))
 
+    enemy_prefab_paths = _enemy_model_prefab_paths(provider_path, enemy_bindings, check_cancelled) if enemy_bindings else {}
+    requested_paths.update(path for paths in enemy_prefab_paths.values() for path in paths)
     try:
         providers_by_path, provider_source = _provider_details(
             provider_path,
@@ -466,7 +727,7 @@ def _read_independent_npc_catalog_sources(
 
     records: list[IndependentNpcRecord] = []
     prefab_sources: list[IndependentNpcCatalogSource] = []
-    for npc_id, value in sorted(table_values["NpcInfoTable"].items()):
+    for npc_id, value in sorted(npc_info.items()):
         row = _table_object(value, f"NpcInfoTable[{npc_id}]")
         template_id = _optional_reference(row.get("templateId"), f"NpcInfoTable[{npc_id}].templateId")
         if template_id is None:
@@ -482,6 +743,10 @@ def _read_independent_npc_catalog_sources(
             npc_table_by_data_key,
         )
         prefab_source = npc_sources[npc_id]
+        if name.status == "missing" and prefab_source is not None and prefab_source.avatar_mesh_name is not None:
+            family = prefab_source.avatar_mesh_name.replace("\\", "/").casefold().split("/")[:3]
+            if family == ["npc", "avatarmesh", "monster"]:
+                name = _resolve_enemy_prefab_name(prefab_source.part_names, enemy_bindings, enemy_names)
         prefab_path = f"Data/Json/NPC/PrefabInfo/{template_id}.json"
         prefab_parts: tuple[IndependentNpcPrefabReference, ...] = ()
         avatar_mesh: IndependentNpcConfigReference | None = None
@@ -534,7 +799,7 @@ def _read_independent_npc_catalog_sources(
             resource_reference,
         ))
 
-    frozen_entries = tuple(records)
+    frozen_entries = tuple(records) + _enemy_direct_prefab_records(tuple(records), enemy_bindings, enemy_names, enemy_prefab_paths, providers_by_path)
     source_identity_payload = {
         "tables": [asdict(source) for source in table_sources],
         "prefab_info": [asdict(source) for source in sorted(prefab_sources, key=lambda item: item.virtual_path)],
@@ -634,12 +899,12 @@ def _cache_name_source(value: object, context: str) -> IndependentNpcNameSource 
         return None
     row = _cache_object(value, context)
     table, field = row.get("table"), row.get("field")
-    if table not in ("NpcTemplateGroupTable", "NpcTable"):
+    if table not in ("NpcTemplateGroupTable", "NpcTable", "EnemyTemplateDisplayInfoTable", "EnemyDisplayInfoTable"):
         raise CharacterCacheError(f"Independent NPC cache name source table is unsupported: field={context}")
     if not isinstance(field, str) or not field:
         raise CharacterCacheError(f"Independent NPC cache name source field is invalid: field={context}")
     return IndependentNpcNameSource(
-        "NpcTemplateGroupTable" if table == "NpcTemplateGroupTable" else "NpcTable",
+        cast(NpcNameTable, table),
         _cache_text(row.get("row_key"), f"{context}.row_key"),
         field,
         _cache_optional_text(row.get("text_key"), f"{context}.text_key"),
@@ -782,10 +1047,13 @@ def read_independent_npc_catalog(
     game_root: Path,
     provider_index: Path,
     cache: CharacterDataCache,
+    enemy_model_index: Path | None,
     check_cancelled: Callable[[], None],
 ) -> IndependentNpcCatalog:
     """Read all unlinked NPC templates and resolve exact names and provider references."""
     game, vfs_root, provider_path, source_paths = _catalog_inputs(game_root, provider_index)
+    if enemy_model_index is not None:
+        source_paths += (enemy_model_index,)
     provider_stamp = source_stamp(provider_path)
     cached_provider = cache.lookup_fingerprint(provider_path, _NPC_PROVIDER_SCHEMA, check_cancelled)
     group_headers = tuple(
@@ -806,7 +1074,7 @@ def read_independent_npc_catalog(
         _CATALOG_CACHE_SCHEMA,
         source_paths,
         qualifiers,
-        lambda: asdict(_read_independent_npc_catalog_sources(vfs_root, provider_path, check_cancelled)),
+        lambda: asdict(_read_independent_npc_catalog_sources(vfs_root, provider_path, enemy_model_index, check_cancelled)),
         check_cancelled,
     )
     catalog = _cache_catalog(raw)

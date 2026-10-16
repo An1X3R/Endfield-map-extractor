@@ -228,7 +228,8 @@ class WebUIFirstRunBackendTests(unittest.TestCase):
             partial = coordinator._result_summary(paths, {}, "completed_with_deferred_helpers", request, exit_code=0)
             failed_exit = coordinator._result_summary(paths, {}, "completed", request, exit_code=1)
 
-            self.assertEqual("ready", completed["capabilities"]["blender_build"])
+            self.assertEqual("not_ready", completed["capabilities"]["blender_build"])
+            self.assertEqual("prepared_runtime_invalid", completed["error"]["code"])
             self.assertEqual("not_ready", partial["capabilities"]["blender_build"])
             self.assertEqual("not_ready", failed_exit["capabilities"]["blender_build"])
 
@@ -491,7 +492,7 @@ class WebUIFirstRunBackendTests(unittest.TestCase):
             self.assertNotIn("--skip-helper-bootstrap", command)
             self.assertNotIn("--skip-scene-discovery", command)
 
-    def test_completed_state_restores_ready_gate_and_runtime(self) -> None:
+    def test_completed_state_without_validated_runtime_is_not_ready(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             game = self.make_game_root(root)
@@ -526,19 +527,10 @@ class WebUIFirstRunBackendTests(unittest.TestCase):
             )
 
             status = coordinator.status()
-            self.assertTrue(status["ready"])
-            self.assertEqual("completed", status["state"])
-            self.assertEqual([(run_root / "endfield.runtime.local.json", stage_root)], activated)
-            duplicate = coordinator.submit(
-                {
-                    "format": REQUEST_FORMAT,
-                    "game_root": str(game),
-                    "export_root": str(export),
-                    "cache_root": str(cache),
-                    "run_name": run_name,
-                }
-            )
-            self.assertEqual("already_ready", duplicate["disposition"])
+            self.assertFalse(status["ready"])
+            self.assertEqual("partial", status["state"])
+            self.assertEqual([], activated)
+            self.assertEqual("prepared_runtime_invalid", status["error"]["code"])
 
     def test_completed_state_uses_runtime_retry_stage_instead_of_base_guess(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -579,9 +571,9 @@ class WebUIFirstRunBackendTests(unittest.TestCase):
                 },
                 on_ready=lambda runtime, stage: activated.append((runtime, stage)),
             )
-            self.assertTrue(coordinator.status()["ready"])
+            self.assertFalse(coordinator.status()["ready"])
             self.assertEqual(str(actual_stage), coordinator.status()["result"]["stage_root"])
-            self.assertEqual([(runtime_path, actual_stage)], activated)
+            self.assertEqual([], activated)
 
     def test_status_actions_cover_idle_partial_failed_cancelled_and_completed(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

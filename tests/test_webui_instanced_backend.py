@@ -8,13 +8,14 @@ import sys
 import tempfile
 import subprocess
 import threading
+import time
 import unittest
 from uuid import uuid4
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from webui_instanced_contract import SceneRequestError, canonical_scene_request, scene_build_request
-from webui_instanced_worker import InstancedSceneCoordinator, SceneJobCancelled
+from webui_instanced_worker import InstancedSceneCoordinator, SceneJobCancelled, _NativeFileLock
 
 
 class InstancedBackendTests(unittest.TestCase):
@@ -70,7 +71,7 @@ class InstancedBackendTests(unittest.TestCase):
         self.assertTrue(plan["layers"]["lights"])
         self.assertFalse(plan["layers"]["water"])
 
-    def test_restart_reports_interrupted_job_and_preserves_event_identity(self) -> None:
+    def test_legacy_job_without_owner_lock_is_preserved_when_session_differs(self) -> None:
         request = self.canonical(self.request)
         job_id = request["request_id"]
         path = self.root / "instanced_jobs" / (job_id + ".json")
@@ -81,13 +82,125 @@ class InstancedBackendTests(unittest.TestCase):
         path.write_text(json.dumps({"session": "old-process", "job": job, "events": []}), encoding="utf-8")
         coordinator = InstancedSceneCoordinator(self.status)
         restored = coordinator.get(job_id)
-        self.assertEqual(restored["state"], "failed")
-        self.assertEqual(restored["error"]["code"], "worker_interrupted")
+        self.assertEqual(restored["state"], "building")
+        self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["job"]["state"], "building")
         events = coordinator.events(job_id, 0)
         self.assertEqual(events["job_id"], job_id)
-        self.assertEqual(events["next_after"], 1)
+        self.assertEqual(events["next_after"], 0)
+
+    def test_live_owner_lock_preserves_job_and_released_owner_lock_marks_interruption(self) -> None:
+        request = self.canonical(self.request)
+        job_id = request["request_id"]
+        owner = InstancedSceneCoordinator(self.status)
+        observer = InstancedSceneCoordinator(self.status)
+        path = owner._job_path(job_id)
+        owner_lock = _NativeFileLock(owner._owner_lock_path(path), 0.0)
+        self.assertTrue(owner_lock.acquire())
+        owner._ownership_locks[job_id] = owner_lock
+        self.addCleanup(owner._release_owner_lock, job_id)
+        owner._save(path, {
+            "format": "InstancedSceneJob/1", "job_id": job_id, "state": "building", "phase": "building",
+            "progress": 0.6, "message": "building", "cancel_requested": False,
+            "request": request, "result": None, "error": None,
+        }, [])
+
+        self.assertEqual(observer.get(job_id)["state"], "building")
+        self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["owner"]["session"], owner._session)
+        owner_lock.release()
+        owner._ownership_locks.pop(job_id)
+
+        interrupted = observer.get(job_id)
+        self.assertEqual(interrupted["state"], "failed")
+        self.assertEqual(interrupted["error"]["code"], "worker_interrupted")
+
+    def test_native_owner_lock_is_released_when_worker_process_exits(self) -> None:
+        lock_path = self.root / "owner.lock"
+        ready_path = self.root / "owner.ready"
+        source = Path(__file__).resolve().parents[1] / "src"
+        code = ("import sys,time;from pathlib import Path;sys.path.insert(0," + repr(str(source)) + ");"
+                "from webui_instanced_worker import _NativeFileLock;"
+                "lock=_NativeFileLock(Path(sys.argv[1]),0.0);assert lock.acquire();"
+                "Path(sys.argv[2]).write_text('ready');time.sleep(30)")
+        process = subprocess.Popen([sys.executable, "-c", code, str(lock_path), str(ready_path)],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            deadline = time.monotonic() + 5.0
+            while not ready_path.is_file() and process.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertTrue(ready_path.is_file(), "worker process did not acquire its native lock")
+            contender = _NativeFileLock(lock_path, 0.0)
+            self.assertFalse(contender.acquire())
+            process.terminate()
+            process.wait(timeout=5.0)
+            recovered = _NativeFileLock(lock_path, 0.0)
+            deadline = time.monotonic() + 3.0
+            acquired = recovered.acquire()
+            while not acquired and time.monotonic() < deadline:
+                time.sleep(0.02)
+                acquired = recovered.acquire()
+            self.assertTrue(acquired)
+            recovered.release()
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=5.0)
+
+    def test_cancel_before_result_commit_keeps_incomplete_output(self) -> None:
+        coordinator = InstancedSceneCoordinator(self.status)
+        request = self.canonical(self.request)
+        job_id = request["request_id"]
+        path = coordinator._job_path(job_id)
+        owner_lock = _NativeFileLock(coordinator._owner_lock_path(path), 0.0)
+        self.assertTrue(owner_lock.acquire())
+        coordinator._ownership_locks[job_id] = owner_lock
+        self.addCleanup(coordinator._release_owner_lock, job_id)
+        coordinator._save(path, {
+            "format": "InstancedSceneJob/1", "job_id": job_id, "state": "auditing", "phase": "auditing",
+            "progress": 0.94, "message": "auditing", "cancel_requested": False,
+            "request": request, "result": None, "error": None,
+        }, [])
+        output = self.root / "exports" / "partial"
+        output.mkdir(parents=True)
+        (output / "INCOMPLETE").write_text(job_id, encoding="ascii")
+
+        self.assertEqual(coordinator.cancel(job_id)["state"], "accepted")
+        coordinator._finish_success(job_id, output, {"status": "completed", "files": []})
+
+        job = coordinator.get(job_id)
+        self.assertEqual(job["state"], "cancelled")
+        self.assertIsNone(job["result"])
+        self.assertTrue((output / "INCOMPLETE").is_file())
+        self.assertFalse((output / "instanced_result.json").exists())
+        coordinator._release_owner_lock(job_id)
+
+    def test_cancel_after_result_commit_reports_terminal_completed_state(self) -> None:
+        coordinator = InstancedSceneCoordinator(self.status)
+        request = self.canonical(self.request)
+        job_id = request["request_id"]
+        path = coordinator._job_path(job_id)
+        owner_lock = _NativeFileLock(coordinator._owner_lock_path(path), 0.0)
+        self.assertTrue(owner_lock.acquire())
+        coordinator._ownership_locks[job_id] = owner_lock
+        self.addCleanup(coordinator._release_owner_lock, job_id)
+        coordinator._save(path, {
+            "format": "InstancedSceneJob/1", "job_id": job_id, "state": "auditing", "phase": "auditing",
+            "progress": 0.94, "message": "auditing", "cancel_requested": False,
+            "request": request, "result": None, "error": None,
+        }, [])
+        output = self.root / "exports" / "complete"
+        output.mkdir(parents=True)
+        (output / "INCOMPLETE").write_text(job_id, encoding="ascii")
+        result = {"status": "partial", "files": []}
+
+        coordinator._finish_success(job_id, output, result)
+
         self.assertEqual(coordinator.cancel(job_id)["state"], "already_terminal")
-        self.assertEqual(coordinator.events(job_id, 1)["events"], [])
+        job = coordinator.get(job_id)
+        self.assertEqual(job["state"], "partial")
+        self.assertEqual(job["result"], result)
+        self.assertFalse((output / "INCOMPLETE").exists())
+        self.assertEqual(json.loads((output / "instanced_result.json").read_text(encoding="utf-8")), result)
+        coordinator._release_owner_lock(job_id)
 
     def test_shutdown_cancels_real_helper_and_queued_job_and_rejects_submissions(self) -> None:
         from endfield_scene_export import _run_observed_scene_process

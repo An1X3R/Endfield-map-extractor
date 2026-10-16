@@ -7,7 +7,7 @@ import json
 import math
 from pathlib import Path
 import struct
-from typing import TypedDict
+from typing import NotRequired, TypedDict
 
 import bmesh
 import bpy
@@ -27,6 +27,12 @@ class WaterBuildRecord(TypedDict):
     detail: str
     vertices: int
     missing_bottom_vertices: int
+    source_polygons: NotRequired[int]
+    exported_polygons: NotRequired[int]
+    pending_polygons: NotRequired[int]
+    source_area: NotRequired[float]
+    exported_area: NotRequired[float]
+    unverified_depth_polygons: NotRequired[int]
 
 
 def normalize_water_surface(obj: bpy.types.Object) -> None:
@@ -146,13 +152,45 @@ def _measure_bottoms(
         return WaterDepthAudit(rows, 0, 0, ()), str(error)
 
 
+def retain_measured_water_faces(obj: bpy.types.Object, depth: WaterDepthResult) -> WaterDepthResult:
+    """Keep native faces whose vertices all have measured bottoms, preserving UVs."""
+    if obj.name != depth.object_name or len(obj.data.vertices) != len(depth.hits):
+        raise ValueError(f"WATER_DEPTH_VERTEX_MAPPING_MISMATCH object={obj.name}")
+    mesh = bmesh.new()
+    try:
+        mesh.from_mesh(obj.data)
+        mesh.verts.index_update()
+        source_index = mesh.verts.layers.int.new("endfield_measured_source_index")
+        for vertex in mesh.verts:
+            vertex[source_index] = vertex.index
+        unsupported = [face for face in mesh.faces
+                       if any(depth.hits[vertex[source_index]] is None for vertex in face.verts)]
+        if unsupported:
+            bmesh.ops.delete(mesh, geom=unsupported, context="FACES_ONLY")
+        loose = [vertex for vertex in mesh.verts if not vertex.link_faces]
+        if loose:
+            bmesh.ops.delete(mesh, geom=loose, context="VERTS")
+        mesh.verts.index_update()
+        retained = tuple(depth.hits[vertex[source_index]] for vertex in mesh.verts)
+        if any(hit is None for hit in retained):
+            raise ValueError(f"WATER_MEASURED_SURFACE_RETAINS_UNRESOLVED_VERTEX object={obj.name}")
+        mesh.verts.layers.int.remove(source_index)
+        mesh.to_mesh(obj.data)
+    finally:
+        mesh.free()
+    obj.data.update()
+    return WaterDepthResult(obj.name, retained)
+
+
 def build_scene_water(
     geometry_rows: Sequence[Mapping[str, object]],
     material_rows: Sequence[object],
     bounds: Mapping[str, float],
 ) -> list[WaterBuildRecord]:
-    """Report unresolved bottoms instead of inventing bathymetry or opaque water."""
+    """Retain source water and distinguish measured media from open optical surfaces."""
     from blender_scene_water_waves import build_water_normal
+    from blender_water_open_surface import (UNMEASURED_OPTICAL_DEPTH, bind_open_water_surface,
+                                            measured_water_volume, unmeasured_water_faces)
 
     if not geometry_rows:
         return []
@@ -243,13 +281,9 @@ def build_scene_water(
             bpy.context.evaluated_depsgraph_get(), tuple(obj for _, obj in objects))
     for (entity, obj), depth in zip(objects, depth_audit.waters, strict=True):
         missing = sum(hit is None for hit in depth.hits)
-        if missing:
-            results.append({"entity_id": entity, "status": "bottom_geometry_missing" if bottom_error else "bottom_geometry_incomplete",
-                            "detail": bottom_error or "No opaque bottom hit within 150 m at every clipped surface vertex; include terrain and bottom assets",
-                            "vertices": len(obj.data.vertices), "missing_bottom_vertices": missing,
-                            "removed_degenerate_triangles": obj.get("endfield_water_shore_removed_degenerate_triangles", 0)})
-            _drop_surface(obj)
-            continue
+        source_polygons = len(obj.data.polygons)
+        source_area = sum(face.area for face in obj.data.polygons)
+        open_faces = unmeasured_water_faces(obj, depth)
         spec = materials[entity]
         global_config = json.loads(spec.global_source_json)
         size = global_config["SectorSize"]
@@ -283,17 +317,28 @@ def build_scene_water(
         material["endfield_optics_parameters"] = (
             "Source roughness; retained validated Blender IOR and medium calibration. "
             "Source WaterIor scales screen distortion and is not physical IOR.")
-        values = tuple(hit.depth for hit in depth.hits if hit is not None)
+        values = tuple(hit.depth if hit is not None else UNMEASURED_OPTICAL_DEPTH for hit in depth.hits)
         attribute = obj.data.attributes.new(optics.depth_attribute, "FLOAT", "POINT")
         attribute.data.foreach_set("value", values)
         obj.data.materials.append(material)
         for face in obj.data.polygons:
             face.material_index = 0
-        volume = create_water_volume(obj, values, material)
-        collection.objects.link(volume)
-        results.append({"entity_id": entity, "status": "restored", "detail": "Source waves and measured bottom; calibrated dual-engine optics; foam=" + foam_status,
-                        "vertices": len(obj.data.vertices), "missing_bottom_vertices": 0,
+        if open_faces:
+            volume = measured_water_volume(obj, depth, material)
+            bind_open_water_surface(obj, depth, material, open_faces)
+        else:
+            volume = create_water_volume(obj, values, material)
+        if volume is not None:
+            collection.objects.link(volume)
+        results.append({"entity_id": entity, "status": "surface_restored_depth_unverified" if missing else "restored",
+                        "detail": ("Source faces retained; unmeasured depth uses explicit host optical saturation without invented bottom; " if missing else "")
+                                  + "Source waves; calibrated dual-engine optics; foam=" + foam_status,
+                        "vertices": len(obj.data.vertices), "missing_bottom_vertices": missing,
+                        "source_polygons": source_polygons, "exported_polygons": len(obj.data.polygons),
+                        "pending_polygons": source_polygons - len(obj.data.polygons),
+                        "unverified_depth_polygons": len(open_faces),
+                        "source_area": source_area, "exported_area": sum(face.area for face in obj.data.polygons),
                         "removed_degenerate_triangles": obj.get("endfield_water_shore_removed_degenerate_triangles", 0)})
-    if any(row["status"] == "restored" for row in results):
+    if any(row["status"] in ("restored", "surface_restored_depth_unverified") for row in results):
         configure_water_scene(bpy.context.scene)
     return results

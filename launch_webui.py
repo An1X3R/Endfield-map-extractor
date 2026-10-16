@@ -50,6 +50,9 @@ from webui_first_run_coordinator import FirstRunCoordinator, FirstRunCoordinator
 from webui_instanced_worker import InstancedSceneCoordinator, SceneJobNotFound
 from webui_character_contract import CharacterJobNotFound, CharacterRequestConflict, CharacterRequestError
 from webui_character_worker import CharacterCoordinator
+from webui_level_map_preparation import (
+    LevelMapPreparationCoordinator, LevelMapPreparationUnavailable, LevelMapPreparationConflict,
+)
 
 
 WEBUI_ROOT = ROOT / "webui"
@@ -179,16 +182,18 @@ def collect_first_run_paths(args: argparse.Namespace) -> None:
 
 class PathPickerServer(ThreadingHTTPServer):
     token: str
+    level_map_runtime: Path | None
     coordinator: ExportCoordinator
     first_run: FirstRunCoordinator
     instanced: InstancedSceneCoordinator
     character: CharacterCoordinator
+    level_map_preparation: LevelMapPreparationCoordinator
     require_first_run_ready: bool
 
     def server_close(self) -> None:
         errors: list[Exception] = []
         try:
-            for name in ("first_run", "character", "instanced", "coordinator"):
+            for name in ("level_map_preparation", "first_run", "character", "instanced", "coordinator"):
                 if hasattr(self, name):
                     try:
                         getattr(self, name).shutdown()
@@ -266,7 +271,9 @@ class PathPickerHandler(BaseHTTPRequestHandler):
         return value
 
     def handle_error(self, error: Exception) -> None:
-        if isinstance(error, FileNotFoundError):
+        if isinstance(error, (LevelMapPreparationUnavailable, LevelMapPreparationConflict)):
+            self.send_json(409, error_response("level_map_preparation_unavailable", str(error), retryable=True))
+        elif isinstance(error, FileNotFoundError):
             self.send_json(404, {"error": "job_not_found", "message": str(error)})
         elif isinstance(error, FirstRunRequestError):
             self.send_json(
@@ -319,6 +326,9 @@ class PathPickerHandler(BaseHTTPRequestHandler):
 
     def character_get(self, path: str, query: str) -> None:
         try:
+            if path == "/creatures":
+                self.send_json(200, self.server.character.creature_catalog())
+                return
             actions = re.fullmatch(r"/characters/([^/]+)/animations", path)
             if actions:
                 params = parse_qs(query)
@@ -375,7 +385,48 @@ class PathPickerHandler(BaseHTTPRequestHandler):
             self.send_json(404, {"error": "not_found"})
             return
         parsed = urlparse(self.path)
-        if parsed.path == "/characters" or parsed.path.startswith(("/characters/", "/character-jobs/", "/character-preparation/")):
+        if parsed.path == "/level-map-preparation" or parsed.path.startswith("/level-map-preparation/"):
+            match = re.fullmatch(r"/level-map-preparation/([A-Za-z0-9-]+)", parsed.path)
+            try:
+                if parsed.path == "/level-map-preparation":
+                    self.send_json(200, self.server.level_map_preparation.catalog())
+                elif match is not None:
+                    self.send_json(200, self.server.level_map_preparation.status(match.group(1)))
+                else:
+                    self.send_json(404, {"error": "level_map_preparation_route_not_found"})
+            except Exception as error:
+                self.handle_error(error)
+            return
+        if parsed.path == "/level-maps" or parsed.path.startswith("/level-maps/"):
+            from endfield_level_maps import LevelMapError, resolve_level_map_image
+            from webui_level_maps import LevelMapsNotPrepared, prepared_level_map_manifest, public_prepared_level_maps
+
+            match = re.fullmatch(r"/level-maps/(map\d{2}_lv\d{3})/image", parsed.path)
+            if parsed.path != "/level-maps" and match is None:
+                self.send_json(404, {"error": "level_map_route_not_found"})
+                return
+            try:
+                manifest = prepared_level_map_manifest(self.server.level_map_runtime)
+                if match is None:
+                    self.send_json(200, public_prepared_level_maps(manifest))
+                else:
+                    image = resolve_level_map_image(manifest, manifest.parent, match.group(1))
+                    with image.open("rb") as stream:
+                        self.send_response(200)
+                        self.send_header("Content-Type", "image/png")
+                        self.send_header("Content-Length", str(os.fstat(stream.fileno()).st_size))
+                        self.send_header("Cache-Control", "no-store")
+                        self.send_header("X-Content-Type-Options", "nosniff")
+                        self.end_headers()
+                        shutil.copyfileobj(stream, self.wfile)
+            except LevelMapsNotPrepared as error:
+                self.send_json(409, {"error": "level_maps_not_prepared", "message": str(error)})
+            except KeyError as error:
+                self.send_json(404, {"error": "level_map_not_found", "message": str(error)})
+            except (LevelMapError, ValueError, FileNotFoundError, ConfigurationError) as error:
+                self.send_json(409, {"error": "level_map_source_invalid", "message": str(error)})
+            return
+        if parsed.path in ("/characters", "/creatures") or parsed.path.startswith(("/characters/", "/character-jobs/", "/character-preparation/")):
             self.character_get(parsed.path, parsed.query)
             return
         if parsed.path == "/instanced-scenes" or parsed.path.startswith(("/instanced-scenes/", "/instanced-scene-jobs/")):
@@ -439,6 +490,18 @@ class PathPickerHandler(BaseHTTPRequestHandler):
             self.send_json(404, {"error": "not_found"})
             return
         parsed = urlparse(self.path)
+        if parsed.path == "/level-map-preparation" or parsed.path.startswith("/level-map-preparation/"):
+            cancel = re.fullmatch(r"/level-map-preparation/([A-Za-z0-9-]+)/cancel", parsed.path)
+            try:
+                if parsed.path == "/level-map-preparation":
+                    self.send_json(202, self.server.level_map_preparation.start(self.read_json_body()))
+                elif cancel is not None:
+                    self.send_json(202, self.server.level_map_preparation.cancel(cancel.group(1)))
+                else:
+                    self.send_json(404, {"error": "level_map_preparation_route_not_found"})
+            except Exception as error:
+                self.handle_error(error)
+            return
         if parsed.path in {"/character-jobs", "/character-preparation"} or parsed.path.startswith(("/character-jobs/", "/character-preparation/")):
             self.character_post(parsed.path)
             return
@@ -536,6 +599,7 @@ def start_path_picker(
 ) -> tuple[PathPickerServer, threading.Thread]:
     server = PathPickerServer(("127.0.0.1", 0), PathPickerHandler)
     server.token = secrets.token_urlsafe(32)
+    server.level_map_runtime = runtime_config
     server.require_first_run_ready = require_first_run_ready
     server.coordinator = (
         ExportCoordinator(stage119_root=stage119_root, runtime_config=runtime_config)
@@ -550,6 +614,7 @@ def start_path_picker(
         )
         server.coordinator.shutdown()
         server.coordinator = replacement
+        server.level_map_runtime = generated_config
         if on_stage_ready is not None:
             on_stage_ready(generated_config, generated_stage)
 
@@ -579,8 +644,15 @@ def start_path_picker(
         requirements_path=PYTHON_REQUIREMENTS,
         default_run_name=first_run_name,
         on_ready=activate_generated_runtime,
-        initial_request=complete_initial_request,
+        initial_request=None if runtime_config is not None and runtime_config.is_file() else complete_initial_request,
         initial_defaults=public_first_run_defaults,
+    )
+    if runtime_config is not None and runtime_config.is_file() and complete_initial_request is not None:
+        server.first_run.restore_runtime(runtime_config, complete_initial_request)
+    preparation_root = Path(str(character_defaults["export_root"])) if character_defaults.get("export_root") else ROOT / "exports"
+    server.level_map_preparation = LevelMapPreparationCoordinator(
+        runtime_provider=lambda: server.level_map_runtime,
+        state_root=preparation_root / "log" / "level_map_jobs",
     )
     server.instanced = InstancedSceneCoordinator(server.first_run.status)
     from endfield_character_service import CharacterService

@@ -19,6 +19,10 @@ class CorrespondingSourcePathTests(unittest.TestCase):
             "webui/LICENSE",
             "CHANGELOG.md",
             "docs/INSTALL.md",
+            "NuGet.config",
+            "endfield.config.example.json",
+            "endfield.runtime.example.json",
+            "launch_first_run.ps1",
             "dotnet/CharacterTools/ThirdParty/Ruri/LICENSE",
         ):
             with self.subTest(path=value):
@@ -32,6 +36,9 @@ class CorrespondingSourcePathTests(unittest.TestCase):
             "third_party/sources/scene/AnimeStudio/CNKeys.json",
             "third_party/character-nuget/AnimeStudio.FBXWrapper/packages.lock.json",
             ".tools/character/runtime.json",
+            "endfield.runtime.local.json",
+            "endfield.character.local.json",
+            "reconstruction.local.json",
             "third_party/source-overrides/animestudio/default.shader",
         ):
             with self.subTest(path=value):
