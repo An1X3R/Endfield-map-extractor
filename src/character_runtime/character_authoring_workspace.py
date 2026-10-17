@@ -10,6 +10,8 @@ from character_authoring import AnimationRequest
 from character_material_authoring import package_material_authoring, verify_material_authoring
 from character_viewport_preview import attach_viewport_preview, verify_viewport_preview
 from character_weather_panel import attach_weather_panel, verify_weather_panel
+from character_rig_panel import attach_rig_panel, verify_rig_panel
+from character_rig_ik import attach_ik_tools, verify_ik_tools
 from character_rig_authoring import (
     apply_rig_authoring, read_animation_human_slot_paths,
     read_humanoid_bone_map, verify_rig_authoring,
@@ -52,9 +54,13 @@ def prepare_authoring_workspace(source_directory: Path,
         rig_reports.append(report)
     preview = attach_viewport_preview(rigs[0])
     verify_viewport_preview(preview)
+    ik_tools = attach_ik_tools()
+    verify_ik_tools(ik_tools)
+    rig_panel = attach_rig_panel(rigs[0])
+    verify_rig_panel(rig_panel)
     return {'format': 'EndfieldAuthoringWorkspace/1', 'materials': material_report,
             'material_check': material_check, 'rigs': rig_reports, 'viewport_preview': preview,
-            'weather_panel': weather_panel}
+            'weather_panel': weather_panel, 'rig_panel': rig_panel, 'ik_tools': ik_tools}
 
 
 def verify_authoring_workspace(report: dict[str, object]) -> dict[str, object]:
@@ -67,4 +73,8 @@ def verify_authoring_workspace(report: dict[str, object]) -> dict[str, object]:
         checks['viewport_preview'] = verify_viewport_preview(report['viewport_preview'])
     if 'weather_panel' in report:
         checks['weather_panel'] = verify_weather_panel(report['weather_panel'])
+    if 'rig_panel' in report:
+        checks['rig_panel'] = verify_rig_panel(report['rig_panel'])
+    if 'ik_tools' in report:
+        checks['ik_tools'] = verify_ik_tools(report['ik_tools'])
     return checks

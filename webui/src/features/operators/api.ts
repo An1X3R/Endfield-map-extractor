@@ -1,4 +1,5 @@
 import { isJsonObject, requestJson } from '../../lib/backendClient'
+import { assertMaterialAcknowledgement, WEATHER_EFFECTS } from './materials'
 import type {
   CharacterAnimation,
   CharacterAnimationCatalog,
@@ -14,6 +15,8 @@ import type {
   CharacterDetail,
   CharacterExportOptions,
   CharacterExportRequest,
+  CharacterMaterialOptions,
+  CharacterWeatherEffect,
   CharacterJob,
   CharacterJobError,
   CharacterJobEvent,
@@ -392,9 +395,27 @@ const parsePreparationRequest = (value: unknown): CharacterPreparationRequest =>
   }
 }
 
+const parseMaterials = (value: unknown, field: string): CharacterMaterialOptions => {
+  const row = object(value, field)
+  if (row.mode !== 'original' && row.mode !== 'simplified') return invalid(`${field}.mode`, 'original or simplified')
+  if (row.lighting !== 'full' && row.lighting !== 'simple') return invalid(`${field}.lighting`, 'full or simple')
+  const weather = object(row.weather, `${field}.weather`)
+  if (weather.quality !== 'full' && weather.quality !== 'simple') return invalid(`${field}.weather.quality`, 'full or simple')
+  const effects = array<CharacterWeatherEffect>(weather.effects, `${field}.weather.effects`, (effect, effectField) => {
+    if (effect !== 'wet' && effect !== 'snow' && effect !== 'rain') return invalid(effectField, 'wet, snow or rain')
+    return effect
+  })
+  if (new Set(effects).size !== effects.length) return invalid(`${field}.weather.effects`, 'unique effects')
+  if (row.mode === 'original' && (row.lighting !== 'full' || weather.quality !== 'full' || effects.length !== 3)) {
+    return invalid(field, 'original mode with full lighting, full weather and wet, snow, rain')
+  }
+  return { mode: row.mode, lighting: row.lighting, weather: { quality: weather.quality, effects: WEATHER_EFFECTS.filter(effect => effects.includes(effect)) } }
+}
+
 const parseExportOptions = (value: unknown): CharacterExportOptions => {
   const row = object(value, 'CharacterExportRequest.options')
   const result: CharacterExportOptions = {}
+  if ('materials' in row) result.materials = parseMaterials(row.materials, 'CharacterExportRequest.options.materials')
   if ('raw_expressions' in row) result.raw_expressions = bool(row.raw_expressions, 'CharacterExportRequest.options.raw_expressions')
   if ('basic_mmd' in row) result.basic_mmd = bool(row.basic_mmd, 'CharacterExportRequest.options.basic_mmd')
   if ('native_expression_replay_id' in row) {
@@ -523,6 +544,7 @@ const parseJobResult = (value: unknown, kind: CharacterJobKind): CharacterJobRes
   if (row.format !== expectedFormat) return invalid('CharacterJob.result.format', expectedFormat)
   if (row.status !== 'completed' && row.status !== 'partial') return invalid('CharacterJob.result.status', 'completed or partial')
   return {
+    ...(kind === 'export' && 'material_options' in row ? { material_options: parseMaterials(row.material_options, 'CharacterJob.result.material_options') } : {}),
     format: expectedFormat,
     status: row.status,
     output_directory: text(row.output_directory, 'CharacterJob.result.output_directory'),
@@ -735,15 +757,21 @@ const verifyValidation = (
   }
 }
 
-export const validateCharacterExport = (
+export const validateCharacterExport = async (
   request: CharacterExportRequest,
   signal: AbortSignal,
-): Promise<CharacterRequestValidation> => requestParsed(
-  `${JOBS_PATH}/validate`,
-  { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(request), signal },
-  parseValidation,
-  (validation) => verifyValidation(validation, 'export', request.request_id),
-)
+): Promise<CharacterRequestValidation> => {
+  const validation = await requestParsed(
+    `${JOBS_PATH}/validate`,
+    { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(request), signal },
+    parseValidation,
+    (value) => verifyValidation(value, 'export', request.request_id),
+  )
+  if (validation.canonical_request.format === 'CharacterExportRequest/1') {
+    assertMaterialAcknowledgement(request.options?.materials, validation.canonical_request.options?.materials)
+  }
+  return validation
+}
 
 export const submitCharacterExport = (
   request: CharacterExportRequest,

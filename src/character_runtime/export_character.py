@@ -1,6 +1,5 @@
 """Export one explicitly selected character through source readers and one Blender build."""
 from __future__ import annotations
-from character_geometry_source import geometry_source
 
 import argparse
 from dataclasses import asdict, dataclass
@@ -14,6 +13,11 @@ import subprocess
 import sys
 import time
 from typing import Literal
+
+from character_geometry_source import geometry_source
+from character_material_options import (
+    CharacterMaterialOptions, parse_character_material_options,
+)
 
 
 @dataclass(frozen=True)
@@ -48,6 +52,7 @@ class ExportRequest:
     hair_z: tuple[float, ...]
     authoring: Path | None
     fur_curves_settings: Path | None
+    material_options: CharacterMaterialOptions | None
 
 
 @dataclass(frozen=True)
@@ -112,6 +117,7 @@ def read_request(path: Path) -> ExportRequest:
         *(require_vector(raw, key) for key in ('face_right', 'face_up', 'face_forward', 'hair_x', 'hair_y', 'hair_z')),
         source('authoring') if raw.get('authoring') is not None else None,
         source('fur_curves_settings') if raw.get('fur_curves_settings') is not None else None,
+        parse_character_material_options(raw['material_options']) if 'material_options' in raw else None,
     )
     if request.output.exists():
         raise FileExistsError(request.output)
@@ -153,6 +159,37 @@ def run_stage(name: str, command: tuple[str, ...], logs: Path, environment: dict
         result = subprocess.run(command, env=environment, stdout=stream, stderr=subprocess.STDOUT, check=False)
     return StageTiming(name, time.perf_counter() - tick, time.perf_counter() - started,
                        result.returncode, 'passed' if result.returncode == 0 else 'failed', str(log), command)
+
+
+def write_material_options(request: ExportRequest) -> Path | None:
+    """Write canonical settings for Blender only when the caller supplied them."""
+    if request.material_options is None:
+        return None
+    path = request.output / 'material_options.json'
+    path.write_text(request.material_options.canonical_json() + '\n', encoding='utf-8')
+    return path
+
+
+def build_arguments(request: ExportRequest, sample: Path, target: Path,
+                    material_options_path: Path | None) -> tuple[str, ...]:
+    """Build the legacy Blender arguments plus an explicit optional settings file."""
+    if (request.material_options is None) != (material_options_path is None):
+        raise ValueError('Material settings and Blender settings path must be provided together')
+    material_profile_root = sample / 'material_profile'
+    arguments = ['--fbx', str(geometry_source(sample / 'static_probe')), '--source-dir', str(sample / 'static_probe'),
+        '--shader-identities', str(sample / 'shader_identity/shader_identity.json'), '--renderer-visibility', str(sample / 'renderer_visibility.json'),
+        '--profile', str(material_profile_root / 'material_profile.json'), '--repository-src', str(request.repository_src),
+        '--alpha-audit', str(material_profile_root / 'shadow_alpha_audit.json'),
+        '--output-dir', str(target), '--head-bone', request.head_bone]
+    for key in ('face_right', 'face_up', 'face_forward', 'hair_x', 'hair_y', 'hair_z'):
+        arguments.extend(('--' + key.replace('_', '-'), *(str(value) for value in getattr(request, key))))
+    if request.authoring is not None:
+        arguments.extend(('--authoring-request', str(request.authoring)))
+    if request.fur_curves_settings is not None:
+        arguments.extend(('--fur-curves-preparation', str(sample / 'fur_curves/preparation.json')))
+    if material_options_path is not None:
+        arguments.extend(('--material-options', str(material_options_path)))
+    return tuple(arguments)
 
 
 def main(request_path: Path) -> None:
@@ -226,9 +263,10 @@ def main(request_path: Path) -> None:
         def cache_cancel() -> None:
             return None
         cache_tick = time.perf_counter()
+        cache_options = (request.character_id, request.template_id, request.part_name, request.resource_path,
+                         request.variant, request.unity_version)
         cache_identity = prepared_identity(cache, request.game_root, request.database, request.cab_inventory,
-            request.provider, tuple(sorted(dependencies)),
-            (request.character_id, request.template_id, request.part_name, request.resource_path, request.variant, request.unity_version), cache_cancel)
+            request.provider, tuple(sorted(dependencies)), cache_options, cache_cancel)
         restored = restore_prepared(cache, cache_identity, job_sample, cache_cancel)
         cache_log = logs / 'prepared_cache.log'
         cache_log.write_text(json.dumps({'key': cache_identity.key, 'hit': restored is not None,
@@ -272,18 +310,8 @@ def main(request_path: Path) -> None:
                 0, 'published_and_copied', str(publish_log), ()))
         sample = job_sample
     print(json.dumps({'stage': 'prepared_ready', 'seconds': time.perf_counter() - started, 'disposition': 'private_prepared_copy_complete'}), flush=True)
-    material_profile_root = sample / 'material_profile'
-    build_args = ['--fbx', str(geometry_source(sample / 'static_probe')), '--source-dir', str(sample / 'static_probe'),
-        '--shader-identities', str(sample / 'shader_identity/shader_identity.json'), '--renderer-visibility', str(sample / 'renderer_visibility.json'),
-        '--profile', str(material_profile_root / 'material_profile.json'), '--repository-src', str(request.repository_src),
-        '--alpha-audit', str(material_profile_root / 'shadow_alpha_audit.json'),
-        '--output-dir', str(target), '--head-bone', request.head_bone]
-    for key in ('face_right', 'face_up', 'face_forward', 'hair_x', 'hair_y', 'hair_z'):
-        build_args.extend(('--' + key.replace('_', '-'), *(str(value) for value in getattr(request, key))))
-    if request.authoring is not None:
-        build_args.extend(('--authoring-request', str(request.authoring)))
-    if request.fur_curves_settings is not None:
-        build_args.extend(('--fur-curves-preparation', str(sample / 'fur_curves/preparation.json')))
+    material_options_path = write_material_options(request)
+    build_args = build_arguments(request, sample, target, material_options_path)
     common = (str(request.blender), '--background', '--factory-startup', '--disable-autoexec', '--python-exit-code', '1', '--python')
     execute('blender_build', common + (str(module / 'build_character_blend.py'), '--', *build_args))
     built_seconds = time.perf_counter() - started
@@ -302,6 +330,11 @@ def main(request_path: Path) -> None:
         'cache_scope': 'Verified immutable prepared character dependencies; private job copies; fresh Blender build and saved-file reopen; OS file cache not flushed.',
         'prepared_cache_hit': restored is not None,
         'validation_scope': 'One final scripts-disabled reopen; regression renders are separate from normal export.'}
+    if request.material_options is not None:
+        report['material_options'] = request.material_options.as_json()
+        report['material_options_sha256'] = hashlib.sha256(request.material_options.canonical_json().encode('utf-8')).hexdigest()
+        if cache_identity is not None:
+            report['prepared_cache_key'] = cache_identity.key
     (request.output / 'export_receipt.json').write_text(json.dumps(report, indent=2), encoding='utf-8')
     print(json.dumps({'status': report['status'], 'blend': str(blend), 'completed_seconds': completed_seconds}), flush=True)
 

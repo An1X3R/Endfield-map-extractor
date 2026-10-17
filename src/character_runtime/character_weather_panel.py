@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from collections.abc import Sequence
+import json
 from typing import TypedDict
 
 import bpy
@@ -27,6 +28,9 @@ class WeatherPanelReport(TypedDict):
 
 def weather_groups(material: bpy.types.Material) -> tuple[bpy.types.NodeTree, ...]:
     """Resolve controls through this material, including appended/renamed groups."""
+    options = material.get('endfield_material_options')
+    if options is not None and not json.loads(options)['weather']['effects']:
+        return ()
     pending = [material.node_tree] if material.use_nodes else []
     visited: set[int] = set()
     matches: list[bpy.types.NodeTree] = []
@@ -36,10 +40,10 @@ def weather_groups(material: bpy.types.Material) -> tuple[bpy.types.NodeTree, ..
             continue
         visited.add(tree.as_pointer())
         labels = {node.label for node in tree.nodes if node.type == 'VALUE'}
-        if all(label in labels for label, _ in CONTROL_ROWS) and any(
+        if tree.get('endfield_simple_weather') or tree.get('endfield_weather_selected_effects') or (all(label in labels for label, _ in CONTROL_ROWS) and any(
             item.item_type == 'SOCKET' and item.in_out == 'OUTPUT'
             and item.name == 'Native Global Wetness' for item in tree.interface.items_tree
-        ):
+        )):
             matches.append(tree)
         pending.extend(node.node_tree for node in tree.nodes
                        if node.type == 'GROUP' and node.node_tree is not None)
@@ -75,6 +79,13 @@ class ENDFIELD_PT_material_weather(bpy.types.Panel):
         layout.label(text='强度 0–1；水面高度为世界坐标')
         for tree in weather_groups(context.material):
             box = layout.box()
+            if tree.get('endfield_simple_weather') or tree.get('endfield_weather_selected_effects'):
+                box.label(text='简化天气 · 独立材质控制' if tree.get('endfield_simple_weather') else '精细天气 · 已选效果')
+                labels = {node.label for node in tree.nodes if node.type == 'VALUE'}
+                for label, title in CONTROL_ROWS[1:4]:
+                    if label in labels:
+                        box.prop(weather_socket(tree, label), 'default_value', text=title)
+                continue
             for label, title in CONTROL_ROWS[:4]:
                 box.prop(weather_socket(tree, label), 'default_value', text=title)
             header, body = layout.panel('endfield_weather_water_' + tree.name, default_closed=True)
@@ -86,6 +97,9 @@ class ENDFIELD_PT_material_weather(bpy.types.Panel):
 
 def register() -> None:
     """Replace only this panel when another exported character is opened."""
+    owner = getattr(bpy.types, 'ENDFIELD_PT_character_tools_addon', None)
+    if owner is not None and owner.__module__ != globals().get('__package__'):
+        return
     previous = getattr(bpy.types, ENDFIELD_PT_material_weather.bl_idname, None)
     if previous is not None:
         bpy.utils.unregister_class(previous)

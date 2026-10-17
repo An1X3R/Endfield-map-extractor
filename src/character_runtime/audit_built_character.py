@@ -39,6 +39,7 @@ def main(args: argparse.Namespace) -> None:
     receipt = object_value(json.loads(io_path(args.build_receipt).read_text(encoding='utf-8')), 'build receipt')
     if receipt['format'] != 'EndfieldCharacterBuild/1' or receipt['status'] != 'built_not_reopened':
         raise ValueError('Expected a completed build-only character receipt')
+    material_variant_declared = 'material_variant' in receipt
     if receipt['source_geometry_digest_basis'] != 'source_local_parent_chain/1':
         raise ValueError('Expected stable local/parent-chain source geometry fingerprints')
     blend = Path(string_value(receipt['output'], 'output')).resolve(strict=True)
@@ -50,24 +51,60 @@ def main(args: argparse.Namespace) -> None:
     refresh()
     workspace_audit = None
     if 'authoring_workspace' in receipt:
-        from character_authoring_workspace import verify_authoring_workspace
-        workspace_audit = verify_authoring_workspace(object_value(receipt['authoring_workspace'], 'authoring workspace'))
+        workspace = object_value(receipt['authoring_workspace'], 'authoring workspace')
+        if material_variant_declared:
+            from character_rig_authoring import verify_rig_authoring
+            rigs = workspace['rigs']
+            if not isinstance(rigs, list):
+                raise TypeError('Authoring workspace rigs must be an array')
+            workspace_audit = {
+                'status': 'passed',
+                'materials': {'status': 'replaced_by_material_variant'},
+                'rigs': [verify_rig_authoring(object_value(row, 'authoring rig')) for row in rigs],
+            }
+            if 'viewport_preview' in workspace:
+                from character_viewport_preview import verify_viewport_preview
+                workspace_audit['viewport_preview'] = verify_viewport_preview(
+                    object_value(workspace['viewport_preview'], 'viewport preview'))
+            if 'weather_panel' in workspace:
+                from character_weather_panel import verify_weather_panel
+                workspace_audit['weather_panel'] = verify_weather_panel(
+                    object_value(workspace['weather_panel'], 'weather panel'))
+            if 'rig_panel' in workspace:
+                from character_rig_panel import verify_rig_panel
+                workspace_audit['rig_panel'] = verify_rig_panel(
+                    object_value(workspace['rig_panel'], 'rig panel'))
+            if 'ik_tools' in workspace:
+                from character_rig_ik import verify_ik_tools
+                workspace_audit['ik_tools'] = verify_ik_tools(
+                    object_value(workspace['ik_tools'], 'IK tools'))
+        else:
+            from character_authoring_workspace import verify_authoring_workspace
+            workspace_audit = verify_authoring_workspace(workspace)
     from character_emotion_atlas import verify_emotion_atlases
     emotion_atlas_audit = verify_emotion_atlases(receipt['emotion_atlas']) if 'emotion_atlas' in receipt else None
-    late_materials_audit = (verify_late_materials(receipt['late_materials'])
-                            if 'late_materials' in receipt else None)
-    from character_wetfilm_profile import verify_profile_wetfilm
-    wetfilm_audit = (verify_profile_wetfilm(receipt['standard_wetfilm'])
-                     if 'standard_wetfilm' in receipt else None)
-    from character_standard_snow_profile import verify_profile_standard_snow
-    standard_snow_audit = (verify_profile_standard_snow(object_value(receipt['standard_snow'], 'standard snow'))
-                           if 'standard_snow' in receipt else None)
-    from character_skin_weather_profile import verify_profile_skin_rain
-    skin_rain_audit = (verify_profile_skin_rain(receipt['skin_rain'])
-                       if 'skin_rain' in receipt else None)
-    from character_hair_fur_snow_profile import verify_profile_hair_fur_snow
-    hair_fur_snow_audit = (verify_profile_hair_fur_snow(object_value(receipt['hair_fur_snow'], 'Hair/Fur snow'))
-                           if 'hair_fur_snow' in receipt else None)
+    if material_variant_declared:
+        replaced_material_audit = {'status': 'replaced_by_material_variant'}
+        late_materials_audit = replaced_material_audit
+        wetfilm_audit = replaced_material_audit
+        standard_snow_audit = replaced_material_audit
+        skin_rain_audit = replaced_material_audit
+        hair_fur_snow_audit = replaced_material_audit
+    else:
+        late_materials_audit = (verify_late_materials(receipt['late_materials'])
+                                if 'late_materials' in receipt else None)
+        from character_wetfilm_profile import verify_profile_wetfilm
+        wetfilm_audit = (verify_profile_wetfilm(receipt['standard_wetfilm'])
+                         if 'standard_wetfilm' in receipt else None)
+        from character_standard_snow_profile import verify_profile_standard_snow
+        standard_snow_audit = (verify_profile_standard_snow(object_value(receipt['standard_snow'], 'standard snow'))
+                               if 'standard_snow' in receipt else None)
+        from character_skin_weather_profile import verify_profile_skin_rain
+        skin_rain_audit = (verify_profile_skin_rain(receipt['skin_rain'])
+                           if 'skin_rain' in receipt else None)
+        from character_hair_fur_snow_profile import verify_profile_hair_fur_snow
+        hair_fur_snow_audit = (verify_profile_hair_fur_snow(object_value(receipt['hair_fur_snow'], 'Hair/Fur snow'))
+                               if 'hair_fur_snow' in receipt else None)
     from character_fur_curves_profile import verify_profile_fur_curves
     fur_curves_snow_audit = verify_profile_fur_curves(
         object_value(receipt.get('fur_curves_snow', {'status': 'not_requested'}), 'Fur Curves snow'))
@@ -164,6 +201,11 @@ def main(args: argparse.Namespace) -> None:
     if after != original_geometry:
         changed = tuple(name for name in names if after[name] != original_geometry[name])
         raise AssertionError(f'Saved geometry, UVs, weights or shape keys differ: {changed}')
+    material_variant_audit = None
+    if material_variant_declared:
+        from character_material_variant import verify_material_variant
+        material_variant_audit = verify_material_variant(
+            object_value(receipt['material_variant'], 'material variant'))
     report = {'format': 'EndfieldCharacterBuildReopenAudit/1', 'status': 'passed', 'blend': str(blend),
               'blend_sha256': digest, 'source_renderers': len(names), 'packed_image_roles': len(images),
               'source_geometry_and_skin_preserved': True, 'source_visibility_preserved': True,
@@ -180,6 +222,8 @@ def main(args: argparse.Namespace) -> None:
               'authoring': authoring_audit,
               'authoring_workspace': workspace_audit,
               'build_receipt_sha256': hashlib.sha256(io_path(args.build_receipt).read_bytes()).hexdigest()}
+    if material_variant_declared:
+        report['material_variant'] = material_variant_audit
     io_path(args.output).write_text(json.dumps(report, indent=2), encoding='utf-8')
     print(json.dumps({'status': 'passed', 'source_renderers': len(names), 'packed_image_roles': len(images)}))
 

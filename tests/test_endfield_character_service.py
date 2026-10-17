@@ -3,13 +3,17 @@ from __future__ import annotations
 
 from dataclasses import asdict
 import json
+import os
 from pathlib import Path
+import sys
 import tempfile
 import unittest
 from uuid import uuid4
 
 from endfield_character_cache import CharacterSourceChangedError, source_stamp
-from endfield_character_service import CharacterService, CharacterServiceError, _PATH_DEFAULTS, _VALUE_DEFAULTS
+from endfield_character_service import (
+    CharacterService, CharacterServiceError, _PATH_DEFAULTS, _VALUE_DEFAULTS, require_character_export_blender,
+)
 from endfield_character_sources import CharacterSourceContext, game_source_stamps, prepare_character_sources
 from webui_character_worker import CharacterJobCancelled
 
@@ -102,15 +106,48 @@ class CharacterServiceTests(unittest.TestCase):
         self.assertNotIn("expression_exporter", tools)
 
     def test_cancellation_after_lock_acquisition_creates_no_output_and_releases_lock(self) -> None:
+        selected = os.environ.get("ENDFIELD_TEST_BLENDER")
+        if not selected:
+            self.skipTest("Set ENDFIELD_TEST_BLENDER to an actual Blender >=4.4 executable")
+        request = {**self.request, "source": {**self.request["source"], "blender_exe": str(Path(selected).resolve())}}
         def cancel_when_acquired() -> None:
             if self.service._prepare_lock.locked():
                 raise CharacterJobCancelled("cancel after admission")
         with self.assertRaises(CharacterJobCancelled):
-            self.service.prepare(self.request, self.context.output_root / "character_jobs/artifacts" / str(uuid4()),
+            self.service.prepare(request, self.context.output_root / "character_jobs/artifacts" / str(uuid4()),
                                  cancel_when_acquired, no_progress)
         self.assertFalse(self.service._prepare_lock.locked())
         self.assertFalse(self.context.cache_root.exists())
         self.assertFalse(self.context.output_root.exists())
+
+    def test_preparation_requires_an_actual_supported_blender_before_writing_outputs(self) -> None:
+        supported = os.environ.get("ENDFIELD_TEST_BLENDER")
+        unsupported = os.environ.get("ENDFIELD_TEST_UNSUPPORTED_BLENDER")
+        if not supported or not unsupported:
+            self.skipTest("Set actual supported and unsupported Blender executable paths for version integration checks")
+        for executable in (supported, unsupported):
+            request = {**self.request, "source": {
+                **self.request["source"], "blender_exe": str(Path(executable).resolve())}}
+            if executable == supported:
+                self.assertEqual(self.service.canonical_preparation(request)["source"], request["source"])
+            else:
+                with self.assertRaisesRegex(CharacterServiceError, "Blender 4.4") as captured:
+                    self.service.canonical_preparation(request)
+                self.assertIn(str(Path(executable).resolve()), str(captured.exception))
+                self.assertIn("returncode=0", str(captured.exception))
+                self.assertIn("stdout=", str(captured.exception))
+        self.assertFalse(self.context.cache_root.exists())
+        self.assertFalse(self.context.output_root.exists())
+        self.assertFalse((self.root / "state").exists())
+
+    def test_blender_probe_rejects_non_blender_output_and_unlaunchable_file(self) -> None:
+        with self.assertRaisesRegex(CharacterServiceError, "returncode=0") as captured:
+            require_character_export_blender(Path(sys.executable))
+        self.assertIn(str(Path(sys.executable)), str(captured.exception))
+        self.assertIn("Python ", str(captured.exception))
+        with self.assertRaisesRegex(CharacterServiceError, "returncode=not_started") as captured:
+            require_character_export_blender(self.context.blender)
+        self.assertIn(str(self.context.blender), str(captured.exception))
 
     def test_sources_cancel_before_snapshot_or_workspace_creation(self) -> None:
         workspace = self.context.cache_root / "sources" / str(uuid4())

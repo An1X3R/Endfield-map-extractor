@@ -1,7 +1,7 @@
 {
   "name": "endfield-atlas-composer-webui-2",
   "private": true,
-  "version": "3.1.0",
+  "version": "3.2.0",
   "license": "MIT",
   "type": "module",
   "scripts": {
@@ -19,6 +19,11 @@
     "pixi.js": "8.19.0",
     "react": "19.3.0-canary-0f42eac2-20260730",
     "react-dom": "19.3.0-canary-0f42eac2-20260730"
+  },
+  "overrides": {
+    "lucide-react@1.28.0": { "react": "$react" },
+    "motion@12.43.0": { "react": "$react", "react-dom": "$react-dom" },
+    "framer-motion@12.43.0": { "react": "$react", "react-dom": "$react-dom" }
   },
   "devDependencies": {
     "@types/react": "19.2.18",

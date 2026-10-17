@@ -2,6 +2,8 @@
 
 安装与升级见 [INSTALL.md](INSTALL.md)。以下记录源码入口与离线数据契约；公开 WebUI 按当前配置运行，不要求使用历史研究入口。
 
+WebUI 使用锁定的 React Canary 提供 `ViewTransition`。`package.json` 仅对已验证版本的 lucide-react、motion 与 framer-motion 指定 React peer 覆盖；保留普通 `npm ci` 的其余依赖校验，不使用 `--force` 或 `--legacy-peer-deps`。升级这些库时需同步复核覆盖范围、锁文件、干净安装和界面过渡效果。
+
 ## 主要入口
 
 - `launch_extractor.ps1`：Windows 日常启动入口，通过项目 `.venv` 调用 `launch_webui.py` 并透传参数；`-Check` 只检查现有 Python 环境，`-NoInstall` 为兼容参数且不会安装依赖。

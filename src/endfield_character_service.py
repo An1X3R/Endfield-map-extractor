@@ -9,6 +9,8 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
+import subprocess
 import threading
 import time
 import tempfile
@@ -40,6 +42,9 @@ from endfield_scene_capacity import system_memory_snapshot
 from endfield_scene_export import run_scene_process
 from endfield_scene_resources import write_index
 from webui_character_contract import CharacterRequestError, json_object, required_text, normalize_character_request
+from character_runtime.character_material_options import (
+    CharacterMaterialOptions, CharacterMaterialOptionsError, parse_character_material_options,
+)
 
 
 Progress = Callable[[str, float, str], None]
@@ -106,6 +111,92 @@ def _safe_storage(game: Path, target: Path) -> None:
         validate_character_storage(game, target)
     except ValueError as error:
         raise CharacterServiceError("角色缓存、输出及运行状态必须使用与游戏目录不重叠的独立文件夹。") from error
+
+
+def require_character_export_blender(blender: Path) -> None:
+    """Probe the selected executable only at preparation and export validation boundaries."""
+    if not blender.is_file():
+        raise CharacterServiceError(f"Blender 程序不存在：path={blender}")
+    try:
+        result = subprocess.run([str(blender), "--version"], stdin=subprocess.DEVNULL,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0, check=False)
+    except subprocess.TimeoutExpired as error:
+        raise CharacterServiceError(
+            f"Blender 版本读取超时：path={blender}; timeout=10s; returncode=timeout; "
+            f"stdout={error.stdout!r}; stderr={error.stderr!r}") from error
+    except OSError as error:
+        raise CharacterServiceError(
+            f"Blender 版本读取无法启动：path={blender}; returncode=not_started; error={error}") from error
+    evidence = f"path={blender}; returncode={result.returncode}; stdout={result.stdout!r}; stderr={result.stderr!r}"
+    match = re.search(r"^Blender (\d+)\.(\d+)(?:\.\d+)?(?:\s|$)", result.stdout, re.MULTILINE)
+    if result.returncode != 0 or match is None:
+        raise CharacterServiceError(f"无法读取有效 Blender 版本：{evidence}")
+    version = (int(match.group(1)), int(match.group(2)))
+    if version < (4, 4):
+        raise CharacterServiceError(
+            f"角色导出需要 Blender 4.4 或更新版本；4.3 可读取成品不代表支持导出。{evidence}")
+
+
+def _confirm_material_options(expected: CharacterMaterialOptions, value: object,
+                              evidence: str) -> CharacterMaterialOptions:
+    """Require canonical material settings from a named execution receipt."""
+    try:
+        actual = parse_character_material_options(value)
+    except CharacterMaterialOptionsError as error:
+        raise CharacterServiceError(f"Material confirmation is invalid: evidence={evidence}; {error}") from error
+    if actual != expected:
+        raise CharacterServiceError(
+            f"Material confirmation differs: evidence={evidence}; "
+            f"requested={expected.canonical_json()}; actual={actual.canonical_json()}")
+    return actual
+
+
+def _verified_character_material_options(options: dict[str, object], receipt: dict[str, object],
+                                         build: dict[str, object], audit: dict[str, object]) -> dict[str, object] | None:
+    """Confirm explicit settings against the exported file's build and reopen evidence."""
+    if "materials" not in options:
+        return None
+    expected = parse_character_material_options(options["materials"])
+    for evidence, row, format_name, status in (
+            ("export receipt", receipt, "EndfieldCharacterExport/1", "exported_reopened"),
+            ("build receipt", build, "EndfieldCharacterBuild/1", "built_not_reopened"),
+            ("reopen audit", audit, "EndfieldCharacterBuildReopenAudit/1", "passed")):
+        if row.get("format") != format_name or row.get("status") != status:
+            raise CharacterServiceError(f"Material confirmation requires completed evidence: evidence={evidence}")
+    confirmed = _confirm_material_options(expected, receipt.get("material_options"), "export receipt")
+    options_hash = hashlib.sha256(confirmed.canonical_json().encode("utf-8")).hexdigest()
+    if receipt.get("material_options_sha256") != options_hash:
+        raise CharacterServiceError("Material confirmation hash differs: evidence=export receipt")
+    if (build.get("sha256") != receipt.get("blend_sha256")
+            or audit.get("blend_sha256") != receipt.get("blend_sha256")):
+        raise CharacterServiceError("Material evidence refers to different character files")
+    if confirmed.mode == "original":
+        if "material_variant" in build or "material_variant" in audit:
+            raise CharacterServiceError("Original materials have unexpected variant evidence")
+    else:
+        variant = json_object(build.get("material_variant"), "build material variant")
+        reopened = json_object(audit.get("material_variant"), "reopened material variant")
+        if variant.get("format") != "EndfieldMaterialVariant/1" or reopened.get("status") != "passed":
+            raise CharacterServiceError("Simplified material variant did not pass saved-file verification")
+        _confirm_material_options(confirmed, variant.get("options"), "build material variant")
+        _confirm_material_options(confirmed, reopened.get("options"), "reopened material variant")
+    return confirmed.as_json()
+
+
+def _verified_npc_material_options(options: dict[str, object], receipt: dict[str, object]) -> dict[str, object] | None:
+    """Confirm the assembly adapter's fixed original-material scope independently."""
+    if "materials" not in options:
+        return None
+    if (receipt.get("format") != "EndfieldNpcExportReceipt/1"
+            or receipt.get("status") != "source_assembled_reopened"):
+        raise CharacterServiceError("Original NPC materials require the source assembly reopen receipt")
+    original = parse_character_material_options({"mode": "original", "lighting": "full",
+        "weather": {"quality": "full", "effects": ["wet", "snow", "rain"]}})
+    _confirm_material_options(original, options["materials"], "NPC assembly material scope")
+    if "material_options" in receipt:
+        _confirm_material_options(original, receipt["material_options"], "NPC assembly receipt")
+    return original.as_json()
 
 
 def character_source_pending(probe: dict[str, object], audit: dict[str, object]) -> list[dict[str, str]]:
@@ -821,12 +912,11 @@ class CharacterService:
         game, blender = paths["game_root"], paths["blender_exe"]
         if not (game / "Endfield.exe").is_file() or not (game / "Endfield_Data/StreamingAssets/VFS").is_dir():
             raise CharacterServiceError("游戏目录不完整，请选择包含 Endfield.exe 的目录。")
-        if not blender.is_file():
-            raise CharacterServiceError("Blender 程序不存在，请重新选择。")
         for name in ("cache_root", "output_root"):
             target = paths[name]
             _safe_storage(game, target)
         _safe_storage(game, self._state_path().parent)
+        require_character_export_blender(blender)
         return {**request, "source": {name: str(path) for name, path in paths.items()}}
 
     def canonical_export(self, payload: dict[str, object]) -> dict[str, object]:
@@ -835,6 +925,7 @@ class CharacterService:
             raise CharacterServiceError("需要角色导出请求。")
         _, runtime_defaults = self._runtime_defaults()
         context, catalog, npc, identity = self._catalog_source()
+        require_character_export_blender(context.blender)
         if request["catalog_id"] != _digest((identity, "catalog/1")) or request["source_identity"] != identity:
             raise CharacterServiceError("角色目录已更新，请刷新后重新选择。")
         match = {**self._variants(catalog), **self._npc_variants(npc)}.get(str(request["variant_id"]))
@@ -855,6 +946,11 @@ class CharacterService:
             if len(entries) != 1:
                 raise CharacterServiceError("独立 NPC 来源不唯一，请刷新目录。")
             if entries[0].source_kind == "config_assembled":
+                materials = json_object(options["materials"], "material options") if "materials" in options else None
+                if materials is not None and materials["mode"] == "simplified":
+                    raise CharacterServiceError(
+                        "简化材质暂不支持配置装配型 NPC；请改用原始材质模式，或选择普通角色/NPC 导出入口。"
+                    )
                 if not self._npc_assembly_tools():
                     raise CharacterServiceError("NPC 配置装配导出需要配置 npc_assembly_tools。")
                 if any(options.get(name) for name in ("raw_expressions", "basic_mmd")):
@@ -1047,6 +1143,9 @@ class CharacterService:
                    "cache_dir": str(context.cache_root), "output": str(payload),
                    **{name: selection[name] for name in ("character_id", "template_id", "part_name", "resource_path", "variant")},
                    "provider": selection["logical_provider"]}
+        selected_options = json_object(canonical.get("options", {}), "options")
+        if "materials" in selected_options:
+            request["material_options"] = selected_options["materials"]
         if self.config is not None and self.config.get("format") == "EndfieldCharacterRuntime/2":
             _, record = self._current()
             request["format"] = "EndfieldCharacterExportRequest/2"
@@ -1063,7 +1162,6 @@ class CharacterService:
         temporary.mkdir()
         position = 0
         fragment = ""
-        selected_options = json_object(canonical.get("options", {}), "options")
         static_fraction = .74 if any(selected_options.get(name) for name in ("raw_expressions", "basic_mmd", "animation")) else 1.0
         fractions = {"prepared_cache": .69, "prepare_bundles": .15, "source_export": .45, "shader_identity": .6,
                      "renderer_visibility": .65, "fur_curves_source_channels": .69,
@@ -1130,6 +1228,7 @@ class CharacterService:
                 raise ValueError("Character delivery differs from its reader receipt")
             build = _read(payload / "build/build_receipt.json")
             options = json_object(canonical.get("options", {}), "options")
+            verified_materials = _verified_character_material_options(options, receipt, build, audit)
             files: list[dict[str, object]] = [{"relative_path": blend.relative_to(output_dir).as_posix(),
                                             "role": "character", "bytes": blend.stat().st_size, "sha256": digest}]
             authoring_pending: list[dict[str, str]] = []
@@ -1171,7 +1270,10 @@ class CharacterService:
         final_context, _, _, final_identity = self._catalog_source()
         if final_context != context or final_identity != identity:
             raise CharacterServiceError("角色或动作源数据在导出期间变化，请重新准备后导出。")
-        return {"status": "partial", "files": files, "pending": [*pending, *authoring_pending]}
+        manifest = {"status": "partial", "files": files, "pending": [*pending, *authoring_pending]}
+        if verified_materials is not None:
+            manifest["material_options"] = verified_materials
+        return manifest
 
     def _prepare_authoring(self, canonical: dict[str, object], context: CharacterSourceContext, catalog: CharacterCatalog,
                        selection: dict[str, object], identity: str, payload: Path, output_dir: Path,
@@ -1326,6 +1428,7 @@ class CharacterService:
             digest = hashlib.file_digest(stream, "sha256").hexdigest()
         if digest != row.get("sha256") or blend.stat().st_size != row.get("bytes"):
             raise ValueError("NPC character artifact differs from its source reopen receipt")
+        verified_materials = _verified_npc_material_options(options, receipt)
         files = [{"relative_path": blend.relative_to(output_dir).as_posix(), "role": "character",
                   "bytes": blend.stat().st_size, "sha256": digest}]
         pending = [{"code": "npc_configuration_static_scope", "message":
@@ -1354,4 +1457,7 @@ class CharacterService:
         final_context, _, _, final_identity = self._catalog_source()
         if final_context != context or final_identity != identity:
             raise CharacterServiceError("NPC 源数据在导出期间变化，请重新准备后导出。")
-        return {"status": "partial", "files": files, "pending": pending}
+        manifest: dict[str, object] = {"status": "partial", "files": files, "pending": pending}
+        if verified_materials is not None:
+            manifest["material_options"] = verified_materials
+        return manifest

@@ -439,6 +439,9 @@ def attach_source_shadows(args: argparse.Namespace) -> dict[str, object]:
 
 def main(args: argparse.Namespace) -> None:
     started = time.perf_counter()
+    from character_material_variant import read_material_options, native_weather_required, attach_full_response_simple_weather, apply_material_variant
+    material_options = read_material_options(args.material_options)
+    variant_options = material_options if material_options is not None and material_options.mode == 'simplified' else None
     weather_input = read_weather_per_draw_input(args.weather_per_draw_input)
     fur_curves_profile = read_fur_curves_build_profile(args.fur_curves_profile)
     fur_curves_preparation = read_fur_curves_preparation(args.fur_curves_preparation)
@@ -500,15 +503,22 @@ def main(args: argparse.Namespace) -> None:
         weather_controls['source_input_kind'] = 'explicit_dry_artist_values'
         weather_controls['endfield_character_weather_controls'] = True
     late_materials = attach_supported_late_materials(layout_shader_node_tree, weather_controls, hgrp.extent)
-    wetfilm = attach_profile_wetfilm(args.profile, layout_shader_node_tree, weather_controls)
-    standard_snow = attach_profile_standard_snow(args.profile, layout_shader_node_tree, wetfilm)
-    skin_rain = attach_profile_skin_rain(
-        args.profile, layout_shader_node_tree,
-        weather_input.source if weather_input is not None else None,
-        weather_input.sha256 if weather_input is not None else None,
-        standard_snow,
-    )
-    hair_fur_snow = attach_profile_hair_fur_snow(args.profile, weather_controls, layout_shader_node_tree)
+    if native_weather_required(material_options):
+        wetfilm = attach_profile_wetfilm(args.profile, layout_shader_node_tree, weather_controls)
+        standard_snow = attach_profile_standard_snow(args.profile, layout_shader_node_tree, wetfilm)
+        skin_rain = attach_profile_skin_rain(
+            args.profile, layout_shader_node_tree,
+            weather_input.source if weather_input is not None else None,
+            weather_input.sha256 if weather_input is not None else None,
+            standard_snow,
+        )
+        hair_fur_snow = attach_profile_hair_fur_snow(args.profile, weather_controls, layout_shader_node_tree)
+    else:
+        wetfilm = {'status': 'not_requested', 'groups': []}
+        standard_snow = {'status': 'not_requested', 'groups': []}
+        skin_rain = {'status': 'not_requested', 'bindings': []}
+        hair_fur_snow = {'status': 'not_requested', 'groups': []}
+    prepared_variant_weather = attach_full_response_simple_weather(bpy.context.scene, variant_options) if variant_options is not None else []
     mark = time.perf_counter()
     if fur_curves_preparation is not None:
         fur_curves_snow = attach_prepared_fur_curves(
@@ -535,6 +545,10 @@ def main(args: argparse.Namespace) -> None:
     workspace = prepare_authoring_workspace(
         args.source_dir, authoring_request.animations if authoring is not None else ())
     stage_times['authoring_workspace'] = time.perf_counter() - mark
+    material_variant = apply_material_variant(bpy.context.scene, variant_options, prepared_variant_weather) if variant_options is not None else None
+    if material_variant is not None:
+        from character_weather_panel import attach_weather_panel
+        workspace['weather_panel'] = attach_weather_panel(tuple(slot.material for obj in bpy.context.scene.objects if obj.type == 'MESH' for slot in obj.material_slots if slot.material is not None))
     output = args.output_dir / 'character.blend'
     if authoring is not None:
         from character_authoring_validation import character_invariants, material_signature_details
@@ -570,7 +584,13 @@ def main(args: argparse.Namespace) -> None:
     source_hashes.update({str(Path(__file__).parent/name): file_hash(Path(__file__).parent/name)
                          for name in ('character_emotion_atlas.py', 'character_expression_material_controls.py',
                                       'character_authoring_workspace.py', 'character_material_authoring.py',
-                                      'character_rig_authoring.py', 'character_viewport_preview.py')})
+                                      'character_rig_authoring.py', 'character_viewport_preview.py',
+                                      'character_rig_panel.py', 'character_rig_ik.py', 'character_weather_panel.py')})
+    if material_variant is not None:
+        source_hashes.update({str(Path(__file__).parent/name): file_hash(Path(__file__).parent/name)
+                             for name in ('character_material_options.py', 'character_material_variant.py',
+                                          'character_simple_materials.py', 'character_simple_layout.py', 'character_simple_weather.py',
+                                          'character_simple_full_weather.py')})
     if weather_input is not None:
         source_artifact_refs.append({'path': str(weather_input.path), 'bytes': weather_input.byte_count,
                                      'sha256': weather_input.sha256})
@@ -612,6 +632,8 @@ def main(args: argparse.Namespace) -> None:
                          'Frozen mathematical kernels, constructor state and explicit preview frames do not equal native game runtime captures.',
                          'GN vertex-ray shadows and face-domain alpha dither remain explicit host approximations.',
                          'Hair mode0 Point/Spot is wired only for supported source variants; other Hair modes/keywords, Eye/Fur, live cookie projection and native area-light descriptors remain unimplemented.']}
+    if material_variant is not None:
+        report['material_variant'] = material_variant
     io_path(args.output_dir / 'build_receipt.json').write_text(json.dumps(report, indent=2, allow_nan=False), encoding='utf-8')
     print(json.dumps({'status': report['status'], 'output': str(output), 'elapsed_seconds': report['elapsed_seconds']}))
 
@@ -623,6 +645,7 @@ if __name__ == '__main__':
     parser.add_argument('--head-bone', required=True)
     parser.add_argument('--authoring-request', type=Path)
     parser.add_argument('--weather-per-draw-input', type=Path)
+    parser.add_argument('--material-options', type=Path)
     curves = parser.add_mutually_exclusive_group()
     curves.add_argument('--fur-curves-profile', type=Path)
     curves.add_argument('--fur-curves-preparation', type=Path)

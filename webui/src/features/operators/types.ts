@@ -215,7 +215,18 @@ export type CharacterReferenceAnimationSelection = {
   maximum_stored_frames: number
 }
 
+export type CharacterWeatherEffect = 'wet' | 'snow' | 'rain'
+export type CharacterMaterialOptions = {
+  mode: 'original' | 'simplified'
+  lighting: 'full' | 'simple'
+  weather: {
+    quality: 'full' | 'simple'
+    effects: CharacterWeatherEffect[]
+  }
+}
+
 export type CharacterExportOptions = {
+  materials?: CharacterMaterialOptions
   raw_expressions?: boolean
   basic_mmd?: boolean
   native_expression_replay_id?: string
@@ -267,6 +278,7 @@ export type CharacterDeliveryFile = {
 }
 
 export type CharacterJobResult = {
+  material_options?: CharacterMaterialOptions
   format: 'CharacterExportResult/1' | 'CharacterPreparationResult/1'
   status: 'completed' | 'partial'
   output_directory: string

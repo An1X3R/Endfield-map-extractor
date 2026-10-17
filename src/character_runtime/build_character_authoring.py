@@ -105,8 +105,12 @@ def main(request_path: Path) -> None:
     report['preserved'] = current
     report['material_signature_details'] = material_signature_details()
     report['authoring_workspace'] = workspace
-    help_text.write('Body posing: select the armature and use Pose Mode; Body and Hands contain FK display controls.\n'
-                    'Source Details retains all other bones. No automatic IK or cloth simulation is added.\n'
+    help_text.write('Select the armature or a skinned mesh, then open the 3D View sidebar > Endfield character workbench.\n'
+                    'Body, Hands, Hair, Face, Ears, Tail, Clothing and Accessories expose source FK controls.\n'
+                    'Source Details retains technical and unclassified bones. Cloth physics is not synthesized.\n'
+                    'The expression board edits the original shape-key/material controllers and can insert keyframes.\n'
+                    'Optional hand/foot IK is created from the current pose; FK 0 restores the source Action.\n'
+                    'Run Endfield Rig IK.py and Endfield Character Rig Panel.py once if embedded scripts are disabled.\n'
                     'Replace textures at the material root; calculation groups retain the source shading equations.\n'
                     'Material Properties > Endfield Weather exposes shared wetness, snow and rain values.\n'
                     'Trust the embedded Endfield Weather Panel.py UI script, or run it once in the Text Editor; shading needs no UI script.\n'

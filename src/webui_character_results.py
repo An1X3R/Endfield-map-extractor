@@ -6,6 +6,7 @@ from pathlib import Path, PureWindowsPath
 import re
 from typing import TypedDict
 
+from character_runtime.character_material_options import parse_character_material_options
 from webui_character_contract import json_object, required_text
 
 
@@ -75,5 +76,12 @@ def build_character_result(output_dir: Path, manifest: dict[str, object], kind: 
                         "message": required_text(row.get("message"), "pending.message")})
     if pending and status == "completed":
         raise ValueError("Character manifest with pending items must report partial status")
-    return {"format": "CharacterPreparationResult/1" if kind == "preparation" else "CharacterExportResult/1",
-            "status": status, "output_directory": str(root), "files": files, "pending": pending}
+    result: dict[str, object] = {
+        "format": "CharacterPreparationResult/1" if kind == "preparation" else "CharacterExportResult/1",
+        "status": status, "output_directory": str(root), "files": files, "pending": pending,
+    }
+    if "material_options" in manifest:
+        if kind != "export":
+            raise ValueError("Material export options are valid only for character export results")
+        result["material_options"] = parse_character_material_options(manifest["material_options"]).as_json()
+    return result

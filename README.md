@@ -15,7 +15,7 @@
 
 ## 开始使用
 
-在 [Releases](https://github.com/An1X3R/Endfield-map-extractor/releases/latest) 下载 **Endfield-Extractor-v3.1-windows-x64.zip**，解压后按 [安装与升级说明](docs/INSTALL.md) 完成一次环境准备。
+在 [Releases](https://github.com/An1X3R/Endfield-map-extractor/releases/latest) 下载 **Endfield-Extractor-v3.2-windows-x64.zip**，解压后按 [安装与升级说明](docs/INSTALL.md) 完成一次环境准备。
 
 | 依赖 | 要求 |
 |---|---|
@@ -37,6 +37,18 @@ powershell -ExecutionPolicy Bypass -File .\launch_extractor.ps1
 以后只需运行第二条启动命令。在网页中选择自己的游戏目录与输出位置，完成所需数据准备后即可导出。游戏目录始终只读。
 
 GitHub 自动生成的 Source code ZIP 不含预编译工具。开发者可查看 [对应源码构建说明](third_party/SOURCE-BUILD.md)。
+
+## 角色材质与 Blender 插件
+
+网页导出可选择原始或精简材质。精简模式可分别选择光照与天气精度，并按需保留湿润、覆雪、雨水效果；原始模式保留完整选项。精简模式侧重修改与迁移便利，效果采用近似实现；组合式 NPC 暂不支持精简材质。
+
+角色工作台可作为独立扩展安装，提供骨骼分类、IK、手腕／脚踝旋转、表情及材质天气入口。支持 Blender 4.3+；适用于本提取器导出且带有相应控制数据的文件，不会自动给普通模型绑定骨架或补回旧文件缺少的控制器。
+
+在同版本 Release 下载 **endfield_character_tools-0.1.4.zip**。在 Blender 的「编辑 → 偏好设置 → 插件」菜单选择「从磁盘安装」，选中 ZIP 并启用，无需解压或另外安装依赖。选择角色网格或骨架后，在 **N 侧栏 → 终末地** 调整；天气参数位于 **材质属性 → 终末地 · 天气**。源码构建命令：`python src/build_character_tools_addon.py --output-dir output/blender-addons`。
+
+插件启用后可直接切换文件，无需运行文件内嵌脚本，也不需要开启全局脚本自动执行。若手动运行了旧文件的脚本，可用「终末地 · 插件 → 刷新角色工作台」恢复插件面板。插件卸载或禁用后，模型、材质、动作及已创建的原生约束仍保留。
+
+**N 侧栏 → 终末地 → 后处理**可手动为当前场景添加曝光、对比度、饱和度、辉光、RGB 曲线、锐化与输出抖动，角色和地图均可用。参数可保存为 JSON 预设；「查看原图」保留参数，「重置后处理参数」恢复中性值，「移除并恢复原合成链」接回原连接。复制场景共用节点时，面板会提供独立化入口。效果作用于渲染合成，普通材质预览不显示；不替换既有色彩管理，关闭插件后原生节点仍可渲染。此功能已验证 Blender 4.3.2 / 4.4.3，更新版本尚未实测。
 
 ## 当前限制
 

@@ -8,7 +8,7 @@ import tempfile
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src' / 'character_runtime'))
-from export_character import read_request
+from export_character import build_arguments, read_request, write_material_options
 
 
 class CharacterExportRequestTests(unittest.TestCase):
@@ -50,6 +50,25 @@ class CharacterExportRequestTests(unittest.TestCase):
             request = read_request(request_path)
             self.assertEqual(request.weather_manifest, (root / 'weather_manifest.bin').resolve())
             self.assertEqual(request.output, (root / 'export').resolve())
+            self.assertIsNone(request.material_options)
+            geometry_dir = root / 'prepared/static_probe'
+            geometry_dir.mkdir(parents=True)
+            (geometry_dir / 'model.fbx').write_bytes(b'fbx')
+            legacy_args = build_arguments(request, root / 'prepared', root / 'build', write_material_options(request))
+            self.assertNotIn('--material-options', legacy_args)
+
+            with_materials = {**document, 'output': 'simplified_export', 'material_options': {
+                'mode': 'simplified', 'lighting': 'simple', 'weather': {'quality': 'full', 'effects': ['rain', 'wet']}}}
+            simplified_path = root / 'simplified_request.json'
+            simplified_path.write_text(json.dumps(with_materials), encoding='utf-8')
+            simplified_request = read_request(simplified_path)
+            simplified_request.output.mkdir()
+            options_path = write_material_options(simplified_request)
+            self.assertIsNotNone(options_path)
+            simplified_args = build_arguments(simplified_request, root / 'prepared', root / 'build', options_path)
+            self.assertEqual(simplified_args[-2:], ('--material-options', str(options_path)))
+            self.assertEqual(json.loads(options_path.read_text(encoding='utf-8')),
+                {'mode': 'simplified', 'lighting': 'simple', 'weather': {'quality': 'full', 'effects': ['wet', 'rain']}})
 
     def test_rejects_previous_request_format(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

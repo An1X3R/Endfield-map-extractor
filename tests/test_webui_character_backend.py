@@ -1,8 +1,10 @@
 """Check character contracts and real durable files without running game readers."""
 from __future__ import annotations
 
+from copy import deepcopy
 import hashlib
 import json
+import os
 from pathlib import Path
 import tempfile
 import threading
@@ -17,6 +19,10 @@ from webui_character_contract import (
 )
 from webui_character_results import build_character_result
 from webui_character_worker import CharacterCoordinator, CharacterJobCancelled
+from character_runtime.character_material_options import parse_character_material_options
+from endfield_character_service import (
+    CharacterServiceError, _verified_character_material_options, _verified_npc_material_options,
+)
 
 
 def export_request(job_id: str) -> dict[str, object]:
@@ -26,6 +32,48 @@ def export_request(job_id: str) -> dict[str, object]:
 
 
 class CharacterContractTests(unittest.TestCase):
+    def test_material_options_are_required_typed_canonical_and_part_of_request_digest(self) -> None:
+        request = export_request(str(uuid4()))
+        self.assertEqual(normalize_character_request(request), ("export", request))
+        materials = {"mode": "simplified", "lighting": "simple", "weather": {
+            "quality": "full", "effects": ["rain", "wet"], "future_weather_switch": True},
+            "future_material_switch": "ignored"}
+        _, normalized = normalize_character_request({**request, "options": {"materials": materials}})
+        expected = {"mode": "simplified", "lighting": "simple", "weather": {
+            "quality": "full", "effects": ["wet", "rain"]}}
+        self.assertEqual(normalized["options"]["materials"], expected)
+        self.assertEqual(public_request(normalized)["options"]["materials"], expected)
+        self.assertNotEqual(request_digest(normalized), request_digest(request))
+
+    def test_original_material_options_require_the_full_unmodified_chain(self) -> None:
+        request = export_request(str(uuid4()))
+        materials = {"mode": "original", "lighting": "full", "weather": {
+            "quality": "full", "effects": ["rain", "wet", "snow"]}}
+        _, normalized = normalize_character_request({**request, "options": {"materials": materials}})
+        self.assertEqual(normalized["options"]["materials"]["weather"]["effects"], ["wet", "snow", "rain"])
+        invalid = (
+            {**materials, "lighting": "simple"},
+            {**materials, "weather": {"quality": "simple", "effects": ["wet", "snow", "rain"]}},
+            {**materials, "weather": {"quality": "full", "effects": ["wet", "snow"]}},
+        )
+        for value in invalid:
+            with self.subTest(value=value), self.assertRaises(CharacterRequestError):
+                normalize_character_request({**request, "options": {"materials": value}})
+
+    def test_material_options_reject_missing_fields_invalid_enums_and_duplicate_effects(self) -> None:
+        request = export_request(str(uuid4()))
+        valid = {"mode": "simplified", "lighting": "full", "weather": {
+            "quality": "simple", "effects": ["wet"]}}
+        invalid = (
+            {"mode": "simplified", "lighting": "full", "weather": {"quality": "simple"}},
+            {**valid, "mode": "legacy"},
+            {**valid, "weather": {"quality": "simple", "effects": ["wet", "wet"]}},
+            {**valid, "weather": {"quality": "simple", "effects": ["hail"]}},
+        )
+        for value in invalid:
+            with self.subTest(value=value), self.assertRaises(CharacterRequestError):
+                normalize_character_request({**request, "options": {"materials": value}})
+
     def test_reference_selector_is_distinct_from_generic_action(self) -> None:
         request = export_request(str(uuid4()))
         reference = {"reference_id": "a" * 64, "maximum_stored_frames": 480}
@@ -70,6 +118,10 @@ class CharacterContractTests(unittest.TestCase):
             result = build_character_result(root, manifest, "export")
             self.assertEqual(result["files"], [file])
             self.assertNotIn("private_source", result)
+            material_options = {"mode": "simplified", "lighting": "simple", "weather": {
+                "quality": "simple", "effects": ["snow"]}}
+            with_options = build_character_result(root, {**manifest, "material_options": material_options}, "export")
+            self.assertEqual(with_options["material_options"], material_options)
             for changes in ({"relative_path": "../character.blend"}, {"relative_path": "F:\\secret.blend"},
                             {"bytes": 999}, {"sha256": "0" * 64}, {"role": "bundle"}):
                 with self.assertRaises(ValueError):
@@ -85,6 +137,93 @@ class CharacterContractTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 build_character_result(Path(temporary), {"status": "completed", "files": [],
                     "pending": [{"code": "missing", "message": "Pending"}]}, "preparation")
+
+
+class CharacterMaterialEvidenceTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.materials: dict[str, object] = {"mode": "simplified", "lighting": "simple",
+            "weather": {"quality": "simple", "effects": ["wet"]}}
+        self.original: dict[str, object] = {"mode": "original", "lighting": "full",
+            "weather": {"quality": "full", "effects": ["wet", "snow", "rain"]}}
+        canonical = parse_character_material_options(self.materials).canonical_json()
+        self.receipt: dict[str, object] = {"format": "EndfieldCharacterExport/1", "status": "exported_reopened",
+            "blend_sha256": "a" * 64, "material_options": deepcopy(self.materials),
+            "material_options_sha256": hashlib.sha256(canonical.encode("utf-8")).hexdigest()}
+        self.build: dict[str, object] = {"format": "EndfieldCharacterBuild/1", "status": "built_not_reopened",
+            "sha256": "a" * 64, "material_variant": {"format": "EndfieldMaterialVariant/1", "options": deepcopy(self.materials)}}
+        self.audit: dict[str, object] = {"format": "EndfieldCharacterBuildReopenAudit/1", "status": "passed",
+            "blend_sha256": "a" * 64, "material_variant": {"status": "passed", "options": deepcopy(self.materials)}}
+
+    def test_confirmed_materials_reach_the_public_result_without_request_aliasing(self) -> None:
+        confirmed = _verified_character_material_options(
+            {"materials": self.materials}, self.receipt, self.build, self.audit)
+        self.assertEqual(confirmed, self.materials)
+        self.assertIsNot(confirmed, self.materials)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            body = b"verified material delivery"
+            (root / "character.blend").write_bytes(body)
+            result = build_character_result(root, {"status": "partial", "material_options": confirmed,
+                "files": [{"relative_path": "character.blend", "role": "character", "bytes": len(body),
+                           "sha256": hashlib.sha256(body).hexdigest()}]}, "export")
+            self.assertEqual(result["material_options"], self.materials)
+
+    def test_explicit_materials_reject_missing_or_different_export_acknowledgement(self) -> None:
+        for value in (None, self.original):
+            with self.subTest(value=value), self.assertRaisesRegex(CharacterServiceError, "export receipt"):
+                _verified_character_material_options({"materials": self.materials},
+                    {**self.receipt, "material_options": value}, self.build, self.audit)
+
+    def test_simplified_materials_require_matching_build_and_reopened_variants(self) -> None:
+        changed: dict[str, object] = {**self.materials, "lighting": "full"}
+        for stage in ("build", "reopen"):
+            for variant in (None, {"format": "EndfieldMaterialVariant/1", "status": "passed", "options": changed}):
+                build = {**self.build, "material_variant": variant} if stage == "build" else self.build
+                audit = {**self.audit, "material_variant": variant} if stage == "reopen" else self.audit
+                with self.subTest(stage=stage, variant=variant), self.assertRaises(ValueError):
+                    _verified_character_material_options({"materials": self.materials}, self.receipt, build, audit)
+        with self.assertRaisesRegex(CharacterServiceError, "saved-file verification"):
+            _verified_character_material_options({"materials": self.materials}, self.receipt, self.build,
+                {**self.audit, "material_variant": {"status": "failed", "options": self.materials}})
+
+    def test_material_evidence_requires_matching_hashes_and_completed_stages(self) -> None:
+        cases = (
+            ({**self.receipt, "material_options_sha256": "0" * 64}, self.build, self.audit),
+            (self.receipt, {**self.build, "sha256": "b" * 64}, self.audit),
+            (self.receipt, self.build, {**self.audit, "blend_sha256": "b" * 64}),
+            (self.receipt, {**self.build, "status": "failed"}, self.audit),
+            (self.receipt, self.build, {**self.audit, "status": "failed"}),
+        )
+        for receipt, build, audit in cases:
+            with self.subTest(receipt=receipt, build=build, audit=audit), self.assertRaises(CharacterServiceError):
+                _verified_character_material_options({"materials": self.materials}, receipt, build, audit)
+
+    def test_original_materials_confirm_native_receipts_without_requiring_a_variant(self) -> None:
+        canonical = parse_character_material_options(self.original).canonical_json()
+        receipt = {**self.receipt, "material_options": self.original,
+                   "material_options_sha256": hashlib.sha256(canonical.encode("utf-8")).hexdigest()}
+        build = {key: value for key, value in self.build.items() if key != "material_variant"}
+        audit = {key: value for key, value in self.audit.items() if key != "material_variant"}
+        self.assertEqual(_verified_character_material_options(
+            {"materials": self.original}, receipt, build, audit), self.original)
+        with self.assertRaisesRegex(CharacterServiceError, "unexpected variant"):
+            _verified_character_material_options({"materials": self.original}, receipt, self.build, audit)
+
+    def test_npc_original_scope_uses_its_existing_independent_receipt(self) -> None:
+        receipt: dict[str, object] = {"format": "EndfieldNpcExportReceipt/1", "status": "source_assembled_reopened"}
+        confirmed = _verified_npc_material_options({"materials": self.original}, receipt)
+        self.assertEqual(confirmed, self.original)
+        self.assertIsNot(confirmed, self.original)
+        with self.assertRaisesRegex(CharacterServiceError, "NPC assembly material scope"):
+            _verified_npc_material_options({"materials": self.materials}, receipt)
+        with self.assertRaisesRegex(CharacterServiceError, "source assembly reopen"):
+            _verified_npc_material_options({"materials": self.original}, {**receipt, "status": "failed"})
+        with self.assertRaisesRegex(CharacterServiceError, "NPC assembly receipt"):
+            _verified_npc_material_options({"materials": self.original}, {**receipt, "material_options": self.materials})
+
+    def test_omitted_materials_keep_legacy_receipt_compatibility(self) -> None:
+        self.assertIsNone(_verified_character_material_options({}, {}, {}, {}))
+        self.assertIsNone(_verified_npc_material_options({}, {}))
 
 
 class CharacterDurableTests(unittest.TestCase):
@@ -196,6 +335,9 @@ class CharacterDurableTests(unittest.TestCase):
 
     def test_validation_rejects_job_root_overlapping_game_without_writing(self) -> None:
         from endfield_character_service import CharacterService, _PATH_DEFAULTS, _VALUE_DEFAULTS
+        selected = os.environ.get("ENDFIELD_TEST_BLENDER")
+        if not selected:
+            self.skipTest("Set ENDFIELD_TEST_BLENDER to an actual Blender >=4.4 executable")
         game = self.root / "game"
         (game / "Endfield_Data/StreamingAssets/VFS").mkdir(parents=True)
         (game / "Endfield.exe").write_bytes(b"")
@@ -207,7 +349,7 @@ class CharacterDurableTests(unittest.TestCase):
                 **{field: str(tool) for field in _PATH_DEFAULTS}, **{field: "test" for field in _VALUE_DEFAULTS}}}), encoding="utf-8")
         service = CharacterService(config_path)
         request = {"format": "CharacterPreparationRequest/1", "request_id": str(uuid4()),
-                   "source": {"game_root": str(game), "blender_exe": str(tool),
+                   "source": {"game_root": str(game), "blender_exe": str(Path(selected).resolve()),
                               "cache_root": str(self.root / "cache"), "output_root": str(self.root / "outputs")}}
         for root in (game / "jobs", self.root):
             worker = CharacterCoordinator(service, root)

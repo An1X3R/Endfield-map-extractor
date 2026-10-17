@@ -69,4 +69,41 @@ for (const animation of [
   { reference_id: referenceId, maximum_stored_frames: 18001 },
 ]) assert.throws(() => api.parseCharacterExportRequest({ ...request, options: { animation } }), /animation/)
 
+const { assertMaterialAcknowledgement, originalMaterials, simplifiedMaterialRestriction } = await import('../src/features/operators/materials.ts')
+const original = originalMaterials()
+assert.doesNotThrow(() => assertMaterialAcknowledgement(undefined, undefined))
+assert.doesNotThrow(() => assertMaterialAcknowledgement(original, original))
+assert.throws(() => assertMaterialAcknowledgement(original, undefined), /停止提交/)
+assert.throws(() => assertMaterialAcknowledgement(original, { ...original, mode: 'simplified' }), /停止提交/)
+assert.equal(api.parseCharacterExportRequest(request).options, undefined)
+const withMaterials = materials => api.parseCharacterExportRequest({ ...request, options: { materials } }).options.materials
+assert.deepEqual(withMaterials(original), original)
+for (const lighting of ['simple', 'full']) {
+  for (const quality of ['simple', 'full']) {
+    for (let mask = 0; mask < 8; mask += 1) {
+      const effects = ['wet', 'snow', 'rain'].filter((effect, index) => mask & (1 << index))
+      const materials = { mode: 'simplified', lighting, weather: { quality, effects } }
+      assert.deepEqual(withMaterials(materials), materials)
+      if (lighting !== 'full' || quality !== 'full' || mask !== 7) {
+        assert.throws(() => withMaterials({ ...materials, mode: 'original' }), /materials/)
+      }
+    }
+  }
+}
+assert.deepEqual(withMaterials({ ...original, extra: true, weather: { ...original.weather, effects: ['rain', 'wet', 'snow'], extra: true } }), original)
+for (const invalid of [null, {}, { mode: 'simplified' }, { ...original, lighting: 'fast' }, { ...original, weather: { quality: 'full' } }, { ...original, weather: { quality: 'full', effects: ['wet', 'wet', 'snow'] } }, { ...original, weather: { quality: 'full', effects: ['wet', 'snow', 'fog'] } }, { ...original, weather: { quality: 'high', effects: [] } }]) {
+  assert.throws(() => withMaterials(invalid), /materials/)
+}
+assert.equal(simplifiedMaterialRestriction(npc), null)
+assert.match(simplifiedMaterialRestriction({ ...npc, source_kind: 'config_assembled' }), /原始材质/)
+assert.equal(api.parseCharacterCatalog({ ...catalog, characters: [{ ...npc, source_kind: 'config_assembled' }] }).characters[0].source_kind, 'config_assembled')
+const result = { format: 'CharacterExportResult/1', status: 'completed', output_directory: 'exports/asset', files: [], pending: [] }
+const job = { format: 'CharacterJob/1', job_id: request.request_id, kind: 'export', state: 'completed', phase: 'completed', progress: 1, message: 'Complete', cancel_requested: false, request: { ...request, options: { materials: original } }, result, error: null }
+assert.equal(api.parseCharacterJob(job).result.material_options, undefined)
+const actual = { mode: 'simplified', lighting: 'simple', weather: { quality: 'full', effects: [] } }
+assert.deepEqual(api.parseCharacterJob({ ...job, result: { ...result, material_options: actual } }).result.material_options, actual)
+assert.throws(() => api.parseCharacterJob({ ...job, result: { ...result, material_options: null } }), /result.material_options/)
+const combined = { materials: actual, basic_mmd: true, raw_expressions: true, animation: { action_id: 'action-current', maximum_stored_frames: 300 } }
+assert.deepEqual(api.parseCharacterExportRequest({ ...request, options: combined }).options, combined)
+
 process.stdout.write('Operator category, capability, rejection, binding and request contracts passed.\n')

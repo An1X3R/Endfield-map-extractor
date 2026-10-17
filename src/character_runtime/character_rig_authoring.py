@@ -6,7 +6,8 @@ import hashlib
 import json
 import math
 from pathlib import Path
-from typing import cast
+import re
+from typing import TypedDict, cast
 
 import bpy
 from mathutils import Vector
@@ -21,7 +22,8 @@ SHAPE_PROPERTY = 'endfield_rig_authoring_shape'
 HUMAN_CORE_SLOT_COUNT = 25
 EXTENDED_HAND_SLOT_START = 25
 EXTENDED_HAND_SLOT_STOP = 55
-BODY_SLOTS = frozenset(range(0, 18)) | frozenset(range(20, 25))
+BODY_SLOTS = frozenset(range(0, 18)) | frozenset((20, 21))
+FACE_SLOTS = frozenset((22, 23, 24))
 HAND_SLOTS = frozenset((18, 19)) | frozenset(range(EXTENDED_HAND_SLOT_START, EXTENDED_HAND_SLOT_STOP))
 HAND_ROOT_SLOTS = frozenset((18, 19))
 FINGER_NAMES = ('Thumb', 'Index', 'Middle', 'Ring', 'Little')
@@ -40,7 +42,46 @@ EXTENDED_SLOT_NAMES = tuple(
     for segment in FINGER_SEGMENTS
 )
 SLOT_NAMES = CORE_SLOT_NAMES + EXTENDED_SLOT_NAMES
-ROLE_NAMES = ('Body', 'Hands', 'Source Details')
+LEGACY_ROLE_NAMES = ('Body', 'Hands', 'Source Details')
+ACCESSORY_ROLES = ('Hair', 'Face', 'Ears', 'Tail', 'Clothing', 'Accessories')
+ROLE_NAMES = ('Body', 'Hands') + ACCESSORY_ROLES + ('Source Details',)
+AUTHORING_REVISION = 2
+ROLE_COLORS = {
+    'Body': (0.16, 0.55, 0.95), 'Hands': (0.15, 0.85, 0.55),
+    'Hair': (0.75, 0.30, 0.95), 'Face': (1.0, 0.55, 0.30),
+    'Ears': (1.0, 0.35, 0.60), 'Tail': (0.10, 0.80, 0.85),
+    'Clothing': (0.95, 0.75, 0.15), 'Accessories': (0.55, 0.75, 1.0),
+    'Source Details': (0.35, 0.35, 0.35),
+}
+SEMANTIC_TOKENS = {
+    'Hair': frozenset(('hair', 'bang', 'bangs', 'ponytail', 'braid', 'toufa')),
+    'Face': frozenset(('face', 'eye', 'eyeball', 'eyebrow', 'eyelash', 'eyelid',
+                       'brow', 'nose', 'tongue', 'jaw', 'lip', 'mouth', 'cheek',
+                       'tooth', 'teeth', 'iris', 'pupil')),
+    'Ears': frozenset(('ear', 'ears', 'erduo')),
+    'Tail': frozenset(('tail', 'weiba')),
+    'Clothing': frozenset(('clothes', 'clothing', 'cloth', 'collar', 'sleeve',
+                           'skirt', 'coat', 'cape', 'dress', 'belt', 'ribbon',
+                           'qunbai', 'yibai', 'lalian')),
+    'Accessories': frozenset(('accessory', 'accessories', 'prop', 'phone', 'hat',
+                              'maozi', 'beidai', 'bag', 'pouch', 'weapon', 'holster',
+                              'pendant', 'ornament', 'glasses', 'goggles', 'headset')),
+}
+TECHNICAL_TOKENS = frozenset(('corrective', 'twist', 'helper', 'end', 'nub',
+                              'effector', 'collision', 'collider', 'physics',
+                              'rigidbody', 'solver', 'constraint', 'dummy', 'mc'))
+
+
+class SourceFKControl(TypedDict):
+    """A display control mapped directly to one unchanged source bone."""
+
+    bone: str
+    path: str
+    role: str
+    category: str
+    control_kind: str
+    reason: str
+    evidence_segment: str
 
 
 def _record(value: object, label: str) -> dict[str, object]:
@@ -321,9 +362,64 @@ def _path_index(rig: bpy.types.Object) -> dict[str, bpy.types.Bone]:
 def _bone_role(slot: int) -> str:
     if slot in HAND_SLOTS:
         return 'Hands'
+    if slot in FACE_SLOTS:
+        return 'Face'
     if slot in BODY_SLOTS:
         return 'Body'
     return 'Source Details'
+
+
+def _name_tokens(name: str) -> frozenset[str]:
+    """Split source identifiers at case, separator and numeric boundaries."""
+    separated = re.sub(r'([a-z])([A-Z])', r'\1_\2', name)
+    return frozenset(re.findall(r'[a-z]+', separated.lower()))
+
+
+def _semantic_role(path: str) -> tuple[str, str]:
+    """Use the nearest named source segment, without guessing from character IDs."""
+    for segment in reversed(path.split('/')[1:]):
+        tokens = _name_tokens(segment)
+        for role, vocabulary in SEMANTIC_TOKENS.items():
+            if tokens & vocabulary:
+                return role, segment
+        if tokens & frozenset(('head',)) and tokens & frozenset(('up', 'mid', 'dn')):
+            return 'Face', segment
+    return 'Source Details', ''
+
+
+def _classify_source_bones(rig: bpy.types.Object, direct_roles: Mapping[str, str],
+                           hand_paths: set[str]) -> list[SourceFKControl]:
+    """Describe direct source FK targets and keep technical or unknown nodes separate."""
+    result: list[SourceFKControl] = []
+    for bone in sorted(rig.data.bones, key=lambda item: item.name):
+        raw_path = bone.get('source_transform_path')
+        path = raw_path if isinstance(raw_path, str) else ''
+        tokens = _name_tokens(path.rsplit('/', 1)[-1]) if path else frozenset()
+        category, evidence = _semantic_role(path)
+        technical = sorted(tokens & TECHNICAL_TOKENS)
+        if path in direct_roles:
+            role, reason = direct_roles[path], 'source_avatar_slot'
+            category, evidence = role, path.rsplit('/', 1)[-1]
+        elif technical:
+            role, reason = 'Source Details', 'technical_name:' + ','.join(technical)
+        elif path in hand_paths and tokens & frozenset(('finger', 'thumb', 'index', 'middle', 'ring', 'little', 'pinky')):
+            role, reason = 'Hands', 'source_hand_subtree_finger'
+            category, evidence = role, path.rsplit('/', 1)[-1]
+        elif category != 'Source Details':
+            role, reason = category, 'source_path_semantics'
+        else:
+            role, reason = 'Source Details', 'unclassified_source_path' if path else 'missing_source_path'
+        parent_path = bone.parent.get('source_transform_path') if bone.parent is not None else None
+        parent_category = _semantic_role(parent_path)[0] if isinstance(parent_path, str) else 'Source Details'
+        if role == 'Source Details':
+            kind = 'technical' if technical else 'unknown'
+        elif role in ACCESSORY_ROLES:
+            kind = 'chain_segment' if parent_category == role else 'chain_root'
+        else:
+            kind = 'source_fk'
+        result.append({'bone': bone.name, 'path': path, 'role': role, 'category': category,
+                       'control_kind': kind, 'reason': reason, 'evidence_segment': evidence})
+    return result
 
 
 def _slot_provenance(slot: int) -> tuple[str, int]:
@@ -405,7 +501,7 @@ def _ensure_bone_collections(rig: bpy.types.Object, slot_paths: Mapping[int, str
     result = {name: data.collections.get(name) or data.collections.new(name) for name in ROLE_NAMES}
     data[RIG_MARKER_PROPERTY] = FORMAT
     for collection in result.values():
-        collection.is_visible = collection.name != 'Source Details' or not slot_paths
+        collection.is_visible = collection.name in ('Body', 'Hands') or (not slot_paths and collection.name == 'Source Details')
     return result
 
 
@@ -422,6 +518,19 @@ def _expression_control(obj: bpy.types.Object) -> bool:
 
 
 def _owned_by_rig(obj: bpy.types.Object, rig: bpy.types.Object) -> bool:
+    # Imported NPC mesh containers can be siblings of the armature under an Empty root.
+    import_root = rig
+    while import_root.parent is not None and import_root.parent.type == 'EMPTY':
+        if any(child.type == 'ARMATURE' and child != rig
+               for child in import_root.parent.children_recursive):
+            break
+        import_root = import_root.parent
+    if import_root != rig:
+        ancestor = obj
+        while ancestor is not None:
+            if ancestor == import_root:
+                return True
+            ancestor = ancestor.parent
     parent = obj.parent
     visited: set[int] = set()
     while parent is not None:
@@ -455,32 +564,109 @@ def _ring_vertices(center: Vector, axis: Vector, radius_a: float, radius_b: floa
                  for index in range(segments))
 
 
-def _child_direction(bone: bpy.types.Bone) -> tuple[Vector, float]:
+def _local_skeleton_scale(bone: bpy.types.Bone) -> float:
+    neighbor_distances = [float((item.head_local - bone.head_local).length)
+                          for item in (bone.parent, *bone.children)
+                          if item is not None
+                          and float((item.head_local - bone.head_local).length) > 1e-5]
+    if neighbor_distances:
+        return min(neighbor_distances)
+    armature = bone.id_data
+    joint_distances = sorted(
+        float((item.head_local - item.parent.head_local).length)
+        for item in armature.bones
+        if item.parent is not None
+        and float((item.head_local - item.parent.head_local).length) > 1e-5)
+    if not joint_distances:
+        raise ValueError(f'Cannot derive a control-widget scale from zero-length armature: {armature.name}')
+    return joint_distances[len(joint_distances) // 2]
+
+
+def _direction_role_priority(role: str, candidate: bpy.types.Bone) -> int | None:
+    """Prefer a same-chain child so nearby accessory branches cannot steer body controls."""
+    if role == 'Body':
+        preferred_roles = ('Body', 'Hands', 'Face')
+    elif role == 'Hands' or role in ACCESSORY_ROLES or role == 'Source Details':
+        preferred_roles = (role,)
+    else:
+        raise ValueError(f'Unknown source-bone role for widget direction: {role}')
+    candidate_roles = {collection.name for collection in candidate.collections}
+    return next((priority for priority, candidate_role in enumerate(preferred_roles)
+                 if candidate_role in candidate_roles), None)
+
+
+def _child_direction(bone: bpy.types.Bone, role: str) -> tuple[Vector, float]:
+    """Use the nearest role-matched source joint, never Unity placeholder bone lengths."""
     inverse = bone.matrix_local.inverted()
-    pending = list(bone.children)
-    candidates: list[tuple[float, Vector]] = []
-    visited: set[int] = set()
-    while pending:
-        child = pending.pop(0)
-        pointer = child.as_pointer()
-        if pointer in visited:
-            raise ValueError(f'Cycle in armature child hierarchy at {bone.name}')
-        visited.add(pointer)
-        vector = inverse @ child.head_local
-        length = float(vector.length)
-        if length > 1e-5:
-            candidates.append((length, vector.copy()))
-        else:
-            pending.extend(child.children)
-    if candidates:
-        length, vector = max(candidates, key=lambda item: item[0])
-        return vector.normalized(), length
+    queue: list[tuple[bpy.types.Bone, int, float]] = []
+    for child in bone.children:
+        edge_distance = float((child.head_local - bone.head_local).length)
+        queue.append((child, 1, edge_distance if edge_distance > 1e-5 else math.inf))
+
+    while queue:
+        depth = queue[0][1]
+        level: list[tuple[bpy.types.Bone, int, float]] = []
+        remaining: list[tuple[bpy.types.Bone, int, float]] = []
+        for item in queue:
+            (level if item[1] == depth else remaining).append(item)
+        candidates: list[tuple[int, float, str, Vector, float]] = []
+        for child, _child_depth, path_spacing in level:
+            priority = _direction_role_priority(role, child)
+            if priority is not None:
+                vector = inverse.to_3x3() @ (child.head_local - bone.head_local)
+                distance = float(vector.length)
+                if distance > 1e-5:
+                    candidates.append((priority, distance, child.name, vector.copy(), path_spacing))
+            for grandchild in child.children:
+                edge_distance = float((grandchild.head_local - child.head_local).length)
+                next_spacing = min(path_spacing, edge_distance) if edge_distance > 1e-5 else path_spacing
+                remaining.append((grandchild, depth + 1, next_spacing))
+        if candidates:
+            _priority, distance, _name, vector, path_spacing = min(
+                candidates, key=lambda item: (item[0], item[1], item[2]))
+            segment_scale = min(distance, path_spacing)
+            return vector.normalized(), segment_scale
+        queue = remaining
+
     if bone.parent is not None:
-        parent_vector = inverse @ bone.parent.head_local
-        parent_length = float(parent_vector.length)
-        if parent_length > 1e-5:
-            return parent_vector.normalized(), parent_length
-    return Vector((0.0, 1.0, 0.0)), max(float(bone.length), 0.05)
+        parent_vector = inverse.to_3x3() @ (bone.head_local - bone.parent.head_local)
+        parent_distance = float(parent_vector.length)
+        if parent_distance > 1e-5:
+            return parent_vector.normalized(), parent_distance
+
+    axis = Vector((0.0, 1.0, 0.0))
+    return axis, _local_skeleton_scale(bone)
+
+
+def _face_joint_spacing(bone: bpy.types.Bone) -> float:
+    """Bound face-widget size by nearby source joints and any available face-rig span."""
+    face_bones = tuple(item for item in bone.id_data.bones
+                       if any(collection.name == 'Face' for collection in item.collections))
+    coordinates = tuple(item.head_local for item in face_bones)
+    face_extent = (max(float(max(point[axis] for point in coordinates)
+                           - min(point[axis] for point in coordinates))
+                       for axis in range(3)) if len(coordinates) > 1 else 0.0)
+    minimum_spacing = face_extent * 0.02 if face_extent > 1e-5 else 1e-5
+    face_distances = sorted(
+        float((item.head_local - bone.head_local).length)
+        for item in face_bones
+        if item != bone
+        and float((item.head_local - bone.head_local).length) >= minimum_spacing)
+    source_distances = sorted(
+        float((item.head_local - bone.head_local).length)
+        for item in bone.id_data.bones
+        if item != bone
+        and float((item.head_local - bone.head_local).length) >= minimum_spacing)
+    spacing_candidates = face_distances or source_distances
+    if not spacing_candidates:
+        spacing_candidates = sorted(
+            float((item.head_local - bone.head_local).length)
+            for item in bone.id_data.bones
+            if item != bone and float((item.head_local - bone.head_local).length) > 1e-5)
+    if not spacing_candidates:
+        raise ValueError(f'Cannot derive nearby source-joint spacing for face widget: {bone.name}')
+    neighbor_spacing = spacing_candidates[0]
+    return min(neighbor_spacing, face_extent * 0.15) if face_extent > 1e-5 else neighbor_spacing
 
 
 def _hand_branch_ranks(hand_paths: set[str], path_index: Mapping[str, bpy.types.Bone],
@@ -507,10 +693,13 @@ def _hand_branch_ranks(hand_paths: set[str], path_index: Mapping[str, bpy.types.
 
 def _shape_geometry(bone: bpy.types.Bone, role: str, hand_root: bool, hand_rank: int,
                     hand_branch_count: int) -> tuple[tuple[tuple[float, float, float], ...], tuple[tuple[int, int], ...]]:
-    axis, length = _child_direction(bone)
+    axis, length = _child_direction(bone, role)
+    if length <= 1e-5:
+        raise ValueError(f'Cannot create a nonzero control widget for source bone: {bone.name}')
     start = Vector((0.0, 0.0, 0.0))
-    end = axis * length
-    scale = min(max(length, 0.025), 0.3)
+    scale = _face_joint_spacing(bone) if role == 'Face' else length
+    end_scale = 0.3 if role == 'Face' else 0.5 if role == 'Clothing' else 1.0
+    end = axis * (scale * end_scale)
     if role == 'Hands' and hand_root:
         radius = scale * 0.22
         fractions = (0.0, 0.34, 0.72, 1.0)
@@ -532,6 +721,12 @@ def _shape_geometry(bone: bpy.types.Bone, role: str, hand_root: bool, hand_rank:
         profiles = ((radius * 0.7, radius * 0.85), (radius, radius * 1.25),
                     (radius * 0.78, radius), (radius * 0.55, radius * 0.68))
         segments = 8
+    elif role in ACCESSORY_ROLES:
+        radius = scale * (0.10 if role in ('Face', 'Clothing') else 0.18)
+        fractions = (0.0, 0.24, 0.72)
+        profiles = ((radius, radius), (radius * 0.8, radius), (radius * 0.55, radius * 0.65))
+        segments = {'Hair': 4, 'Face': 12, 'Ears': 3, 'Tail': 8,
+                    'Clothing': 6, 'Accessories': 5}[role]
     else:
         radius = scale * 0.075
         fractions = (0.0, 0.5, 1.0)
@@ -633,19 +828,15 @@ def apply_rig_authoring(rig: bpy.types.Object, slot_paths: Mapping[int, str] | N
                           'source_field': source_field, 'source_index': source_index})
 
     hand_paths = _hand_subtree_paths(path_index, slots)
-    for path in hand_paths:
-        direct_roles[path] = 'Hands'
-    roles_by_name = {
-        bone.name: direct_roles.get(bone.get('source_transform_path'), 'Source Details')
-        for bone in rig.data.bones
-    }
+    classified = _classify_source_bones(rig, direct_roles, hand_paths)
+    roles_by_name = {row['bone']: row['role'] for row in classified}
+    classified_by_name = {row['bone']: row for row in classified}
     hand_ranks = _hand_branch_ranks(hand_paths, path_index, slots)
     branch_count = max(hand_ranks.values(), default=0) + 1
     unmapped = [
         {'bone': bone.name, 'path': bone.get('source_transform_path')}
         for bone in sorted(rig.data.bones, key=lambda item: item.name)
-        if bone.get('source_transform_path') not in direct_roles
-        and bone.get('source_transform_path') not in hand_paths
+        if roles_by_name[bone.name] == 'Source Details'
     ]
 
     rest_before = _rest_signature(rig)
@@ -694,6 +885,16 @@ def apply_rig_authoring(rig: bpy.types.Object, slot_paths: Mapping[int, str] | N
         pose_bone.custom_shape = shape
         pose_bone.custom_shape_scale_xyz = (1.0, 1.0, 1.0)
         pose_bone.use_custom_shape_bone_size = False
+        color = ROLE_COLORS[role]
+        pose_bone.color.palette = 'CUSTOM'
+        pose_bone.color.custom.normal = color
+        pose_bone.color.custom.select = tuple(min(component * 0.6 + 0.4, 1.0) for component in color)
+        pose_bone.color.custom.active = (1.0, 1.0, 1.0)
+        if (role in ACCESSORY_ROLES and role not in ('Face', 'Clothing')
+                and classified_by_name[bone.name]['control_kind'] == 'chain_root'):
+            pose_bone.custom_shape_scale_xyz = (1.25, 1.25, 1.25)
+        pose_bone['endfield_fk_category'] = role
+        pose_bone['endfield_fk_control_kind'] = classified_by_name[bone.name]['control_kind']
         shape_names[bone.name] = shape.name
 
     saved_slots = {str(slot): path for slot, path in sorted(slots.items())}
@@ -710,12 +911,18 @@ def apply_rig_authoring(rig: bpy.types.Object, slot_paths: Mapping[int, str] | N
 
     report: dict[str, object] = {
         'format': FORMAT,
+        'authoring_revision': AUTHORING_REVISION,
         'armature': rig.name,
         'mapping_status': mapping_origin,
         'mapped_slots': slot_rows,
         'mapped_bones': sorted({row['bone'] for row in slot_rows}),
         'hierarchy_classified_hand_bones': sorted(
-            path_index[path].name for path in hand_paths if path not in {row['path'] for row in slot_rows}),
+            row['bone'] for row in classified if row['reason'] == 'source_hand_subtree_finger'),
+        'source_fk_controls': classified,
+        'unknown_classification': [row for row in classified if row['control_kind'] == 'unknown'],
+        'technical_source_bones': [row for row in classified if row['control_kind'] == 'technical'],
+        'classification_policy': 'Exact Avatar slots, then named source-path semantics; unknown and technical nodes remain accessible in Source Details. No source-bone renaming, parenting, or binding changes.',
+        'control_colors': {role: list(color) for role, color in ROLE_COLORS.items()},
         'unmapped_bones': unmapped,
         'bone_collections': {name: sorted(bone.name for bone in rig.data.bones if bone.name in collection.bones)
                              for name, collection in bone_collections.items()},
@@ -765,7 +972,11 @@ def verify_rig_authoring(report: Mapping[str, object]) -> dict[str, object]:
         raise AssertionError(f'Armature authoring display settings are incomplete: {rig_name}')
 
     expected_collections = _record(report.get('bone_collections'), 'report.bone_collections')
-    for role in ROLE_NAMES:
+    revision = report.get('authoring_revision', 1)
+    if type(revision) is not int or revision not in (1, AUTHORING_REVISION):
+        raise ValueError(f'Unsupported rig authoring revision: {revision!r}')
+    expected_roles = LEGACY_ROLE_NAMES if revision == 1 else ROLE_NAMES
+    for role in expected_roles:
         collection = rig.data.collections.get(role)
         expected_bones = _rows(expected_collections.get(role), f'report.bone_collections.{role}')
         if collection is None:
@@ -773,8 +984,33 @@ def verify_rig_authoring(report: Mapping[str, object]) -> dict[str, object]:
         actual_bones = sorted(bone.name for bone in rig.data.bones if bone.name in collection.bones)
         if actual_bones != sorted(_text(name, f'report.bone_collections.{role}[]') for name in expected_bones):
             raise AssertionError(f'Bone Collection membership differs from authoring report: {role}')
-        if role == 'Source Details' and collection.is_visible != (not bool(_rows(report.get('mapped_slots'), 'report.mapped_slots'))):
+        if (revision == 1 and role == 'Source Details'
+                and collection.is_visible != (not bool(_rows(report.get('mapped_slots'), 'report.mapped_slots')))):
             raise AssertionError('Source Details visibility differs from mapped/unmapped rig state')
+
+    if revision == AUTHORING_REVISION:
+        controls = _rows(report.get('source_fk_controls'), 'report.source_fk_controls')
+        expected_names = {bone.name for bone in rig.data.bones}
+        control_names: set[str] = set()
+        for index, value in enumerate(controls):
+            row = _record(value, f'report.source_fk_controls[{index}]')
+            name = _text(row.get('bone'), f'FK control[{index}].bone')
+            role = _text(row.get('role'), f'FK control[{index}].role')
+            if name in control_names or name not in expected_names or role not in ROLE_NAMES:
+                raise AssertionError(f'Invalid or duplicate direct FK control: {name}, {role}')
+            control_names.add(name)
+            bone = rig.data.bones[name]
+            if row.get('path') != bone.get('source_transform_path', '') or name not in rig.data.collections[role].bones:
+                raise AssertionError(f'Direct FK control differs from its source bone: {name}')
+            pose_bone = rig.pose.bones[name]
+            if (pose_bone.get('endfield_fk_category') != role
+                    or pose_bone.get('endfield_fk_control_kind') != row.get('control_kind')
+                    or pose_bone.color.palette != 'CUSTOM'
+                    or any(abs(actual - expected) > (1.0 / 255.0 + 1e-5) for actual, expected in
+                           zip(pose_bone.color.custom.normal, ROLE_COLORS[role], strict=True))):
+                raise AssertionError(f'FK control category or display color differs: {name}')
+        if control_names != expected_names:
+            raise AssertionError(f'Direct FK classification does not cover every source bone: {rig_name}')
 
     expected_slot_paths: dict[str, str] = {}
     for index, raw_slot in enumerate(_rows(report.get('mapped_slots'), 'report.mapped_slots')):

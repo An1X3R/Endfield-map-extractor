@@ -7,6 +7,10 @@ import re
 from typing import Literal, TypedDict, cast
 from uuid import UUID
 
+from character_runtime.character_material_options import (
+    CharacterMaterialOptionsError, parse_character_material_options,
+)
+
 
 CharacterJobKind = Literal["preparation", "export"]
 
@@ -75,6 +79,11 @@ def normalize_character_request(payload: object) -> tuple[CharacterJobKind, dict
     if "options" in value:
         options = json_object(value["options"], "options")
         normalized: dict[str, object] = {}
+        if "materials" in options:
+            try:
+                normalized["materials"] = parse_character_material_options(options["materials"]).as_json()
+            except CharacterMaterialOptionsError as error:
+                raise CharacterRequestError(str(error)) from error
         for field in ("raw_expressions", "basic_mmd"):
             flag = options.get(field, False)
             if type(flag) is not bool:

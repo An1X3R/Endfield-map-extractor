@@ -2,7 +2,7 @@
 
 ## 普通用户：预编译发行包
 
-从 [GitHub Releases](https://github.com/An1X3R/Endfield-map-extractor/releases/latest) 下载 `Endfield-Extractor-v3.1-windows-x64.zip`，完整解压到可写目录。请保留 `.tools` 文件夹；GitHub 自动生成的 Source code ZIP 不包含它。
+从 [GitHub Releases](https://github.com/An1X3R/Endfield-map-extractor/releases/latest) 下载 `Endfield-Extractor-v3.2-windows-x64.zip`，完整解压到可写目录。请保留 `.tools` 文件夹；GitHub 自动生成的 Source code ZIP 不包含它。
 
 需要 Windows x64、Python 3.11+、Node.js/npm、.NET 9 x64 运行时和 Blender 4.4+（已验证 4.4.3）。读取工具已预编译，不需要 Git 或 .NET SDK。工具运行依赖以随包回执校验。
 
@@ -39,6 +39,12 @@ v3.1 会核对地图实例索引与当前包体是否匹配。旧索引缺少来
 也可把配置复制到新版根目录并保留文件名 `endfield.runtime.local.json`。移动缓存后需同步修正配置路径；配置变化后重启启动器，刷新网页不足以重载启动配置。本机配置不要随项目转发。
 
 如果移动了整个程序目录，重新运行 `setup_release_environment.ps1` 绑定当前环境路径。保存原导出文件与外部缓存，直到确认新版可正常使用。
+
+## Blender 角色工作台
+
+可另行下载同版本 Release 中的 `endfield_character_tools-0.1.4.zip`，在 Blender 偏好设置中从磁盘安装并启用。插件支持 Blender 4.3+，用于跨文件操作本提取器生成的控制器、天气与后处理；**执行角色提取仍要求 Blender 4.4+**。安装插件不会自动补齐旧成品缺少的控制数据，需用新版重新导出。
+
+精简材质的光照、天气精度与效果范围在网页导出前选择；湿润、覆雪等强度在生成文件的材质属性中调整。后处理需通过插件手动添加，效果作用于渲染合成。
 
 ## 导出结果
 
