@@ -21,6 +21,28 @@ WebUI 使用锁定的 React Canary 提供 `ViewTransition`。`package.json` 仅�
 
 场景首次扫描同时收录 `assets/` 和 `packages/`，地图候选仍按 `assets/` 归组。预制体边界优先复用已准备的元数据，缺失批次共享已解包依赖；正常导出按本地文件身份复用边界和选区缓存，不重复重建源层级进行深审计。跨选区模型仍按实际边界选取，显式排查时可调用 `validate_prefab_selection_evidence`；默认路径只检查保存的选区归属及基本数据结构。性能报告应区分首次准备、新选区计算和缓存复用，不能将三者作为同一测速口径。
 
+## 武器、立绘与展示道具接口
+
+三类资源复用已完成的角色独立准备，无需先导出大地图。后端入口为 `endfield_asset_service.py`，异步任务为 `webui_asset_worker.py`；前端设计尚待讨论。
+
+| 接口 | 用途 |
+| --- | --- |
+| `GET /asset-catalogs/weapon` | 扫描武器中文名、原始星级、类型和可用外观资源 |
+| `GET /asset-catalogs/illustration` | 扫描原尺寸透明立绘及其角色关联 |
+| `GET /asset-catalogs/display_prop` | 扫描展示道具，保留配置证明的角色和挂点关联 |
+| `POST /asset-jobs/validate` | 校验选择、目录身份及所需工具 |
+| `POST /asset-jobs` | 提交批量异步导出，相同 UUID 和相同规范请求幂等复用 |
+| `GET /asset-jobs/{request_id}` | 轮询进度、完成结果或诊断编号 |
+| `POST /asset-jobs/{request_id}/cancel` | 协作式取消，保留已经生成的文件 |
+
+全部接口沿用本机桥的 `X-Endfield-Path-Picker-Token`。请求必须包含 `format: "AssetExportRequest/1"`、UUID `request_id`、`kind`、当前 `catalog_id` 和非空不重复的 `item_ids`。`kind` 为 `weapon`、`illustration` 或 `display_prop`；武器还必须显式传 `variant: "base"` 或 `"refined_candidate"`，其他两类禁止该字段。未知字段丢弃，不接受客户端命令、工具路径或游戏资源路径。
+
+武器选择值取 `entries[].variants[].item_id`（不是 `weapon_id`），立绘取 `entries[].illustration_id`，展示道具取 `entries[].prop_id`。缺资源或有歧义的条目保留在目录中，无法唯一解析的选择会被拒绝；`validate` 只确认请求与源关系，不代表模型已构建成功。武器 `rarity` 保留游戏表原值；强化候选只表示发现独立资源，不承诺游戏里的具体解锁条件。
+
+任务状态为 `queued/running/completed/partial/failed/cancelled`。完成结果 `AssetExportResult/1` 包含 `kind`、`catalog_id`、`request`、`output_directory` 和逐项 `items`，必须以实际结果状态显示成功或部分完成。输出落在用户选择的角色输出目录下 `asset_jobs/{request_id}`，任务记录与诊断独立保存；中断的任务在重启后明确标记失败，不自动当作成功或继续覆盖。
+
+立绘直接导出原始尺寸的 RGBA PNG；武器和展示道具导出内嵌贴图的静态 `.blend`。展示道具目前复用通用模型构建器，底层文件名为 `weapon.blend`，以外层 `EndfieldDisplayPropExport/1` 回执识别用途；配置挂点仅作关系证据，尚未自动挂接角色或附带展示动画。目录不暴露本机游戏和索引路径，所有关联均从当前游戏资源及配置扫描得到。
+
 ## 目录导航
 
 - 根目录：公开启动器、环境引导、依赖清单和本机配置模板；启动器从仓库根目录运行。

@@ -50,6 +50,8 @@ from webui_first_run_coordinator import FirstRunCoordinator, FirstRunCoordinator
 from webui_instanced_worker import InstancedSceneCoordinator, SceneJobNotFound
 from webui_character_contract import CharacterJobNotFound, CharacterRequestConflict, CharacterRequestError
 from webui_character_worker import CharacterCoordinator
+from webui_asset_worker import AssetCoordinator
+from endfield_asset_service import AssetService
 from webui_level_map_preparation import (
     LevelMapPreparationCoordinator, LevelMapPreparationUnavailable, LevelMapPreparationConflict,
 )
@@ -187,13 +189,14 @@ class PathPickerServer(ThreadingHTTPServer):
     first_run: FirstRunCoordinator
     instanced: InstancedSceneCoordinator
     character: CharacterCoordinator
+    assets: AssetCoordinator
     level_map_preparation: LevelMapPreparationCoordinator
     require_first_run_ready: bool
 
     def server_close(self) -> None:
         errors: list[Exception] = []
         try:
-            for name in ("level_map_preparation", "first_run", "character", "instanced", "coordinator"):
+            for name in ("level_map_preparation", "first_run", "assets", "character", "instanced", "coordinator"):
                 if hasattr(self, name):
                     try:
                         getattr(self, name).shutdown()
@@ -385,6 +388,19 @@ class PathPickerHandler(BaseHTTPRequestHandler):
             self.send_json(404, {"error": "not_found"})
             return
         parsed = urlparse(self.path)
+        if parsed.path.startswith(("/asset-catalogs/", "/asset-jobs/")):
+            try:
+                catalog = re.fullmatch(r"/asset-catalogs/(weapon|illustration|display_prop)", parsed.path)
+                job = re.fullmatch(r"/asset-jobs/([A-Za-z0-9-]+)", parsed.path)
+                if catalog:
+                    self.send_json(200, self.server.assets.service.catalog(catalog.group(1)))
+                elif job:
+                    self.send_json(200, self.server.assets.get(job.group(1)))
+                else:
+                    self.send_json(404, {"error": "asset_route_not_found"})
+            except Exception as error:
+                self.handle_character_error(error)
+            return
         if parsed.path == "/level-map-preparation" or parsed.path.startswith("/level-map-preparation/"):
             match = re.fullmatch(r"/level-map-preparation/([A-Za-z0-9-]+)", parsed.path)
             try:
@@ -490,6 +506,20 @@ class PathPickerHandler(BaseHTTPRequestHandler):
             self.send_json(404, {"error": "not_found"})
             return
         parsed = urlparse(self.path)
+        if parsed.path == "/asset-jobs" or parsed.path.startswith("/asset-jobs/"):
+            try:
+                cancel = re.fullmatch(r"/asset-jobs/([A-Za-z0-9-]+)/cancel", parsed.path)
+                if cancel:
+                    self.send_json(202, self.server.assets.cancel(cancel.group(1)))
+                elif parsed.path == "/asset-jobs/validate":
+                    self.send_json(200, self.server.assets.validate(self.read_json_body()))
+                elif parsed.path == "/asset-jobs":
+                    self.send_json(202, self.server.assets.submit(self.read_json_body()))
+                else:
+                    self.send_json(404, {"error": "asset_route_not_found"})
+            except Exception as error:
+                self.handle_character_error(error)
+            return
         if parsed.path == "/level-map-preparation" or parsed.path.startswith("/level-map-preparation/"):
             cancel = re.fullmatch(r"/level-map-preparation/([A-Za-z0-9-]+)/cancel", parsed.path)
             try:
@@ -662,6 +692,8 @@ def start_path_picker(
         CharacterService(Path(str(character_config)) if character_config else None),
         (Path(str(character_export_root)) if character_export_root else ROOT / "exports") / "character_jobs",
     )
+    server.assets = AssetCoordinator(AssetService(server.character.service),
+        (Path(str(character_export_root)) if character_export_root else ROOT / "exports") / "asset_jobs")
     thread = threading.Thread(target=server.serve_forever, name="endfield-path-picker", daemon=True)
     thread.start()
     return server, thread
