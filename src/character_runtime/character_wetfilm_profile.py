@@ -17,6 +17,7 @@ from character_material_profile import profile_shader_identity
 from patch_character_hgrp import source_keywords
 from patch_native_character_weather import rest_attributes
 from review_character_hgrp import visible_source_group_names
+from character_windows_paths import io_path
 
 
 DRY_WEATHER_SOURCE = 'explicit_dry_artist_values'
@@ -26,14 +27,14 @@ NATIVE_WETFILM_STATUS = 'standard_wetfilm_connected_native_per_draw'
 
 
 def file_digest(path: Path) -> str:
-    with path.open('rb') as stream:
+    with io_path(path).open('rb') as stream:
         return hashlib.file_digest(stream, 'sha256').hexdigest()
 
 
 def verified_file(parent: Path, value: object, digest: object) -> Path:
     if not isinstance(value, str) or not value or not isinstance(digest, str):
         raise ValueError('Wet-film source requires a configured path and SHA-256')
-    path = (parent / value).resolve(strict=True)
+    path = io_path(parent / value).resolve(strict=True)
     if file_digest(path) != digest.casefold():
         raise ValueError(f'Wet-film source SHA-256 mismatch: {path}')
     return path
@@ -104,7 +105,7 @@ def attach_profile_wetfilm(
     weather_controls: bpy.types.ShaderNodeTree | None,
 ) -> dict[str, object]:
     """Keep zero weather neutral; source runtime uniforms remain explicit artist inputs."""
-    document = json.loads(profile.read_text(encoding='utf-8'))
+    document = json.loads(io_path(profile).read_text(encoding='utf-8'))
     if 'standard_wet_film' not in document:
         return {'status': 'not_configured', 'groups': []}
     config = document['standard_wet_film']
@@ -143,7 +144,7 @@ def attach_profile_wetfilm(
     if not meshes:
         raise ValueError('Standard wet-film groups have no visible source mesh')
     attributes = rest_attributes(tuple(meshes.values()))
-    records = json.loads(manifest.read_text(encoding='utf-8'))
+    records = json.loads(io_path(manifest).read_text(encoding='utf-8'))
     if not isinstance(records, list):
         raise ValueError('Weather texture manifest must be an array')
     rain = tuple(row for row in records if isinstance(row, dict) and row.get('slot') == 'characterRainDropTexture')

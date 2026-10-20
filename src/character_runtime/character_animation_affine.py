@@ -10,6 +10,11 @@ import numpy as np
 from numpy.typing import NDArray
 
 
+SPACE_PROPERTY = 'source_affine_target_space'
+PARENT_SPACE = 'source_parent_bone/1'
+ARMATURE_SPACE = 'armature/1'
+
+
 @dataclass(frozen=True)
 class AffineTarget:
     bone_name: str
@@ -87,18 +92,43 @@ def create_affine_targets(armature: bpy.types.Object, bone_names: tuple[str, ...
             obj.rotation_mode = 'QUATERNION'
             obj['source_affine_bone'] = name
             obj['source_affine_armature'] = armature.name
-        left.parent = armature
-        left.matrix_parent_inverse = Matrix.Identity(4)
-        right.parent = left
-        right.matrix_parent_inverse = Matrix.Identity(4)
         constraint = armature.pose.bones[name].constraints.new('COPY_TRANSFORMS')
         constraint.name = 'Source affine target'
         constraint.target = right
         constraint.owner_space = 'WORLD'
         constraint.target_space = 'WORLD'
         constraint.mix_mode = 'REPLACE'
-        result.append(AffineTarget(name, left, right, constraint.name))
+        helper = AffineTarget(name, left, right, constraint.name)
+        bind_affine_parent(armature, helper)
+        result.append(helper)
     return tuple(result)
+
+
+def bind_affine_parent(armature: bpy.types.Object, helper: AffineTarget) -> None:
+    """Bind the source-parent frame; existing helper keys must be rebaked afterward."""
+    parent = armature.data.bones[helper.bone_name].parent
+    if parent is not None and parent.use_relative_parent:
+        raise ValueError(f'Affine target requires ordinary bone parenting: armature={armature.name}, '
+                         f'bone={helper.bone_name}, parent={parent.name}, use_relative_parent=True')
+    helper.left.parent = armature
+    helper.left.parent_type = 'OBJECT' if parent is None else 'BONE'
+    helper.left.parent_bone = '' if parent is None else parent.name
+    helper.left.matrix_parent_inverse = (Matrix.Identity(4) if parent is None
+                                        else Matrix.Translation((0., -parent.length, 0.)))
+    helper.right.parent = helper.left
+    helper.right.parent_type = 'OBJECT'
+    helper.right.parent_bone = ''
+    helper.right.matrix_parent_inverse = Matrix.Identity(4)
+    for obj in (helper.left, helper.right):
+        obj[SPACE_PROPERTY] = ARMATURE_SPACE if parent is None else PARENT_SPACE
+
+
+def affine_target_matrix(helper: AffineTarget, targets: dict[str, Matrix]) -> Matrix:
+    """Express the source target relative to its editable source-parent pose."""
+    target = targets[helper.bone_name]
+    if helper.left.parent_type == 'BONE':
+        return targets[helper.left.parent_bone].inverted() @ target
+    return target
 
 
 def assign_affine_target(helper: AffineTarget, factors: AffineFactors) -> None:
@@ -139,6 +169,8 @@ def finish_affine_targets(helpers: tuple[AffineTarget, ...], frames: int) -> lis
                     point.interpolation = 'LINEAR'
             objects.append({'object': obj.name, 'action': action.name})
         result.append({'bone_name': helper.bone_name, 'constraint': helper.constraint_name,
+                       'parent_bone': helper.left.parent_bone or None,
+                       'target_space': helper.left[SPACE_PROPERTY],
                        'collection': helper.left.users_collection[0].name, 'objects': objects})
     return result
 
@@ -161,5 +193,24 @@ def validate_affine_targets(armature: bpy.types.Object, records: list[object], f
             if action is None or action.name != row['action'] or len(action.fcurves) != 10 or any(len(curve.keyframe_points) != frames for curve in action.fcurves):
                 raise ValueError(f'Saved affine helper Action is missing or differs: {obj.name}')
             resolved.append(obj)
-        if resolved[0].parent != armature or resolved[1].parent != resolved[0] or constraint is None or constraint.type != 'COPY_TRANSFORMS' or constraint.target != resolved[1] or constraint.mute or constraint.influence != 1. or constraint.owner_space != 'WORLD' or constraint.target_space != 'WORLD' or constraint.mix_mode != 'REPLACE':
+        parent = bone.parent
+        if parent is not None and parent.bone.use_relative_parent:
+            raise ValueError(f'Saved affine target parent uses relative parenting: {bone.name}/{parent.name}')
+        parent_type = 'OBJECT' if parent is None else 'BONE'
+        parent_name = '' if parent is None else parent.name
+        target_space = ARMATURE_SPACE if parent is None else PARENT_SPACE
+        identity = Matrix.Identity(4)
+        parent_inverse = Matrix.Identity(4) if parent is None else Matrix.Translation((0., -parent.bone.length, 0.))
+        if (resolved[0].parent != armature or resolved[0].parent_type != parent_type
+                or resolved[0].parent_bone != parent_name
+                or any(obj.get(SPACE_PROPERTY) != target_space for obj in resolved)
+                or record.get('target_space') != target_space or record.get('parent_bone') != (parent_name or None)
+                or max(abs(resolved[0].matrix_parent_inverse[row][column] - parent_inverse[row][column])
+                       for row in range(4) for column in range(4)) > 1e-6
+                or resolved[1].parent != resolved[0] or resolved[1].parent_type != 'OBJECT'
+                or max(abs(resolved[1].matrix_parent_inverse[row][column] - identity[row][column])
+                       for row in range(4) for column in range(4)) > 1e-6
+                or constraint is None or constraint.type != 'COPY_TRANSFORMS' or constraint.target != resolved[1]
+                or constraint.mute or constraint.influence != 1. or constraint.owner_space != 'WORLD'
+                or constraint.target_space != 'WORLD' or constraint.mix_mode != 'REPLACE'):
             raise ValueError(f'Saved affine target constraint differs: {bone.name}')

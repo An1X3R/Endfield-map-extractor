@@ -23,6 +23,11 @@ _VERIFIED_1472_KEYWORDS = frozenset({
     "_SAMPLE_TEX0", "_SAMPLE_TEX1", "_SAMPLE_TEX2", "_SAMPLE_TEX3",
     "_SAMPLE_TEX4", "_USE_SOFTBLEND", "_USE_VERTOFFSET",
 })
+_VERIFIED_1471_KEYWORDS = _VERIFIED_1472_KEYWORDS - {"_SAMPLE_TEX4"}
+_VERIFIED_1468_KEYWORDS = _VERIFIED_1471_KEYWORDS - {"_SAMPLE_TEX2", "_SAMPLE_TEX3"}
+_VERIFIED_1448_KEYWORDS = _VERIFIED_1468_KEYWORDS - {"_USE_SOFTBLEND"}
+_VERIFIED_VERTEX_KEYWORDS = (_VERIFIED_1448_KEYWORDS, _VERIFIED_1468_KEYWORDS,
+                            _VERIFIED_1471_KEYWORDS, _VERIFIED_1472_KEYWORDS)
 
 
 @dataclass(frozen=True)
@@ -103,7 +108,7 @@ def _controls(material: Mapping[str, object], texture_source: str,
 
 def validate_vertex_offset_source(
         material: Mapping[str, object]) -> tuple[Mapping[str, object], OffsetSamplerContract]:
-    """Validate the bounded 1472 VFXBaseV2 vertex-offset source contract."""
+    """Validate verified VFXBaseV2 offset profiles at an explicit preview time."""
     shader = _mapping(material.get("Shader"), "Material.Shader")
     if shader.get("Name") != "HGRP/Effect/VFXBaseV2":
         raise NotImplementedError(f"Vertex-offset shader family is unsupported: shader={shader.get('Name')!r}")
@@ -114,7 +119,7 @@ def validate_vertex_offset_source(
         raise ValueError("Vertex-offset source keywords are missing or malformed: field=Material.RenderState.ValidKeywords")
     if len(keywords) != len(set(keywords)):
         raise ValueError(f"Vertex-offset source keywords contain duplicates: keywords={keywords}")
-    if frozenset(keywords) != _VERIFIED_1472_KEYWORDS:
+    if frozenset(keywords) not in _VERIFIED_VERTEX_KEYWORDS:
         raise NotImplementedError(f"Vertex-offset compiled variant is unsupported: keywords={keywords}")
 
     textures = material.get("Textures")
@@ -136,6 +141,12 @@ def validate_vertex_offset_source(
 
     controls = _controls(material, texture_source, texture_path_id)
     floats = _mapping(material.get("Floats"), "Material.Floats")
+    if frozenset(keywords) == _VERIFIED_1448_KEYWORDS:
+        # The current no-soft vertex path adds this source-gated alpha multiplier.
+        weight = _number(floats.get("_UseVertexColorAlphaAsVertOffsetWeight"),
+                         "Material.Floats._UseVertexColorAlphaAsVertOffsetWeight")
+        if weight != 0.0:
+            raise NotImplementedError(f"Vertex-offset source color-alpha weighting is unsupported: value={weight}")
     if controls.in_particle not in (0.0, 1.0):
         raise NotImplementedError(
             f"Vertex-offset source control is unsupported: field=_InParticle, value={controls.in_particle}")
@@ -144,9 +155,9 @@ def validate_vertex_offset_source(
         value = _number(floats.get(field), f"Material.Floats.{field}")
         if value != expected:
             raise NotImplementedError(f"Vertex-offset source control is unsupported: field={field}, value={value}")
-    if controls.bidirectional not in (0.0, 1.0) or controls.camera_offset < 0.0:
+    if controls.bidirectional not in (0.0, 1.0):
         raise NotImplementedError(
-            "Vertex-offset bidirectional or camera-offset control is unsupported: "
+            "Vertex-offset bidirectional control is unsupported: "
             f"bidirectional={controls.bidirectional}, camera_offset={controls.camera_offset}")
 
     color_space = reference.get("ColorSpace")
@@ -226,14 +237,16 @@ def _custom1_y_by_vertex(mesh: bpy.types.Mesh, custom_name: str) -> tuple[float,
 
 def _offset_inputs_by_vertex(
         mesh: bpy.types.Mesh, layer_name: str,
-        in_particle: float) -> tuple[tuple[tuple[float, float], float], ...]:
+        controls: _Controls) -> tuple[tuple[tuple[float, float], float], ...]:
     uvs = _uv_by_vertex(mesh, layer_name)
-    if in_particle == 0.0:
+    if controls.in_particle not in (0.0, 1.0):
+        raise UnsupportedVertexOffset(f"Vertex-offset _InParticle must be zero or one: value={controls.in_particle}")
+    if (controls.in_particle == 0.0 or
+            (controls.offset_speed[2:] == (0.0, 0.0) and controls.offset_dir[3] == 0.0)):
+        # Zero coefficients eliminate Custom1.Y without inventing a vertex stream.
         custom_y_values = (0.0,) * len(uvs)
-    elif in_particle == 1.0:
-        custom_y_values = _custom1_y_by_vertex(mesh, "EF_FX_CUSTOM1")
     else:
-        raise UnsupportedVertexOffset(f"Vertex-offset _InParticle must be zero or one: value={in_particle}")
+        custom_y_values = _custom1_y_by_vertex(mesh, "EF_FX_CUSTOM1")
     return tuple((uv, custom_y) for uv, custom_y in zip(uvs, custom_y_values, strict=True))
 
 
@@ -278,16 +291,19 @@ def _vertex_offset_preview_context_issues(
         issues.append("shader_not_vfxbasev2")
     if not isinstance(keywords, list) or any(type(item) is not str for item in keywords):
         issues.append("material_keywords_invalid")
-    elif frozenset(keywords) != _VERIFIED_1472_KEYWORDS:
+    elif frozenset(keywords) not in _VERIFIED_VERTEX_KEYWORDS:
         issues.append("compiled_vertex_variant_not_verified")
+    elif (frozenset(keywords) == _VERIFIED_1448_KEYWORDS and
+          floats.get("_UseVertexColorAlphaAsVertOffsetWeight") != 0.0):
+        issues.append("source_vertex_color_alpha_offset_weight_not_zero")
     if controls.in_particle not in (0.0, 1.0):
         issues.append(f"unsupported__InParticle={controls.in_particle!r}")
     for field, expected in (("_UseVertexOffset", 1), ("_OffsetSwitchDir", 0), ("_OffsetUVSet", 0),
                             ("_UseVertexOffsetMask", 0)):
         if floats.get(field) != expected:
             issues.append(f"unsupported_{field}={floats.get(field)!r}")
-    if controls.bidirectional not in (0.0, 1.0) or controls.camera_offset < 0.0:
-        issues.append("unsupported_bidirectional_or_camera_offset")
+    if controls.bidirectional not in (0.0, 1.0):
+        issues.append("unsupported_bidirectional_control")
     if (sampler.filter_mode != "bilinear_lod0" or sampler.wrap_u not in ("repeat", "clamp") or
             sampler.wrap_v not in ("repeat", "clamp") or sampler.source_color_space != 1 or
             sampler.sampler_evidence not in ("source_verified", "research_assumption") or
@@ -328,7 +344,7 @@ def vertex_offset_preview_issues(material: Mapping[str, object], mesh: bpy.types
         object_to_world, camera_world, time_seconds, pass_gate))
     if not issues:
         try:
-            _offset_inputs_by_vertex(mesh, "UVMap", controls.in_particle)
+            _offset_inputs_by_vertex(mesh, "UVMap", controls)
         except UnsupportedVertexOffset as error:
             issues.append(str(error))
     return tuple(issues)
@@ -346,7 +362,7 @@ def apply_vertex_offset_research_preview(material: Mapping[str, object], source_
     if issues:
         raise UnsupportedVertexOffset(f"Vertex-offset research preview unsupported: issues={issues}")
     controls = _controls(material, texture_source, texture_path_id)
-    vertex_streams = _offset_inputs_by_vertex(source_mesh, "UVMap", controls.in_particle)
+    vertex_streams = _offset_inputs_by_vertex(source_mesh, "UVMap", controls)
     width, height = int(image.size[0]), int(image.size[1])
     pixels = array("f", [0.0]) * (width * height * 4)
     image.pixels.foreach_get(pixels)

@@ -661,6 +661,11 @@ def _build_prepared_scene() -> None:
     terrain_contact_host = apply_scene_terrain_contact(
         scene, materials, args.output.parent / "terrain_contact_host")
     scene_color_snapshot = None
+    flow_presentation = None
+    if "effect_flow_presentation" in plan:
+        from blender_effect_flow_preview import apply_flow_presentation
+
+        flow_presentation = apply_flow_presentation(scene, plan["effect_flow_presentation"])
     if "scene_color_snapshot" in plan:
         from blender_scene_vfxrefract import finalize_scene_vfxrefract, verify_scene_vfxrefract
 
@@ -682,7 +687,8 @@ def _build_prepared_scene() -> None:
                          "status": material["endfield_emissive_motion_status"]}
                         for material in used_materials
                         if material.get("endfield_emissive_motion_status") in (
-                            "unsupported_sweep_variant", "source_formula_preview_runtime_unresolved")]
+                            "unsupported_sweep_variant", "source_formula_preview_runtime_unresolved",
+                            "blender_approximation_runtime_unresolved")]
     material_pending.extend({"material": material.name, "component": "fog_surface",
                              "reason": material["endfield_fx_limitations"],
                              "status": material["endfield_fx_status"]}
@@ -772,6 +778,7 @@ def _build_prepared_scene() -> None:
         "decals": decals, "water": water, "water_transport": water_transport,
         "effects": effects, "fog_depth": fog_depth, "lights": lights, "environment": environment,
         "scene_color_snapshot": scene_color_snapshot,
+        "effect_flow_presentation": flow_presentation,
         "direct_effect_pending": plan.get("direct_effect_pending", []),
         "dynamic_geometry_pending": plan["dynamic_geometry_pending"],
         "static_role_exclusions": plan["static_role_exclusions"],

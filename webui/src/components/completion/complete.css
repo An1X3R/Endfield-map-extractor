@@ -154,7 +154,7 @@
 .ec-seal small { display: block; margin-top: 7px; color: #b0bfc7; font: 11px var(--ec-mono); }
 .ec-card--map02 .ec-seal small { color: #a8c7b9; }
 .ec-title-wrap { overflow: hidden; }
-.ec-title { margin: 0; color: #f2f4ec; font: 800 clamp(34px, 4.1vw, 66px)/1.12 var(--ec-display); letter-spacing: -.05em; }
+.ec-title { margin: 0; color: #f2f4ec; font: 800 clamp(34px, 4.1vw, 66px)/1.12 var(--ec-display); letter-spacing: -.05em; text-wrap: balance; }
 .ec-card--map02 .ec-title { color: #b7f7d9; }
 .ec-subtitle { margin: 15px 0 24px; color: #d9dca5; font-size: 16px; }
 .ec-card--map02 .ec-subtitle { color: #ded0a5; }

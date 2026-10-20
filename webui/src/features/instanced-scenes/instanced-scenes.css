@@ -91,71 +91,27 @@
   font: 9px var(--mono);
 }
 
-.isc-heading {
-  position: relative;
-  z-index: 2;
-  height: 162px;
-  min-height: 162px;
-  padding: 11px 18px 4px;
-  border-top: 5px solid var(--isc-yellow);
+.isc-workspace-line {
+  height: 39px; display: flex; align-items: center; justify-content: space-between;
+  padding: 0 28px; border-bottom: 1px solid var(--isc-rule);
+  background: #fafbfa; color: #697373; font: 10px var(--mono); letter-spacing: .05em;
 }
-
-.isc-kicker {
-  font: 11px var(--mono);
-  letter-spacing: 0.14em;
-}
-
-.isc-heading h1 {
-  margin: 4px 0 0;
-  font: 900 clamp(54px, 5.2vw, 72px) / 0.72 var(--display);
-  letter-spacing: -0.075em;
-  white-space: nowrap;
-}
-
-.isc-heading h1 br {
-  display: block;
-}
-
-.isc-heading h1 em {
-  color: #9ba3a3;
-  font-style: normal;
-}
-
-.isc-heading h1 em::before {
-  content: none;
-}
-
-.isc-heading-cn {
-  position: absolute;
-  top: 24px;
-  left: min(750px, 67%);
-  padding: 7px 12px;
-  background: #1a1f20;
-  color: var(--isc-yellow);
-  font-size: 15px;
-  font-weight: 800;
-}
-
-.isc-heading p {
-  position: absolute;
-  bottom: 5px;
-  left: 19px;
-  max-width: none;
-  margin: 0;
-  color: #5c6567;
-  font-size: 11px;
-}
+.isc-workspace-line button, .isc-settings-close { display: none; }
+.isc-heading { position: relative; flex: none; padding: 22px 18px 20px; border-top: 5px solid var(--isc-yellow); }
+.isc-kicker { font: 10px var(--mono); letter-spacing: .12em; }
+.isc-heading h1 { margin: 12px 0 0; font: 900 clamp(42px, 3.4vw, 56px)/.82 var(--display); letter-spacing: -.065em; }
+.isc-heading h1 em { color: #8f9999; font-style: normal; }
 
 .isc-layout {
   position: relative;
   z-index: 2;
   display: grid;
-  height: calc(100% - 188px);
+  height: calc(100% - 65px);
   min-height: 0;
-  grid-template-columns: clamp(300px, 18vw, 460px) minmax(0, 1fr) clamp(340px, 20vw, 500px);
+  grid-template-columns: 390px minmax(0, 1fr) 430px;
   grid-template-rows: minmax(0, 1fr) clamp(160px, 24vh, 184px);
-  gap: 12px;
-  padding: 0 16px 4px;
+  gap: 20px 26px;
+  padding: 24px 28px 0;
 }
 
 .isc-index,
@@ -355,6 +311,7 @@
   align-items: center;
   gap: 7px;
   padding: 7px 11px 7px 19px;
+  border: 0;
   border-top: 1px solid #e1e4e2;
   background: transparent;
   color: inherit;
@@ -1767,36 +1724,30 @@
   to { clip-path: inset(0); }
 }
 
-@media (min-width: 1600px) {
-  .isc-layout { grid-template-columns: clamp(380px, 18vw, 460px) minmax(0, 1fr) clamp(420px, 20vw, 500px); }
+@media (min-width: 1800px) {
+  .isc-layout { grid-template-columns: 420px minmax(0, 1fr) 450px; gap: 20px 40px; padding: 30px 40px 0; }
 }
-
-@media (max-width: 1370px) {
-  .isc-layout { grid-template-columns: 240px minmax(0, 1fr) 280px; }
+@media (min-width: 1200px) and (max-width: 1599px) {
+  .isc-layout { grid-template-columns: 320px minmax(0, 1fr) 360px; gap: 16px 22px; padding-inline: 22px; }
   .isc-stage-title { left: 25px; }
-  .isc-index-note { margin: 7px 10px; }
-  .isc-action { padding: 8px; }
-  .isc-action-selection { margin: 4px 0; }
-  .isc-action button { min-height: 44px; }
-  .isc-action button strong { font-size: 13px; }
-  .isc-action-message { margin-top: 3px; }
 }
-
-@media (max-width: 1050px) {
-  .isc-layout {
-    grid-template-columns: 210px minmax(0, 1fr) 240px;
-    gap: 8px;
-    padding-right: 9px;
-    padding-left: 9px;
-  }
-  .isc-settings-head { padding: 10px; }
-  .isc-settings-body { padding: 8px; }
-  .isc-stage-title { left: 25px; }
-  .isc-stage-title h2 { font-size: 38px; }
-  .isc-action button strong { font-size: 12px; }
-  .isc-heading h1 { font-size: 55px; }
-  .isc-heading-cn { left: min(650px, 67%); right: auto; }
+@media (min-width: 801px) and (max-width: 1199px) {
+  .isc-workspace-line { padding-inline: 20px; }
+  .isc-workspace-line > span:nth-child(2) { display: none; }
+  .isc-workspace-line button { display: block; padding: 7px 12px; background: #202526; color: #ffe600; }
+  .isc-layout { grid-template-columns: minmax(0,45fr) minmax(0,55fr); gap: 18px 28px; padding: 20px 20px 0; }
+  .isc-stage { grid-row: 1; }
+  .isc-stage-title { left: 20px; }
+  .isc-stage-title h2 { font-size: 42px; }
+  .isc-action { grid-column: 2; }
+  .isc-settings { display: none; position: absolute; grid-area: 1 / 1 / -1 / -1; z-index: 30; inset: 10px 20px 10px auto; width: 390px; max-width: calc(100% - 40px); transform: none !important; background: var(--isc-paper); box-shadow: 0 18px 65px #101a1945; }
+  .isc-settings.is-open { display: flex; animation: isc-settings-enter 260ms cubic-bezier(.16,1,.3,1) both; }
+  .isc-settings-head { cursor: default; }
+  .isc-settings-head > span b, .isc-settings-head > button:not(.isc-settings-close) { display: none; }
+  .isc-settings-head .isc-settings-close { display: block; }
+  .isc-job-panel { grid-row: 1; margin-inline: 0; }
 }
+@keyframes isc-settings-enter { from { opacity: 0; translate: 16px 0; } to { opacity: 1; translate: 0 0; } }
 
 @media (max-width: 800px) {
   .isc-workspace {
@@ -1806,31 +1757,10 @@
     overflow: visible;
   }
 
-  .isc-heading {
-    height: auto;
-    min-height: 170px;
-    padding: 18px 20px 8px;
-  }
-
-  .isc-heading h1 {
-    margin-top: 9px;
-    font-size: 55px;
-    line-height: 0.8;
-  }
-
-  .isc-heading-cn {
-    top: 28px;
-    left: auto;
-    right: 15px;
-  }
-
-  .isc-heading p {
-    position: static;
-    max-width: 600px;
-    margin: 8px 0 0;
-    font-size: 12px;
-  }
-
+  .isc-workspace-line { padding-inline: 15px; }
+  .isc-workspace-line > span:nth-child(2) { display: none; }
+  .isc-heading { padding: 15px; }
+  .isc-heading h1 { font-size: 42px; }
   .isc-layout {
     display: grid;
     height: auto;
@@ -1842,7 +1772,7 @@
 
   .isc-index {
     height: auto;
-    max-height: 290px;
+    max-height: 420px;
     grid-column: 1;
     grid-row: auto;
   }
@@ -1915,10 +1845,7 @@
 }
 
 @media (max-width: 560px) {
-  .isc-heading { min-height: 160px; padding: 15px; }
   .isc-heading h1 { font-size: clamp(38px, 11.5vw, 45px); }
-  .isc-heading p { max-width: 270px; }
-  .isc-heading-cn { top: 23px; right: 14px; padding: 5px; font-size: 10px; }
   .isc-stage { min-height: 430px; }
   .isc-stage-title { top: 50px; }
   .isc-stage-title h2 { font-size: 34px; }
@@ -1930,12 +1857,7 @@
 }
 
 @media (max-height: 780px) and (min-width: 801px) {
-  .isc-heading { height: 110px; min-height: 110px; }
-  .isc-heading h1 { font-size: clamp(54px, 4.9vw, 64px); line-height: .86; }
-  .isc-heading h1 br { display: none; }
-  .isc-heading h1 em::before { content: "\00a0"; }
-  .isc-heading p { bottom: 8px; }
-  .isc-layout { height: calc(100% - 136px); grid-template-rows: minmax(190px, 1fr) 160px; gap: 10px; }
+  .isc-layout { grid-template-rows: minmax(190px, 1fr) 170px; row-gap: 12px; }
   .isc-settings-head { box-sizing: border-box; height: 68px; padding: 9px 15px; }
   .isc-settings-head h2 { margin-top: 5px; line-height: 1; }
   .isc-settings-head button { bottom: 9px; }
@@ -1943,6 +1865,7 @@
 }
 
 @media (prefers-reduced-motion: reduce) {
+  .isc-settings.is-open,
   .isc-scene-entry,
   .isc-group-items,
   .isc-group-arrow,

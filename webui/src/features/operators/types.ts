@@ -226,6 +226,7 @@ export type CharacterMaterialOptions = {
 }
 
 export type CharacterExportOptions = {
+  appearance?: CharacterAppearanceOptions
   materials?: CharacterMaterialOptions
   raw_expressions?: boolean
   basic_mmd?: boolean
@@ -278,6 +279,8 @@ export type CharacterDeliveryFile = {
 }
 
 export type CharacterJobResult = {
+  appearance_options?: CharacterAppearanceOptions
+  appearance_report?: CharacterAppearanceReport
   material_options?: CharacterMaterialOptions
   format: 'CharacterExportResult/1' | 'CharacterPreparationResult/1'
   status: 'completed' | 'partial'
@@ -287,6 +290,33 @@ export type CharacterJobResult = {
     code: string
     message: string
   }>
+}
+
+export type CharacterAppearanceOptions = {
+  potential: 'base' | 'maximum'
+  fur: 'existing' | 'source_shell' | 'charcoal_embers'
+}
+
+export type CharacterAppearanceReport = {
+  format: 'EndfieldCharacterAppearance/1'
+  status: 'completed' | 'partial'
+  potential: {
+    requested: CharacterAppearanceOptions['potential']
+    status: 'applied' | 'not_applicable' | 'partial'
+    scope?: string
+    pending?: string[]
+  }
+  fur: {
+    requested: CharacterAppearanceOptions['fur']
+    status: 'applied' | 'not_applicable' | 'partial' | 'unchanged'
+    pending?: string[]
+    verification?: {
+      source_shell_count?: number
+      artist_applied_count?: number
+      artist_skipped_count?: number
+      skipped_hidden_source_count?: number
+    }
+  }
 }
 
 export type CharacterJobState = 'queued' | 'running' | 'completed' | 'partial' | 'failed' | 'cancelled'

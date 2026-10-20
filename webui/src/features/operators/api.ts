@@ -1,5 +1,6 @@
 import { isJsonObject, requestJson } from '../../lib/backendClient'
 import { assertMaterialAcknowledgement, WEATHER_EFFECTS } from './materials'
+import { assertAppearanceAcknowledgement } from './appearance'
 import type {
   CharacterAnimation,
   CharacterAnimationCatalog,
@@ -15,6 +16,8 @@ import type {
   CharacterDetail,
   CharacterExportOptions,
   CharacterExportRequest,
+  CharacterAppearanceOptions,
+  CharacterAppearanceReport,
   CharacterMaterialOptions,
   CharacterWeatherEffect,
   CharacterJob,
@@ -412,10 +415,55 @@ const parseMaterials = (value: unknown, field: string): CharacterMaterialOptions
   return { mode: row.mode, lighting: row.lighting, weather: { quality: weather.quality, effects: WEATHER_EFFECTS.filter(effect => effects.includes(effect)) } }
 }
 
+const parseAppearanceOptions = (value: unknown, field: string): CharacterAppearanceOptions => {
+  const row = object(value, field)
+  if (row.potential !== 'base' && row.potential !== 'maximum') return invalid(`${field}.potential`, 'base or maximum')
+  if (row.fur !== 'existing' && row.fur !== 'source_shell' && row.fur !== 'charcoal_embers') return invalid(`${field}.fur`, 'existing, source_shell or charcoal_embers')
+  return { potential: row.potential, fur: row.fur }
+}
+
+const parseAppearanceReport = (value: unknown, options: CharacterAppearanceOptions): CharacterAppearanceReport => {
+  const field = 'CharacterJob.result.appearance_report'
+  const row = object(value, field)
+  if (row.format !== 'EndfieldCharacterAppearance/1') return invalid(`${field}.format`, 'EndfieldCharacterAppearance/1')
+  if (row.status !== 'completed' && row.status !== 'partial') return invalid(`${field}.status`, 'completed or partial')
+  const potential = object(row.potential, `${field}.potential`)
+  const fur = object(row.fur, `${field}.fur`)
+  if (potential.requested !== options.potential || fur.requested !== options.fur) return invalid(field, 'requested values matching result.appearance_options')
+  if (potential.status !== 'applied' && potential.status !== 'not_applicable' && potential.status !== 'partial') return invalid(`${field}.potential.status`, 'applied, not_applicable or partial')
+  if (fur.status !== 'applied' && fur.status !== 'not_applicable' && fur.status !== 'partial' && fur.status !== 'unchanged') return invalid(`${field}.fur.status`, 'applied, not_applicable, partial or unchanged')
+  if (row.status === 'completed' && (potential.status === 'partial' || fur.status === 'partial')) return invalid(`${field}.status`, 'partial when a component is partial')
+  // Evidence entries have source-specific shapes; preserve them as inert JSON text.
+  const evidence = (items: unknown, path: string): string[] => array(items, path, (item, itemField) => {
+    const serialized = JSON.stringify(item)
+    return serialized === undefined ? invalid(itemField, 'JSON evidence') : serialized
+  })
+  const result: CharacterAppearanceReport = {
+    format: 'EndfieldCharacterAppearance/1', status: row.status,
+    potential: { requested: options.potential, status: potential.status },
+    fur: { requested: options.fur, status: fur.status },
+  }
+  if ('scope' in potential) result.potential.scope = text(potential.scope, `${field}.potential.scope`)
+  if ('pending' in potential) result.potential.pending = evidence(potential.pending, `${field}.potential.pending`)
+  if ('pending' in fur) result.fur.pending = evidence(fur.pending, `${field}.fur.pending`)
+  if ('verification' in fur) {
+    const verification = object(fur.verification, `${field}.fur.verification`)
+    result.fur.verification = {}
+    for (const key of ['source_shell_count', 'artist_applied_count', 'artist_skipped_count', 'skipped_hidden_source_count'] as const) {
+      if (key in verification) result.fur.verification[key] = integer(verification[key], `${field}.fur.verification.${key}`, 0)
+    }
+  }
+  return result
+}
+
 const parseExportOptions = (value: unknown): CharacterExportOptions => {
   const row = object(value, 'CharacterExportRequest.options')
   const result: CharacterExportOptions = {}
   if ('materials' in row) result.materials = parseMaterials(row.materials, 'CharacterExportRequest.options.materials')
+  if ('appearance' in row) {
+    result.appearance = parseAppearanceOptions(row.appearance, 'CharacterExportRequest.options.appearance')
+    if (result.materials?.mode === 'simplified') return invalid('CharacterExportRequest.options.appearance', 'original materials')
+  }
   if ('raw_expressions' in row) result.raw_expressions = bool(row.raw_expressions, 'CharacterExportRequest.options.raw_expressions')
   if ('basic_mmd' in row) result.basic_mmd = bool(row.basic_mmd, 'CharacterExportRequest.options.basic_mmd')
   if ('native_expression_replay_id' in row) {
@@ -543,7 +591,14 @@ const parseJobResult = (value: unknown, kind: CharacterJobKind): CharacterJobRes
   const expectedFormat = kind === 'preparation' ? 'CharacterPreparationResult/1' : 'CharacterExportResult/1'
   if (row.format !== expectedFormat) return invalid('CharacterJob.result.format', expectedFormat)
   if (row.status !== 'completed' && row.status !== 'partial') return invalid('CharacterJob.result.status', 'completed or partial')
+  const appearance: Pick<CharacterJobResult, 'appearance_options' | 'appearance_report'> = {}
+  if ('appearance_options' in row || 'appearance_report' in row) {
+    if (kind !== 'export' || !('appearance_options' in row) || !('appearance_report' in row)) return invalid('CharacterJob.result.appearance_options', 'paired options and report on an export')
+    appearance.appearance_options = parseAppearanceOptions(row.appearance_options, 'CharacterJob.result.appearance_options')
+    appearance.appearance_report = parseAppearanceReport(row.appearance_report, appearance.appearance_options)
+  }
   return {
+    ...appearance,
     ...(kind === 'export' && 'material_options' in row ? { material_options: parseMaterials(row.material_options, 'CharacterJob.result.material_options') } : {}),
     format: expectedFormat,
     status: row.status,
@@ -769,6 +824,7 @@ export const validateCharacterExport = async (
   )
   if (validation.canonical_request.format === 'CharacterExportRequest/1') {
     assertMaterialAcknowledgement(request.options?.materials, validation.canonical_request.options?.materials)
+    assertAppearanceAcknowledgement(request.options?.appearance, validation.canonical_request.options?.appearance)
   }
   return validation
 }

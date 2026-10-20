@@ -14,6 +14,8 @@ from blender_hgrp_surface import packed_normal_group, remap_roughness, apply_aut
 from blender_hgrp_emission import apply_lit_sweep, apply_lit_map_sweep, apply_lit_mask_sweep
 from endfield_scene_material_contract import MaterialRecord, TextureSlot, AssetReference, supported_slots, has_procedural_foliage_emission
 from endfield_shader_contract import has_verified_lit_alpha_clip
+from endfield_shader_contract import has_approximate_lit_sweep
+from blender_hgrp_emission import mark_lit_sweep_approximation
 
 
 def ref_key(ref: AssetReference) -> tuple[str, int]:
@@ -456,7 +458,8 @@ def create_material(record: MaterialRecord, texture_files: dict[tuple[str, int],
         if not image_path.is_file():
             raise FileNotFoundError(image_path)
         color_space = ref.get("ColorSpace") if ref else None
-        if (role == "emissive" and color_space is None and has_verified_lit_sweep(record)
+        if (role == "emissive" and color_space is None
+                and (has_verified_lit_sweep(record) or has_approximate_lit_sweep(record))
                 and record["Floats"].get("_EmissiveMaskChannel") == 0):
             raise ValueError(f"Mapped sweep requires source texture ColorSpace; refresh scene resources: material={record['Name']}, property={prop}, reference={ref}")
         if role == "emissive" and color_space is not None and (type(color_space) is not int or color_space not in (0, 1)):
@@ -553,7 +556,8 @@ def create_material(record: MaterialRecord, texture_files: dict[tuple[str, int],
                 0.0, floats.get("_EmissiveIntensity", floats.get("_EmissiveRemap", 1.0)))
             emissive_used = True
     layer_sweep = "_LAYERBLEND_MASK" in (record.get("RenderState") or {}).get("ValidKeywords", [])
-    if (tri_channel_mask or layer_sweep) and has_verified_lit_sweep(record):
+    if ((tri_channel_mask or layer_sweep)
+            and (has_verified_lit_sweep(record) or has_approximate_lit_sweep(record))):
         source_base = _input(principled, "Base Color")
         if not source_base.is_linked:
             raise ValueError(f"Masked surface sweep requires source base texture: material={record['Name']}")
@@ -728,9 +732,11 @@ def _apply_verified_emission(material: bpy.types.Material, record: MaterialRecor
     material["endfield_emissive_mask_channel"] = int(floats["_EmissiveMaskChannel"])
     material["endfield_emissive_mask_contract"] = "Lit/Trunk/LitTransparent serialized source selector"
     verified_sweep = has_verified_lit_sweep(record)
+    approximate_sweep = has_approximate_lit_sweep(record)
+    preview_sweep = verified_sweep or approximate_sweep
     emission_color = None
     if source == "constant":
-        if verified_sweep:
+        if preview_sweep:
             tint = nodes.new("ShaderNodeRGB")
             tint.label = "Endfield _EmissiveColor"
             tint.outputs[0].default_value = (*authored[:3], 1.0)
@@ -774,10 +780,10 @@ def _apply_verified_emission(material: bpy.types.Material, record: MaterialRecor
                 links.new(contribution, add.inputs[2])
                 result = add.outputs["Color"]
         emission_color = result
-        if not verified_sweep:
+        if not preview_sweep:
             links.new(result, emission)
         material["endfield_emissive_mask_status"] = "applied_source_channel_static_approximation"
-    if verified_sweep:
+    if preview_sweep:
         if emission_color is None:
             raise ValueError(f"Verified Lit sweep lacks emission source: material={record['Name']}")
         base = _input(principled, "Base Color")
@@ -807,6 +813,8 @@ def _apply_verified_emission(material: bpy.types.Material, record: MaterialRecor
             material["endfield_emissive_albedo_enable_status"] = "serialized_toggle_not_independently_mapped_in_verified_fragment"
             if source_albedo is not None:
                 material["endfield_emissive_albedo_status"] = "verified_1065_pre_tri_mask_albedo"
+        if approximate_sweep:
+            mark_lit_sweep_approximation(material, record)
     elif floats.get("_EnableEmissiveAnimSweep", 0.0) > 0.5:
         _input(principled, "Emission Strength").default_value = 0.0
         material["endfield_emissive_motion_status"] = "unsupported_sweep_variant"

@@ -6,6 +6,7 @@ never scene regions or material names. Unknown shaders retain their old contract
 """
 from __future__ import annotations
 
+import math
 from typing import Literal, TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -135,6 +136,47 @@ def has_verified_lit_sweep(record: MaterialRecord) -> bool:
             and floats.get("_EnableUVAnimation") == 0
             and record["Floats"].get("_EnableEmissiveAnimSweep", 0.0) > 0.5
             and (mapped or constant or masked or tri_constant))
+
+
+def has_approximate_lit_sweep(record: MaterialRecord) -> bool:
+    """Permit a source-driven UV0 preview without certifying the variant formula."""
+    if surface_family(record) != "lit" or has_verified_lit_sweep(record):
+        return False
+    floats = record["Floats"]
+    state = record.get("RenderState")
+    keywords = set(state["ValidKeywords"]) if state is not None else set()
+    allowed = {"_EMISSIVE_ANIM_SWEEP", "_EMISSIVE_MAP", "_EMISSIVE_NOMAP",
+               "_EMISSIVE_MASK", "_TWO_BASEMAP", "_ALPHATEST_ON", "_TERRAIN_BLEND",
+               "_LAYERBLEND_MASK", "_TRI_CHANNEL_MASK", "_DETAIL_MAP", "_PARALLAX_MAP",
+               "_SUBSURFACE", "_SUBSURFACE_THICKNESSMAP", "_VAT_RIGIDBODY"}
+    selector = floats.get("_EmissiveMaskChannel")
+    branch = ("_EMISSIVE_MAP" if selector == 0 else
+              "_EMISSIVE_NOMAP" if selector == 5 else
+              "_EMISSIVE_MASK" if selector in (1, 2, 3) else None)
+    if (branch is None or "_EMISSIVE_ANIM_SWEEP" not in keywords
+            or not keywords <= allowed
+            or keywords & {"_EMISSIVE_MAP", "_EMISSIVE_NOMAP", "_EMISSIVE_MASK"} != {branch}
+            or floats.get("_EnableEmissiveAnimSweep", 0.0) <= 0.5
+            or floats.get("_EnableEmissiveMap", 0.0) <= 0.5
+            or floats.get("_BaseUVSet") != 0 or floats.get("_BasePbrMapUVSet") != 0
+            or floats.get("_EnableUVAnimation") != 0
+            or floats.get("_EmissiveNoMapUseFresnel") != 0):
+        return False
+    names = ("_EmissiveSweepSpeed", "_EmissiveSweepInterval", "_EmissiveSweepWidth",
+             "_EmissiveSweepFalloff", "_EmissiveSweepHeightOffset", "_EmissiveSweepRandom",
+             "_EmissiveSweepAlbedoScale", "_AlbedoAffectEmissive")
+    if any(name not in floats or not math.isfinite(floats[name]) for name in names):
+        return False
+    if floats["_EmissiveSweepInterval"] <= 0 or floats["_EmissiveSweepWidth"] <= 0:
+        return False
+    if selector == 0:
+        if floats.get("_EmissiveUVSet") != 0 or floats.get("_EmissiveType") not in (0, 1):
+            return False
+        bindings = [slot for slot in record["Textures"] if slot["Property"] == "_EmissiveMap"]
+        if len(bindings) != 1 or bindings[0]["Texture"] is None:
+            return False
+        return bindings[0]["Texture"].get("ColorSpace") in (0, 1)
+    return True
 
 
 def has_unresolved_liteffect_sweep(record: MaterialRecord) -> bool:

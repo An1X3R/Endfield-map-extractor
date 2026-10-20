@@ -138,8 +138,13 @@ def _read_flushed_errors(path: Path, position: int, fragment: bytes,
 
 def run_scanner_shards(scanner: Path, index: Path, work: Path, log: Path,
                        start: int, end: int, capacity: ScannerCapacity,
+                       container_prefixes: tuple[str, ...],
                        check_cancelled: Callable[[], None], emit: Emit, observe: Observe) -> None:
     """Join/cancel all children before publishing an ordered provider/CAB pair."""
+    if (not container_prefixes or len(set(container_prefixes)) != len(container_prefixes)
+            or any(not prefix or prefix.startswith("/") or not prefix.endswith("/") or "\\" in prefix
+                   for prefix in container_prefixes)):
+        raise ValueError(f"Scanner container prefixes must be unique relative slash-terminated paths: {container_prefixes}")
     targets = (work / "bundle_candidates.jsonl", work / "bundle_cab_inventory.jsonl", work / "performance.json")
     if any(path.exists() for path in targets) or log.exists() or (work / "shards").exists():
         raise FileExistsError(f"Scanner requires a fresh work/log destination: work={work}, log={log}")
@@ -162,9 +167,11 @@ def run_scanner_shards(scanner: Path, index: Path, work: Path, log: Path,
         directory = work / "shards" / f"{number:02d}"
         directory.mkdir()
         command = [str(scanner), "--input", str(index), "--output", str(directory / "providers.jsonl"),
-                   "--cab-output", str(directory / "cabs.jsonl"), "--contains", "assets/",
-                   "--skip", str(shard.start), "--limit", str(shard.end), "--progress-every", "256",
-                   "--performance-report", str(directory / "performance.json")]
+                   "--cab-output", str(directory / "cabs.jsonl")]
+        for prefix in container_prefixes:
+            command.extend(("--contains", prefix))
+        command.extend(("--skip", str(shard.start), "--limit", str(shard.end), "--progress-every", "256",
+                        "--performance-report", str(directory / "performance.json")))
         position, fragment = 0, b""
 
         def check_shard() -> None:

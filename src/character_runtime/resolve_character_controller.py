@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Mapping
 from contextlib import closing
 from dataclasses import dataclass, fields
 import hashlib
@@ -108,7 +109,18 @@ def read_request(path: Path) -> ControllerRequest:
     return request
 
 
-def decode_controller_hash(payload: bytes) -> bytes:
+def controller_string_pool(vfs_root: Path) -> Mapping[int, str] | None:
+    """Select the source-declared JSON string storage, without guessing from field bytes."""
+    from extractor_core.resources import load_group, read_virtual_file
+    from extractor_core.scene_string_pool import read_scene_string_pool
+
+    group = load_group(vfs_root, "775A31D1")
+    if not any(item.file_name.casefold() == "data/json/stringpool/stringpool0.byte" for item in group.iter_files()):
+        return None
+    return read_scene_string_pool(lambda path: read_virtual_file(vfs_root, "775A31D1", path))
+
+
+def decode_controller_hash(payload: bytes, strings: Mapping[int, str] | None) -> bytes:
     """Decode only the native-verified null-fallback-montage prefix."""
     if len(payload) < 30 or payload[:2] != b"\x0f\xff":
         raise ControllerSourceError("Unsupported AnimationConfig prefix; full schema decoding is required")
@@ -121,10 +133,16 @@ def decode_controller_hash(payload: bytes) -> bytes:
             raise ControllerSourceError(f"Invalid mask object: offset={offset}")
         size, = struct.unpack_from("<i", payload, offset + 1)
         offset += 5
-        if size < 1 or offset + size + 8 > len(payload):
-            raise ControllerSourceError(f"Invalid mask name: offset={offset}, size={size}")
-        payload[offset:offset + size].decode("utf-8")
-        offset += size + 8
+        if strings is None:
+            if size < 1 or offset + size + 8 > len(payload):
+                raise ControllerSourceError(f"Invalid mask name: offset={offset}, size={size}")
+            payload[offset:offset + size].decode("utf-8")
+            offset += size
+        elif size not in strings or not strings[size].strip():
+            raise ControllerSourceError(f"Source mask name is absent from its string pool: offset={offset - 4}, string_id={size}")
+        if offset + 8 > len(payload):
+            raise ControllerSourceError(f"Truncated source mask path hash: offset={offset}")
+        offset += 8
     key = payload[offset:offset + 8]
     if len(key) != 8 or key == bytes(8):
         raise ControllerSourceError("Source normal-controller hash is missing or truncated")
@@ -219,7 +237,8 @@ def resolve_controller(request: ControllerRequest) -> dict[str, object]:
     config_path, animation = selected_components(characters[0].value, request.character_id, request.part_name)
     vfs_root = request.game_root / "Endfield_Data/StreamingAssets/VFS"
     payload = read_virtual_file(vfs_root, "775A31D1", config_path)
-    key = decode_controller_hash(payload)
+    strings = controller_string_pool(vfs_root)
+    key = decode_controller_hash(payload, strings)
     hash_path = request.output / "StringPathHash.bin"
     hash_path.write_bytes(read_virtual_file(vfs_root, "D6E622F7", "Data/ExtendData/Main/StringPathHash.bin"))
     with closing(sqlite3.connect(request.resource_database.as_uri() + "?mode=ro", uri=True)) as connection:
@@ -253,6 +272,9 @@ def resolve_controller(request: ControllerRequest) -> dict[str, object]:
         "string_path_hash_sha256": sha(hash_path),
         "character_data_source": source_identity(characters[0].metadata), "animation_component": animation,
         "animation_config_virtual_path": config_path, "animation_config_sha256": hashlib.sha256(payload).hexdigest(),
+        "animation_config_string_storage": "inline" if strings is None else "pooled",
+        "animation_config_string_pool_sha256": None if strings is None else hashlib.sha256(
+            json.dumps(dict(strings), sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest(),
         "controller_resource_path": controller_path, "controller_bundle": str(bundle), "controller_bundle_sha256": sha(bundle),
         "reader_controller_bundle": str(bundle),
         "controller": receipt, "selected_clip_source": source_identity(clips[0].metadata), "clip_reference": references[0] if references else None,

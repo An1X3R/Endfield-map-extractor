@@ -21,7 +21,8 @@ from webui_character_results import build_character_result
 from webui_character_worker import CharacterCoordinator, CharacterJobCancelled
 from character_runtime.character_material_options import parse_character_material_options
 from endfield_character_service import (
-    CharacterServiceError, _verified_character_material_options, _verified_npc_material_options,
+    CharacterServiceError, _verified_character_appearance, _verified_character_material_options,
+    _verified_npc_material_options,
 )
 
 
@@ -59,6 +60,32 @@ class CharacterContractTests(unittest.TestCase):
         for value in invalid:
             with self.subTest(value=value), self.assertRaises(CharacterRequestError):
                 normalize_character_request({**request, "options": {"materials": value}})
+
+    def test_appearance_options_are_required_typed_canonical_and_part_of_request_digest(self) -> None:
+        request = export_request(str(uuid4()))
+        appearance = {"potential": "maximum", "fur": "source_shell", "future_switch": True}
+        _, normalized = normalize_character_request({**request, "options": {"appearance": appearance}})
+        expected = {"potential": "maximum", "fur": "source_shell"}
+        self.assertEqual(normalized["options"]["appearance"], expected)
+        self.assertEqual(public_request(normalized)["options"]["appearance"], expected)
+        self.assertNotEqual(request_digest(normalized), request_digest(request))
+        for fur in ("existing", "source_shell", "charcoal_embers"):
+            _, selected = normalize_character_request({**request, "options": {
+                "appearance": {"potential": "base", "fur": fur}}})
+            self.assertEqual(selected["options"]["appearance"], {"potential": "base", "fur": fur})
+
+    def test_appearance_options_reject_missing_fields_and_unknown_values(self) -> None:
+        request = export_request(str(uuid4()))
+        invalid = (
+            {"potential": "maximum"},
+            {"fur": "source_shell"},
+            {"potential": "all", "fur": "existing"},
+            {"potential": "base", "fur": "black"},
+            {"potential": True, "fur": "existing"},
+        )
+        for appearance in invalid:
+            with self.subTest(appearance=appearance), self.assertRaises(CharacterRequestError):
+                normalize_character_request({**request, "options": {"appearance": appearance}})
 
     def test_material_options_reject_missing_fields_invalid_enums_and_duplicate_effects(self) -> None:
         request = export_request(str(uuid4()))
@@ -224,6 +251,74 @@ class CharacterMaterialEvidenceTests(unittest.TestCase):
     def test_omitted_materials_keep_legacy_receipt_compatibility(self) -> None:
         self.assertIsNone(_verified_character_material_options({}, {}, {}, {}))
         self.assertIsNone(_verified_npc_material_options({}, {}))
+
+
+class CharacterAppearanceEvidenceTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.options: dict[str, object] = {"potential": "maximum", "fur": "charcoal_embers"}
+        self.report: dict[str, object] = {"format": "EndfieldCharacterAppearance/1", "status": "partial",
+            "potential": {"requested": "maximum", "status": "applied", "selected_renderer_count": 2},
+            "fur": {"requested": "charcoal_embers", "status": "partial", "eligible_shell_count": 1}}
+        self.receipt: dict[str, object] = {"format": "EndfieldCharacterExport/1", "status": "exported_reopened",
+            "blend_sha256": "a" * 64, "appearance_options": dict(self.options),
+            "appearance_report": deepcopy(self.report)}
+        self.build: dict[str, object] = {"format": "EndfieldCharacterBuild/1", "status": "built_not_reopened",
+            "sha256": "a" * 64, "appearance_options": dict(self.options),
+            "appearance_report": deepcopy(self.report)}
+        self.audit: dict[str, object] = {"format": "EndfieldCharacterBuildReopenAudit/1", "status": "passed",
+            "blend_sha256": "a" * 64, "appearance_options": dict(self.options),
+            "appearance_report": deepcopy(self.report)}
+
+    def test_appearance_receipt_and_source_specific_report_are_required(self) -> None:
+        confirmed, report = _verified_character_appearance(
+            {"appearance": self.options}, self.receipt, self.build, self.audit)
+        self.assertEqual(confirmed, self.options)
+        self.assertIsNot(confirmed, self.options)
+        self.assertEqual(report, self.report)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            body = b"verified appearance delivery"
+            (root / "character.blend").write_bytes(body)
+            result = build_character_result(root, {"status": "partial", "files": [{
+                "relative_path": "character.blend", "role": "character", "bytes": len(body),
+                "sha256": hashlib.sha256(body).hexdigest()}], "appearance_options": confirmed,
+                "appearance_report": report}, "export")
+            self.assertEqual(result["appearance_options"], self.options)
+            self.assertEqual(result["appearance_report"], self.report)
+
+    def test_appearance_acknowledgement_rejects_missing_or_mismatched_evidence(self) -> None:
+        cases = (
+            ({**self.receipt, "appearance_options": None}, self.build, self.audit),
+            ({**self.receipt, "appearance_options": {"potential": "maximum", "fur": "source_shell"}}, self.build, self.audit),
+            ({**self.receipt, "appearance_report": None}, self.build, self.audit),
+            ({**self.receipt, "appearance_report": {**self.report, "format": "old"}}, self.build, self.audit),
+            ({**self.receipt, "appearance_report": {**self.report, "status": "applied"}}, self.build, self.audit),
+            ({**self.receipt, "appearance_report": {**self.report, "potential": {
+                "requested": "base", "status": "applied"}}}, self.build, self.audit),
+            ({**self.receipt, "appearance_report": {**self.report, "status": "completed"}}, self.build, self.audit),
+            (self.receipt, {**self.build, "sha256": "b" * 64}, self.audit),
+            (self.receipt, self.build, {**self.audit, "status": "failed"}),
+            (self.receipt, {**self.build, "appearance_options": {"potential": "base", "fur": "existing"}}, self.audit),
+            (self.receipt, self.build, {**self.audit, "appearance_options": {"potential": "base", "fur": "existing"}}),
+            (self.receipt, {**self.build, "appearance_report": {**self.report, "fur": {
+                "requested": "charcoal_embers", "status": "applied"}}}, self.audit),
+            (self.receipt, self.build, {**self.audit, "appearance_report": {**self.report, "fur": {
+                "requested": "charcoal_embers", "status": "applied"}}}),
+        )
+        for receipt, build, audit in cases:
+            with self.subTest(receipt=receipt, build=build, audit=audit), self.assertRaises(CharacterServiceError):
+                _verified_character_appearance({"appearance": self.options}, receipt, build, audit)
+
+    def test_legacy_exports_omit_appearance_evidence_and_result_requires_both_fields(self) -> None:
+        self.assertEqual(_verified_character_appearance({}, {}, {}, {}), (None, None))
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            body = b"appearance receipt pairing"
+            (root / "character.blend").write_bytes(body)
+            with self.assertRaisesRegex(ValueError, "only together"):
+                build_character_result(root, {"status": "partial", "files": [{
+                    "relative_path": "character.blend", "role": "character", "bytes": len(body),
+                    "sha256": hashlib.sha256(body).hexdigest()}], "appearance_options": self.options}, "export")
 
 
 class CharacterDurableTests(unittest.TestCase):

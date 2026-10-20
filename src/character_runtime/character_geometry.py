@@ -112,6 +112,19 @@ def geometry_bind_worlds(worlds: dict[str, Matrix], meshes: tuple[dict[str, obje
     return binds, mesh_worlds
 
 
+def source_bone_name(node: GeometryNode) -> str:
+    """Fit Blender's 63-byte UTF-8 name limit without splitting a source code point."""
+    if len(node.name.encode('utf-8')) <= 63:
+        return node.name
+    suffix = '_' + hashlib.sha256(node.path.encode('utf-8')).hexdigest()[:12]
+    prefix = ''
+    for character in node.name:
+        if len((prefix + character + suffix).encode('utf-8')) > 63:
+            break
+        prefix += character
+    return prefix + suffix
+
+
 def _rig(nodes: tuple[GeometryNode, ...], worlds: dict[str, Matrix], meshes: tuple[dict[str, object], ...]) -> tuple[bpy.types.Object, dict[str, str], dict[str, Matrix]]:
     roots = tuple(node for node in nodes if node.parent is None)
     if len(roots) != 1:
@@ -125,6 +138,8 @@ def _rig(nodes: tuple[GeometryNode, ...], worlds: dict[str, Matrix], meshes: tup
                 raise ValueError(f'Skin bone is absent from source hierarchy: {path}')
             paths.add(path)
             path = lookup[path].parent
+    skin_hierarchy = frozenset(paths)
+    paths = set(lookup)
     data = bpy.data.armatures.new(roots[0].name + ' Skeleton')
     rig = bpy.data.objects.new(roots[0].name, data)
     rig['source_transform_path'] = roots[0].path
@@ -138,10 +153,12 @@ def _rig(nodes: tuple[GeometryNode, ...], worlds: dict[str, Matrix], meshes: tup
         for node in nodes:
             if node.path not in paths:
                 continue
-            bone = data.edit_bones.new(node.name)
+            bone = data.edit_bones.new(source_bone_name(node))
             bone.head = (0, 0, 0)
             bone.tail = (0, .05, 0)
             bone.matrix = binds.get(node.path, worlds[node.path])
+            if node.path not in skin_hierarchy:
+                bone.use_deform = False
             names[node.path] = bone.name
         for node in nodes:
             if node.path in paths and node.parent in paths:
@@ -151,6 +168,10 @@ def _rig(nodes: tuple[GeometryNode, ...], worlds: dict[str, Matrix], meshes: tup
     for path, name in names.items():
         data.bones[name]['source_transform_path'] = path
         rig.pose.bones[name]['source_transform_path'] = path
+        if path not in skin_hierarchy:
+            data.bones[name]['source_unskinned_transform'] = True
+            data.bones[name].hide = True
+    rig['source_unskinned_transform_count'] = len(paths - skin_hierarchy)
     return rig, names, mesh_worlds
 
 
@@ -257,8 +278,8 @@ def _morphs(value: object, payload: bytes, objects: dict[str, bpy.types.Object])
                     key.data[int(index)].co = position
 
 
-def import_character_geometry(path: Path) -> list[bpy.types.Object]:
-    """Create editable geometry from the verified native reader payload."""
+def read_geometry_payload(path: Path) -> tuple[dict[str, object], bytes]:
+    """Verify the shared portable geometry and binary identities before import."""
     document = fields(json.loads(path.read_text(encoding='utf-8')), 'geometry')
     if document['format'] != 'EndfieldCharacterGeometry/1':
         raise ValueError(f'Unsupported character geometry format: {path}')
@@ -268,6 +289,53 @@ def import_character_geometry(path: Path) -> list[bpy.types.Object]:
     payload = binary_path.read_bytes()
     if len(payload) != document['binary_bytes'] or hashlib.sha256(payload).hexdigest() != document['binary_sha256']:
         raise ValueError(f'Geometry binary identity mismatch: {binary_path}')
+    return document, payload
+
+
+def import_static_geometry(path: Path) -> list[bpy.types.Object]:
+    """Import unskinned source meshes under one movable source root."""
+    document, payload = read_geometry_payload(path)
+    nodes = _nodes(document['nodes'])
+    worlds = _worlds(nodes)
+    roots = tuple(node for node in nodes if node.parent is None)
+    if len(roots) != 1:
+        raise ValueError(f'Static geometry requires one explicit root: {len(roots)}')
+    meshes = tuple(fields(value, 'mesh') for value in rows(document['meshes'], 'meshes'))
+    paths = tuple(text(mesh['path'], 'mesh.path') for mesh in meshes)
+    if not meshes or len(set(paths)) != len(paths):
+        raise ValueError('Static geometry requires nonempty unique mesh paths')
+    if any(rows(mesh['bones'], 'mesh.bones') or mesh['skin'] is not None for mesh in meshes):
+        raise ValueError('Static geometry importer cannot discard source skin bindings')
+    root = bpy.data.objects.new(roots[0].name, None)
+    root['source_transform_path'] = roots[0].path
+    root['source_static_hierarchy'] = json.dumps(document['nodes'])
+    bpy.context.collection.objects.link(root)
+    root.matrix_world = Matrix.Rotation(math.pi / 2, 4, 'X')
+    objects = {text(mesh['path'], 'mesh.path'): _mesh(mesh, payload, worlds[text(mesh['path'], 'mesh.path')], root, {}) for mesh in meshes}
+    transforms = {roots[0].path: root, **objects}
+    if roots[0].path in objects:
+        bpy.data.objects.remove(root, do_unlink=True)
+        root = objects[roots[0].path]
+    for node in nodes:
+        if node.path not in transforms:
+            obj = bpy.data.objects.new(node.name, None)
+            bpy.context.collection.objects.link(obj)
+            transforms[node.path] = obj
+    for node in nodes:
+        obj = transforms[node.path]
+        obj['source_transform_path'] = node.path
+        obj.parent = transforms[node.parent] if node.parent is not None else None
+        obj.matrix_parent_inverse = Matrix.Identity(4)
+        obj.matrix_basis = node.local if node.parent is not None else Matrix.Rotation(math.pi / 2, 4, 'X') @ node.local
+    root['source_static_hierarchy'] = json.dumps(document['nodes'])
+    _morphs(document['morphs'], payload, objects)
+    bpy.context.view_layer.update()
+    return list(transforms.values())
+
+
+def import_character_geometry(path: Path) -> list[bpy.types.Object]:
+    """Create editable geometry from the verified native reader payload."""
+    document, payload = read_geometry_payload(path)
     nodes = _nodes(document['nodes'])
     worlds = _worlds(nodes)
     meshes = tuple(fields(value, 'mesh') for value in rows(document['meshes'], 'meshes'))

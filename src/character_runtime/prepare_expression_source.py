@@ -202,7 +202,6 @@ def read_provider_row(value: JsonValue, line_number: int, avatar_cab: str) -> tu
 
 def scan_provider_index(path: Path, avatar_cab: str) -> ProviderScan:
     digest = hashlib.sha256()
-    candidates: list[ProviderCandidate] = []
     line_count = 0
     provider_row_count = 0
     progress_row_count = 0
@@ -221,18 +220,18 @@ def scan_provider_index(path: Path, avatar_cab: str) -> ProviderScan:
             kind = require_string(row.get("kind"), f"provider index line {line_count}.kind")
             if footer_failure_count is not None:
                 raise ValueError(f"Provider index contains a record after its completion footer: line={line_count}.")
+            if kind in {"progress", "complete"} and "utc" in row:
+                require_string(row["utc"], f"provider index line {line_count}.utc")
             if kind == "progress":
                 require_int(row.get("scanned"), f"provider index line {line_count}.scanned")
                 require_int(row.get("failed"), f"provider index line {line_count}.failed")
                 require_int(row.get("matches"), f"provider index line {line_count}.matches")
-                require_string(row.get("utc"), f"provider index line {line_count}.utc")
                 progress_row_count += 1
                 continue
             if kind == "complete":
                 require_int(row.get("scanned"), f"provider index line {line_count}.scanned")
                 footer_failure_count = require_int(row.get("failed"), f"provider index line {line_count}.failed")
                 footer_match_count = require_int(row.get("matches"), f"provider index line {line_count}.matches")
-                require_string(row.get("utc"), f"provider index line {line_count}.utc")
                 continue
             if kind != "match":
                 raise ValueError(f"Provider index has an unsupported record kind; scan completeness is unknown: line={line_count}, kind={kind}.")

@@ -1,4 +1,4 @@
-"""Export a bounded source-backed particle cache from an existing scene."""
+"""Export source-backed particle caches and timed mesh effects from a scene."""
 from __future__ import annotations
 
 import argparse
@@ -22,6 +22,7 @@ from blender_scene_effect_animation import (
     animate_effect_material_time,
     bake_effect_geometry_sequence,
     save_effect_cache_delivery,
+    save_effect_material_delivery,
 )
 from blender_scene_effects import (
     _finite,
@@ -37,6 +38,7 @@ from blender_scene_effects import (
     _owner_matrix_root_relative,
     _particle_mesh_aligned,
     _particle_mesh_instances,
+    _particle_mesh_rotations,
     _particle_world_matrix,
     _trail_mesh,
 )
@@ -45,8 +47,9 @@ from blender_scene_effect_vertex_offset import apply_material_vertex_offset
 from extractor_core.particle_snapshot import (
     PARTICLE_PARAMETER_SCHEMA_VERSION,
     ParticleSnapshot,
-    generate_particle_snapshot,
+    generate_fixed_emitter_particle_snapshot,
 )
+from extractor_core.particle_mesh_geometry import ParticleMeshGeometry, load_particle_shape_geometry
 
 def _array(value: object, label: str) -> list[object]:
     if type(value) is not list:
@@ -112,8 +115,10 @@ def _matrix_error(actual: Matrix, expected: Matrix) -> float:
 
 
 def _snapshot(system: Mapping[str, object], seconds: float, identity: str,
-              gravity_local: tuple[float, float, float]) -> ParticleSnapshot:
-    snapshot = generate_particle_snapshot(system, seconds, identity, 100000, 100000, gravity_local)
+              gravity_local: tuple[float, float, float],
+              shape_geometry: ParticleMeshGeometry | None) -> ParticleSnapshot:
+    snapshot = generate_fixed_emitter_particle_snapshot(system, seconds, identity, 100000, 100000,
+                                                        gravity_local, shape_geometry)
     parameters = _record(_field(system, "Parameters", "System"), "System.Parameters")
     initial = _record(_field(parameters, "Initial", "Parameters"), "Parameters.Initial")
     source_limit = _integer(_field(initial, "MaxNumParticles", "Initial"), "Initial.MaxNumParticles")
@@ -128,11 +133,14 @@ def _particle_sample(system: Mapping[str, object], renderer: Mapping[str, object
                      templates: tuple[tuple[bpy.types.Mesh, ...], ...], identity: str,
                      gravity_local: tuple[float, float, float], object_name: str,
                      material: bpy.types.Material,
+                     shape_geometry: ParticleMeshGeometry | None,
                      seconds: float) -> bpy.types.Mesh:
-    snapshot = _snapshot(system, seconds, identity, gravity_local)
+    snapshot = _snapshot(system, seconds, identity, gravity_local, shape_geometry)
     render_mode = _integer(_field(renderer, "RenderMode", "Renderer"), "Renderer.RenderMode")
     if render_mode == 4:
-        mesh = _particle_mesh_instances(object_name, snapshot.particles, templates)
+        rotations = _particle_mesh_rotations(snapshot.particles,
+            _integer(_field(renderer, "RenderAlignment", "Renderer"), "Renderer.RenderAlignment"))
+        mesh = _particle_mesh_instances(object_name, snapshot.particles, templates, rotations)
     else:
         mesh = _particle_mesh_aligned(
             object_name, snapshot.particles, world, camera, render_mode,
@@ -152,8 +160,9 @@ def _particle_sample(system: Mapping[str, object], renderer: Mapping[str, object
 
 def _trail_sample(system: Mapping[str, object], camera: bpy.types.Object,
                   world: Matrix, identity: str, gravity_local: tuple[float, float, float],
-                  object_name: str, seconds: float) -> bpy.types.Mesh:
-    snapshot = _snapshot(system, seconds, identity, gravity_local)
+                  object_name: str, shape_geometry: ParticleMeshGeometry | None,
+                  seconds: float) -> bpy.types.Mesh:
+    snapshot = _snapshot(system, seconds, identity, gravity_local, shape_geometry)
     mesh = _trail_mesh(object_name, snapshot.particles, world, camera)
     if mesh is not None:
         return mesh
@@ -242,11 +251,15 @@ def _build_samplers(plan: Mapping[str, object], camera: bpy.types.Object,
                     raise ValueError(f"FX trail transform does not match its source component: identity={key}, trail={trail_obj.name}, maxMatrixError={trail_matrix_error}")
             if obj.modifiers or obj.constraints:
                 raise ValueError(f"Source FX object must have no modifiers or constraints: identity={key}, object={obj.name}")
+            if (_integer(_field(system, "MoveWithTransform", "System"), "System.MoveWithTransform") == 1
+                    and (obj.parent is not None or obj.animation_data is not None)):
+                raise ValueError(f"World-space source preview requires a fixed, unparented emitter without transform animation: identity={key}, object={obj.name}")
             if trail_obj is not None and (trail_obj.modifiers or trail_obj.constraints):
                 raise ValueError(f"Source FX trail must have no modifiers or constraints: identity={key}, object={trail_obj.name}")
             gravity_local = _system_gravity_local(gravity_world, unity_world, system)
             identity = f"{entity_id}:{system_key[0]}:{system_key[1]}"
-            initial_snapshot = _snapshot(system, frame_start / fps, identity, gravity_local)
+            shape_geometry = load_particle_shape_geometry(manifest, manifest_path, system)
+            initial_snapshot = _snapshot(system, frame_start / fps, identity, gravity_local, shape_geometry)
             render_mode = _integer(_field(renderer, "RenderMode", "Renderer"), "Renderer.RenderMode")
             if render_mode not in (0, 1, 4):
                 raise ValueError(f"Source FX object has unsupported renderer mode: identity={key}, mode={render_mode}")
@@ -256,11 +269,11 @@ def _build_samplers(plan: Mapping[str, object], camera: bpy.types.Object,
                 raise ValueError(f"Particle animation requires one source material: identity={key}, object={obj.name}")
             samplers.append(EffectMeshSampler(obj, partial(
                 _particle_sample, system, renderer, world, camera, templates,
-                identity, gravity_local, obj.name, obj.material_slots[0].material)))
+                identity, gravity_local, obj.name, obj.material_slots[0].material, shape_geometry)))
             trail_name: str | None = None
             if trail_obj is not None:
                 samplers.append(EffectMeshSampler(trail_obj, partial(
-                    _trail_sample, system, camera, world, identity, gravity_local, trail_obj.name)))
+                    _trail_sample, system, camera, world, identity, gravity_local, trail_obj.name, shape_geometry)))
                 trail_name = trail_obj.name
             object_materials = tuple(slot.material for slot in obj.material_slots if slot.material)
             if not object_materials:
@@ -284,6 +297,7 @@ def _build_samplers(plan: Mapping[str, object], camera: bpy.types.Object,
                 "initial_particles": len(initial_snapshot.particles),
                 "initial_particles_omitted_by_source_limit": initial_snapshot.truncated,
                 "unsupported_modules": list(initial_snapshot.unsupported_modules),
+                "preview_scope": initial_snapshot.preview_scope,
                 "vertex_offset_scope": obj.get("endfield_fx_vertex_offset_scope"),
             })
     unmatched = sorted(set(sources) - planned)
@@ -369,8 +383,6 @@ def main() -> None:
     sources, trails = _source_objects()
     samplers, materials, animated_rows, skipped = _build_samplers(
         plan, camera, sources, trails, fps, args.frame_start, gravity_world)
-    if not animated_rows:
-        raise ValueError(f"No source-backed particle objects can be animated: skipped={skipped[:8]}")
     if len(animated_rows) > args.max_systems:
         raise ValueError(f"Animation system limit exceeded: selected={len(animated_rows)}, maxSystems={args.max_systems}; narrow the source scene")
 
@@ -388,28 +400,35 @@ def main() -> None:
         else:
             animate_effect_material_time(material, scene)
             driven_materials.append(name)
+    if not samplers and not driven_materials:
+        raise ValueError(
+            f"No source-backed particle geometry or timed mesh materials can be animated: "
+            f"skipped={skipped[:8]}, materialsWithoutTime={materials_without_time}")
     audit = {
         "format": "EndfieldBoundedEffectAnimation/1",
         "source_blend": str(source_blend),
         "source_plan": str(plan_path),
         "output": str(output),
-        "cache": str(cache_path),
+        "cache": str(cache_path) if samplers else None,
         "frames": [args.frame_start, args.frame_end],
         "fps": fps,
         "camera": camera.name,
-        "camera_orientation_baked": True,
+        "camera_orientation_baked": bool(samplers),
+        "playback_mode": "particle_cache_and_material_time" if samplers else "material_time_only",
         "animated_systems": animated_rows,
         "skipped_components": skipped,
         "uv_time_driver_materials": driven_materials,
         "mesh_uv_time_driver_materials": sorted(set(driven_materials) & mesh_materials.keys()),
         "materials_without_source_time_input": materials_without_time,
-        "limitations": [
+        "limitations": [*([
             "Deterministic previews do not reproduce Unity simulation or start phase",
             "Billboard orientation uses the fixed reference camera",
             "The cache covers only the requested frame interval",
             "Unsupported particle modules remain unreconstructed",
+        ] if samplers else []),
             "UV drivers affect all users of selected materials",
             "Mesh material UV animation does not resimulate mesh vertex offsets or runtime activation",
+            "Camera-bound SceneColor snapshots are not refreshed by material clocks",
         ],
     }
     cache_created = False
@@ -422,18 +441,24 @@ def main() -> None:
             stream.write(json.dumps(audit, ensure_ascii=False, indent=2) + "\n")
             stream.flush()
             os.fsync(stream.fileno())
-        bake_effect_geometry_sequence(samplers, cache_path, args.frame_start,
-                                     args.frame_end, 500000)
-        cache_created = True
+        if samplers:
+            bake_effect_geometry_sequence(samplers, cache_path, args.frame_start,
+                                         args.frame_end, 500000)
+            cache_created = True
         for image in bpy.data.images:
             if image.source == "FILE" and image.users and not image.packed_file:
                 image.pack()
         scene.frame_start = args.frame_start
         scene.frame_end = args.frame_end
         scene.frame_set(args.frame_start)
-        scene["endfield_fx_animation_contract"] = "EndfieldBoundedParticlePlayback/1"
-        scene["endfield_fx_animation_scope"] = "selected_source_subset_fixed_reference_camera"
-        save_effect_cache_delivery(cache_path, output)
+        scene["endfield_fx_animation_contract"] = (
+            "EndfieldBoundedParticlePlayback/1" if samplers else "EndfieldMaterialTimePlayback/1")
+        scene["endfield_fx_animation_scope"] = (
+            "selected_source_subset_fixed_reference_camera" if samplers else "selected_source_material_time")
+        if samplers:
+            save_effect_cache_delivery(cache_path, output)
+        else:
+            save_effect_material_delivery(output)
         blend_created = True
         os.link(audit_temporary, audit_path)
         audit_created = True
@@ -451,7 +476,7 @@ def main() -> None:
         if cleanup_errors:
             error.add_note("Failed to clean partial animation delivery: " + "; ".join(cleanup_errors))
         raise
-    print(json.dumps({"status": "completed", "output": str(output), "cache": str(cache_path),
+    print(json.dumps({"status": "completed", "output": str(output), "cache": str(cache_path) if samplers else None,
                       "audit": str(audit_path), "animatedSystems": len(animated_rows),
                       "skippedComponents": len(skipped), "frames": [args.frame_start, args.frame_end]}))
 

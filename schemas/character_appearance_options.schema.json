@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local.endfield.invalid/schemas/character_appearance_options.schema.json",
+  "title": "Endfield character appearance export options",
+  "type": "object",
+  "required": ["potential", "fur"],
+  "properties": {
+    "potential": {"type": "string", "enum": ["base", "maximum"]},
+    "fur": {"type": "string", "enum": ["existing", "source_shell", "charcoal_embers"]}
+  },
+  "additionalProperties": true
+}

@@ -300,17 +300,19 @@ def _constraint_signature(rig: bpy.types.Object) -> str:
     return _json_signature(rows)
 
 
-def _source_geometry_signature() -> str:
+def _source_geometry_signature(objects: tuple[bpy.types.Object, ...],
+                               source_visibility: Mapping[str, tuple[bool, bool, bool]]) -> str:
     """Hash source-mesh layout and visibility without rescanning vertex payloads."""
     rows = []
-    for obj in sorted((item for item in bpy.data.objects
-                       if item.type == 'MESH' and item.get('source_geometry_path')), key=lambda item: item.name):
+    for obj in sorted(objects, key=lambda item: item.name):
+        visibility = (source_visibility[obj.name] if obj.name in source_visibility
+                      else (bool(obj.hide_render), bool(obj.hide_viewport), bool(obj.hide_get())))
         rows.append({
             'name': obj.name,
             'path': obj.get('source_geometry_path'),
-            'hidden': bool(obj.hide_get()),
-            'hide_viewport': bool(obj.hide_viewport),
-            'hide_render': bool(obj.hide_render),
+            'hidden': visibility[2],
+            'hide_viewport': visibility[1],
+            'hide_render': visibility[0],
             'mesh': obj.data.name,
             'vertex_count': len(obj.data.vertices),
             'edge_count': len(obj.data.edges),
@@ -318,6 +320,51 @@ def _source_geometry_signature() -> str:
             'groups': [group.name for group in obj.vertex_groups],
         })
     return _json_signature(rows)
+
+
+def _registered_source_geometry(report: Mapping[str, object]) -> tuple[bpy.types.Object, ...]:
+    """Resolve the source set registered before later optional display layers existed."""
+    names = tuple(_text(name, 'report.source_geometry[]')
+                  for name in _rows(report.get('source_geometry'), 'report.source_geometry'))
+    if len(names) != len(set(names)):
+        raise ValueError('Rig authoring source geometry contains duplicate object names')
+    objects: list[bpy.types.Object] = []
+    for name in names:
+        obj = bpy.context.scene.objects.get(name)
+        if obj is None or obj.type != 'MESH' or not obj.get('source_geometry_path'):
+            raise AssertionError(f'Registered source geometry is absent from the actual scene: {name}')
+        objects.append(obj)
+    return tuple(objects)
+
+
+def _potential_source_visibility(objects: tuple[bpy.types.Object, ...]) -> dict[str, tuple[bool, bool, bool]]:
+    """Delegate only verified overlay visibility while retaining the original source hash."""
+    from character_potential_build import verify_potential_appearance
+
+    source_names = frozenset(obj.name for obj in objects)
+    result: dict[str, tuple[bool, bool, bool]] = {}
+    for owner in bpy.context.scene.objects:
+        saved = owner.get('endfield_potential_build_report')
+        if saved is None:
+            continue
+        potential = _record(json.loads(_text(saved, 'potential build report')), 'potential build report')
+        applied = _record(potential.get('applied'), 'potential.applied')
+        overlay_names = tuple(_text(name, 'potential.overlay_objects[]')
+                              for name in _rows(applied.get('overlay_objects'), 'potential.overlay_objects'))
+        if not source_names.intersection(overlay_names):
+            continue
+        verify_potential_appearance(potential, bpy.context.scene)
+        baseline = _record(potential.get('source_overlay_visibility'), 'potential.source_overlay_visibility')
+        if set(baseline) != set(overlay_names):
+            raise ValueError('Potential source visibility evidence differs from its exact overlay set')
+        for name in overlay_names:
+            if name not in source_names or name in result:
+                raise ValueError(f'Potential overlay is outside or repeats the registered source set: object={name}')
+            visibility = _rows(baseline[name], f'potential.source_overlay_visibility.{name}')
+            if len(visibility) != 3 or any(type(value) is not bool for value in visibility):
+                raise ValueError(f'Potential source visibility requires three booleans: object={name}')
+            result[name] = (visibility[0], visibility[1], visibility[2])
+    return result
 
 
 def _slot_paths(value: Mapping[int, str] | None, rig: bpy.types.Object) -> tuple[dict[int, str], str]:
@@ -397,7 +444,10 @@ def _classify_source_bones(rig: bpy.types.Object, direct_roles: Mapping[str, str
         tokens = _name_tokens(path.rsplit('/', 1)[-1]) if path else frozenset()
         category, evidence = _semantic_role(path)
         technical = sorted(tokens & TECHNICAL_TOKENS)
-        if path in direct_roles:
+        if bone.get('source_unskinned_transform') is True:
+            role, reason = 'Source Details', 'source_unskinned_transform'
+            category, evidence = role, path.rsplit('/', 1)[-1]
+        elif path in direct_roles:
             role, reason = direct_roles[path], 'source_avatar_slot'
             category, evidence = role, path.rsplit('/', 1)[-1]
         elif technical:
@@ -842,7 +892,11 @@ def apply_rig_authoring(rig: bpy.types.Object, slot_paths: Mapping[int, str] | N
     rest_before = _rest_signature(rig)
     actions_before = _action_signature(rig)
     constraints_before = _constraint_signature(rig)
-    geometry_before = _source_geometry_signature()
+    geometry_objects = tuple(obj for obj in bpy.context.scene.objects
+                             if obj.type == 'MESH' and obj.get('source_geometry_path'))
+    geometry_before = _source_geometry_signature(geometry_objects, {})
+    source_geometry_before = _source_geometry_signature(
+        geometry_objects, _potential_source_visibility(geometry_objects))
     rig_collection = _create_rig_collection(rig)
     expression_collection = _create_child_collection(rig_collection, rig, 'Expression Controls')
     helper_collection = _create_child_collection(rig_collection, rig, 'Technical Helpers')
@@ -869,7 +923,7 @@ def apply_rig_authoring(rig: bpy.types.Object, slot_paths: Mapping[int, str] | N
                 _move_object(obj, helper_collection)
                 obj.hide_set(True)
                 technical_helpers.append(obj.name)
-        elif obj.type == 'MESH' and obj.get('source_geometry_path'):
+        elif obj in geometry_objects:
             _move_object(obj, geometry_collection)
             source_geometry.append(obj.name)
 
@@ -906,7 +960,7 @@ def apply_rig_authoring(rig: bpy.types.Object, slot_paths: Mapping[int, str] | N
         raise AssertionError('Active source Action changed during authoring setup')
     if _constraint_signature(rig) != constraints_before:
         raise AssertionError('Source pose constraints changed during authoring setup')
-    if _source_geometry_signature() != geometry_before:
+    if _source_geometry_signature(geometry_objects, {}) != geometry_before:
         raise AssertionError('Source mesh layout or visibility changed during authoring setup')
 
     report: dict[str, object] = {
@@ -941,7 +995,7 @@ def apply_rig_authoring(rig: bpy.types.Object, slot_paths: Mapping[int, str] | N
         'rest_signature': rest_before,
         'action_signature': actions_before,
         'constraint_signature': constraints_before,
-        'source_geometry_signature': geometry_before,
+        'source_geometry_signature': source_geometry_before,
         'verified': True,
     }
     verify_rig_authoring(report)
@@ -965,7 +1019,8 @@ def verify_rig_authoring(report: Mapping[str, object]) -> dict[str, object]:
         raise AssertionError(f'Active Action signature changed: {rig_name}')
     if _constraint_signature(rig) != report.get('constraint_signature'):
         raise AssertionError(f'Pose constraint signature changed: {rig_name}')
-    if _source_geometry_signature() != report.get('source_geometry_signature'):
+    source_geometry = _registered_source_geometry(report)
+    if _source_geometry_signature(source_geometry, _potential_source_visibility(source_geometry)) != report.get('source_geometry_signature'):
         raise AssertionError(f'Source geometry signature changed: {rig_name}')
     if (rig.data.display_type != 'STICK' or rig.data.show_names
             or not rig.data.show_bone_custom_shapes or not rig.show_in_front):
@@ -1067,7 +1122,7 @@ def verify_rig_authoring(report: Mapping[str, object]) -> dict[str, object]:
         if (controller is None or controller.type != 'EMPTY' or not _expression_control(controller)
                 or name not in found_collections['expression_controls'].objects):
             raise AssertionError(f'Expression controller is missing or unclassified: {name}')
-    geometry_names = {_text(name, 'report.source_geometry[]') for name in _rows(report.get('source_geometry'), 'report.source_geometry')}
+    geometry_names = {obj.name for obj in source_geometry}
     for name in geometry_names:
         geometry = bpy.data.objects.get(name)
         if (geometry is None or geometry.type != 'MESH' or not geometry.get('source_geometry_path')

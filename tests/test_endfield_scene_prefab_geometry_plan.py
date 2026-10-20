@@ -10,7 +10,10 @@ import unittest
 from extractor_core.dynamic_models import DynamicModelInventory, DynamicModelRecord, DynamicModelSource
 from endfield_scene_material_contract import reference_key, validate_material
 from endfield_scene_mesh_uv_contract import MeshUvCatalog
-from endfield_scene_prefab_bounds import select_prefab_geometry_inventory, validate_prefab_selection_evidence
+from endfield_scene_prefab_bounds import (
+    select_prefab_geometry_inventory, validate_prefab_selection_evidence, validate_prefab_selection_ownership,
+)
+from endfield_scene_prefab_selection_cache import select_cached_prefab_geometry_inventory
 from endfield_scene_prefab_geometry_plan import (build_prefab_geometry_plan, observed_prefab_geometry_paths,
                                                prefab_material_pass_indices, validate_prefab_geometry_plan)
 from tests.test_scene_materials import material_record
@@ -171,6 +174,13 @@ class PrefabGeometryPlanTests(unittest.TestCase):
             self.assertAlmostEqual(proof["maximum"][0], 6.)
             self.assertAlmostEqual(proof["minimum"][2], 3.)
             self.assertAlmostEqual(proof["maximum"][2], 7.)
+            cached = select_cached_prefab_geometry_inventory(all_models, (manifest,), (0., 5., 0., 10.), whole, root)
+            self.assertEqual(cached, left)
+            cache_files = tuple((root / "prefab_selections_v1").glob("*.json"))
+            self.assertEqual(len(cache_files), 1)
+            cache_stamp = cache_files[0].stat().st_mtime_ns
+            self.assertEqual(select_cached_prefab_geometry_inventory(all_models, (manifest,), (0., 5., 0., 10.), whole, root), left)
+            self.assertEqual(cache_files[0].stat().st_mtime_ns, cache_stamp)
             children[0]["RendererType"] = "SkinnedMeshRenderer"
             children[0]["RendererRole"]["SourceFields"] = {"m_AABB": {
                 "m_Center": {"x": 0, "y": .5, "z": 0}, "m_Extent": {"x": 1, "y": .5, "z": 1}}}
@@ -188,6 +198,9 @@ class PrefabGeometryPlanTests(unittest.TestCase):
             self.assertFalse(empty_skin.inventory.records)
             self.assertFalse(empty_skin.pending)
             self.assertEqual(empty_skin.empty_count, 2)
+            cached_empty = select_cached_prefab_geometry_inventory(all_models, (manifest,), (0., 5., 0., 10.), whole, root)
+            self.assertEqual(cached_empty, empty_skin)
+            self.assertEqual(len(tuple((root / "prefab_selections_v1").glob("*.json"))), 2)
             children[0]["RendererRole"]["SourceFields"]["m_Mesh"]["m_PathID"] = 999
             manifest.write_text(json.dumps(data), encoding="utf-8")
             unresolved_skin = select_prefab_geometry_inventory(all_models, (manifest,), whole, whole)
@@ -202,6 +215,13 @@ class PrefabGeometryPlanTests(unittest.TestCase):
             from dataclasses import asdict
             validated = {**asdict(exterior), "geometry_selection": proof}
             validate_prefab_selection_evidence(validated, dict(zip(("xmin", "xmax", "zmin", "zmax"), (0., 5., 0., 10.))))
+            light_proof = {**proof, "source_manifest": str(root / "not_reopened_by_normal_export.json")}
+            validate_prefab_selection_ownership({**validated, "geometry_selection": light_proof},
+                {"xmin": 0., "xmax": 5., "zmin": 0., "zmax": 10.})
+            with self.assertRaisesRegex(ValueError, "finite bounds"):
+                validate_prefab_selection_ownership(
+                    {**validated, "geometry_selection": {**light_proof, "minimum": [float("nan"), 0., 0.]}},
+                    {"xmin": 0., "xmax": 5., "zmin": 0., "zmax": 10.})
             proof["minimum"][0] -= 1
             with self.assertRaisesRegex(ValueError, "differ from source geometry"):
                 validate_prefab_selection_evidence(validated, dict(zip(("xmin", "xmax", "zmin", "zmax"), (0., 5., 0., 10.))))

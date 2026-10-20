@@ -399,9 +399,9 @@ def validate_prefab_geometry_plan(plan: Mapping[str, object]) -> None:
         if len(bytes.fromhex(str(record.get("raw_record_hex")))) != 96:
             raise ValueError(f"Prefab placement must preserve its 96-byte source record: placement={key}")
         if "geometry_selection" in record:
-            from endfield_scene_prefab_bounds import validate_prefab_selection_evidence
+            from endfield_scene_prefab_bounds import validate_prefab_selection_ownership
 
-            validate_prefab_selection_evidence(record, cast(Mapping[str, float], require_object(plan.get("bounds"), "prefab bounds")))
+            validate_prefab_selection_ownership(record, cast(Mapping[str, float], require_object(plan.get("bounds"), "prefab bounds")))
     manifests = tuple(Path(str(value)) for value in cast(list[object], plan["scene_manifests"]))
     candidates = prefab_candidates(manifests, frozenset(str(row["prefab_path"]).replace("\\", "/").casefold() for row in placements.values()))
     seen: set[str] = set()

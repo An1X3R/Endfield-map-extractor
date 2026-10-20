@@ -14,6 +14,7 @@ from character_material_authoring import select_nodes, shader_editor
 from endfield_scene_material_contract import AssetReference, MaterialRecord, TextureSlot
 from blender_scene_effect_materials import make_mesh_effect_material
 from character_npr_vfx import CHARACTER_VFX_SHADER, MESH_EFFECT_SHADERS, character_vfx_preview_record
+from character_windows_paths import io_path
 
 if TYPE_CHECKING:
     from build_npc_material_sample import NpcMeshInstance
@@ -163,7 +164,7 @@ def _source_identity(value: object, context: str) -> Identity:
 
 
 def _texture_path_key(path: Path) -> str:
-    return str(path.resolve()).casefold()
+    return str(io_path(path).resolve()).casefold()
 
 
 def _scene_record(source: MaterialSource, packet: SourcePacket) -> tuple[MaterialRecord, Mapping[Identity, tuple[Path, str]], dict[str, object]]:
@@ -188,9 +189,10 @@ def _scene_record(source: MaterialSource, packet: SourcePacket) -> tuple[Materia
     for identity, texture in packet.textures.items():
         if identity != texture.identity:
             raise ValueError(f"Verified source texture map key differs from its record: map_key={identity}, texture={texture.identity}")
-        if not texture.path.is_file():
+        path = io_path(texture.path)
+        if not path.is_file():
             raise FileNotFoundError(f"Verified source texture disappeared before scene adaptation: identity={identity}, path={texture.path}")
-        path_map[identity] = (texture.path.parent, texture.path.name)
+        path_map[identity] = (path.parent, path.name)
 
     texture_slots: list[TextureSlot] = []
     for raw_slot in _array(raw.get("textures"), "character.material.textures"):
@@ -313,7 +315,7 @@ def _tag_and_pack_factory_images(
     texture_paths: Mapping[Identity, tuple[Path, str]],
     packet: SourcePacket,
     record: MaterialRecord,
-    images: Mapping[tuple[Identity, str], bpy.types.Image],
+    images: Mapping[tuple[Identity, str, str], bpy.types.Image],
 ) -> None:
     by_path: dict[str, TextureSource] = {}
     for texture in packet.textures.values():
@@ -335,7 +337,7 @@ def _tag_and_pack_factory_images(
         expected_space = "Non-Color" if texture.color_space == 0 else "sRGB"
         if image.colorspace_settings.name != expected_space:
             raise ValueError(f"VFX factory image color space differs from source evidence: node={sample.name}, expected={expected_space}, actual={image.colorspace_settings.name}")
-        shared = images.get((texture.identity, expected_space))
+        shared = images.get((texture.identity, expected_space, image.alpha_mode))
         if shared is None:
             raise KeyError(f"VFX source image role is absent from the character image cache: identity={texture.identity}, colorspace={expected_space}, node={sample.name}")
         if shared.colorspace_settings.name != expected_space or shared.alpha_mode != image.alpha_mode:
@@ -465,7 +467,8 @@ def _group_factory_surface(
     group_tree["scope"] = "Existing scene VFXBaseV2 surface wrapped as a character material pass; snapshot-time approximation and scene-factory limitations remain explicit."
     for key in ("endfield_fx_source_material", "endfield_fx_source", "endfield_fx_path_id",
                 "endfield_fx_source_material_json", "endfield_fx_status", "endfield_fx_limitations",
-                "endfield_fx_custom1_channels"):
+                "endfield_fx_custom1_channels", "endfield_character_vfx_normal_preview",
+                "endfield_character_vfx_mesh_uv_weights", "endfield_character_vfx_missing_uv1_reference"):
         if key in material:
             group_tree[key] = material[key]
     if "endfield_fx_limitations" not in group_tree:
@@ -481,7 +484,7 @@ def _group_factory_surface(
 def material_group(
     source: MaterialSource,
     packet: SourcePacket,
-    images: Mapping[tuple[Identity, str], bpy.types.Image],
+    images: Mapping[tuple[Identity, str, str], bpy.types.Image],
     color_source: MeshColorSource | None,
     layout: Callable[[bpy.types.NodeTree], None],
 ) -> bpy.types.ShaderNodeTree:
@@ -491,19 +494,41 @@ def material_group(
     if color_source is None:
         raise ValueError(f"VFXBaseV2 material requires actual imported Mesh color evidence: material={source.identity}")
     record, texture_paths, raw_render_state = _scene_record(source, packet)
-    preview_record = character_vfx_preview_record(record) if source.shader == CHARACTER_VFX_SHADER else record
-    material = make_mesh_effect_material(preview_record, dict(texture_paths), VFX_SNAPSHOT_TIME, color_source.components)
+    surface_record = record
+    if source.shader == CHARACTER_VFX_SHADER and source.floats['_UseVertexOffset'] == 1.0:
+        from character_vfx_vertex_offset import require_installed_offset
+        require_installed_offset(source, color_source.mesh_names)
+        # Geometry Nodes own this source stage; the surface factory must not displace twice.
+        surface_record = {**record, 'Floats': {**record['Floats'], '_UseVertexOffset': 0.0}}
+    preview_record = character_vfx_preview_record(surface_record) if source.shader == CHARACTER_VFX_SHADER else record
+    factory_record = preview_record
+    if source.shader == CHARACTER_VFX_SHADER:
+        from character_npr_vfx_uv import character_vfx_mesh_uv_record
+        factory_record = character_vfx_mesh_uv_record(preview_record, color_source.mesh_names)
+    material = make_mesh_effect_material(factory_record, dict(texture_paths), VFX_SNAPSHOT_TIME, color_source.components)
+    if source.shader == CHARACTER_VFX_SHADER:
+        from character_npr_vfx_uv import apply_character_vfx_mesh_uv_weights
+        apply_character_vfx_mesh_uv_weights(material, preview_record, color_source.mesh_names)
+    if source.shader == CHARACTER_VFX_SHADER and source.floats['_EnableNormalMap'] == 1.0:
+        from character_npr_vfx_normal import apply_character_vfx_fresnel_normal
+        apply_character_vfx_fresnel_normal(material, record, source, packet, texture_paths, color_source.mesh_names, VFX_SNAPSHOT_TIME)
     _tag_and_pack_factory_images(material, texture_paths, packet, preview_record, images)
     group = _group_factory_surface(material, source, color_source, raw_render_state, layout)
     if source.shader == CHARACTER_VFX_SHADER:
         group['source_adapter'] = 'EndfieldCharacterNprVfxNamedRoles/1'
         group['endfield_fx_source_material_json'] = json.dumps(record, sort_keys=True)
         group['source_vfx_preview_record'] = json.dumps(preview_record, sort_keys=True)
+        if source.floats.get('_UsePosYAsScreenV', 0.0) != preview_record['Floats'].get('_UsePosYAsScreenV', 0.0):
+            group['source_inactive_screen_modifier'] = 'Source _UsePosYAsScreenV is retained in source_floats; the host adapter prunes it only when every active named texture role has zero screen-UV weight.'
         group['source_sampler_slot_scope'] = 'Sampler source_slot names refer to host preview aliases; the native bindings are preserved in endfield_fx_source_material_json.'
         group['scope'] = 'Current CharacterNPR_VFX named texture roles and source values adapted to existing host VFX nodes. Shader program equivalence, native lighting, separate depth draws and screen effects remain unverified.'
         group['native_shader_semantics_verified'] = False
         limitations = _array(json.loads(group['endfield_fx_limitations']), 'VFX limitations')
         limitations.append('CharacterNPR_VFX named roles use the shared host preview graph; current compiled shader equivalence is not audited.')
+        if source.floats['_UseVertexOffset'] == 1.0:
+            from character_vfx_vertex_offset import CONTRACT, LIMITATION
+            group['source_vertex_offset_geometry_contract'] = CONTRACT
+            limitations.append(LIMITATION)
         if source.floats['_Bi_Disturb'] == 1.0:
             limitations.append('Bidirectional disturbance uses two opposed half-strength samples of the actual source texture; native time phases and flow composition remain unverified.')
         if source.floats['_ZWriteWithAlphaTest'] == 1.0:

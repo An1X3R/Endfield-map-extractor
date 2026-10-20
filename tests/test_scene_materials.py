@@ -107,6 +107,48 @@ class SceneMaterialTests(unittest.TestCase):
                    "ValidKeywords": [*record["RenderState"]["ValidKeywords"], "_TERRAIN_BLEND"]}}
         self.assertFalse(has_verified_lit_sweep(validate_material(terrain)))
 
+    def test_sweep_approximation_preserves_verified_identity_and_source_boundaries(self) -> None:
+        from endfield_shader_contract import has_approximate_lit_sweep, has_verified_lit_sweep
+        row = validate_material({**material_record(),
+            "Shader": {"Source": "CAB-93483c2cb844b6b343af0950ad4630ad", "PathId": 5324015590718682574},
+            "Floats": {"_BaseTextureMapCount": 1, "_BaseUVSet": 0, "_BasePbrMapUVSet": 0,
+                       "_EnableUVAnimation": 0, "_EnableEmissiveMap": 1, "_EnableEmissiveAnimSweep": 1,
+                       "_EmissiveMaskChannel": 5, "_EmissiveNoMapUseFresnel": 0,
+                       "_EmissiveSweepSpeed": 8, "_EmissiveSweepInterval": 2, "_EmissiveSweepWidth": 3,
+                       "_EmissiveSweepFalloff": 1, "_EmissiveSweepHeightOffset": 0, "_EmissiveSweepRandom": 0,
+                       "_EmissiveSweepAlbedoScale": 0.3, "_AlbedoAffectEmissive": 1},
+            "RenderState": {"DisabledShaderPasses": [], "CustomRenderQueue": 2000,
+                            "ValidKeywords": ["_EMISSIVE_ANIM_SWEEP", "_EMISSIVE_NOMAP",
+                                              "_TWO_BASEMAP", "_VAT_RIGIDBODY"]}})
+        self.assertTrue(has_approximate_lit_sweep(row))
+        self.assertFalse(has_verified_lit_sweep(row))
+        for field, value in (("_BaseUVSet", 1), ("_BasePbrMapUVSet", 1), ("_EnableUVAnimation", 1),
+                             ("_EmissiveNoMapUseFresnel", 1), ("_EmissiveSweepWidth", 0)):
+            with self.subTest(field=field):
+                changed = {**row, "Floats": {**row["Floats"], field: value}}
+                self.assertFalse(has_approximate_lit_sweep(changed))
+        missing = {name: value for name, value in row["Floats"].items() if name != "_EmissiveSweepRandom"}
+        self.assertFalse(has_approximate_lit_sweep({**row, "Floats": missing}))
+        effect = {**row, "Shader": {"Source": "CAB-2c811ef28608ab220ecdb5c4e0629d2d",
+                                   "PathId": 6428594484694422749}}
+        self.assertFalse(has_approximate_lit_sweep(effect))
+        verified = {**row, "RenderState": {**row["RenderState"], "ValidKeywords": [
+            "_EMISSIVE_ANIM_SWEEP", "_EMISSIVE_NOMAP", "_TWO_BASEMAP"]}}
+        self.assertTrue(has_verified_lit_sweep(verified))
+        self.assertFalse(has_approximate_lit_sweep(verified))
+        mapped = {**row, "Floats": {**row["Floats"], "_EmissiveMaskChannel": 0,
+                                   "_EmissiveUVSet": 0, "_EmissiveType": 1},
+                  "Textures": [{"Property": "_EmissiveMap", "Texture": {
+                      "Source": "CAB-texture", "PathId": 3, "ColorSpace": 0},
+                      "Scale": [1.0, 1.0], "Offset": [0.0, 0.0]}],
+                  "RenderState": {**row["RenderState"], "ValidKeywords": [
+                      "_EMISSIVE_ANIM_SWEEP", "_EMISSIVE_MAP", "_TERRAIN_BLEND"]}}
+        self.assertTrue(has_approximate_lit_sweep(mapped))
+        missing_color_space = {**mapped, "Textures": [{**mapped["Textures"][0], "Texture": {
+            "Source": "CAB-texture", "PathId": 3}}]}
+        self.assertFalse(has_approximate_lit_sweep(missing_color_space))
+        self.assertFalse(has_approximate_lit_sweep({**mapped, "Floats": {**mapped["Floats"], "_EmissiveUVSet": 1}}))
+
     def test_render_state_enrichment_preserves_source_and_rejects_conflicts(self) -> None:
         original = validate_material(material_record())
         state = {"DisabledShaderPasses": ["DepthOnly"], "ValidKeywords": [], "CustomRenderQueue": 2000}

@@ -51,11 +51,16 @@ class CharacterExportRequestTests(unittest.TestCase):
             self.assertEqual(request.weather_manifest, (root / 'weather_manifest.bin').resolve())
             self.assertEqual(request.output, (root / 'export').resolve())
             self.assertIsNone(request.material_options)
+            self.assertIsNone(request.appearance_options)
+            self.assertIsNone(request.potential_json_reader)
+            self.assertIsNone(request.potential_scene_probe)
             geometry_dir = root / 'prepared/static_probe'
             geometry_dir.mkdir(parents=True)
             (geometry_dir / 'model.fbx').write_bytes(b'fbx')
             legacy_args = build_arguments(request, root / 'prepared', root / 'build', write_material_options(request))
             self.assertNotIn('--material-options', legacy_args)
+            self.assertNotIn('--appearance-options', legacy_args)
+            self.assertNotIn('--potential-manifest', legacy_args)
 
             with_materials = {**document, 'output': 'simplified_export', 'material_options': {
                 'mode': 'simplified', 'lighting': 'simple', 'weather': {'quality': 'full', 'effects': ['rain', 'wet']}}}
@@ -69,6 +74,48 @@ class CharacterExportRequestTests(unittest.TestCase):
             self.assertEqual(simplified_args[-2:], ('--material-options', str(options_path)))
             self.assertEqual(json.loads(options_path.read_text(encoding='utf-8')),
                 {'mode': 'simplified', 'lighting': 'simple', 'weather': {'quality': 'full', 'effects': ['wet', 'rain']}})
+
+            potential_json_reader = root / 'potential_json_reader.bin'
+            potential_scene_probe = root / 'potential_scene_probe.bin'
+            potential_json_reader.write_bytes(b'fixture')
+            potential_scene_probe.write_bytes(b'fixture')
+            with_appearance = {
+                **document,
+                'output': 'appearance_export',
+                'appearance_options': {
+                    'potential': 'maximum',
+                    'fur': 'existing',
+                    'ignored_extra': 'filtered',
+                },
+                'potential_json_reader': potential_json_reader.name,
+                'potential_scene_probe': potential_scene_probe.name,
+            }
+            appearance_path = root / 'appearance_request.json'
+            appearance_path.write_text(json.dumps(with_appearance), encoding='utf-8')
+            appearance_request = read_request(appearance_path)
+            self.assertEqual(appearance_request.appearance_options.as_json(), {
+                'potential': 'maximum', 'fur': 'existing'})
+            self.assertEqual(appearance_request.potential_json_reader, potential_json_reader.resolve())
+            self.assertEqual(appearance_request.potential_scene_probe, potential_scene_probe.resolve())
+            appearance_args = build_arguments(
+                appearance_request, root / 'prepared', root / 'appearance_build', write_material_options(appearance_request))
+            self.assertEqual(appearance_args[-4:], (
+                '--appearance-options', str(root / 'appearance_export/appearance_options.json'),
+                '--potential-manifest', str(root / 'appearance_export/potential/potential_manifest.json'),
+            ))
+
+            simplified_appearance = {
+                **with_appearance,
+                'output': 'invalid_simplified_appearance',
+                'material_options': {
+                    'mode': 'simplified', 'lighting': 'simple',
+                    'weather': {'quality': 'full', 'effects': ['rain', 'wet']},
+                },
+            }
+            simplified_appearance_path = root / 'simplified_appearance_request.json'
+            simplified_appearance_path.write_text(json.dumps(simplified_appearance), encoding='utf-8')
+            with self.assertRaisesRegex(ValueError, 'original character materials'):
+                read_request(simplified_appearance_path)
 
     def test_rejects_previous_request_format(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
-import type { CharacterMaterialOptions } from './types'
+import { describeAppearance } from './appearance'
+import type { CharacterAppearanceOptions, CharacterAppearanceReport, CharacterMaterialOptions } from './types'
 import { describeMaterials } from './materials'
 import { createScan } from './scan'
 import type { OperatorPortrait } from './portraits'
@@ -7,6 +8,8 @@ import type { ScanFrameDetail } from './scan'
 import { createCompletionMotion, OPERATOR_COMPLETION_DURATION } from './completionMotion'
 
 export type OperatorReport = {
+  appearanceOptions?: CharacterAppearanceOptions
+  appearanceReport?: CharacterAppearanceReport
   materialOptions?: CharacterMaterialOptions
   portrait: OperatorPortrait | null
   id: string
@@ -103,7 +106,7 @@ export function OperatorCompletion({ report, open, reduced, onClose, onCopy }: P
         <section className="completion-report"><div className="operator-report-field" aria-hidden="true" />
           <div className="report-decoration" aria-hidden="true"><span className="report-ghost-number">04</span><svg viewBox="0 0 680 610" preserveAspectRatio="xMaxYMid slice"><g fill="none" stroke="currentColor"><path pathLength="1" d="M472 40h150v154M622 244v292H390M344 536H42M558 40v496M42 488h580" /><path d="M440 66h154v354H440zM456 82h122v322H456z" strokeDasharray="3 9" /><circle pathLength="1" cx="574" cy="438" r="134" /><circle pathLength="1" cx="574" cy="438" r="108" /><path pathLength="1" d="M412 438h268M574 277v290M451 349l19 19m194 194-19-19M478 531l-20 20" /><path pathLength="1" d="M632 84h14m-14 12h8m-8 12h8m-8 12h14m-14 12h8m-8 12h8m-8 12h14M72 549v14m12-14v8m12-8v8m12-8v14m12-14v8m12-8v8m12-8v14" /></g></svg><span className="report-registration">ENTITY / ARCHIVE<br />REGISTRATION PLATE — 04</span><span className="report-edge-code">PORTRAIT · MATERIAL · MOTION</span></div>
           <div className="completion-kicker"><span className="completion-light" /> {partial ? 'ASSET / PARTIAL' : success ? 'ASSET / COMPILED' : `TASK / ${report.state.toUpperCase()}`}</div><p id="completion-entity">{report.entity}</p><div className="operator-title-mask"><h1 id="completion-title">{title}</h1></div><p className="completion-subtitle">{partial ? '产物已生成 · 有待处理项；数量不等于缺失资产数量' : success ? '导出完成 · 产物已就绪' : report.error ?? '后端已确认任务取消'}</p><div className="completion-rule"><i id="completion-progress" style={{ width: `${frame.printProgress * 100}%` }} /></div>
-          <div className="completion-summary"><span>OUTPUT / BLENDER</span><strong id="completion-path">{report.output ?? '未返回产物目录'}</strong><p id="completion-pending">{partial ? `待处理 ${report.pending.length} 项 · 详情保留在档案报告中` : report.development ? '开发样例 · 不生成真实产物' : `${report.files.length} 项已生成文件`}</p>{!report.development && report.output && <p data-testid="operator-completion-materials">{report.materialOptions ? `实际材质：${describeMaterials(report.materialOptions)}` : '后端未返回材质确认信息'}</p>}</div>
+          <div className="completion-summary"><span>OUTPUT / BLENDER</span><strong id="completion-path">{report.output ?? '未返回产物目录'}</strong><p id="completion-pending">{partial ? `待处理 ${report.pending.length} 项 · 详情保留在档案报告中` : report.development ? '开发样例 · 不生成真实产物' : `${report.files.length} 项已生成文件`}</p>{!report.development && report.output && <p data-testid="operator-completion-materials">{report.materialOptions ? `实际材质：${describeMaterials(report.materialOptions)}` : '后端未返回材质确认信息'}</p>}{!report.development && report.appearanceReport && <p data-testid="operator-completion-appearance">{describeAppearance(report.appearanceReport)} · 粒子为固定快照</p>}</div>
           <div className="completion-controls">{success && <><button data-testid="operator-replay" onClick={() => { setDuration(OPERATOR_COMPLETION_DURATION); setReplay(value => value + 1) }}>重播动画 ↻</button><button data-testid="operator-slow" onClick={() => { setDuration(6500); setReplay(value => value + 1) }}>慢速观察</button></>}{report.output && <button data-testid="operator-modal-copy" onClick={() => onCopy(report.output!, '产物目录已复制')}>{report.development ? '复制示例路径' : '复制产物目录'}</button>}{partial && <button data-testid="operator-modal-diagnostics" onClick={() => onCopy(report.pending.map(item => `${item.code}: ${item.message}`).join('\n'), '完整诊断已复制')}>复制完整诊断</button>}</div>
           <button className="completion-return" data-testid="operator-completion-return" onClick={close}>返回角色档案 <span>↗</span></button><small>{report.development ? 'DEV PREVIEW / ' : ''}{report.portrait ? '角色档案 · 扫描显影' : '实体档案 · 暂无角色头像'}</small>
         </section>

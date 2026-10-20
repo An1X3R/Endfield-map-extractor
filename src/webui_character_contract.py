@@ -10,6 +10,9 @@ from uuid import UUID
 from character_runtime.character_material_options import (
     CharacterMaterialOptionsError, parse_character_material_options,
 )
+from character_runtime.character_appearance_options import (
+    CharacterAppearanceOptionsError, parse_character_appearance_options,
+)
 
 
 CharacterJobKind = Literal["preparation", "export"]
@@ -83,6 +86,11 @@ def normalize_character_request(payload: object) -> tuple[CharacterJobKind, dict
             try:
                 normalized["materials"] = parse_character_material_options(options["materials"]).as_json()
             except CharacterMaterialOptionsError as error:
+                raise CharacterRequestError(str(error)) from error
+        if "appearance" in options:
+            try:
+                normalized["appearance"] = parse_character_appearance_options(options["appearance"]).as_json()
+            except CharacterAppearanceOptionsError as error:
                 raise CharacterRequestError(str(error)) from error
         for field in ("raw_expressions", "basic_mmd"):
             flag = options.get(field, False)

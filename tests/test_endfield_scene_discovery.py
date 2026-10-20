@@ -13,6 +13,7 @@ from endfield_scene_discovery import (
     describe_file,
     helper_progress,
     observe_helper,
+    read_asset_bundle_candidate_names_by_map,
     read_checkpoint,
     stage_work,
     tool_identity,
@@ -24,6 +25,24 @@ def no_cancel() -> None:
 
 
 class SceneDiscoveryCheckpointTests(unittest.TestCase):
+    def test_map_roots_ignore_package_containers(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            results = Path(temporary) / "providers.jsonl"
+            rows = (
+                {"kind": "match", "logical_name": "asset_map01", "containers": ["assets/map01/lv001/scene"]},
+                {"kind": "match", "logical_name": "package_map01", "containers": ["packages/map01/lv001/scene"]},
+                {"kind": "match", "logical_name": "mixed_map01",
+                 "containers": ["packages/map01/lv002/scene", "assets/map01/lv002/scene"]},
+                {"kind": "match", "logical_name": "asset_map02", "containers": ["Assets\\Map02\\Lv007\\Scene"]},
+                {"kind": "match", "logical_name": "package_map02", "containers": ["packages/map02/lv007/scene"]},
+                {"kind": "complete", "scanned": 5, "failed": 0, "matches": 5},
+            )
+            results.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+            roots = read_asset_bundle_candidate_names_by_map(results)
+
+            self.assertEqual({"map01": ["asset_map01", "mixed_map01"], "map02": ["asset_map02"]}, roots)
+
     def test_completed_checkpoint_reuses_verified_file_outputs(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

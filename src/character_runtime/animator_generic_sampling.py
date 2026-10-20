@@ -186,7 +186,8 @@ def sample_auxiliary_layers(request_path: Path, check_cancelled: CheckCancelled,
         'animator_ordinary_plan.py', 'character_animator_graph.py', 'animator_selected_avatar_bindings.py',
         'animator_clip_references.py', 'build_auxiliary_candidate.py', 'animator_auxiliary_layers.py',
         'animator_ordinary_source.py', 'animator_clip_delta.py', 'animator_ordinary_direct.py',
-        'animator_ordinary_layers.py', 'animator_direct_parameters.py', 'animator_weighted_channels.py'))
+        'animator_ordinary_layers.py', 'animator_direct_parameters.py', 'animator_weighted_channels.py',
+        'animator_legacy_dense.py'))
     if version == 'EndfieldGenericAuxiliarySamplingRequest/2':
         immutable += tuple(module_root / name for name in ('character_animation_state_export.py',
             'animator_state_schedule.py', 'animator_state_clock.py', 'animator_state_pose.py', 'build_native_state_clock_candidate.py'))
@@ -255,9 +256,14 @@ def sample_auxiliary_layers(request_path: Path, check_cancelled: CheckCancelled,
         source = object_row(read_json(samples / str(target.index) / 'clip_source.json'), 'clip.source')
         bindings_result = selected_avatar_bindings(source, avatar, hierarchy)
         decoded = load_selected_avatar_clip(samples / str(target.index), avatar, hierarchy)
+        legacy = (object_row(read_json(samples / str(target.index) / 'legacy_dense_clip.json'), 'legacy samples')
+                  if integer(source['OutputTrackCount'], 'track count') == 0 else None)
         settings.append({key: source[key] for key in ('cab', 'pathId', 'rawDataSha256', *LOOP_FIELDS)} | {'index': target.index})
         clips.append({**asdict(target), 'name': source['m_Name'], 'raw_data_sha256': source['rawDataSha256'],
             'frames': len(decoded.times), 'mapped_tracks': len(decoded.paths),
+            'sample_encoding': 'legacy_streamed_dense_and_constant' if legacy is not None else 'new_acl',
+            'legacy_stored_frames': legacy['m_FrameCount'] if legacy is not None else None,
+            'legacy_excluded_outside_clip_domain': integer(legacy['m_FrameCount'], 'legacy frames') - len(decoded.times) if legacy is not None else None,
             'unmapped_tracks_skipped': sum(row.avatar_index == -1 for row in bindings_result),
             'full_reader_binding_validation': read_json(samples / str(target.index) / 'verification_status.json')})
     execution_settings = {'format': 'EndfieldAuxiliaryClipExecutionSettings/1', 'clips': settings}

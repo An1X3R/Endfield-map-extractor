@@ -7,6 +7,9 @@ import re
 from typing import TypedDict
 
 from character_runtime.character_material_options import parse_character_material_options
+from character_runtime.character_appearance_options import (
+    parse_character_appearance_options, verify_character_appearance_report,
+)
 from webui_character_contract import json_object, required_text
 
 
@@ -84,4 +87,11 @@ def build_character_result(output_dir: Path, manifest: dict[str, object], kind: 
         if kind != "export":
             raise ValueError("Material export options are valid only for character export results")
         result["material_options"] = parse_character_material_options(manifest["material_options"]).as_json()
+    if "appearance_options" in manifest or "appearance_report" in manifest:
+        if kind != "export" or "appearance_options" not in manifest or "appearance_report" not in manifest:
+            raise ValueError("Appearance settings and their completed report are valid only together on character exports")
+        appearance = parse_character_appearance_options(manifest["appearance_options"])
+        result["appearance_options"] = appearance.as_json()
+        result["appearance_report"] = verify_character_appearance_report(
+            appearance, manifest["appearance_report"])
     return result

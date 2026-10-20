@@ -9,7 +9,7 @@ import math
 from pathlib import Path
 from types import ModuleType
 import sys
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
 import bpy
 import numpy as np
@@ -25,6 +25,9 @@ from character_hair_fur_snow_profile import HairFurSnowProfile, read_hair_fur_sn
 from character_wetfilm_profile import file_digest, verified_file
 from character_windows_paths import io_path
 from patch_character_hgrp import source_keywords
+
+if TYPE_CHECKING:
+    from rebuild_character_materials import SourcePacket
 
 
 PROFILE_FORMAT = 'EndfieldFurCurvesBuildProfile/1'
@@ -444,6 +447,27 @@ def attach_profile_fur_curves(
                    'attributes': curve_attribute_hashes(curves.data, tuple(attribute.name for attribute in curves.data.attributes)),
                    'reason': 'Current source keyword variant is outside the verified mapped Fur snow/wet kernel; source geometry, appearance inputs and original shell remain retained.',
                    'native_shader_semantics_verified': False}
+    from character_special_vfx import attach_special_vfx, source_from_group
+    special_source = source_from_group(group)
+    if special_source is not None:
+        if special_source.floats['_AlphaPremultiply'] != 0.0:
+            raise ValueError('Fur Curves special VFX requires a separately established source BaseMap alpha for premultiplied variants')
+        curve_material, = curves.data.materials
+        curve_tree = curve_material.node_tree
+        surface_output, = (item for item in curve_tree.nodes if item.type == 'OUTPUT_MATERIAL' and item.is_active_output)
+        surface_link, = surface_output.inputs['Surface'].links
+        uv = curve_tree.nodes.new('ShaderNodeAttribute')
+        uv.attribute_name = 'UVMap'
+        uv.label = 'Special VFX source root UV0'
+        geometric = curve_tree.nodes.new('ShaderNodeNewGeometry')
+        alpha_multiplier = curve_tree.nodes.new('ShaderNodeValue')
+        alpha_multiplier.outputs[0].default_value = 1.0
+        alpha_multiplier.label = 'Source AlphaPremultiply is disabled'
+        shader = attach_special_vfx(curve_tree, special_source, surface_link.from_socket,
+            uv.outputs['Vector'], geometric.outputs['Normal'], geometric.outputs['Incoming'],
+            alpha_multiplier.outputs[0], bpy.context.scene)
+        curve_tree.links.new(shader, surface_output.inputs['Surface'])
+        layout(curve_tree)
     after = source_geometry_digest((source_mesh.name,))
     if geometry != after:
         raise AssertionError(f'Optional Fur Curves generation changed original Mesh geometry or skin: {source_mesh.name}')
@@ -468,6 +492,7 @@ def attach_profile_fur_curves(
                               'disable_rain_effect_on_material': disable_rain},
         'source_fur_direction': direction_record,
         'source_fur_dye': dye,
+        'source_special_vfx': json.loads(curves.data.materials[0].node_tree['source_special_vfx']) if special_source is not None else {'status': 'not_selected_by_source_keyword'},
         'source_geometry_preserved': True,
         'collection': collection.name,
         'bind_guides': asdict(built),
@@ -543,6 +568,10 @@ def verify_profile_fur_curves(receipt: dict[str, object]) -> dict[str, object]:
     collection = bpy.data.collections.get(collection_name)
     if collection is None or curves.name not in collection.objects or guides.name not in collection.objects:
         raise AssertionError('Saved optional Fur Curves collection membership differs')
+    special = receipt.get('source_special_vfx')
+    if isinstance(special, dict) and special.get('format') == 'EndfieldCharacterSpecialVfx/1':
+        from character_special_vfx import verify_special_vfx
+        verify_special_vfx(curves.data.materials[0].node_tree, special)
     return {'status': 'passed', 'source_mesh': source_mesh.name, 'driven_curves': curves.name,
             'bind_guides_hidden': True, 'source_mesh_retained_visible': True, 'weather': weather_audit}
 
@@ -570,4 +599,29 @@ def attach_prepared_fur_curves(
             'preparation': {'path': str(preparation.path), 'sha256': preparation.sha256},
             'entries': entries, 'skipped_hidden_sources': skipped,
             'source_mesh_candidates': len(preparation.profiles), 'mesh_fur_retained': True}
+
+
+def attach_prepared_fur_shells(
+    preparation: FurCurvesPreparation,
+    source_dir: Path,
+    weather_profile_path: Path,
+    controls: bpy.types.ShaderNodeTree,
+    layout: Callable[[bpy.types.NodeTree], None],
+    packet: SourcePacket,
+) -> dict[str, object]:
+    """Explicitly select retained source shells; ordinary optional Curves callers remain unchanged."""
+    from character_fur_source_shell import activate_source_fur_shell, build_source_fur_shell
+    curves = attach_prepared_fur_curves(preparation, source_dir, weather_profile_path, controls, layout)
+    entries = curves.get('entries')
+    if not isinstance(entries, list):
+        raise TypeError('Prepared source shells require a completed Curves entry list')
+    built = [build_source_fur_shell(_object(entry, 'prepared Fur entry'), packet, layout)
+             for entry in entries]
+    shells = [activate_source_fur_shell(entry) for entry in built]
+    return {'format': 'EndfieldPreparedSourceFurShells/1', 'status': 'completed',
+            'preparation': curves['preparation'], 'entries': shells,
+            'skipped_hidden_sources': curves['skipped_hidden_sources'],
+            'source_mesh_candidates': curves['source_mesh_candidates'],
+            'retained_curves_preparation': curves,
+            'native_shader_semantics_verified': False}
 

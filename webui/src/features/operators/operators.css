@@ -2705,3 +2705,13 @@
 .operator-workspace-shell .material-quality-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-top: 16px; }
 .operator-workspace-shell .material-quality-fields select { margin-top: 8px; }
 .operator-workspace-shell .material-effects { display: flex; flex-wrap: wrap; gap: 4px 18px; }
+
+.operator-workspace-shell .appearance-choices { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; }
+.operator-workspace-shell .appearance-choices button { padding: 12px 8px; text-align: left; border: 1px solid var(--line); background: var(--paper); color: inherit; }
+.operator-workspace-shell .appearance-choices button b { display: block; font-size: 13px; }
+.operator-workspace-shell .appearance-choices button small { display: block; margin-top: 6px; line-height: 1.5; }
+.operator-workspace-shell .appearance-choices button[aria-pressed="true"] { background: var(--ink); color: var(--paper); border-top: 3px solid var(--yellow); padding-top: 10px; }
+.operator-workspace-shell .appearance-choices button:disabled { opacity: .45; cursor: not-allowed; }
+.operator-workspace-shell .appearance-choices button:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
+.operator-workspace-shell .appearance-result details { border-top: 1px solid var(--line); padding-top: 12px; }
+.operator-workspace-shell .appearance-result pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 240px; overflow: auto; font-size: 11px; }

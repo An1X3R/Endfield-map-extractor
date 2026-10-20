@@ -354,6 +354,22 @@ def save_effect_cache_delivery(cache_path: Path, blend_path: Path) -> None:
         cache.filepath = original_path
 
 
+def save_effect_material_delivery(blend_path: Path) -> None:
+    """Save material-only playback without introducing an empty geometry cache."""
+    if not blend_path.is_absolute():
+        raise ValueError(f"Material animation requires an absolute path: blend={blend_path}")
+    if blend_path.exists():
+        raise FileExistsError(f"Material animation output already exists: blend={blend_path}")
+    unpacked = tuple(image.name for image in bpy.data.images
+                     if image.source == 'FILE' and image.users and not image.packed_file)
+    caches = tuple(cache.filepath for cache in bpy.data.cache_files if cache.users > 0)
+    if unpacked or caches:
+        raise ValueError(f"Material animation has external dependencies: images={unpacked}, caches={caches}")
+    bpy.ops.wm.save_as_mainfile(filepath=str(blend_path), relative_remap=True, copy=True)
+    if not blend_path.is_file():
+        raise FileNotFoundError(f"Material animation did not produce a blend file: blend={blend_path}")
+
+
 def animate_effect_material_time(material: bpy.types.Material, scene: bpy.types.Scene) -> None:
     """Drive verified VFX UV scroll with Blender seconds and explicit proxy scope."""
     if material.node_tree is None:
@@ -363,6 +379,8 @@ def animate_effect_material_time(material: bpy.types.Material, scene: bpy.types.
         raise ValueError(f"Effect material must be rebuilt with its source time input: material={material.name}")
     driver = node.outputs[0].driver_add('default_value').driver
     driver.expression = 'frame * fps_base / fps'
+    for variable in tuple(driver.variables):
+        driver.variables.remove(variable)
     for name, path in (('fps', 'render.fps'), ('fps_base', 'render.fps_base')):
         variable = driver.variables.new()
         variable.name = name

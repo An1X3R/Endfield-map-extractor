@@ -22,6 +22,7 @@ from character_weather_per_draw import WeatherPerDrawSource, decode_weather_per_
 from character_material_profile import ShaderIdentity, profile_shader_identity
 from patch_character_hgrp import source_keywords
 from review_character_hgrp import visible_source_group_names
+from character_windows_paths import io_path
 
 
 PROFILE_KEY = "skin_rain"
@@ -56,7 +57,7 @@ class RootUsage:
 
 
 def file_digest(path: Path) -> str:
-    with path.open("rb") as stream:
+    with io_path(path).open("rb") as stream:
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
@@ -83,7 +84,7 @@ def verified_file(parent: Path, value: object, digest: object, label: str) -> Pa
     expected_digest = string_value(digest, label + " SHA-256").casefold()
     if len(expected_digest) != 64 or any(character not in "0123456789abcdef" for character in expected_digest):
         raise ValueError(f"{label} SHA-256 must contain 64 hexadecimal characters")
-    path = (parent / relative_path).resolve(strict=True)
+    path = io_path(parent / relative_path).resolve(strict=True)
     actual_digest = file_digest(path)
     if actual_digest != expected_digest:
         raise ValueError(f"{label} SHA-256 mismatch: path={path}; expected={expected_digest}; actual={actual_digest}")
@@ -91,8 +92,8 @@ def verified_file(parent: Path, value: object, digest: object, label: str) -> Pa
 
 
 def read_profile(profile_path: Path) -> tuple[SkinRainProfile | None, str]:
-    profile = profile_path.resolve(strict=True)
-    document = object_value(json.loads(profile.read_text(encoding="utf-8")), "character profile")
+    profile = io_path(profile_path).resolve(strict=True)
+    document = object_value(json.loads(io_path(profile).read_text(encoding="utf-8")), "character profile")
     raw_config = document.get(PROFILE_KEY)
     if raw_config is None:
         return None, file_digest(profile)
@@ -315,14 +316,14 @@ def load_skin_snow_texture(
     standard_snow_receipt: Mapping[str, object],
 ) -> tuple[bpy.types.Image, dict[str, object]]:
     """Load the exact configured common snow texture and cross-check any reused Standard image."""
-    profile = object_value(json.loads(profile_path.read_text(encoding="utf-8")), "character profile")
+    profile = object_value(json.loads(io_path(profile_path).read_text(encoding="utf-8")), "character profile")
     config = object_value(profile.get("standard_snow"), "Skin snow requires the configured standard_snow source record")
     if config.get("format") != "EndfieldStandardSnowProfile/1" or config.get("texture_slot") != "characterSnowTexture":
         raise ValueError("Skin snow requires the evidenced characterSnowTexture profile slot")
     wetfilm = object_value(profile.get("standard_wet_film"), "Skin snow requires the shared standard_wet_film texture manifest")
     manifest = verified_file(profile_path.parent, wetfilm.get("texture_manifest"),
                              wetfilm.get("texture_manifest_sha256"), "Skin snow texture manifest")
-    manifest_rows = json.loads(manifest.read_text(encoding="utf-8"))
+    manifest_rows = json.loads(io_path(manifest).read_text(encoding="utf-8"))
     if not isinstance(manifest_rows, list):
         raise TypeError("Skin snow texture manifest must be an array")
     matches = tuple(object_value(row, "Skin snow texture row") for row in manifest_rows
@@ -345,7 +346,7 @@ def load_skin_snow_texture(
     for expected_path, expected_sha256 in ((manifest, file_digest(manifest)), (texture, texture_sha256)):
         matching_files = tuple(item for item in receipt_files
                                if isinstance(item.get("path"), str)
-                               and Path(str(item["path"])).resolve(strict=True) == expected_path
+                               and io_path(str(item["path"])).resolve(strict=True) == expected_path
                                and item.get("sha256") == expected_sha256)
         if receipt_files and len(matching_files) != 1:
             raise ValueError(f"Reused Standard snow receipt does not identify the exact Skin texture source: {expected_path}")

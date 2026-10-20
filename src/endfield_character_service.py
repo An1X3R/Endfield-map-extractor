@@ -45,6 +45,9 @@ from webui_character_contract import CharacterRequestError, json_object, require
 from character_runtime.character_material_options import (
     CharacterMaterialOptions, CharacterMaterialOptionsError, parse_character_material_options,
 )
+from character_runtime.character_appearance_options import (
+    CharacterAppearanceOptionsError, parse_character_appearance_options, verify_character_appearance_report,
+)
 
 
 Progress = Callable[[str, float, str], None]
@@ -199,6 +202,52 @@ def _verified_npc_material_options(options: dict[str, object], receipt: dict[str
     return original.as_json()
 
 
+def _verified_character_appearance(options: dict[str, object], receipt: dict[str, object],
+                                   build: dict[str, object], audit: dict[str, object]
+                                   ) -> tuple[dict[str, str] | None, dict[str, object] | None]:
+    """Expose requested appearance only after the completed export and reopen evidence agree."""
+    if "appearance" not in options:
+        return None, None
+    try:
+        expected = parse_character_appearance_options(options["appearance"])
+    except CharacterAppearanceOptionsError as error:
+        raise CharacterServiceError(f"Character appearance request is invalid: {error}") from error
+    if (receipt.get("format") != "EndfieldCharacterExport/1"
+            or receipt.get("status") != "exported_reopened"
+            or build.get("format") != "EndfieldCharacterBuild/1"
+            or build.get("status") != "built_not_reopened"
+            or audit.get("format") != "EndfieldCharacterBuildReopenAudit/1"
+            or audit.get("status") != "passed"):
+        raise CharacterServiceError("Appearance confirmation requires completed export, build, and reopen evidence")
+    digest = receipt.get("blend_sha256")
+    if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+        raise CharacterServiceError("Appearance confirmation requires the completed character SHA-256")
+    if build.get("sha256") != digest or audit.get("blend_sha256") != digest:
+        raise CharacterServiceError("Appearance evidence refers to different character files")
+    try:
+        confirmed = parse_character_appearance_options(receipt.get("appearance_options"))
+        build_options = parse_character_appearance_options(build.get("appearance_options"))
+        audit_options = parse_character_appearance_options(audit.get("appearance_options"))
+        report = verify_character_appearance_report(expected, receipt.get("appearance_report"))
+        build_report = verify_character_appearance_report(expected, build.get("appearance_report"))
+        audit_report = verify_character_appearance_report(expected, audit.get("appearance_report"))
+    except CharacterAppearanceOptionsError as error:
+        raise CharacterServiceError(f"Character appearance confirmation is invalid: {error}") from error
+    expected_json = expected.as_json()
+    if (confirmed.as_json() != expected_json
+            or build_options.as_json() != expected_json
+            or audit_options.as_json() != expected_json
+            or receipt.get("appearance_options") != expected_json
+            or build.get("appearance_options") != expected_json
+            or audit.get("appearance_options") != expected_json):
+        raise CharacterServiceError(
+            "Appearance options differ across the request, export receipt, build receipt, and reopen audit")
+    if build_report != report or audit_report != report:
+        raise CharacterServiceError(
+            "Appearance reports differ across the export receipt, build receipt, and reopen audit")
+    return confirmed.as_json(), report
+
+
 def character_source_pending(probe: dict[str, object], audit: dict[str, object]) -> list[dict[str, str]]:
     """Expose reader coverage separately from successful source material rebuilding."""
     if probe.get("format") != "EndfieldCharacterStaticReceipt/1" or audit.get("format") != "EndfieldCharacterSourceAudit/1":
@@ -306,7 +355,8 @@ class CharacterService:
                 raise CharacterServiceError("角色天气纹理清单已变化，请重新准备角色数据。")
         return context, record
 
-    def _runtime_defaults(self) -> tuple[Path, dict[str, object]]:
+    def _runtime_defaults(self, options: dict[str, object],
+                          context: CharacterSourceContext | None) -> tuple[Path, dict[str, object]]:
         config, parent = self._require_config()
         exporter = _path(config.get("exporter"), parent, "exporter")
         raw = json_object(config.get("export_defaults"), "export_defaults")
@@ -324,6 +374,40 @@ class CharacterService:
         missing = [name for name in path_fields if not Path(str(defaults[name])).exists()]
         if not exporter.is_file() or missing:
             raise CharacterServiceError("角色工具或材质组件未安装完整，请检查角色运行配置。")
+        if "appearance" in options:
+            try:
+                parse_character_appearance_options(options["appearance"])
+            except CharacterAppearanceOptionsError as error:
+                raise CharacterServiceError(f"Character appearance request is invalid: {error}") from error
+            if config.get("format") != "EndfieldCharacterRuntime/2":
+                raise CharacterServiceError("外观选项需要支持 ExportRequest/2 的角色运行配置，请更新角色工具配置。")
+            if context is None or self.config_path is None:
+                raise CharacterServiceError("外观选项需要已准备的角色源及运行配置。")
+
+            if "potential_json_reader" in raw:
+                json_reader = _path(raw.get("potential_json_reader"), parent, "potential_json_reader")
+            else:
+                if config.get("npc_assembly_tools") is None:
+                    raise CharacterServiceError(
+                        "角色运行配置缺少满潜 JSON reader，请更新运行配置或配置 npc_assembly_tools.json_reader。")
+                assembly = json_object(config.get("npc_assembly_tools"), "npc_assembly_tools")
+                json_reader = _path(assembly.get("json_reader"), parent, "npc_assembly_tools.json_reader")
+            if not json_reader.is_file():
+                raise CharacterServiceError("满潜源配置读取器不存在，请检查 potential_json_reader 或 npc_assembly_tools.json_reader。")
+
+            if "potential_scene_probe" in raw:
+                scene_probe = _path(raw.get("potential_scene_probe"), parent, "potential_scene_probe")
+            else:
+                try:
+                    from endfield_scene_helpers import require_prepared_scene_helpers
+                    scene_probe = require_prepared_scene_helpers(self.config_path, context.cache_root).probe
+                except (OSError, ValueError, KeyError, TypeError) as error:
+                    raise CharacterServiceError(
+                        f"无法从已核验的场景工具回执解析 potential_scene_probe：{error}") from error
+            if not scene_probe.is_file():
+                raise CharacterServiceError("满潜场景探针不存在，请检查 potential_scene_probe 或已准备的场景工具回执。")
+            defaults["potential_json_reader"] = str(json_reader)
+            defaults["potential_scene_probe"] = str(scene_probe)
         return exporter, defaults
 
     def prepared_source_context(self) -> CharacterSourceContext:
@@ -576,7 +660,7 @@ class CharacterService:
         tools = self._npc_animation_tools()
         if not tools:
             raise CharacterServiceError("NPC 配置动作需要配置 npc_animation_tools；不会按动作族猜测 Avatar。")
-        _, defaults = self._runtime_defaults()
+        _, defaults = self._runtime_defaults({}, None)
         try:
             catalog = read_npc_action_catalog(context, selection, tools, defaults, check_cancelled)
         except (ValueError, OSError, RuntimeError) as error:
@@ -620,7 +704,7 @@ class CharacterService:
                        identity: str, variant_id: str, check_cancelled: CheckCancelled) -> dict[str, object]:
         """Authenticate controller-referenced clips for one exact enemy prefab."""
         tools = self._npc_prefab_animation_tools()
-        _, defaults = self._runtime_defaults()
+        _, defaults = self._runtime_defaults({}, None)
         try:
             document = read_enemy_animation_catalog(context, selection, tools, defaults, check_cancelled)
             source = parse_enemy_action_catalog(document, selection)
@@ -695,7 +779,7 @@ class CharacterService:
                     "availability": {"ready": False, "reason": str(error)}, "characters": [], "profiles": []}
         runtime_reason: str | None = None
         try:
-            self._runtime_defaults()
+            self._runtime_defaults({}, None)
         except CharacterServiceError as error:
             runtime_reason = str(error)
         variants = self._variants(catalog)
@@ -903,7 +987,7 @@ class CharacterService:
 
     def canonical_preparation(self, payload: dict[str, object]) -> dict[str, object]:
         self._require_config()
-        self._runtime_defaults()
+        self._runtime_defaults({}, None)
         kind, request = normalize_character_request(payload)
         if kind != "preparation":
             raise CharacterServiceError("需要角色准备请求。")
@@ -923,7 +1007,9 @@ class CharacterService:
         kind, request = normalize_character_request(payload)
         if kind != "export":
             raise CharacterServiceError("需要角色导出请求。")
-        _, runtime_defaults = self._runtime_defaults()
+        options = json_object(request.get("options", {}), "options")
+        if "appearance" not in options:
+            _, runtime_defaults = self._runtime_defaults(options, None)
         context, catalog, npc, identity = self._catalog_source()
         require_character_export_blender(context.blender)
         if request["catalog_id"] != _digest((identity, "catalog/1")) or request["source_identity"] != identity:
@@ -931,7 +1017,16 @@ class CharacterService:
         match = {**self._variants(catalog), **self._npc_variants(npc)}.get(str(request["variant_id"]))
         if match is None or match[0] != request["selection_id"]:
             raise CharacterServiceError("角色变体不属于当前选择，或尚无可运行的导出入口。")
-        options = json_object(request.get("options", {}), "options")
+        if "appearance" in options:
+            parse_character_appearance_options(options["appearance"])
+            if self.config is None or self.config.get("format") != "EndfieldCharacterRuntime/2":
+                raise CharacterServiceError("外观选项需要支持 ExportRequest/2 的角色运行配置，请更新角色工具配置。")
+            materials = json_object(options["materials"], "material options") if "materials" in options else None
+            if materials is not None and materials.get("mode") == "simplified":
+                raise CharacterServiceError("外观选项需要原始材质；请移除简化材质选项后重试。")
+            if str(request["selection_id"]).startswith("independent-npc-"):
+                raise CharacterServiceError("当前不支持独立 NPC 外观选项；请移除 options.appearance 后重试。")
+            _, runtime_defaults = self._runtime_defaults(options, context)
         if options.get("animation") and "finalik_replay_id" in json_object(options["animation"], "animation options"):
             if str(request["selection_id"]).startswith("independent-npc-"):
                 raise CharacterServiceError("FinalIK 回放暂仅支持角色 action_id；独立 NPC 回放尚未接入。")
@@ -981,7 +1076,7 @@ class CharacterService:
                     if entries[0].source_kind != "prefab":
                         raise CharacterServiceError("reference_id 需要精确预制体 NPC 来源。")
                     tools = self._npc_prefab_animation_tools()
-                    _, defaults = self._runtime_defaults()
+                    _, defaults = self._runtime_defaults(options, context)
                     try:
                         references = read_npc_cpu_action_references(context, match[1], tools, defaults, _no_cancel)
                         document = npc_cpu_reference_document(references, match[1], str(animation["reference_id"]))
@@ -1118,8 +1213,9 @@ class CharacterService:
         current = self.canonical_export(canonical)
         if current != canonical:
             raise CharacterServiceError("角色准备数据已变化，请重新提交。")
-        exporter, defaults = self._runtime_defaults()
         context = _context_from_row(json_object(canonical["context"], "context"))
+        selected_options = json_object(canonical.get("options", {}), "options")
+        exporter, defaults = self._runtime_defaults(selected_options, context)
         _safe_storage(context.game_root, output_dir)
         if not output_dir.resolve().is_relative_to(context.output_root):
             raise CharacterServiceError("角色产物目录不属于所选输出文件夹，请重新选择输出目录。")
@@ -1143,9 +1239,10 @@ class CharacterService:
                    "cache_dir": str(context.cache_root), "output": str(payload),
                    **{name: selection[name] for name in ("character_id", "template_id", "part_name", "resource_path", "variant")},
                    "provider": selection["logical_provider"]}
-        selected_options = json_object(canonical.get("options", {}), "options")
         if "materials" in selected_options:
             request["material_options"] = selected_options["materials"]
+        if "appearance" in selected_options:
+            request["appearance_options"] = selected_options["appearance"]
         if self.config is not None and self.config.get("format") == "EndfieldCharacterRuntime/2":
             _, record = self._current()
             request["format"] = "EndfieldCharacterExportRequest/2"
@@ -1229,6 +1326,8 @@ class CharacterService:
             build = _read(payload / "build/build_receipt.json")
             options = json_object(canonical.get("options", {}), "options")
             verified_materials = _verified_character_material_options(options, receipt, build, audit)
+            verified_appearance_options, appearance_report = _verified_character_appearance(
+                options, receipt, build, audit)
             files: list[dict[str, object]] = [{"relative_path": blend.relative_to(output_dir).as_posix(),
                                             "role": "character", "bytes": blend.stat().st_size, "sha256": digest}]
             authoring_pending: list[dict[str, str]] = []
@@ -1273,6 +1372,9 @@ class CharacterService:
         manifest = {"status": "partial", "files": files, "pending": [*pending, *authoring_pending]}
         if verified_materials is not None:
             manifest["material_options"] = verified_materials
+        if verified_appearance_options is not None and appearance_report is not None:
+            manifest["appearance_options"] = verified_appearance_options
+            manifest["appearance_report"] = appearance_report
         return manifest
 
     def _prepare_authoring(self, canonical: dict[str, object], context: CharacterSourceContext, catalog: CharacterCatalog,
@@ -1341,6 +1443,9 @@ class CharacterService:
                              part_names: tuple[str, ...], defaults: dict[str, object], check_cancelled: CheckCancelled,
                              progress: Progress) -> dict[str, object]:
         """Run the source configuration adapter and verify its actual saved artifact."""
+        options = json_object(canonical.get("options", {}), "NPC options")
+        if "appearance" in options:
+            raise CharacterServiceError("当前不支持独立 NPC 外观选项；请移除 options.appearance 后重试。")
         tools = self._npc_assembly_tools()
         selection = json_object(canonical["selection"], "selection")
         payload = output_dir / "payload"
@@ -1351,7 +1456,6 @@ class CharacterService:
             "npc_id": selection["character_id"], "template_id": selection["template_id"],
             "part_name": selection["part_name"], "part_names": list(part_names), "source_identity": npc_identity,
             "unity_version": defaults["unity_version"], "tools": {name: str(path) for name, path in tools.items() if name != "exporter"}}
-        options = json_object(canonical.get("options", {}), "NPC options")
         animated = bool(options.get("animation"))
         if animated:
             action_options = json_object(options["animation"], "NPC animation options")

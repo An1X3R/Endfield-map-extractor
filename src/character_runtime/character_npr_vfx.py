@@ -1,6 +1,7 @@
 """Translate CharacterNPR VFX source roles into the existing host VFX preview contract."""
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING
 from character_material_profile import integer_value, object_value, text_value
 
@@ -23,13 +24,17 @@ def validate_character_vfx_shader(shader_row: dict[str, object]) -> None:
     if not isinstance(rows, list):
         raise ValueError('CharacterNPR_VFX requires the source Shader property table')
     required = {'_TintColor': 0, '_SurfaceType': 2, '_MainTex': 4,
-                '_MainTexUVSpeed': 1, '_MainTexUVWeights': 1, '_MainTexUVRotateMat': 1}
+                '_MainTexUVSpeed': 1, '_MainTexUVWeights': 1, '_MainTexUVRotateMat': 1,
+                '_EnableNormalMap': 2, '_NormalMap': 4, '_NormalScale': 3,
+                '_NormalMapUVSpeed': 1, '_NormalMapUVWeights': 1, '_NormalMapUVRotateMat': 1}
     for flag, _, texture, speed, weights, rotation in ROLE_SOURCES:
         required.update({flag: 2, texture: 4, speed: 1, weights: 1, rotation: 1})
     found: set[str] = set()
     for raw in rows:
         row = object_value(raw, 'Character VFX Shader property')
         name = text_value(row.get('m_Name'), 'Character VFX Shader property name')
+        if name == '_OffsetSwitchDir' and row.get('m_Attributes') != ['Enum(Object, 0, World, 1, Normal, 2)']:
+            raise ValueError('Character VFX source offset direction enum differs from the implemented native property contract')
         if name not in required:
             continue
         if name in found or integer_value(row.get('m_Type'), name + '.m_Type') != required[name]:
@@ -48,12 +53,21 @@ def character_vfx_preview_record(record: MaterialRecord) -> MaterialRecord:
     if record['Shader'].get('Name') != CHARACTER_VFX_SHADER:
         raise ValueError(f'Character VFX adapter received another Shader family: material={record["Name"]}')
     floats, colors = record['Floats'], record['Colors']
-    for flag in ('_UseDisturb', '_UseMask', '_UseBlend', '_Bi_Disturb'):
+    for flag in ('_UseDisturb', '_UseMask', '_UseBlend', '_Bi_Disturb', '_EnableNormalMap'):
         if floats[flag] not in (0.0, 1.0):
             raise ValueError(f'Character VFX source feature switch is not binary: material={record["Name"]}; property={flag}; value={floats[flag]}')
-    for flag in ('_EnableNormalMap', '_UseHeightColorGradient', '_UseEmission', '_UseVertexOffset', '_UseDissolve', '_UseCutOff', '_MainTexUseFlowmap'):
+    for flag in ('_UseHeightColorGradient', '_UseEmission', '_UseVertexOffset', '_UseDissolve', '_UseCutOff', '_MainTexUseFlowmap'):
         if floats[flag] != 0.0:
             raise ValueError(f'Character VFX source branch has no host implementation: material={record["Name"]}; property={flag}; value={floats[flag]}')
+    if floats['_EnableNormalMap'] == 1.0:
+        if floats['_UseFresnel'] != 1.0:
+            raise ValueError(f'Character VFX normal preview requires an active Fresnel consumer: material={record["Name"]}')
+        if floats['_NormalMapUVSet'] != 0.0 or colors['_NormalMapUVWeights'] != [1.0, 0.0, 0.0, 0.0]:
+            raise ValueError(f'Character VFX normal preview only supports source UV0: material={record["Name"]}')
+        if colors['_NormalMapUVSpeed'][2:] != [0.0, 0.0]:
+            raise ValueError(f'Character VFX normal preview has no source custom UV-speed stream: material={record["Name"]}')
+        if not math.isfinite(floats['_NormalScale']) or floats['_NormalScale'] < 0.0:
+            raise ValueError(f'Character VFX normal scale must be finite and nonnegative: material={record["Name"]}; value={floats["_NormalScale"]}')
     derived_floats = {f'_UseSampleTex{index}': 0.0 for index in range(6)}
     derived_colors: dict[str, list[float]] = {}
     aliases: list[TextureSlot] = []
@@ -91,6 +105,11 @@ def character_vfx_preview_record(record: MaterialRecord) -> MaterialRecord:
         derived_colors.update({name + 'UVSpeed': list(preview_colors[speed]), name + 'UVWeights': list(preview_colors[weights]),
                                name + 'UVRotateMat': list(preview_colors[rotation])})
     derived_floats['_UsePolarUV'] = float(any(value == [0.0, 0.0, 1.0, 0.0] for key, value in {**colors, **derived_colors}.items() if key.endswith('UVWeights')))
+    active_uv_weights = [colors['_MainTexUVWeights'], *(derived_colors[f'_SampleTex{index}UVWeights']
+                         for index in range(len(active)))]
+    if all(weights[3] == 0.0 for weights in active_uv_weights):
+        # A screen-coordinate modifier cannot affect named roles that never sample screen UVs.
+        derived_floats['_UsePosYAsScreenV'] = 0.0
     # The host preview represents bidirectional flow as two opposed half-strength samples.
     derived_floats.update({'_UseDisturb2': float(any(row[1] == 1 for row in active)),
                            '_Bi_Disturb': 0.0, '_UseWeightTex': 0.0})

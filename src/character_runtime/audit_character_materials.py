@@ -7,13 +7,13 @@ import json
 from pathlib import Path
 import struct
 import sys
-from typing import Callable, Sequence
+from typing import Callable, Mapping, Sequence
 
 sys.dont_write_bytecode = True
 import bpy
 
 
-def _geometry_digest(object_names: Sequence[str], transform_bytes: Callable[[bpy.types.Object], bytes], shape_blocks: Callable[[bpy.types.Object], Sequence[bpy.types.ShapeKey]]) -> dict[str, str]:
+def _geometry_digest(object_names: Sequence[str], transform_bytes: Callable[[bpy.types.Object], bytes], shape_blocks: Callable[[bpy.types.Object], Sequence[bpy.types.ShapeKey]], visibility: Callable[[bpy.types.Object], tuple[bool, bool, bool]], modifiers: Callable[[bpy.types.Object], Sequence[bpy.types.Modifier]]) -> dict[str, str]:
     result: dict[str, str] = {}
     for name in object_names:
         obj = bpy.data.objects[name]
@@ -37,7 +37,7 @@ def _geometry_digest(object_names: Sequence[str], transform_bytes: Callable[[bpy
             digest.update(block.name.encode("utf-8") + b"\0")
             for vertex in block.data:
                 digest.update(struct.pack("<3f", *vertex.co))
-        for modifier in obj.modifiers:
+        for modifier in modifiers(obj):
             digest.update((modifier.name + "|" + modifier.type).encode("utf-8") + b"\0")
             if modifier.type == "ARMATURE":
                 if modifier.object is None:
@@ -47,7 +47,7 @@ def _geometry_digest(object_names: Sequence[str], transform_bytes: Callable[[bpy
                     digest.update(bone.name.encode("utf-8") + b"\0")
                     for row in bone.matrix_local:
                         digest.update(struct.pack("<4f", *row))
-        digest.update(bytes((obj.hide_render, obj.hide_viewport, obj.hide_get())))
+        digest.update(bytes(visibility(obj)))
         result[name] = digest.hexdigest()
     return result
 
@@ -76,12 +76,39 @@ def _source_transform_bytes(obj: bpy.types.Object) -> bytes:
 
 def geometry_digest(object_names: Sequence[str]) -> dict[str, str]:
     """Hash evaluated world transforms with the original geometry/skin invariants."""
-    return _geometry_digest(object_names, _world_transform_bytes, _all_shape_blocks)
+    return _geometry_digest(object_names, _world_transform_bytes, _all_shape_blocks, _actual_visibility, _actual_modifiers)
 
 
 def source_geometry_digest(object_names: Sequence[str]) -> dict[str, str]:
     """Hash source local/parent transforms and geometry independently of hidden world caches."""
-    return _geometry_digest(object_names, _source_transform_bytes, _all_shape_blocks)
+    return _geometry_digest(object_names, _source_transform_bytes, _all_shape_blocks, _actual_visibility, _actual_modifiers)
+
+
+def _actual_modifiers(obj: bpy.types.Object) -> Sequence[bpy.types.Modifier]:
+    return tuple(obj.modifiers)
+
+
+def source_geometry_digest_with_modifiers(object_names: Sequence[str], modifiers: Callable[[bpy.types.Object], Sequence[bpy.types.Modifier]]) -> dict[str, str]:
+    """Keep source hashes while a caller separately verifies intentional added modifiers."""
+    return _geometry_digest(object_names, _source_transform_bytes, _all_shape_blocks, _actual_visibility, modifiers)
+
+
+def _actual_visibility(obj: bpy.types.Object) -> tuple[bool, bool, bool]:
+    return bool(obj.hide_render), bool(obj.hide_viewport), bool(obj.hide_get())
+
+
+def source_geometry_digest_with_visibility(object_names: Sequence[str], source_visibility: Mapping[str, tuple[bool, bool, bool]]) -> dict[str, str]:
+    """Use verified overlay source visibility while hashing all other source payloads unchanged."""
+    if set(source_visibility) - set(object_names):
+        raise ValueError('Canonical visibility contains objects outside the source geometry set')
+    for name, values in source_visibility.items():
+        if len(values) != 3 or any(type(value) is not bool for value in values):
+            raise ValueError(f'Canonical source visibility requires three booleans: object={name}')
+
+    def visibility(obj: bpy.types.Object) -> tuple[bool, bool, bool]:
+        return source_visibility[obj.name] if obj.name in source_visibility else _actual_visibility(obj)
+
+    return _geometry_digest(object_names, _source_transform_bytes, _all_shape_blocks, visibility, _actual_modifiers)
 
 
 def _all_shape_blocks(obj: bpy.types.Object) -> Sequence[bpy.types.ShapeKey]:
@@ -94,7 +121,7 @@ def _no_shape_blocks(obj: bpy.types.Object) -> Sequence[bpy.types.ShapeKey]:
 
 def source_geometry_without_shapes(object_names: Sequence[str]) -> dict[str, str]:
     """Check immutable geometry and skin while intentional new shape keys are audited separately."""
-    return _geometry_digest(object_names, _source_transform_bytes, _no_shape_blocks)
+    return _geometry_digest(object_names, _source_transform_bytes, _no_shape_blocks, _actual_visibility, _actual_modifiers)
 
 
 def main(argv: Sequence[str]) -> None:

@@ -96,10 +96,17 @@ export function InstancedSceneWorkspace({
   const [outputLabel, setOutputLabel] = useState('scene-export')
   const [resultView, setResultView] = useState<InstancedSceneResultView | null>(null)
   const [showResult, setShowResult] = useState(false)
+  const [settingsOpen, setSettingsOpen] = useState(false)
+  const settingsToggleRef = useRef<HTMLButtonElement | null>(null)
+  const settingsCloseRef = useRef<HTMLButtonElement | null>(null)
   const [actionError, setActionError] = useState<string | null>(null)
   const shownJobId = useRef<string | null>(null)
   const restoredLabelFor = useRef<string | null>(null)
   const shownDevelopmentPreview = useRef<Props['developmentPreview']>(null)
+
+  useEffect(() => {
+    if (settingsOpen) settingsCloseRef.current?.focus()
+  }, [settingsOpen])
 
   const scenes = useInstancedScenes({
     active,
@@ -344,15 +351,18 @@ export function InstancedSceneWorkspace({
     >
       <div className="isc-floor" aria-hidden="true" />
       <div className="isc-horizon" aria-hidden="true"><span>SURFACE_DATUM // 0.000</span></div>
-      <header className="isc-heading">
-        <span className="isc-kicker">03 / DISCRETE SCENE INDEX</span>
-        <h1>INSTANCED<br /><em>SCENES</em></h1>
-        <span className="isc-heading-cn">独立场景</span>
-        <p>按物理场景归属索引，查看目录信息、预览与导出能力。</p>
+      <header className="isc-workspace-line">
+        <span>SCENE INDEX　 /　 独立场景</span>
+        <span>物理场景目录 · 预览与导出</span>
+        <button ref={settingsToggleRef} type="button" data-testid="instanced-settings-toggle" aria-expanded={settingsOpen} aria-controls="instanced-settings" onClick={() => setSettingsOpen(value => !value)}>提取设置 ↗</button>
       </header>
 
       <div className="isc-layout">
         <aside className="isc-index" aria-label="场景目录">
+          <header className="isc-heading">
+            <span className="isc-kicker">03 / DISCRETE SCENE INDEX</span>
+            <h1>INSTANCED<br /><em>SCENES</em></h1>
+          </header>
           <div className="isc-index-head">
             <span>SCENE INDEX / CATALOG</span>
             <b>{catalogReady ? String(sceneCount).padStart(2, '0') : '—'}</b>
@@ -473,14 +483,14 @@ export function InstancedSceneWorkspace({
             </span>
           )}
           <div className="isc-stage-bottom">
-            <span>{selectedScene ? `场景索引已选 · ${sceneOrdinalLabel}/${sceneCountLabel}` : '目录已就绪，等待选择'}</span>
+            <span>{selectedScene ? `场景索引已选 · ${sceneOrdinalLabel}/${sceneCountLabel}` : catalogReady ? '目录已就绪，等待选择' : catalogStateText(scenes.connection)}</span>
             <span>{selectedPreview?.status === 'ready' && selectedPreview.asset
               ? selectedPreview.scope === 'bounded_region' ? '局部图片 / 不限制导出范围' : '全场景图片 / SAME-ORIGIN'
               : '结构预览 / 等待场景规格'}</span>
           </div>
         </section>
 
-        <aside ref={draggable.panelRef} className={`isc-settings${draggable.isDragging ? ' is-dragging' : ''}`} aria-label="独立场景提取设置">
+        <aside ref={draggable.panelRef} id="instanced-settings" className={`isc-settings${draggable.isDragging ? ' is-dragging' : ''}${settingsOpen ? ' is-open' : ''}`} aria-label="独立场景提取设置" onKeyDown={event => { if (event.key === 'Escape' && settingsOpen) { setSettingsOpen(false); settingsToggleRef.current?.focus() } }}>
           <header
             ref={draggable.headerRef}
             className={`isc-settings-head${draggable.isDragging ? ' is-dragging' : ''}`}
@@ -496,6 +506,7 @@ export function InstancedSceneWorkspace({
             <span>EXTRACTION SETTINGS <b>⠿ 拖动</b></span>
             <h2>提取设置</h2>
             <button type="button" onClick={draggable.reset} aria-label="设置面板归位">归位 ↖</button>
+            <button ref={settingsCloseRef} className="isc-settings-close" type="button" data-testid="instanced-settings-close" onClick={() => { setSettingsOpen(false); settingsToggleRef.current?.focus() }}>收起 ×</button>
           </header>
           <div className="isc-settings-body">
             <p className="isc-settings-note">输出设置 · 当前修改只作用于独立场景任务。</p>
@@ -676,7 +687,7 @@ export function InstancedSceneWorkspace({
       </div>
 
       <div className="isc-bottom-rail">
-        <span role="status">{selectedScene ? `已选 ${selectedScene.name} · ${selectedScene.scene_id}` : '独立场景目录已就绪，等待选择'}</span>
+        <span role="status">{selectedScene ? `已选 ${selectedScene.name} · ${selectedScene.scene_id}` : catalogReady ? '独立场景目录已就绪，等待选择' : catalogStateText(scenes.connection)}</span>
         <span>DISCRETE SCENE INDEX / 03</span>
       </div>
 

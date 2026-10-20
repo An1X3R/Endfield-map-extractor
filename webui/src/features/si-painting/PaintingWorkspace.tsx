@@ -72,7 +72,7 @@ export function PaintingWorkspace({ active, previousMap, runtime, onPrepare, res
   return <div className="si-surface" data-theme="si" data-testid="si-workspace" hidden={!active} inert={!active}>
     <svg className="si-ambient" viewBox="0 0 1600 1000" preserveAspectRatio="xMidYMid slice" aria-hidden="true" dangerouslySetInnerHTML={{ __html: AMBIENT_ART }} />
     <div className="si-workspace" ref={workspaceRef}>
-      <PaintingMap onHandoffChange={onHandoffChange} previousMap={previousMap} active={active} overviewUrl={map ? `/api/v2${map.image.url}?v=${map.image.sha256}` : null} metadata={map} preview={preview} onImageReady={setImageReady} onImageError={setImageError} layers={settings.layers} selection={selection} onSelectionChange={onSelection} revision={resetRevision} disabled={busy} />
+      <PaintingMap emptyLabel={runtime.loading ? '正在读取画境地图' : runtime.mapError ? '画境目录读取失败 · 请查看加载诊断' : '画境地图尚未准备'} onHandoffChange={onHandoffChange} previousMap={previousMap} active={active} overviewUrl={map ? `/api/v2${map.image.url}?v=${map.image.sha256}` : null} metadata={map} preview={preview} onImageReady={setImageReady} onImageError={setImageError} layers={settings.layers} selection={selection} onSelectionChange={onSelection} revision={resetRevision} disabled={busy} />
       <section className="si-region-title"><div className="si-hairline"><i /><i /></div><small>ORTHOGRAPHIC REGION SELECTOR / PAINTED REALM</small><div className="si-title-row"><h1>SI’S<br /><span>PAINTING</span></h1><span className="si-region-badge">祀的画</span></div><p><span>WULING / PAINTED REALM</span><i />ATLAS / 03</p><span className="si-title-ghost" aria-hidden="true">叁</span></section>
       <aside ref={panel.panelRef} className="si-settings" aria-label="祀的画提取设置">
         <header ref={panel.headerRef} className="si-settings-handle" tabIndex={0} aria-label="拖动设置面板，方向键移动，Home 归位" onPointerDown={panel.onPointerDown} onPointerMove={panel.onPointerMove} onPointerUp={panel.onPointerUp} onPointerCancel={panel.onPointerCancel} onLostPointerCapture={panel.onLostPointerCapture} onKeyDown={panel.onKeyDown} data-testid="si-settings-handle">
@@ -81,11 +81,11 @@ export function PaintingWorkspace({ active, previousMap, runtime, onPrepare, res
         </header>
         <div className="si-settings-body" hidden={collapsed}>
           <div className="si-preparation-status" data-testid="si-map-status">
-            <strong>{runtime.loading ? '正在读取画境目录' : map ? imageReady ? '画境地图已加载' : '正在加载地图图片' : '画境地图未就绪'}</strong>
+            <strong>{runtime.loading ? '正在读取画境目录' : runtime.mapError ? '画境目录读取失败' : imageError ? '地图图片加载失败' : map ? imageReady ? '画境地图已加载' : '正在加载地图图片' : '画境地图尚未准备'}</strong>
             {!runtime.sourceReady && <button type="button" data-testid="si-prepare-source" disabled={busy} onClick={onPrepare}>打开场景首次准备 ↗</button>}
             <button type="button" data-testid="si-refresh-map" disabled={busy || runtime.loading} onClick={runtime.reload}>刷新地图</button>
-            {(runtime.mapError || imageError) && <details><summary>查看准备状态</summary><p role="alert">{runtime.mapError ?? imageError}</p></details>}
-            {!map && !runtime.loading && runtime.sourceReady && <div data-testid="si-map-preparation">
+            {(runtime.mapError || imageError) && <details open data-testid="si-map-diagnostic"><summary>查看加载诊断</summary><p role="alert">{runtime.mapError ?? imageError}</p></details>}
+            {runtime.mapMissing && !runtime.loading && runtime.sourceReady && <div data-testid="si-map-preparation">
               <p>从当前游戏来源发现地图，按需准备单张原图；已有同源地图将直接校验复用。</p>
               <label className="si-field">区域地图<select data-testid="si-prepare-map-level" value={preparation.selectedLevel} disabled={busy || preparation.loading} onChange={event => preparation.setSelectedLevel(event.target.value)}>
                 {!preparation.catalog && <option value="">{preparation.loading ? '正在发现地图' : '地图目录未读取'}</option>}

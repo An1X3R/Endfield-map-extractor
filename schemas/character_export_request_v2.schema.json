@@ -1,0 +1,135 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local.endfield.invalid/schemas/character_export_request_v2.schema.json",
+  "title": "Endfield character source export request",
+  "type": "object",
+  "required": [
+    "format",
+    "repository_src",
+    "prepare_script",
+    "python",
+    "blender",
+    "static_reader",
+    "shader_reader",
+    "visibility_reader",
+    "catalog",
+    "game_root",
+    "database",
+    "cab_inventory",
+    "weather_manifest",
+    "output",
+    "character_id",
+    "template_id",
+    "part_name",
+    "resource_path",
+    "provider",
+    "unity_version",
+    "head_bone",
+    "face_right",
+    "face_up",
+    "face_forward",
+    "hair_x",
+    "hair_y",
+    "hair_z"
+  ],
+  "properties": {
+    "format": {"const": "EndfieldCharacterExportRequest/2"},
+    "repository_src": {"type": "string", "minLength": 1},
+    "prepare_script": {"type": "string", "minLength": 1},
+    "python": {"type": "string", "minLength": 1},
+    "blender": {"type": "string", "minLength": 1},
+    "static_reader": {"type": "string", "minLength": 1},
+    "shader_reader": {"type": "string", "minLength": 1},
+    "visibility_reader": {"type": "string", "minLength": 1},
+    "catalog": {"type": "string", "minLength": 1},
+    "game_root": {"type": "string", "minLength": 1},
+    "database": {"type": "string", "minLength": 1},
+    "cab_inventory": {"type": "string", "minLength": 1},
+    "weather_manifest": {"type": "string", "minLength": 1},
+    "output": {"type": "string", "minLength": 1},
+    "cache_dir": {"type": ["string", "null"], "minLength": 1},
+    "variant": {"enum": ["characters", "npc"]},
+    "character_id": {"type": "string", "minLength": 1},
+    "template_id": {"type": "string", "minLength": 1},
+    "part_name": {"type": "string", "minLength": 1},
+    "resource_path": {"type": "string", "minLength": 1},
+    "provider": {"type": "string", "minLength": 1},
+    "unity_version": {"type": "string", "minLength": 1},
+    "head_bone": {"type": "string", "minLength": 1},
+    "face_right": {"$ref": "#/$defs/vector3"},
+    "face_up": {"$ref": "#/$defs/vector3"},
+    "face_forward": {"$ref": "#/$defs/vector3"},
+    "hair_x": {"$ref": "#/$defs/vector3"},
+    "hair_y": {"$ref": "#/$defs/vector3"},
+    "hair_z": {"$ref": "#/$defs/vector3"},
+    "authoring": {"type": ["string", "null"], "minLength": 1},
+    "fur_curves_settings": {"type": ["string", "null"], "minLength": 1},
+    "fur_curves_settings_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "material_options": {"$ref": "#/$defs/material_options"},
+    "appearance_options": {"$ref": "character_appearance_options.schema.json"},
+    "potential_json_reader": {"type": "string", "minLength": 1},
+    "potential_scene_probe": {"type": "string", "minLength": 1}
+  },
+  "allOf": [
+    {
+      "if": {"required": ["appearance_options"]},
+      "then": {
+        "required": ["potential_json_reader", "potential_scene_probe"],
+        "properties": {
+          "variant": {"const": "characters"},
+          "material_options": {
+            "not": {
+              "properties": {"mode": {"const": "simplified"}},
+              "required": ["mode"]
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": ["appearance_options"],
+        "properties": {
+          "appearance_options": {
+            "properties": {"fur": {"enum": ["source_shell", "charcoal_embers"]}}
+          }
+        }
+      },
+      "then": {
+        "required": ["fur_curves_settings"],
+        "properties": {"fur_curves_settings": {"type": "string", "minLength": 1}}
+      }
+    }
+  ],
+  "additionalProperties": false,
+  "$defs": {
+    "vector3": {
+      "type": "array",
+      "prefixItems": [{"type": "number"}, {"type": "number"}, {"type": "number"}],
+      "minItems": 3,
+      "maxItems": 3
+    },
+    "material_options": {
+      "type": "object",
+      "required": ["mode", "lighting", "weather"],
+      "properties": {
+        "mode": {"enum": ["original", "simplified"]},
+        "lighting": {"enum": ["full", "simple"]},
+        "weather": {
+          "type": "object",
+          "required": ["quality", "effects"],
+          "properties": {
+            "quality": {"enum": ["simple", "full"]},
+            "effects": {
+              "type": "array",
+              "items": {"enum": ["wet", "snow", "rain"]},
+              "uniqueItems": true
+            }
+          },
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": true
+    }
+  }
+}

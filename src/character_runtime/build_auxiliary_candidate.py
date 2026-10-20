@@ -8,7 +8,7 @@ from pathlib import Path
 import sys
 
 from animator_auxiliary_layers import object_row, pose_from_row, read_json, rows, number, unit
-from animator_selected_avatar_bindings import load_selected_avatar_clip
+from animator_selected_avatar_bindings import load_selected_avatar_clip, sample_input_paths
 from animator_ordinary_source import evaluate_ordinary_frame
 from animator_ordinary_plan import assess_ordinary_layers, select_ordinary_routes, validate_sampled_clip_pointers
 from character_animator_graph import _integer as integer
@@ -63,9 +63,8 @@ def main(request_path: Path) -> None:
     hashes = tuple(integer(value, 'layer_binding_hash') for value in rows(request['layer_binding_hashes'], 'layer_binding_hashes'))
     routes = select_ordinary_routes(assessments, hashes)
     indices = {int(object_row(pointer,'pointer')['index']) for route in routes for pointer in object_row(route,'route')['child_clips']}
-    inputs.update({str(path):hashlib.sha256(path.read_bytes()).hexdigest() for index in indices for path in
-        (paths['clip_samples_root']/str(index)/name for name in
-         ('clip_source.json','value_array_delta.json','transform_samples.json','float_samples.json','root_motion_samples.json'))})
+    inputs.update({str(path):hashlib.sha256(path.read_bytes()).hexdigest() for index in indices
+        for path in sample_input_paths(paths['clip_samples_root']/str(index))})
     validate_sampled_clip_pointers(routes, paths['clip_samples_root'])
     validate_clip_execution_settings(object_row(read_json(paths['clip_execution_settings']), 'clip_execution_settings'), paths['clip_samples_root'], indices)
     clips = {index:load_selected_avatar_clip(paths['clip_samples_root']/str(index),avatar,hierarchy) for index in indices}

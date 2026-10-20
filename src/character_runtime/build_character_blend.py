@@ -441,6 +441,13 @@ def main(args: argparse.Namespace) -> None:
     started = time.perf_counter()
     from character_material_variant import read_material_options, native_weather_required, attach_full_response_simple_weather, apply_material_variant
     material_options = read_material_options(args.material_options)
+    from character_appearance_options import parse_character_appearance_options
+    appearance_options = (parse_character_appearance_options(json.loads(args.appearance_options.read_text(encoding='utf-8')))
+                          if args.appearance_options is not None else None)
+    if (appearance_options is None) != (args.potential_manifest is None):
+        raise ValueError('Appearance options and source potential manifest must be supplied together')
+    if appearance_options is not None and material_options is not None and material_options.mode != 'original':
+        raise ValueError('Explicit appearance currently requires original materials')
     variant_options = material_options if material_options is not None and material_options.mode == 'simplified' else None
     weather_input = read_weather_per_draw_input(args.weather_per_draw_input)
     fur_curves_profile = read_fur_curves_build_profile(args.fur_curves_profile)
@@ -520,7 +527,14 @@ def main(args: argparse.Namespace) -> None:
         hair_fur_snow = {'status': 'not_requested', 'groups': []}
     prepared_variant_weather = attach_full_response_simple_weather(bpy.context.scene, variant_options) if variant_options is not None else []
     mark = time.perf_counter()
-    if fur_curves_preparation is not None:
+    if appearance_options is not None and appearance_options.fur != 'existing':
+        if fur_curves_preparation is None:
+            raise ValueError('Source-shell presentation requires prepared full source Fur channels')
+        from character_fur_backend import attach_backend_fur_shells
+        fur_curves_snow = attach_backend_fur_shells(
+            fur_curves_preparation, args.source_dir, args.profile, weather_controls,
+            layout_shader_node_tree, packet, appearance_options.fur)
+    elif fur_curves_preparation is not None:
         fur_curves_snow = attach_prepared_fur_curves(
             fur_curves_preparation, args.source_dir, args.profile, weather_controls, layout_shader_node_tree)
     else:
@@ -549,6 +563,34 @@ def main(args: argparse.Namespace) -> None:
     if material_variant is not None:
         from character_weather_panel import attach_weather_panel
         workspace['weather_panel'] = attach_weather_panel(tuple(slot.material for obj in bpy.context.scene.objects if obj.type == 'MESH' for slot in obj.material_slots if slot.material is not None))
+    appearance_report = None
+    if appearance_options is not None:
+        from character_potential_build import install_potential_appearance, verify_potential_appearance
+        from character_appearance_options import verify_character_appearance_report
+        owner = bpy.data.objects.new('EF Character Appearance', None)
+        bpy.context.scene.collection.objects.link(owner)
+        owner.parent = rigs[0]
+        owner.empty_display_size = .03
+        potential = install_potential_appearance(bpy.context.scene, owner, rigs[0],
+            json.loads(selection.read_text(encoding='utf-8')), args.potential_manifest, appearance_options.potential)
+        verify_potential_appearance(potential, bpy.context.scene)
+        if appearance_options.fur == 'existing':
+            fur_report = {'requested': 'existing', 'status': 'unchanged'}
+        else:
+            verification = fur_curves_snow['verification']
+            count = verification['source_shell_count']
+            partial = verification['artist_skipped_count'] > 0
+            fur_report = {'requested': appearance_options.fur,
+                          'status': 'partial' if partial else 'applied' if count else 'not_applicable',
+                          'verification': verification}
+        appearance_report = {'format': 'EndfieldCharacterAppearance/1',
+            'status': 'partial' if potential['status'] == 'partial' or fur_report['status'] == 'partial' else 'completed',
+            'potential': potential, 'fur': fur_report}
+        verify_character_appearance_report(appearance_options, appearance_report)
+        # Preserve the requested initial appearance in the existing reopen audit.
+        shadows['source_visibility'] = {name: [bpy.data.objects[name].hide_render,
+            bpy.data.objects[name].hide_viewport, bpy.data.objects[name].hide_get()]
+            for name in shadows['source_visibility']}
     output = args.output_dir / 'character.blend'
     if authoring is not None:
         from character_authoring_validation import character_invariants, material_signature_details
@@ -574,7 +616,7 @@ def main(args: argparse.Namespace) -> None:
                          'audit_character_materials.py','character_late_materials.py','character_wetfilm_profile.py',
                          'character_standard_snow_profile.py','character_hair_fur_snow_profile.py','character_hair_fur_snow.py',
                          'character_fur_curves_profile.py','character_fur_curve_weather.py','character_fur_geometry.py',
-                         'character_fur_texture_contract.py','character_mesh_effect.py','character_npr_vfx.py',
+                         'character_fur_texture_contract.py','character_fur_source_shell.py','character_fur_transmission.py','character_fur_appearance.py','character_fur_microfibres.py','character_mesh_effect.py','character_npr_vfx.py','character_special_vfx.py',
                          'character_hair_wet.py','character_hair_wet_profile.py','character_rain_droplets.py',
                          'character_fur_wet.py','character_fur_wet_profile.py',
                           'character_weather_nodes.py','character_weather_per_draw.py',
@@ -634,6 +676,17 @@ def main(args: argparse.Namespace) -> None:
                          'Hair mode0 Point/Spot is wired only for supported source variants; other Hair modes/keywords, Eye/Fur, live cookie projection and native area-light descriptors remain unimplemented.']}
     if material_variant is not None:
         report['material_variant'] = material_variant
+    if appearance_report is not None:
+        report['appearance_options'] = appearance_options.as_json()
+        report['appearance_report'] = appearance_report
+        appearance_inputs = (args.appearance_options, args.potential_manifest)
+        source_artifact_refs.extend(artifact(path) for path in appearance_inputs)
+        source_hashes.update({str(path): file_hash(path) for path in appearance_inputs})
+        for name in ('character_appearance_options.py', 'character_potential_build.py',
+                     'character_potential_source.py', 'character_potential_selection.py',
+                     'character_potential_controls.py', 'character_effect_attachment.py', 'character_fur_backend.py'):
+            path = Path(__file__).parent / name
+            source_hashes[str(path)] = file_hash(path)
     io_path(args.output_dir / 'build_receipt.json').write_text(json.dumps(report, indent=2, allow_nan=False), encoding='utf-8')
     print(json.dumps({'status': report['status'], 'output': str(output), 'elapsed_seconds': report['elapsed_seconds']}))
 
@@ -646,6 +699,8 @@ if __name__ == '__main__':
     parser.add_argument('--authoring-request', type=Path)
     parser.add_argument('--weather-per-draw-input', type=Path)
     parser.add_argument('--material-options', type=Path)
+    parser.add_argument('--appearance-options', type=Path)
+    parser.add_argument('--potential-manifest', type=Path)
     curves = parser.add_mutually_exclusive_group()
     curves.add_argument('--fur-curves-profile', type=Path)
     curves.add_argument('--fur-curves-preparation', type=Path)

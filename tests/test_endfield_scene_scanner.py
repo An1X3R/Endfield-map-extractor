@@ -31,10 +31,38 @@ class ScannerMergeTests(unittest.TestCase):
             index.write_text("logical_name\tchunk_path\toffset\tlength\n", encoding="utf-8")
             run_scanner_shards(Path(sys.executable), index, root / "work", root / "console.log", 0, 0,
                                ScannerCapacity(1, 1024**3, 1024**3, 8 * 1024**3),
-                               no_cancel, lambda row: None, observe_helper)
+                               ("assets/",), no_cancel, lambda row: None, observe_helper)
             complete = json.loads((root / "work" / "bundle_candidates.jsonl").read_text(encoding="utf-8"))
             self.assertEqual({"kind": "complete", "scanned": 0, "failed": 0, "matches": 0}, complete)
             self.assertEqual([], json.loads((root / "work" / "performance.json").read_text())["shards"])
+
+    def test_container_prefixes_are_passed_as_or_filters(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            index = root / "index.tsv"
+            index.write_text("logical_name\tchunk_path\toffset\tlength\nrow\tchunk\t0\t1\n", encoding="utf-8")
+            commands: list[list[str]] = []
+
+            def observe(command: list[str], log: Path, _temporary: Path,
+                        check: Callable[[], None], _emit: Emit) -> None:
+                commands.append(command)
+                log.write_text("stub scanner\n", encoding="utf-8")
+                scanned = int(command[command.index("--limit") + 1])
+                complete = json.dumps({"kind": "complete", "scanned": scanned, "failed": 0, "matches": 0}) + "\n"
+                Path(command[command.index("--output") + 1]).write_text(complete, encoding="utf-8")
+                Path(command[command.index("--cab-output") + 1]).write_text(complete, encoding="utf-8")
+                report = {"format": "EndfieldHelperPerformanceReport/1", "status": "complete",
+                          "phaseTimingsSeconds": {}}
+                Path(command[command.index("--performance-report") + 1]).write_text(json.dumps(report), encoding="utf-8")
+                check()
+
+            run_scanner_shards(Path(sys.executable), index, root / "work", root / "console.log", 0, 1,
+                               ScannerCapacity(1, 1024**3, 1024**3, 8 * 1024**3),
+                               ("assets/", "packages/"), no_cancel, lambda row: None, observe)
+
+            command = commands[0]
+            prefixes = [command[index + 1] for index, value in enumerate(command) if value == "--contains"]
+            self.assertEqual(["assets/", "packages/"], prefixes)
 
     def test_absolute_ranges_cover_remainder_without_gaps(self) -> None:
         self.assertEqual((ScanShard(13, 15), ScanShard(15, 18), ScanShard(18, 21), ScanShard(21, 24)),
@@ -71,14 +99,14 @@ class NativeScannerTests(unittest.TestCase):
                 work = root / str(workers)
                 run_scanner_shards(scanner, index, work, root / f"{workers}.log", 0, 128,
                                    ScannerCapacity(workers, 2 * 1024**3, 1024**3, 8 * 1024**3),
-                                   no_cancel, lambda row: None, observe_helper)
+                                   ("assets/",), no_cancel, lambda row: None, observe_helper)
                 outputs.append(tuple([json.loads(line) for line in (work / name).read_text(encoding="utf-8").splitlines()]
                                      for name in ("bundle_candidates.jsonl", "bundle_cab_inventory.jsonl")))
             self.assertEqual(outputs[0], outputs[1])
             with self.assertRaises(FileExistsError):
                 run_scanner_shards(scanner, index, root / "2", root / "2.log", 0, 128,
                                    ScannerCapacity(2, 2 * 1024**3, 1024**3, 8 * 1024**3),
-                                   no_cancel, lambda row: None, observe_helper)
+                                   ("assets/",), no_cancel, lambda row: None, observe_helper)
 
     def test_cancellation_stops_both_real_children_and_publishes_nothing(self) -> None:
         scanner = Path(os.environ["ENDFIELD_TEST_SCANNER"])
@@ -109,7 +137,7 @@ class NativeScannerTests(unittest.TestCase):
 
             with self.assertRaises(ProcessCancelled):
                 run_scanner_shards(scanner, index, root / "work", root / "console.log", 0, 2048,
-                                   ScannerCapacity(2, 2 * 1024**3, 1024**3, 8 * 1024**3), cancelled,
+                                   ScannerCapacity(2, 2 * 1024**3, 1024**3, 8 * 1024**3), ("assets/",), cancelled,
                                    lambda row: None, observe)
             self.assertEqual(2, len(children))
             self.assertTrue(all(not process_is_running(pid) for pid in children))
@@ -128,7 +156,7 @@ class NativeScannerTests(unittest.TestCase):
             broken.write_text("\n".join(rows) + "\n", encoding="utf-8")
             with self.assertRaisesRegex(RuntimeError, "exited with code 1"):
                 run_scanner_shards(scanner, broken, root / "work", root / "console.log", 0, 2048,
-                                   ScannerCapacity(2, 2 * 1024**3, 1024**3, 8 * 1024**3), no_cancel,
+                                   ScannerCapacity(2, 2 * 1024**3, 1024**3, 8 * 1024**3), ("assets/",), no_cancel,
                                    lambda row: None, observe_helper)
             self.assertFalse((root / "work" / "bundle_candidates.jsonl").exists())
             self.assertFalse((root / "work" / "performance.json").exists())
@@ -147,7 +175,7 @@ class NativeScannerTests(unittest.TestCase):
             broken.write_text("\n".join(rows) + "\n", encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "source_record=.*error.*logical_name"):
                 run_scanner_shards(scanner, broken, root / "work", root / "console.log", 0, 2048,
-                                   ScannerCapacity(2, 2 * 1024**3, 1024**3, 8 * 1024**3), no_cancel,
+                                   ScannerCapacity(2, 2 * 1024**3, 1024**3, 8 * 1024**3), ("assets/",), no_cancel,
                                    lambda row: None, observe_helper)
             self.assertFalse((root / "work" / "bundle_candidates.jsonl").exists())
             self.assertFalse((root / "work" / "performance.json").exists())

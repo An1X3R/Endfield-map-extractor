@@ -19,6 +19,8 @@ WebUI 使用锁定的 React Canary 提供 `ViewTransition`。`package.json` 仅�
 - `src/extractor_core/`：只读 VFS、资源、实例、资产解析和 terrain 提取实现。
 - `dotnet/`：SceneProbe 与 BundleScanner 的源码、项目文件和依赖锁；`bin/obj` 不发布。
 
+场景首次扫描同时收录 `assets/` 和 `packages/`，地图候选仍按 `assets/` 归组。预制体边界优先复用已准备的元数据，缺失批次共享已解包依赖；正常导出按本地文件身份复用边界和选区缓存，不重复重建源层级进行深审计。跨选区模型仍按实际边界选取，显式排查时可调用 `validate_prefab_selection_evidence`；默认路径只检查保存的选区归属及基本数据结构。性能报告应区分首次准备、新选区计算和缓存复用，不能将三者作为同一测速口径。
+
 ## 目录导航
 
 - 根目录：公开启动器、环境引导、依赖清单和本机配置模板；启动器从仓库根目录运行。

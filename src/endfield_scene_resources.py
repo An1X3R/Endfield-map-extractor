@@ -504,9 +504,13 @@ def _prefab_bounds_game_generation(game: Path) -> tuple[str, list[dict[str, obje
 def ensure_prefab_bounds_manifests(
     runtime_path: Path, requested: frozenset[str], check_cancelled: Callable[[], None],
 ) -> tuple[Path, ...]:
-    """Cache source hierarchy and vertex bounds without exporting meshes or images."""
+    """Reuse exact bounds and unpack each missing dependency once per preparation."""
     import shutil
+    from collections import Counter
     from endfield_scene_export import run_scene_process
+    from endfield_scene_prefab_bounds_cache import (
+        available_bounds_prefabs, bounds_file_stamp, link_bounds_bundles, verified_bounds_manifest,
+    )
 
     if not requested:
         return ()
@@ -528,11 +532,6 @@ def ensure_prefab_bounds_manifests(
         raise ValueError(f"Prefab bounds require a complete prepared provider index: coverage={coverage}, runtime={runtime_path}")
     provider = require_object(descriptor, "bounds provider descriptor")
     provider_path = resolve_path(provider["path"], runtime_path.parent)
-    if describe_file(provider_path) != provider:
-        raise ValueError(f"Prefab bounds provider index changed: path={provider_path}")
-    providers = exact_providers(provider_path, requested)
-    unresolved = {path: list(names) for path, names in providers.items() if len(names) != 1}
-    roots = sorted({names[0] for names in providers.values() if len(names) == 1})
     helpers = require_prepared_scene_helpers(runtime_path, resolve_path(paths["cache_root"], runtime_path.parent))
     probe_identity = str(describe_file(helpers.probe)["sha256"])
     game = resolve_path(paths["game_root"], runtime_path.parent)
@@ -546,32 +545,82 @@ def ensure_prefab_bounds_manifests(
             raise ValueError(f"Prefab bounds game source generation differs: path={game_sources}")
     else:
         write_index(game_sources, generation)
-    groups = {hashlib.sha256("\n".join(roots[index:index + 16]).encode()).hexdigest()[:24]: roots[index:index + 16]
-              for index in range(0, len(roots), 16)}
-    manifests: dict[str, Path] = {}
-    missing: dict[str, list[str]] = {}
-    for key, names in groups.items():
-        receipt = root / key / "receipt.json"
-        if not receipt.is_file():
-            missing[key] = names
+    selection_key = hashlib.sha256(json.dumps(
+        {"requested": sorted(requested), "provider": provider, "providerStat": bounds_file_stamp(provider_path)},
+        sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    selection_path = root / "selections" / (selection_key + ".json")
+    if selection_path.is_file():
+        selection = read_json(selection_path)
+        if (selection.get('format') != 'EndfieldPrefabBoundsSelectionInputs/2'
+                or selection.get('requested') != sorted(requested)
+                or not isinstance(selection.get('manifests'), list)):
+            raise ValueError(f'Invalid prefab bounds selection cache: path={selection_path}')
+        selected: list[Path] = []
+        for value in cast(list[object], selection['manifests']):
+            row = require_object(value, 'selected bounds manifest')
+            descriptor = require_object(row['manifest'], 'selected bounds manifest descriptor')
+            manifest = resolve_path(descriptor['path'], root)
+            if bounds_file_stamp(manifest) != row.get('stat'):
+                raise ValueError(f'Prefab bounds selection source changed: manifest={manifest}')
+            selected.append(manifest)
+        if _prefab_bounds_game_generation(game)[0] != game_identity:
+            raise OSError(f'Game files changed during prefab bounds cache lookup: game={game}')
+        return tuple(selected)
+    if describe_file(provider_path) != provider:
+        raise ValueError(f"Prefab bounds provider index changed: path={provider_path}")
+    manifests: list[Path] = []
+    descriptions: dict[Path, dict[str, object]] = {}
+    remaining = requested
+    for receipt in sorted(root.glob('*/receipt.json')):
+        check_cancelled()
+        if not remaining:
+            break
+        manifest = verified_bounds_manifest(receipt, root, probe_identity, game_identity)
+        covered = available_bounds_prefabs(manifest, remaining)
+        if covered:
+            manifests.append(manifest)
+            descriptions[manifest] = require_object(read_json(receipt)['manifest'], 'cached bounds manifest')
+            remaining = remaining - covered
+    prepared: list[dict[str, object]] = []
+    for value in require_object(extraction.get('maps'), 'bounds runtime maps').values():
+        descriptor = require_object(value, 'bounds runtime map').get('sceneProbe')
+        if descriptor is not None:
+            prepared.append(require_object(descriptor, 'prepared bounds manifest'))
+    for value in cast(list[object], existing.get('manifests', [])):
+        prepared.append(require_object(value, 'supplemental bounds manifest'))
+    for descriptor in prepared:
+        check_cancelled()
+        if not remaining:
+            break
+        manifest = resolve_path(descriptor['path'], runtime_path.parent)
+        if manifest in descriptions:
             continue
-        row = read_json(receipt)
-        record = require_object(row.get("manifest"), "prefab bounds manifest descriptor")
-        manifest = resolve_path(record["path"], root)
-        if (row.get("roots") != names or row.get("probeSha256") != probe_identity or row.get("gameSourceSha256") != game_identity
-                or not manifest.is_relative_to(root)
-                or describe_file(manifest) != record):
-            raise ValueError(f"Prefab bounds cache integrity differs: receipt={receipt}")
-        manifests[key] = manifest
+        covered = available_bounds_prefabs(manifest, remaining)
+        if covered:
+            if describe_file(manifest) != descriptor:
+                raise ValueError(f'Prepared prefab bounds manifest changed: path={manifest}')
+            manifests.append(manifest)
+            descriptions[manifest] = descriptor
+            remaining = remaining - covered
+    providers = exact_providers(provider_path, remaining) if remaining else {}
+    unresolved = {path: list(names) for path, names in providers.items() if len(names) != 1}
+    roots = sorted({names[0] for names in providers.values() if len(names) == 1})
+    missing = {'v2_' + hashlib.sha256("\n".join(roots[index:index + 16]).encode()).hexdigest()[:24]: roots[index:index + 16]
+               for index in range(0, len(roots), 16)}
     lock = root / "preparing.lock"
     if missing:
         with lock.open("x", encoding="utf-8") as stream:
             stream.write(str(os.getpid()))
+        pool: Path | None = None
         try:
             cab = resolve_path(require_object(discovery["cabInventory"], "bounds CAB inventory")["path"], runtime_path.parent)
             closures, metadata = read_bundle_closure_names(missing, cab)
             vfs = resolve_path(paths["game_root"], runtime_path.parent) / "Endfield_Data" / "StreamingAssets" / "VFS"
             database = resolve_path(extraction["resourceDatabase"], runtime_path.parent)
+            pool = root / ('bundle_pool_' + uuid4().hex)
+            pool.mkdir()
+            available: dict[str, Path] = {}
+            uses = Counter(name for names in closures.values() for name in names)
             for key, names in missing.items():
                 check_cancelled()
                 work = root / key / uuid4().hex
@@ -583,8 +632,13 @@ def ensure_prefab_bounds_manifests(
                     check_cancelled()
                     return False
 
-                extraction_report = extract_candidate_bundles(database, vfs, closures[key], bundles,
-                                                               progress=None, cancelled=cancelled)
+                new_names = [name for name in closures[key] if name not in available]
+                extracted = pool / key
+                extraction_report = (extract_candidate_bundles(database, vfs, new_names, extracted,
+                    progress=None, cancelled=cancelled) if new_names else
+                    {'format': 'EndfieldCandidateBundleSet/1', 'requested_count': '0', 'extracted_count': '0', 'bytes': '0'})
+                available.update({name: extracted / name for name in new_names})
+                link_bounds_bundles(available, closures[key], bundles)
                 output = work / "probe"
                 run_scene_process([str(helpers.probe), str(bundles), str(output), "--manifest-only"],
                                   work / "probe.log", environment, check_cancelled)
@@ -592,20 +646,38 @@ def ensure_prefab_bounds_manifests(
                 payload = read_json(manifest)
                 if payload.get("Format") != "EndfieldSceneProbe/1" or not isinstance(payload.get("MeshBounds"), list):
                     raise ValueError(f"Prefab bounds probe lacks source mesh bounds: path={manifest}")
-                write_index(root / key / "receipt.json", {"format": "EndfieldPrefabBoundsBatch/1", "roots": names,
+                descriptor = describe_file(manifest)
+                write_index(root / key / "receipt.json", {"format": "EndfieldPrefabBoundsBatch/2", "roots": names,
                     "probeSha256": probe_identity, "gameSourceSha256": game_identity,
-                    "manifest": describe_file(manifest), "extraction": extraction_report,
+                    "manifest": descriptor, "manifestStat": bounds_file_stamp(manifest), "extraction": extraction_report,
+                    "sharedBundleCount": len(closures[key]) - len(new_names),
                     "closure": metadata["maps"][key]})
-                manifests[key] = manifest
+                manifests.append(manifest)
+                descriptions[manifest] = descriptor
                 resolved_bundles = bundles.resolve()
                 if resolved_bundles.parent != work.resolve() or not resolved_bundles.is_relative_to(root.resolve()):
                     raise ValueError(f"Prefab bounds temporary bundle deletion escaped its cache: path={resolved_bundles}")
                 shutil.rmtree(resolved_bundles)
+                for name in closures[key]:
+                    uses[name] -= 1
+                    if uses[name] == 0:
+                        available.pop(name).unlink()
         finally:
-            lock.unlink()
+            try:
+                if pool is not None and pool.is_dir():
+                    resolved_pool = pool.resolve()
+                    if resolved_pool.parent != root.resolve() or not resolved_pool.name.startswith('bundle_pool_'):
+                        raise ValueError(f'Prefab bounds shared bundle cleanup escaped its cache: path={resolved_pool}')
+                    shutil.rmtree(resolved_pool)
+            finally:
+                lock.unlink()
     if _prefab_bounds_game_generation(game)[0] != game_identity:
         raise OSError(f"Game files changed during prefab bounds preparation; refresh prepared sources after the update: game={game}")
     write_index(root / "selection_inputs.json", {"format": "EndfieldPrefabBoundsInputs/1", "requested": sorted(requested),
         "gameSources": describe_file(game_sources), "unresolvedProviders": unresolved,
-        "manifests": [describe_file(manifests[key]) for key in groups]})
-    return tuple(manifests[key] for key in groups)
+        "manifests": [descriptions[manifest] for manifest in manifests]})
+    selection_path.parent.mkdir(exist_ok=True)
+    write_index(selection_path, {'format': 'EndfieldPrefabBoundsSelectionInputs/2', 'requested': sorted(requested),
+        'unresolvedProviders': unresolved,
+        'manifests': [{'manifest': descriptions[manifest], 'stat': bounds_file_stamp(manifest)} for manifest in manifests]})
+    return tuple(manifests)

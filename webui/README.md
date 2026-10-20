@@ -1,4 +1,4 @@
-# Endfield Atlas Composer WebUI 3.0
+# Endfield Atlas Composer WebUI 3.3
 
 本地地图提取器的 WebUI。游戏安装目录保持只读；导出任务通过 `launch_webui.py` 提供的本机桥接服务生成经过签名和审计的选区数据包，`blend` 模式同时生成逐批 Blender 场景，结果写入用户选择的输出目录。仓库不附带 Stage 数据、地图图片、游戏资产或导出结果，缺少外部输入时相关接口会明确报告不可用。
 
@@ -27,7 +27,7 @@
 
 ## 启动
 
-按[项目根目录的启动与环境准备说明](../README.md#启动)完成一次性显式准备后，从项目根目录运行启动器，以同时启用路径选择和导出任务桥。日常启动、首次游戏数据提取和导出不会自动安装依赖、下载工具或编译 .NET；缺少依赖时按错误详情中的准备命令处理：
+按[项目根目录的启动与环境准备说明](../README.md#开始使用)完成一次性显式准备后，从项目根目录运行启动器，以同时启用路径选择和导出任务桥。日常启动、首次游戏数据提取和导出不会自动安装依赖、下载工具或编译 .NET；缺少依赖时按错误详情中的准备命令处理：
 
 ```powershell
 py .\launch_webui.py
@@ -171,13 +171,27 @@ node --experimental-strip-types tests/mapOverview.contract.test.mjs
 | `POST /api/v2/character-jobs`、`/character-jobs/validate` | `CharacterExportRequest/1`：选择目录、角色、模型变体和输出标签 |
 | `GET /api/v2/character-jobs/{id}`、`/{id}/events`；`POST /{id}/cancel` | 持久化状态、事件分页和取消；准备任务在 `character-preparation` 下提供同样入口 |
 
-导出请求可附带 `options.raw_expressions`、`options.basic_mmd` 和 `options.animation`。动作对象要求 `action_id` 与 `maximum_stored_frames`（2–18000）；当前每次附带一个动作，超过帧预算的动作明确报错，不静默截短。表情按所选预制体的真实引用寻找面部、耳部等独立源表；基础 MMD 表情与已支持的耳控是可编辑形态键，不是 PMX 骨骼转换或全部原生表情调度。独立 NPC 每个变体对应确切预制体部件或 PrefabInfo 同时配置的完整源槽组，几何范围为 LOD0；动作绑定按所选变体验证。独立 NPC 当前不提供表情/MMD 选项，具体能力与不可用原因以目录返回为准。结果中的 `pending` 必须展示，不能把 `partial` 当成失败或完整还原。
+导出请求可附带 `options.raw_expressions`、`options.basic_mmd`、`options.animation` 和普通角色专用的 `options.appearance`。外观对象必须包含 `potential: "base" | "maximum"` 与 `fur: "existing" | "source_shell" | "charcoal_embers"`；额外字段会被规范化时剥离。对应契约见 [character_appearance_options.schema.json](../schemas/character_appearance_options.schema.json)，内部 `EndfieldCharacterExportRequest/2` 见 [character_export_request_v2.schema.json](../schemas/character_export_request_v2.schema.json)。所有外观选项都要求原始材质，不能与简化材质组合；NPC 外观路径会明确拒绝。服务端在提交内部请求时会加入 `potential_json_reader` 与 `potential_scene_probe`：新运行配置从已安装 JSON reader 和场景 helper 回执生成路径，缺少这两个旧字段时分别从 `npc_assembly_tools.json_reader` 与已核验的 SceneProbe 回执解析，不要求用户手工配置。普通请求不读取或校验这些外观工具字段。完成回执核验后，结果才包含规范化的 `appearance_options` 和源端 `appearance_report`；返回字段见 [character_appearance_report.schema.json](../schemas/character_appearance_report.schema.json)，不会只回显提交值。
+
+动作对象要求 `action_id` 与 `maximum_stored_frames`（2–18000）；当前每次附带一个动作，超过帧预算的动作明确报错，不静默截短。表情按所选预制体的真实引用寻找面部、耳部等独立源表；基础 MMD 表情与已支持的耳控是可编辑形态键，不是 PMX 骨骼转换或全部原生表情调度。独立 NPC 每个变体对应确切预制体部件或 PrefabInfo 同时配置的完整源槽组，几何范围为 LOD0；动作绑定按所选变体验证。独立 NPC 当前不提供表情/MMD 选项，具体能力与不可用原因以目录返回为准。结果中的 `pending` 必须展示，不能把 `partial` 当成失败或完整还原。
 
 角色、NPC、动作、表情和材质构建实现位于 `src/character_runtime/`，13 个锁定读取工具入口位于 `dotnet/CharacterTools/`。环境与工具的一次性准备、运行配置生成及第三方许可见[项目根目录说明](../README.md#启动)，客户端不要求填写 Python 脚本、DLL、Shader 或研究目录。游戏源码、反编译文本、原始 Shader、游戏资产和本机配置不进入源码或前端发布包。
 
 动作候选仍需所选 Avatar 的绑定和导出验证；仅在后端明确返回可用能力或执行引用时开放相应选项。事件接口返回带 `next_after` / `has_more` 的分页 JSON，不是 SSE；取消受理不等于已取消，结果以任务终态为准。当前没有专门的角色预览、下载、打开输出目录或任务历史列表接口，不能仅凭结果文件扩展名推导新的导出功能。
 
 准备请求的四项 `source` 路径均必填；当前校验响应及公开任务中的 `request` 会省略这些路径，因此不能将准备校验返回的 `canonical_request` 直接重发为准备请求。未来消费端应保留用户确认过的完整请求及其 `request_id`。不可用角色目录允许 `source_identity: null`，并可能不带 `limitations`；应按可用状态区分响应结构，不将缺失信息解释为零限制。
+
+## 武器后端接口（尚未接入 WebUI）
+
+`src/endfield_weapon_catalog.py` 从当前包体的武器表、道具表、中文文本表和资源索引生成 `EndfieldWeaponCatalog/1`。消费端使用 `weapon_id`，展示 `name`，按 `weapon_type` / `rarity` 分类；重名不合并，名称未解析时保留 ID。`resources` 与 `refined_candidates` 都带来源身份及可解析状态，数量不写死。
+
+`src/endfield_weapon_export.py` 提供 `WeaponExportRequest` / `export_weapon`，复用现有源目录和读取工具，独立生成包含贴图的 `.blend`。命令行用 `--help` 查看必填路径；`--output` 是源准备目录，`--build-output` 是最终构建目录，两者均不得写入游戏安装目录。`EndfieldWeaponExport/1` 返回中文名、源资源、文件哈希、构建/重开回执及 `pending` / `limitations`。目前没有武器 HTTP 路由，不应复用角色请求冒充武器任务。
+
+外观选择为 `base` 或精确扫描得到的 `refined_candidate`；后者代表已找到的精炼资源候选，当前版本的运行时解锁条件尚未直接核实，不应在 UI 无条件标成“满潜已还原”。使用角色材质核心近似重建，不承诺原生视差、实时特效和 HGRP 灯光管线；禁用 LODGroup 暂不支持，蒙皮武器的非权重叶挂点保留于源证据，未全部转换为控制器。
+
+`CharacterNPR_VFX` 的受支持法线纹理位移会生成可编辑几何节点修改器，保留源网格、UV 和材质对应关系。修改器内可调位移强度与预览时间倍率，播放时间轴可查看变化；这是按源参数制作的 Blender 近似，仅位移几何随时间变化，VFX 表面材质仍为源时间零的静态预览。不支持的位移分支会明确报错，不会自动关闭特效后宣称完整导出。
+
+启用 `_PARALLAX_MAP` 的受支持 `CharacterNPR` 材质会使用实际视差贴图、UV/ST、深度和颜色参数生成分层纹理预览。材质中的 `Preview Parallax Strength` 控制近似层强度，设为 0 可恢复原底色链；层间平均和与底色混合属于 Blender 近似，不代表游戏原生视差算法。当前仅支持源 `_ParallaxUseNormal=0` 的分支。
 
 ## 许可与非官方声明
 

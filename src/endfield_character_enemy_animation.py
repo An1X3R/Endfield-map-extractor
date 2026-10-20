@@ -19,7 +19,7 @@ from endfield_scene_export import run_scene_process
 from endfield_scene_resources import write_index
 from extractor_core.projected_decals import build_path_id_index
 from extractor_core.resources import read_virtual_file
-from character_runtime.resolve_character_controller import decode_controller_hash
+from character_runtime.resolve_character_controller import controller_string_pool, decode_controller_hash
 
 
 EMPTY_ENEMY_CLIP_EVIDENCE_FIELDS = (
@@ -222,7 +222,7 @@ def inspect_enemy_animation(
     avatar_cab, avatar_id = _pointer(animator.get("m_Avatar"), root_cab, externals, "Animator.m_Avatar")
     avatar_json, _avatar, avatar_meta = _exact_object(objects, avatar_cab, avatar_id, "Avatar")
     payload = read_virtual_file(context.game_root / "Endfield_Data/StreamingAssets/VFS", "775A31D1", config_path)
-    key = decode_controller_hash(payload)
+    key = decode_controller_hash(payload, controller_string_pool(context.game_root / "Endfield_Data/StreamingAssets/VFS"))
     paths = build_path_id_index(_string_path_hash(context)).get(key, ())
     if len(paths) != 1:
         raise ValueError(f"Enemy normal-controller hash must resolve to one exact resource: hash={key.hex()}, count={len(paths)}")

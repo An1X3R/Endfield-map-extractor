@@ -20,7 +20,8 @@ def _configured_path(path: Path, parent: Path) -> str:
     return os.path.relpath(path.resolve(), parent.resolve()).replace("\\", "/")
 
 
-def _rebind_runtime(destination: Path, receipt: Path, scanner: Path, dotnet: Path, python: Path) -> None:
+def _rebind_runtime(destination: Path, receipt: Path, scanner: Path, scene_probe: Path,
+                    dotnet: Path, python: Path) -> None:
     """Refresh verified tool paths while preserving source selections and artist settings."""
     document = _object(json.loads(destination.read_text(encoding="utf-8")), "runtime")
     if document.get("format") != "EndfieldCharacterRuntime/2":
@@ -41,7 +42,9 @@ def _rebind_runtime(destination: Path, receipt: Path, scanner: Path, dotnet: Pat
                "tools_receipt": _configured_path(receipt, parent), "scanner": _configured_path(scanner, parent),
                "weather_reader": paths["weather_reader"],
                "export_defaults": {**exports, "python": _configured_path(python, parent),
-                                   **{key: paths[key] for key in ("static_reader", "shader_reader", "visibility_reader")}},
+                                   **{key: paths[key] for key in ("static_reader", "shader_reader", "visibility_reader")},
+                                   "potential_json_reader": paths["json_reader"],
+                                   "potential_scene_probe": _configured_path(scene_probe, parent)},
                "authoring_tools": {**authoring, "dotnet": _configured_path(dotnet, parent),
                                    **{key: paths[key] for key in ("animation_reader", "auxiliary_sampler", "controller_audit", "expression_reader")},
                                    "controller_json_reader": paths["json_reader"]},
@@ -69,9 +72,9 @@ def install_bundled_tools(bundle_root: Path, dotnet: Path, python: Path) -> Path
     if destination.exists():
         from endfield_character_service import CharacterService
         from endfield_scene_helpers import require_prepared_scene_helpers
-        scanner = require_prepared_scene_helpers(destination, tools.scene).scanner
-        _rebind_runtime(destination, tools.character_receipt, scanner, dotnet, python)
-        CharacterService(destination)._runtime_defaults()
+        helpers = require_prepared_scene_helpers(destination, tools.scene)
+        _rebind_runtime(destination, tools.character_receipt, helpers.scanner, helpers.probe, dotnet, python)
+        CharacterService(destination)._runtime_defaults({}, None)
         return destination
     return configure_character_runtime(tools.character_receipt, dotnet, python, tools.scene, destination)
 

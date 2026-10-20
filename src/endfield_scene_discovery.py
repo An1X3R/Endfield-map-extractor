@@ -15,12 +15,11 @@ from typing import cast
 from uuid import uuid4
 
 from endfield_scene_export import run_scene_process
-from endfield_scene_resources import describe_file, read_json, validate_scan, write_index
+from endfield_scene_resources import PACKAGE_PROVIDER_COVERAGE, describe_file, read_json, validate_scan, write_index
 from endfield_scene_scanner import run_scanner_shards, scan_index_rows, scanner_capacity
 from extractor_core.effects import GROUP_HASH as EFFECT_GROUP_HASH, read_dynamic_scene_effects
 from extractor_core.resources import (
     extract_candidate_bundles,
-    read_bundle_candidate_names_by_map,
     read_bundle_closure_names,
     read_bundle_provider_names_for_paths,
 )
@@ -28,6 +27,7 @@ from extractor_core.resources import (
 
 Progress = Callable[[float, str, dict[str, object]], None]
 CHECKPOINT_FORMAT = "EndfieldPreparationCheckpoint/1"
+SCENE_SCAN_CONTAINERS = ("assets/", "packages/")
 
 
 def identity(value: object) -> str:
@@ -42,6 +42,40 @@ def tool_identity(executable: Path) -> str:
                           if path.is_file() and path.suffix.casefold() in (".dll", ".json"))}
     return identity([(str(path.relative_to(executable.parent)), describe_file(path)["sha256"])
                      for path in sorted(files)])
+
+
+def read_asset_bundle_candidate_names_by_map(results: Path) -> dict[str, list[str]]:
+    """Group scene roots by Map01/Map02 evidence from assets containers only."""
+    source = results.expanduser().resolve()
+    if not source.is_file():
+        raise FileNotFoundError(f"Bundle scanner results are missing: {source}")
+    names: dict[str, set[str]] = {"map01": set(), "map02": set()}
+    with source.open("r", encoding="utf-8-sig") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            if not line.strip():
+                continue
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError as error:
+                raise ValueError(f"Bundle scanner result is invalid JSONL at line {line_number}: {source}") from error
+            if not isinstance(value, dict):
+                raise ValueError(f"Bundle scanner result must be an object at line {line_number}: {source}")
+            row = cast(dict[str, object], value)
+            logical_name = row.get("logical_name")
+            if row.get("kind") != "match" or not isinstance(logical_name, str):
+                continue
+            containers = row.get("containers")
+            if not isinstance(containers, list) or any(not isinstance(item, str) for item in containers):
+                raise ValueError(f"Bundle scanner match requires string containers at line {line_number}: {source}")
+            asset_containers: list[str] = []
+            for item in containers:
+                normalized = item.casefold().replace("\\", "/")
+                if normalized.startswith("assets/"):
+                    asset_containers.append(normalized)
+            for map_id in names:
+                if any(f"/{map_id}/" in item or f"{map_id}_" in item for item in asset_containers):
+                    names[map_id].add(logical_name.casefold())
+    return {map_id: sorted(values) for map_id, values in names.items()}
 
 
 def helper_progress(line: str) -> dict[str, object] | None:
@@ -223,7 +257,7 @@ def discovery(run_root: Path, log_root: Path, scan_index: Path, database: Path, 
     started = time.perf_counter()
     database_hash = describe_file(database)["sha256"]
     scan_source = identity({"index": describe_file(scan_index)["sha256"], "tool": tool_identity(scanner),
-                            "database": database_hash, "containers": ["assets/"], "contract": 1})
+                            "database": database_hash, "containers": list(SCENE_SCAN_CONTAINERS), "contract": 2})
     scan_state, scan_work = stage_work(root, "scan")
     scan, reason = read_checkpoint(scan_state, scan_source, check_cancelled)
     reused: list[str] = []
@@ -241,7 +275,7 @@ def discovery(run_root: Path, log_root: Path, scan_index: Path, database: Path, 
                      f"Scanning providers and dependencies: {done}/{total or '?'}", {"helperProgress": row})
 
         rows = scan_index_rows(scan_index, check_cancelled)
-        run_scanner_shards(scanner, scan_index, scan_work, log, 0, rows, scanner_capacity(rows),
+        run_scanner_shards(scanner, scan_index, scan_work, log, 0, rows, scanner_capacity(rows), SCENE_SCAN_CONTAINERS,
                            check_cancelled, scan_progress, observe_helper)
         validate_scan(providers)
         validate_scan(cab)
@@ -255,7 +289,7 @@ def discovery(run_root: Path, log_root: Path, scan_index: Path, database: Path, 
     cab = Path(str(cast(dict[str, object], scan["cabInventory"])["path"]))
     progress(0.4, "Resolving dynamic effect prefab providers", {"checkpoint": "dynamic_effects"})
     effect_roots, effects = effect_candidates(root, vfs, string_path_hash, providers, check_cancelled)
-    roots = read_bundle_candidate_names_by_map(providers)
+    roots = read_asset_bundle_candidate_names_by_map(providers)
     roots = {map_id: sorted(set(values) | set(effect_roots[map_id])) for map_id, values in roots.items()}
     names, closure = read_bundle_closure_names(roots, cab)
     probe_tool = tool_identity(probe)
@@ -318,7 +352,7 @@ def discovery(run_root: Path, log_root: Path, scan_index: Path, database: Path, 
         progress(base + 0.28, f"Verified scene preparation for {map_id}", {"reusedStages": list(reused)})
     return {"status": "completed", "checkpointVersion": 1,
             "coverage": "map01_map02_container_and_dynamic_effect_candidates_plus_cab_external_closure",
-            "providerCoverage": "all_asset_containers", "scanIndex": describe_file(scan_index),
+            "providerCoverage": PACKAGE_PROVIDER_COVERAGE, "scanIndex": describe_file(scan_index),
             "scannerResults": scan["scannerResults"], "scannerConsole": scan["scannerConsole"],
             "cabInventory": scan["cabInventory"], "cabConsole": scan["scannerConsole"],
             "closureStatus": "expanded_from_cab_inventory", "closure": closure, "maps": maps,

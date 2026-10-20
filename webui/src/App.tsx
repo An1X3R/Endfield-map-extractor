@@ -683,7 +683,7 @@ export default function App() {
 
   const switchWorkspace = (target: 'maps' | 'instanced' | 'operators' | 'painting', mapTitle: string): void => {
     if (target === workspaceMode || workspaceTransition || mapNavigationBusy) return
-    if (launchState === 'running' || instancedJobBusy || paintingBusy) return
+    if (launchState === 'running' || instancedJobBusy || operatorJobBusy || paintingBusy) return
     if (target === 'painting') {
       const canvas = workspaceMode === 'maps' ? workspaceRef.current?.querySelector('.pixi-host canvas') : null
       setPaintingPreviousMap(canvas instanceof HTMLCanvasElement ? captureCanvasMap(canvas) : null)
@@ -693,7 +693,8 @@ export default function App() {
       if (!stage) throw new Error('Cannot leave painting: map stage is missing')
       setPaintingExitSnapshot(capturePaintingMap(stage))
     }
-    if (target === 'operators' || workspaceMode === 'operators' || target === 'painting' || workspaceMode === 'painting') {
+    if (target === 'operators' || workspaceMode === 'operators' ||
+      (target === 'painting' && workspaceMode === 'maps') || (workspaceMode === 'painting' && target === 'maps')) {
       setWorkspaceMode(target)
       return
     }
@@ -702,7 +703,7 @@ export default function App() {
       return
     }
     setWorkspaceTransition({ phase: 'retract', target })
-    const finalTitle = target === 'instanced' ? 'INSTANCED\nSCENES' : mapTitle
+    const finalTitle = target === 'instanced' ? 'INSTANCED\nSCENES' : target === 'painting' ? '' : mapTitle
     const matrix = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/+'
     const timers = [0, 30, 60, 90, 120].map((elapsed) => window.setTimeout(() => {
       const locked = Math.floor(finalTitle.length * elapsed / 150)
@@ -715,12 +716,12 @@ export default function App() {
     timers.push(window.setTimeout(() => {
       setWorkspaceMode(target)
       setWorkspaceTransition({ phase: 'deploy', target })
-    }, 200))
-    timers.push(window.setTimeout(() => setWorkspaceTransitionTitle(null), 300))
+    }, 240))
+    timers.push(window.setTimeout(() => setWorkspaceTransitionTitle(null), 360))
     timers.push(window.setTimeout(() => {
       setWorkspaceTransition(null)
       workspaceTransitionTimers.current = []
-    }, 380))
+    }, 600))
     workspaceTransitionTimers.current = timers
   }
 
@@ -1047,7 +1048,7 @@ export default function App() {
     }))
     setFirstRunValidation(null)
     setFirstRunError('')
-    notify('已载入可恢复任务的原始目录，请确认后继续准备')
+    notify(firstRunStatus.ready ? '已载入后端已准备目录，无需重新提取必要文件' : '已载入可恢复任务的原始目录，请确认后继续准备')
   }
 
   const resetPrototype = () => {
@@ -1679,7 +1680,7 @@ export default function App() {
           </header>
 
           <div className="settings-scroll">
-            <SettingSection key={sourceReady ? 'first-run-ready' : 'first-run-setup'} title="首次运行准备" code="FIRST RUN / DEPLOY" defaultOpen={!sourceReady}>
+            <SettingSection key={sourceReady && preparedPathsMatch ? 'first-run-ready' : 'first-run-setup'} title="首次运行准备" code="FIRST RUN / DEPLOY" defaultOpen={!sourceReady || !preparedPathsMatch}>
               <div className={`first-run-console state-${firstRunStatus?.state ?? 'offline'} ${sourceReady ? 'is-ready' : ''}`}>
                 <div className="first-run-heading">
                   <div>
@@ -1780,6 +1781,11 @@ export default function App() {
               )}
 
               <div className="first-run-actions">
+                {sourceReady && firstRunStatus?.request && !firstRunRequestMatchesPrepared(firstRunRequest, firstRunStatus.request) && (
+                  <button type="button" data-testid="first-run-use-prepared-paths" onClick={restoreFirstRunRequestPaths} disabled={Boolean(firstRunAction) || launchState === 'running' || instancedJobBusy || operatorJobBusy || paintingBusy}>
+                    <Folder size={13} /><span>载入已准备目录</span>
+                  </button>
+                )}
                 <button
                   type="button"
                   onClick={() => void (firstRunStatus ? validateFirstRun() : loadFirstRunStatus())}

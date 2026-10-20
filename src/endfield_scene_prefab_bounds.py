@@ -242,6 +242,20 @@ def validate_prefab_selection_evidence(placement: Mapping[str, object], batch_bo
     expected = prefab_world_bounds(candidate, anchor)
     if any(proof.get(key) != value for key, value in expected.items()):
         raise ValueError(f"Prefab selection bounds differ from source geometry: placement={placement['key']}")
+    validate_prefab_selection_ownership(placement, batch_bounds)
+
+
+def validate_prefab_selection_ownership(placement: Mapping[str, object], batch_bounds: Mapping[str, float]) -> None:
+    """Check planned region ownership without reopening and rebuilding source geometry."""
+    proof = require_object(placement.get("geometry_selection"), "prefab geometry selection evidence")
+    for field in ("minimum", "maximum"):
+        value = proof.get(field)
+        if (not isinstance(value, list) or len(value) != 3
+                or any(type(item) not in (int, float) or not math.isfinite(item) for item in value)):
+            raise ValueError(f"Prefab selection requires finite bounds: placement={placement['key']}, field={field}")
+    low, high = cast(list[float], proof["minimum"]), cast(list[float], proof["maximum"])
+    if any(low[index] > high[index] for index in range(3)):
+        raise ValueError(f"Prefab selection bounds are reversed: placement={placement['key']}")
     saved_batch = [batch_bounds[name] for name in ("xmin", "xmax", "zmin", "zmax")]
     whole = proof.get("selection_bounds")
     if (proof.get("batch_bounds") != saved_batch or not isinstance(whole, list) or len(whole) != 4

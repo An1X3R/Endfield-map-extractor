@@ -62,7 +62,8 @@ def configure_character_runtime(receipt: Path, dotnet: Path, python: Path, helpe
     source = root / 'src'
     modules = source / 'character_runtime'
     from endfield_scene_helpers import require_prepared_scene_helpers
-    scanner = require_prepared_scene_helpers(destination, helper_cache).scanner
+    scene_helpers = require_prepared_scene_helpers(destination, helper_cache)
+    scanner = scene_helpers.scanner
     if not dotnet.is_file() or not python.is_file():
         raise CharacterToolsError('Select existing dotnet and Python executables before configuring character tools.')
     if destination.exists():
@@ -75,6 +76,8 @@ def configure_character_runtime(receipt: Path, dotnet: Path, python: Path, helpe
         return os.path.relpath(path.resolve(), destination.parent.resolve()).replace('\\', '/')
 
     exports: dict[str, object] = {name: relative(tools[name]) for name in ('static_reader', 'shader_reader', 'visibility_reader')}
+    exports.update({'potential_json_reader': relative(tools['json_reader']),
+                    'potential_scene_probe': relative(scene_helpers.probe)})
     exports.update({'repository_src': relative(source), 'prepare_script': relative(modules / 'prepare_sample.py'),
                     'python': relative(python), 'unity_version': '2021.3.34f5', 'head_bone': 'Bip001_Head',
                     'face_right': [1, 0, 0], 'face_up': [0, 0, 1], 'face_forward': [0, -1, 0],

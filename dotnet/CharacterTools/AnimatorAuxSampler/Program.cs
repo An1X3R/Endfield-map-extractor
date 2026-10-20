@@ -48,6 +48,15 @@ internal static class AuxiliarySampler
                 var containers = manager.assetsFileList.SelectMany(file => file.Objects.OfType<AssetBundle>()).SelectMany(bundle => bundle.m_Container).Where(entry => entry.Value.asset.TryGet(out var value) && ReferenceEquals(value, clip)).Select(entry => entry.Key).ToArray();
                 Write(itemOutput, "clip_source.json", new { cab, pathId, clip.m_Name, containers, rawDataSha256 = Convert.ToHexString(SHA256.HashData(clip.GetRawData())), clip.m_SampleRate, clip.m_AnimationType, clip.m_HasGenericRootTransform, start = clip.m_MuscleClip.m_StartTime, stop = clip.m_MuscleClip.m_StopTime, clip.m_MuscleClip.m_IndexArray, clip.m_MuscleClip.m_ValueArrayReferencePose, clip.m_MuscleClip.m_LoopTime, clip.m_MuscleClip.m_LoopBlend, clip.m_MuscleClip.m_LoopBlendOrientation, clip.m_MuscleClip.m_LoopBlendPositionY, clip.m_MuscleClip.m_LoopBlendPositionXZ, clip.m_MuscleClip.m_CycleOffset, buffer.OutputTrackCount, buffer.FloatCurveCount, buffer.RootTrackCount, masks = buffer.TransformSubTrackMasks, defaultIndices = buffer.m_DefaultIndexs, constantIndices = buffer.m_ConstantIndexs, constantValues = buffer.m_ConstantValues, bindings = clip.m_ClipBindingConstant.genericBindings.Select((binding, index) => new { index, binding.path, binding.attribute, type = binding.typeID.ToString(), binding.customType }) });
                 File.WriteAllText(Path.Combine(itemOutput, "value_array_delta.json"), Newtonsoft.Json.JsonConvert.SerializeObject(clip.m_MuscleClip.m_ValueArrayDelta));
+                if (buffer.OutputTrackCount == 0 && buffer.TransformBufferData.Length == 0 && buffer.RootMotionBufferData.Length == 0 && buffer.FloatBufferData.Length == 0)
+                {
+                    var legacy = clip.m_MuscleClip.m_Clip;
+                    var dense = legacy.m_DenseClip;
+                    if (dense.m_FrameCount > root.GetProperty("maximum_stored_frames").GetInt32()) throw new InvalidDataException("Legacy dense auxiliary clip exceeds explicit stored frame budget.");
+                    Write(itemOutput, "legacy_dense_clip.json", new { format = "EndfieldLegacyDenseClipSamples/1", cab, pathId, rawDataSha256 = Convert.ToHexString(SHA256.HashData(clip.GetRawData())), oldAclIsSet = legacy.m_ACLClip.IsSet, streamedCurveCount = legacy.m_StreamedClip.curveCount, streamedData = legacy.m_StreamedClip.data, dense.m_FrameCount, dense.m_CurveCount, dense.m_SampleRate, dense.m_BeginTime, dense.m_SampleArray, constantValues = legacy.m_ConstantClip.data });
+                    Write(itemOutput, "verification_status.json", new { status = "legacy_dense_samples_require_selected_avatar_validation" });
+                    continue;
+                }
                 foreach (byte[] source in new[] { buffer.TransformBufferData, buffer.RootMotionBufferData, buffer.FloatBufferData }.Where(value => value.Length > 0))
                 {
                     var header = Invoke(sampler, "ReadHeader", source)!;

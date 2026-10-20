@@ -12,7 +12,7 @@ from typing import cast
 import bpy
 from mathutils import Matrix, Quaternion, Vector
 
-from character_animation_affine import (AffineFactors, AffineTarget, assign_affine_target, create_affine_targets,
+from character_animation_affine import (AffineFactors, AffineTarget, affine_target_matrix, assign_affine_target, create_affine_targets,
     finish_affine_targets, key_affine_target, split_affine, trs_residual, validate_affine_targets)
 
 
@@ -344,7 +344,7 @@ def _attach_animation_with_bindings(armature: bpy.types.Object, source_hierarchy
         target = targets(clip, frames[index])
         assign_basis(armature, basis_targets(armature, target))
         for helper in helpers:
-            assign_affine_target(helper, split_affine(target[helper.bone_name], None))
+            assign_affine_target(helper, split_affine(affine_target_matrix(helper, target), None))
         bpy.context.view_layer.update()
         preflight.append(pose_error(armature, target, index + 1, matrix_tolerance))
     armature.animation_data_create()
@@ -363,7 +363,7 @@ def _attach_animation_with_bindings(armature: bpy.types.Object, source_hierarchy
         for index, frame in enumerate(frames):
             target = targets(clip, frame)
             for helper in helpers:
-                factors = split_affine(target[helper.bone_name], previous_factors.get(helper.bone_name))
+                factors = split_affine(affine_target_matrix(helper, target), previous_factors.get(helper.bone_name))
                 helper_rotations = key_affine_target(helper, factors, index + 1, helper_rotations)
                 previous_factors[helper.bone_name] = factors
     checks = sampled_pose_checks(armature, clip, helpers, matrix_tolerance)

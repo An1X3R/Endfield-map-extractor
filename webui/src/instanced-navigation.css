@@ -42,19 +42,21 @@
   .app-shell .map-switch-with-instanced { width: min(100%, 760px); }
 }
 .workspace-transition-retract .map-workspace-surfaces > :not(.map-heading),
-.workspace-transition-retract .isc-workspace {
+.workspace-transition-retract .isc-workspace,
+.workspace-transition-retract .si-surface {
   pointer-events: none;
-  animation: workspace-retract 200ms cubic-bezier(.18,.7,.24,1) both;
+  animation: workspace-retract 240ms cubic-bezier(.55,0,.8,.35) both;
 }
 .workspace-transition-retract .map-stage-frame,
 .workspace-transition-retract .isc-floor {
-  animation: workspace-lines-converge 200ms cubic-bezier(.18,.7,.24,1) both;
+  animation: workspace-lines-converge 240ms cubic-bezier(.55,0,.8,.35) both;
   transform-origin: center;
 }
 .workspace-transition-deploy .isc-workspace,
-.workspace-transition-deploy .map-workspace-surfaces > :not(.map-heading) {
+.workspace-transition-deploy .map-workspace-surfaces > :not(.map-heading),
+.workspace-transition-deploy .si-surface {
   pointer-events: none;
-  animation: workspace-deploy 180ms cubic-bezier(.16,1,.3,1) both;
+  animation: workspace-deploy 360ms cubic-bezier(.16,1,.3,1) both;
 }
 .workspace-transition-datum {
   position: absolute;
@@ -62,12 +64,12 @@
   z-index: 38;
   pointer-events: none;
   background: linear-gradient(transparent 0 49.7%, #ffe600 49.7% 50.3%, transparent 50.3%);
-  animation: workspace-datum-converge 200ms cubic-bezier(.18,.7,.24,1) both;
+  animation: workspace-datum-converge 240ms cubic-bezier(.55,0,.8,.35) both;
 }
 .workspace-transition-deploy .workspace-transition-datum {
   background: #f5f6f4;
   border-block: 2px solid #ffe600;
-  animation: workspace-datum-open 180ms cubic-bezier(.16,1,.3,1) both;
+  animation: workspace-datum-open 360ms cubic-bezier(.16,1,.3,1) both;
 }
 .workspace-title-rebuilding .map-title-lockup,
 .workspace-title-rebuilding .isc-heading h1 { visibility: hidden; }
@@ -84,14 +86,23 @@
 }
 .workspace-transition-title span { display: inline-block; position: absolute; top: -9px; left: min(731px, calc(67vw - 56px)); padding: 10px 18px; background: #171b1d; color: #ffe600; font: 800 18px/1.2 var(--sans); white-space: nowrap; }
 .workspace[data-transition-to="maps"] .workspace-transition-title { top: 76px; left: calc(var(--map-rail) + 44px); font-size: clamp(54px, 5vw, 76px); line-height: .92; }
+.workspace[data-transition-to="instanced"] .workspace-transition-title { top: 125px; left: 48px; font-size: clamp(42px, 3.4vw, 56px); line-height: .82; letter-spacing: -.065em; white-space: pre; }
+.workspace[data-transition-to="instanced"] .workspace-transition-title span { display: none; }
+@media (min-width: 1800px) {
+  .workspace[data-transition-to="instanced"] .workspace-transition-title { top: 131px; left: 60px; }
+}
+@media (min-width: 1200px) and (max-width: 1599px) {
+  .workspace[data-transition-to="instanced"] .workspace-transition-title { left: 42px; }
+}
+@media (max-width: 1199px) {
+  .workspace[data-transition-to="instanced"] .workspace-transition-title { display: none; }
+  .workspace-title-rebuilding .isc-heading h1 { visibility: visible; }
+}
 @keyframes workspace-retract { to { opacity: 0; transform: scale(.98); } }
 @keyframes workspace-lines-converge { to { opacity: 0; transform: scaleY(.015) scaleX(.98); } }
 @keyframes workspace-deploy { from { opacity: 0; clip-path: inset(49.9% 0); } to { opacity: 1; clip-path: inset(0); } }
 @keyframes workspace-datum-converge { from { opacity: 0; transform: scaleY(8); } to { opacity: 1; transform: scaleY(1); } }
 @keyframes workspace-datum-open { from { clip-path: inset(49.8% 0); opacity: 1; } to { clip-path: inset(0); opacity: 0; } }
-@media (max-height: 780px) and (min-width: 801px) {
-  .workspace[data-transition-to="instanced"] .workspace-transition-title { white-space: normal; font-size: clamp(54px, 4.9vw, 64px); line-height: .86; }
-}
 @media (prefers-reduced-motion: reduce) {
   .workspace-transition-retract *, .workspace-transition-deploy * { animation: none !important; }
   .workspace-transition-datum, .workspace-transition-title { display: none; }

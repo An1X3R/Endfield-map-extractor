@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { postJson, requestJson } from '../../lib/backendClient'
+import { BackendRequestError, isJsonObject, postJson, requestJson } from '../../lib/backendClient'
 import { isExportJob, isExportJobValidation } from '../../lib/mapExportJob'
 import type { ExportJob } from '../../lib/mapExportJob'
 import { describeSelection, isLevelMapRegistry, selectionBounds } from './levelMaps'
@@ -41,9 +41,10 @@ export function paintingResult(job: ExportJob, selectionLabel: string): Painting
 
 export function usePaintingRuntime(source: PaintingSource, sourceReady: boolean, preview: boolean) {
   const [map, setMap] = useState<LevelMap | null>(null)
-  const [loading, setLoading] = useState(false)
+  const [loading, setLoading] = useState(true)
   const [mapError, setMapError] = useState<string | null>(null)
   const [mapChecked, setMapChecked] = useState(false)
+  const [mapMissing, setMapMissing] = useState(false)
   const [revision, setRevision] = useState(0)
   const [job, setJob] = useState<ExportJob | null>(null)
   const [jobError, setJobError] = useState<string | null>(null)
@@ -55,22 +56,35 @@ export function usePaintingRuntime(source: PaintingSource, sourceReady: boolean,
   const activeJob = useRef<ExportJob | null>(null)
   const operationGeneration = useRef(0)
   const reload = useCallback((): void => setRevision(value => value + 1), [])
-  const preparation = useMapPreparation(sourceReady && mapChecked && !map && !loading, preview, reload)
+  const preparation = useMapPreparation(sourceReady && mapChecked && mapMissing && !loading, preview, reload)
   const busy = submitting || preparation.busy || Boolean(job && !terminal(job))
 
   useEffect(() => {
     let disposed = false
     setLoading(true)
     setMapChecked(false)
+    setMapMissing(false)
     setMap(null)
     setMapError(null)
     void requestJson('/api/v2/level-maps', { method: 'GET' }, isLevelMapRegistry).then(registry => {
       if (disposed) return
       const entry = registry.entries.find(entry => entry.levelId === 'map02_lv010')
-      if (!entry) throw new Error('当前已准备地图目录中没有祀的画（map02_lv010），请准备该区域地图后刷新。')
-      setMap(entry)
+      setMapMissing(!entry)
+      setMap(entry ?? null)
     }).catch((cause: unknown) => {
-      if (!disposed) setMapError(cause instanceof Error ? cause.message : String(cause))
+      if (disposed) return
+      if (cause instanceof BackendRequestError && cause.status === 409 && cause.responseBody) {
+        try {
+          const body: unknown = JSON.parse(cause.responseBody)
+          if (isJsonObject(body) && body.error === 'level_maps_not_prepared') {
+            setMapMissing(true)
+            return
+          }
+        } catch (error) {
+          if (!(error instanceof SyntaxError)) throw error
+        }
+      }
+      setMapError(cause instanceof Error ? cause.message : String(cause))
     }).finally(() => { if (!disposed) { setLoading(false); setMapChecked(true) } })
     return () => { disposed = true }
   }, [revision, sourceReady])
@@ -134,7 +148,7 @@ export function usePaintingRuntime(source: PaintingSource, sourceReady: boolean,
   }
   const reconnect = (): void => setJobError(null)
   const result = useMemo(() => job ? paintingResult(job, submittedSelection) : null, [job, submittedSelection])
-  return { map, loading, mapError, reload, job, jobError, busy, cancelling, submit, cancel, reconnect, result, sourceReady, preview, preparation }
+  return { map, loading, mapMissing, mapError, reload, job, jobError, busy, cancelling, submit, cancel, reconnect, result, sourceReady, preview, preparation }
 }
 
 export type PaintingRuntime = ReturnType<typeof usePaintingRuntime>

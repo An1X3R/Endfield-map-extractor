@@ -31,8 +31,9 @@ def integer(value: object, field: str) -> int:
     return int(result)
 
 
-def selected_avatar_bindings(source: dict[str, object], avatar: dict[str, object],
-                            hierarchy: list[object]) -> tuple[SelectedAvatarBinding, ...]:
+def selected_avatar_paths(avatar: dict[str, object], hierarchy: list[object],
+                          crcs: tuple[int, ...]) -> dict[int, tuple[int, str | None]]:
+    """Authenticate exact Avatar CRCs against the selected source hierarchy."""
     skeleton = object_row(object_row(avatar['m_Avatar'], 'avatar')['m_AvatarSkeleton'], 'skeleton')
     ids = tuple(integer(value, 'avatar.id') for value in rows(skeleton['m_ID'], 'avatar.ids'))
     raw_tos = object_row(avatar['m_TOS'], 'avatar.tos')
@@ -50,7 +51,29 @@ def selected_avatar_bindings(source: dict[str, object], avatar: dict[str, object
         parts = path.split('/')
         for index in range(len(parts)):
             candidates.setdefault(zlib.crc32('/'.join(parts[index:]).encode('utf-8')), set()).add(path)
+    result: dict[int, tuple[int, str | None]] = {}
+    for crc in crcs:
+        paths = candidates.get(crc, set())
+        if len(paths) > 1:
+            raise ValueError(f'Ambiguous Transform CRC path: hash={crc}')
+        avatar_index = avatar_indices.get(crc, -1)
+        if (avatar_index == -1) != (len(paths) == 0):
+            raise ValueError(f'Selected Avatar and selected hierarchy disagree: hash={crc}')
+        path = next(iter(paths)) if paths else None
+        if path is not None and not (path == tos[crc] or path.endswith('/' + tos[crc])):
+            raise ValueError(f'Selected Avatar TOS and hierarchy path disagree: hash={crc}')
+        result[crc] = (avatar_index, path)
+    return result
+
+
+def selected_avatar_bindings(source: dict[str, object], avatar: dict[str, object],
+                            hierarchy: list[object]) -> tuple[SelectedAvatarBinding, ...]:
     bindings = [object_row(raw, 'binding') for raw in rows(source['bindings'], 'bindings')]
+    mapped = selected_avatar_paths(avatar, hierarchy, tuple(integer(row['path'], 'binding.path')
+        for row in bindings if row['type'] == 'Transform'))
+    if integer(source['OutputTrackCount'], 'track_count') == 0:
+        from animator_legacy_dense import legacy_bindings
+        return legacy_bindings(source, mapped)
     count = integer(source['OutputTrackCount'], 'track_count')
     if count <= 0 or integer(source['FloatCurveCount'], 'float_count') < 0 or not 0 <= integer(source['RootTrackCount'], 'root_count') <= integer(source['FloatCurveCount'], 'float_count'):
         raise ValueError('Source transform/float/root track counts are invalid')
@@ -80,15 +103,7 @@ def selected_avatar_bindings(source: dict[str, object], avatar: dict[str, object
         crc = integer(position['path'], 'binding.path')
         if not all(masks[component * stride + index // 8] & (1 << (7 - index % 8)) for component in (0, 1)) or scale_flags[index] != (crc in scale_crcs):
             raise ValueError(f'Transform subtrack masks disagree with bindings: track={index}')
-        paths = candidates.get(crc, set())
-        if len(paths) > 1:
-            raise ValueError(f'Ambiguous Transform CRC path: track={index}, hash={crc}')
-        avatar_index = avatar_indices.get(crc, -1)
-        if (avatar_index == -1) != (len(paths) == 0):
-            raise ValueError(f'Selected Avatar and selected hierarchy disagree: track={index}, hash={crc}')
-        path = next(iter(paths)) if paths else None
-        if path is not None and not (path == tos[crc] or path.endswith('/' + tos[crc])):
-            raise ValueError(f'Selected Avatar TOS and hierarchy path disagree: track={index}, hash={crc}')
+        avatar_index, path = mapped[crc]
         result.append(SelectedAvatarBinding(index, crc, avatar_index, path, scale_flags[index]))
     if len({row.crc for row in result}) != count:
         raise ValueError('Multiple ACL tracks resolve to one Transform CRC')
@@ -100,6 +115,9 @@ def load_selected_avatar_clip(directory: Path, avatar: dict[str, object],
     """Validate every source channel, then omit only proven unmapped transforms."""
     source = object_row(read_json(directory / 'clip_source.json'), 'source')
     bound = selected_avatar_bindings(source, avatar, hierarchy)
+    if integer(source['OutputTrackCount'], 'track_count') == 0:
+        from animator_legacy_dense import load_legacy_dense_clip
+        return load_legacy_dense_clip(directory, source, bound)
     bindings = [object_row(row, 'binding') for row in rows(source['bindings'], 'bindings')]
     count = len(bound)
     reference = read_clip_reference(source, read_json(directory / 'value_array_delta.json'))
@@ -182,3 +200,11 @@ def load_selected_avatar_clip(directory: Path, avatar: dict[str, object],
     references = tuple(LocalPose(flattened[index], unit(flattened[index + count]), scales.get(bound[index].crc, (1., 1., 1.))) for index in selected)
     return AuxiliaryClip(int(directory.name), times[:common], tuple(tuple(frame[index] for index in selected) for frame in all_poses), references,
         tuple(str(bound[index].source_path) for index in selected), tuple(bound[index].has_scale for index in selected))
+
+
+def sample_input_paths(directory: Path) -> tuple[Path, ...]:
+    """Identify source samples without confusing legacy dense values with new ACL streams."""
+    source = object_row(read_json(directory / 'clip_source.json'), 'source')
+    names = ('legacy_dense_clip.json',) if integer(source['OutputTrackCount'], 'track_count') == 0 else (
+        'transform_samples.json', 'float_samples.json', 'root_motion_samples.json')
+    return tuple(directory / name for name in ('clip_source.json', 'value_array_delta.json', *names))

@@ -9,9 +9,10 @@ from dataclasses import dataclass
 import hashlib
 import math
 import random
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 
 from extractor_core.particle_curves import ParticleMinMaxCurve, evaluate_minmax_curve, parse_minmax_curve
+from extractor_core.particle_mesh_geometry import ParticleMeshGeometry
 
 
 PARTICLE_PARAMETER_SCHEMA_VERSION = 5
@@ -178,11 +179,70 @@ def _color(value: object, time: float, rng: random.Random, context: str) -> tupl
     return tuple(left * (1.0 - factor) + right * factor for left, right in zip(minimum, maximum))  # type: ignore[return-value]
 
 
-def _shape(value: object, rng: random.Random) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
+def _mesh_shape(shape: Mapping[str, object], initial: Mapping[str, object],
+                geometry: ParticleMeshGeometry | None) -> tuple[str, ...]:
+    """Accept only the evidenced random vertex emission with identity shape TRS."""
+    if not isinstance(geometry, ParticleMeshGeometry):
+        raise ParticleSnapshotError("Mesh emission requires source-qualified shape geometry")
+    if not geometry.vertices or len(geometry.normals) != len(geometry.vertices) or geometry.colors and len(geometry.colors) != len(geometry.vertices):
+        raise ParticleSnapshotError("Mesh emission vertex, normal, or color stream counts disagree")
+    placement = _integer(_field(shape, "PlacementMode", "Shape"), "Shape.PlacementMode")
+    spawn = _record(_field(shape, "MeshSpawn", "Shape"), "Shape.MeshSpawn")
+    mode = _integer(_field(spawn, "Mode", "Shape.MeshSpawn"), "Shape.MeshSpawn.Mode")
+    spread = _number(_field(spawn, "Spread", "Shape.MeshSpawn"), "Shape.MeshSpawn.Spread")
+    parse_minmax_curve(_field(spawn, "Speed", "Shape.MeshSpawn"), "Shape.MeshSpawn.Speed")
+    if placement != 0 or mode != 0 or spread != 0:
+        raise UnsupportedParticleSnapshot(f"Only random mesh vertex emission is supported: placement={placement}, spawnMode={mode}, spread={spread}")
+    for name, expected in (("Position", 0.0), ("Rotation", 0.0), ("Scale", 1.0)):
+        value = _record(_field(shape, name, "Shape"), f"Shape.{name}")
+        if any(_number(_field(value, axis, f"Shape.{name}"), f"Shape.{name}.{axis}") != expected for axis in ("X", "Y", "Z")):
+            raise UnsupportedParticleSnapshot(f"Mesh emission requires identity shape TRS: field=Shape.{name}")
+    for name in ("MeshNormalOffset", "RandomDirectionAmount", "SphericalDirectionAmount", "RandomPositionAmount"):
+        if _number(_field(shape, name, "Shape"), f"Shape.{name}") != 0:
+            raise UnsupportedParticleSnapshot(f"Mesh emission modifier is unsupported: field=Shape.{name}")
+    for name in ("UseMeshMaterialIndex", "AlignToDirection"):
+        if _boolean(_field(shape, name, "Shape"), f"Shape.{name}"):
+            raise UnsupportedParticleSnapshot(f"Mesh emission feature is unsupported: field=Shape.{name}")
+    _integer(_field(shape, "MeshMaterialIndex", "Shape"), "Shape.MeshMaterialIndex")
+    if not _trivially_zero_curve(_field(initial, "StartSpeed", "Initial"), "Initial.StartSpeed"):
+        raise UnsupportedParticleSnapshot("Mesh vertex emission currently requires zero Initial.StartSpeed")
+    references = _record(_field(shape, "References", "Shape"), "Shape.References")
+    for name in ("MeshRenderer", "SkinnedMeshRenderer", "Sprite", "SpriteRenderer", "Texture"):
+        pointer = _record(_field(references, name, "Shape.References"), f"Shape.References.{name}")
+        target = _record(_field(pointer, "Target", f"Shape.References.{name}"), f"Shape.References.{name}.Target")
+        if _integer(_field(target, "PathId", f"Shape.References.{name}.Target"), f"Shape.References.{name}.Target.PathId") != 0:
+            raise UnsupportedParticleSnapshot(f"Mesh emission requires an unmodified mesh source: reference=Shape.References.{name}")
+    pointer = _record(_field(references, "Mesh", "Shape.References"), "Shape.References.Mesh")
+    target = _record(_field(pointer, "Target", "Shape.References.Mesh"), "Shape.References.Mesh.Target")
+    if (_field(pointer, "ResolutionStatus", "Shape.References.Mesh") != "resolved"
+            or _field(pointer, "IsResolved", "Shape.References.Mesh") is not True
+            or _field(target, "Type", "Shape.References.Mesh.Target") != "Mesh"
+            or _field(target, "Source", "Shape.References.Mesh.Target") != geometry.source
+            or _integer(_field(target, "PathId", "Shape.References.Mesh.Target"), "Shape.References.Mesh.Target.PathId") != geometry.path_id):
+        raise ParticleSnapshotError("Mesh emission geometry does not match Shape.References.Mesh")
+    if _boolean(_field(shape, "UseMeshColors", "Shape"), "Shape.UseMeshColors") and not geometry.colors:
+        return ("ShapeModule.UseMeshColors_missing_vertex_colors_material_color_unverified",)
+    return ()
+
+
+def _shape(value: object, rng: random.Random,
+           geometry: ParticleMeshGeometry | None) -> tuple[tuple[float, float, float], tuple[float, float, float], tuple[float, float, float, float]]:
     shape = _record(value, "Shape")
     if not _boolean(_field(shape, "Enabled", "Shape"), "Shape.Enabled"):
-        return (0.0, 0.0, 0.0), (0.0, 0.0, 1.0)
+        return (0.0, 0.0, 0.0), (0.0, 0.0, 1.0), (1.0, 1.0, 1.0, 1.0)
     kind = _integer(_field(shape, "Type", "Shape"), "Shape.Type")
+    if kind == 6:
+        if geometry is None:
+            raise ParticleSnapshotError("Mesh emission requires source-qualified shape geometry")
+        index = rng.randrange(len(geometry.vertices))
+        normal = geometry.normals[index]
+        length = math.sqrt(sum(component * component for component in normal))
+        if not math.isfinite(length) or length <= 1e-6:
+            raise ParticleSnapshotError(f"Mesh emission source normal is degenerate: vertex={index}")
+        direction = (normal[0] / length, normal[1] / length, normal[2] / length)
+        color = (geometry.colors[index] if geometry.colors and _boolean(_field(shape, "UseMeshColors", "Shape"), "Shape.UseMeshColors")
+                 else (1.0, 1.0, 1.0, 1.0))
+        return geometry.vertices[index], direction, color
     radius = _record(_field(shape, "Radius", "Shape"), "Shape.Radius")
     arc = _record(_field(shape, "Arc", "Shape"), "Shape.Arc")
     if _integer(_field(radius, "Mode", "Shape.Radius"), "Shape.Radius.Mode") != 0 or _integer(_field(arc, "Mode", "Shape.Arc"), "Shape.Arc.Mode") != 0:
@@ -204,11 +264,26 @@ def _shape(value: object, rng: random.Random) -> tuple[tuple[float, float, float
         direction = (radial * math.cos(azimuth), radial * math.sin(azimuth), z)
         distance = magnitude * ((1.0 - thickness) + thickness * _unit(rng) ** (1.0 / 3.0))
         position = tuple(distance * component for component in direction)
-    elif kind == 4:
+    elif kind in (4, 8):
         normalized_radius = math.sqrt((1.0 - thickness) ** 2 +
                                       (1.0 - (1.0 - thickness) ** 2) * _unit(rng))
-        radial = magnitude * normalized_radius
-        position = (radial * math.cos(azimuth), radial * math.sin(azimuth), 0.0)
+        height = 0.0
+        section_radius = magnitude
+        if kind == 8:
+            length = _number(_field(shape, "Length", "Shape"), "Shape.Length")
+            if length < 0.0 or not 0.0 <= angle < math.pi * 0.5:
+                raise ParticleSnapshotError(f"Cone volume dimensions invalid: length={length}, angle={angle}")
+            slope = math.tan(angle)
+            height_fraction = _unit(rng)
+            if slope <= 1e-8:
+                height = length * height_fraction
+            else:
+                top_radius = magnitude + length * slope
+                section_radius = (magnitude ** 3 + height_fraction *
+                                  (top_radius ** 3 - magnitude ** 3)) ** (1.0 / 3.0)
+                height = (section_radius - magnitude) / slope
+        radial = section_radius * normalized_radius
+        position = (radial * math.cos(azimuth), radial * math.sin(azimuth), height)
         tilt = angle * normalized_radius
         direction = (math.sin(tilt) * math.cos(azimuth), math.sin(tilt) * math.sin(azimuth), math.cos(tilt))
     elif kind == 5:
@@ -234,7 +309,8 @@ def _shape(value: object, rng: random.Random) -> tuple[tuple[float, float, float
 
     transformed = rotate(scaled)
     return (tuple(component + _number(_field(offset, axis, "Shape.Position"), f"Shape.Position.{axis}")
-                  for component, axis in zip(transformed, ("X", "Y", "Z"))), rotate(direction))  # type: ignore[return-value]
+                  for component, axis in zip(transformed, ("X", "Y", "Z"))), rotate(direction),
+            (1.0, 1.0, 1.0, 1.0))  # type: ignore[return-value]
 
 
 def _seed(identity: str, seed: int) -> int:
@@ -243,6 +319,45 @@ def _seed(identity: str, seed: int) -> int:
 
 
 def _birth_times(system: Mapping[str, object], emission: Mapping[str, object], age: float, limit: int, rng: random.Random) -> tuple[float, ...]:
+    distance_rate = parse_minmax_curve(_field(emission, "RateOverDistance", "Emission"), "Emission.RateOverDistance")
+    if distance_rate.mode != 0 or distance_rate.scalar != 0:
+        raise UnsupportedParticleSnapshot("RateOverDistance needs an emitter path")
+    return _time_and_burst_birth_times(system, emission, age, limit, rng)
+
+
+def _fixed_emitter_birth_times(system: Mapping[str, object], emission: Mapping[str, object], age: float,
+                             limit: int, rng: random.Random) -> tuple[float, ...]:
+    """Retain time and burst births; a fixed emitter travels exactly zero distance."""
+    distance_rate = parse_minmax_curve(_field(emission, "RateOverDistance", "Emission"), "Emission.RateOverDistance")
+    if distance_rate.mode != 0:
+        raise UnsupportedParticleSnapshot(
+            f"Fixed emitter distance rate requires a verified constant curve: mode={distance_rate.mode}")
+    if distance_rate.scalar < 0:
+        raise ParticleSnapshotError(f"Negative distance emission rate: rate={distance_rate.scalar}")
+    return _time_and_burst_birth_times(system, emission, age, limit, rng)
+
+
+def _constant_rate_birth_times(rate: float, elapsed: float, delay: float, absolute_end: float,
+                               limit: int) -> tuple[float, ...]:
+    """Place constant-rate events directly without accumulating tick rounding."""
+    if rate < 0:
+        raise ParticleSnapshotError(f"Negative emission rate: rate={rate}")
+    if rate == 0:
+        return ()
+    integrated = elapsed * rate
+    if not math.isfinite(integrated):
+        raise ParticleSnapshotError(f"Emission count is not finite: elapsed={elapsed}, rate={rate}")
+    # Include one candidate across subtraction rounding, then compare actual birth times.
+    candidates = min(math.floor(integrated) + 1, limit + 1)
+    births = tuple(time for index in range(1, candidates + 1)
+                   if (time := delay + index / rate) <= absolute_end)
+    if len(births) > limit:
+        raise ParticleSnapshotError(f"Emission event limit exceeded: limit={limit}")
+    return births
+
+
+def _time_and_burst_birth_times(system: Mapping[str, object], emission: Mapping[str, object], age: float,
+                              limit: int, rng: random.Random) -> tuple[float, ...]:
     length = _number(_field(system, "LengthInSec", "System"), "System.LengthInSec")
     if length <= 0:
         raise ParticleSnapshotError("System length must be positive")
@@ -256,36 +371,36 @@ def _birth_times(system: Mapping[str, object], emission: Mapping[str, object], a
     emission_end = elapsed if looping else min(elapsed, length)
     absolute_end = age if looping else min(age, delay + length)
     rate = parse_minmax_curve(_field(emission, "RateOverTime", "Emission"), "Emission.RateOverTime")
-    distance_rate = parse_minmax_curve(_field(emission, "RateOverDistance", "Emission"), "Emission.RateOverDistance")
-    if distance_rate.mode != 0 or distance_rate.scalar != 0:
-        raise UnsupportedParticleSnapshot("RateOverDistance needs an emitter path")
     step = min(0.05, length / 100.0)
     if emission_end / step > 100000:
         raise ParticleSnapshotError(f"Snapshot emission interval exceeds bounded work: age={age}, step={step}")
     births: list[float] = []
     rate_rng = random.Random(rng.getrandbits(64))
     burst_seed = rng.getrandbits(64)
-    carry = 0.0
-    index = 0
-    while index * step < emission_end:
-        start = index * step
-        # Integrate complete fixed ticks so earlier births never move with age.
-        end = (index + 1) * step
-        normalized = ((start + end) * 0.5 % length) / length
-        hz = evaluate_minmax_curve(rate, normalized, _unit(rate_rng))
-        if hz < 0:
-            raise ParticleSnapshotError(f"Negative emission rate: rate={hz}")
-        previous_carry = carry
-        carry += hz * (end - start)
-        count = math.floor(carry)
-        carry -= count
-        for item in range(count):
-            time = start + (item + 1 - previous_carry) / hz
-            if delay + time <= absolute_end:
-                births.append(delay + time)
-        if len(births) > limit:
-            raise ParticleSnapshotError(f"Emission event limit exceeded: limit={limit}")
-        index += 1
+    if rate.mode == 0:
+        births.extend(_constant_rate_birth_times(rate.scalar, emission_end, delay, absolute_end, limit))
+    else:
+        carry = 0.0
+        index = 0
+        while index * step < emission_end:
+            start = index * step
+            # Integrate complete fixed ticks so earlier births never move with age.
+            end = (index + 1) * step
+            normalized = ((start + end) * 0.5 % length) / length
+            hz = evaluate_minmax_curve(rate, normalized, _unit(rate_rng))
+            if hz < 0:
+                raise ParticleSnapshotError(f"Negative emission rate: rate={hz}")
+            previous_carry = carry
+            carry += hz * (end - start)
+            count = math.floor(carry)
+            carry -= count
+            for item in range(count):
+                time = start + (item + 1 - previous_carry) / hz
+                if delay + time <= absolute_end:
+                    births.append(delay + time)
+            if len(births) > limit:
+                raise ParticleSnapshotError(f"Emission event limit exceeded: limit={limit}")
+            index += 1
     burst_count = _integer(_field(emission, "BurstCount", "Emission"), "Emission.BurstCount")
     bursts = _sequence(_field(emission, "Bursts", "Emission"), "Emission.Bursts")
     if burst_count > len(bursts):
@@ -341,16 +456,16 @@ def _custom_stream(value: object, fraction: float, rng: random.Random, context: 
                                            _unit(rng)) for index, value in enumerate(curves))  # type: ignore[return-value]
 
 
-def _uv_rect(value: object, fraction: float, rng: random.Random) -> tuple[float, float, float, float]:
+def _uv_rect(value: object, fraction: float, elapsed: float, rng: random.Random) -> tuple[float, float, float, float]:
     uv = _record(value, "Uv")
     if not _boolean(_field(uv, "Enabled", "Uv"), "Uv.Enabled"):
         return (0.0, 0.0, 1.0, 1.0)
     mode = _integer(_field(uv, "Mode", "Uv"), "Uv.Mode")
     time_mode = _integer(_field(uv, "TimeMode", "Uv"), "Uv.TimeMode")
     animation = _integer(_field(uv, "AnimationType", "Uv"), "Uv.AnimationType")
-    if mode != 0 or time_mode != 0 or animation not in (0, 1):
+    if mode != 0 or time_mode not in (0, 2) or animation not in (0, 1):
         raise UnsupportedParticleSnapshot(
-            f"UV grid/lifetime animation subset unsupported: mode={mode}, timeMode={time_mode}, animation={animation}")
+            f"UV grid lifetime/FPS animation subset unsupported: mode={mode}, timeMode={time_mode}, animation={animation}")
     columns = _integer(_field(uv, "TilesX", "Uv"), "Uv.TilesX")
     rows = _integer(_field(uv, "TilesY", "Uv"), "Uv.TilesY")
     if columns <= 0 or rows <= 0:
@@ -358,14 +473,23 @@ def _uv_rect(value: object, fraction: float, rng: random.Random) -> tuple[float,
     mask = _integer(_field(uv, "UvChannelMask", "Uv"), "Uv.UvChannelMask")
     if mask != -1 and mask & 1 == 0:
         raise UnsupportedParticleSnapshot(f"UV animation excludes primary UV channel: mask={mask}")
-    cycles = _number(_field(uv, "Cycles", "Uv"), "Uv.Cycles")
-    if cycles <= 0:
-        raise ParticleSnapshotError(f"UV animation cycles must be positive: cycles={cycles}")
-    start = _curve(uv, "StartFrame", 0.0, rng, "Uv")
-    frame = _curve(uv, "FrameOverTime", fraction, rng, "Uv")
-    normalized = (start + frame * cycles) % 1.0
+    frame_count = columns * rows if animation == 0 else columns
+    if time_mode == 0:
+        cycles = _number(_field(uv, "Cycles", "Uv"), "Uv.Cycles")
+        if cycles <= 0:
+            raise ParticleSnapshotError(f"UV animation cycles must be positive: cycles={cycles}")
+        start = _curve(uv, "StartFrame", 0.0, rng, "Uv")
+        frame = _curve(uv, "FrameOverTime", fraction, rng, "Uv")
+        normalized = (start + frame * cycles) % 1.0
+        frame_index = min(frame_count - 1, math.floor(normalized * frame_count))
+    else:
+        fps = _number(_field(uv, "Fps", "Uv"), "Uv.Fps")
+        seconds = _number(elapsed, "Uv.ParticleAge")
+        if fps < 0 or seconds < 0:
+            raise ParticleSnapshotError(f"UV FPS and particle age must be nonnegative: fps={fps}, age={seconds}")
+        start = _curve(uv, "StartFrame", 0.0, rng, "Uv")
+        frame_index = math.floor((start * frame_count + seconds * fps) % frame_count)
     if animation == 0:
-        frame_index = min(columns * rows - 1, math.floor(normalized * columns * rows))
         column, row = frame_index % columns, frame_index // columns
     else:
         row_mode = _integer(_field(uv, "RowMode", "Uv"), "Uv.RowMode")
@@ -377,7 +501,7 @@ def _uv_rect(value: object, fraction: float, rng: random.Random) -> tuple[float,
             raise UnsupportedParticleSnapshot(f"UV single-row selector unsupported: rowMode={row_mode}")
         if not 0 <= row < rows:
             raise ParticleSnapshotError(f"UV row index outside sheet: row={row}, rows={rows}")
-        column = min(columns - 1, math.floor(normalized * columns))
+        column = frame_index
     flip_u = _number(_field(uv, "FlipU", "Uv"), "Uv.FlipU")
     flip_v = _number(_field(uv, "FlipV", "Uv"), "Uv.FlipV")
     if not 0 <= flip_u <= 1 or not 0 <= flip_v <= 1:
@@ -486,13 +610,31 @@ def _trail(value: object, birth: tuple[float, float, float], speed: tuple[float,
 
 def generate_particle_snapshot(system_value: object, snapshot_age: float, identity: str,
                                max_particles: int, max_events: int,
-                               gravity_local_unity: tuple[float, float, float]) -> ParticleSnapshot:
+                               gravity_local_unity: tuple[float, float, float],
+                               mesh_geometry: ParticleMeshGeometry | None) -> ParticleSnapshot:
     """Sample a static preview with explicit limits and unsupported module flags."""
+    return _generate_particle_snapshot(system_value, snapshot_age, identity, max_particles, max_events,
+                                       gravity_local_unity, mesh_geometry, _birth_times)
+
+
+def _generate_particle_snapshot(system_value: object, snapshot_age: float, identity: str,
+                                max_particles: int, max_events: int,
+                                gravity_local_unity: tuple[float, float, float],
+                                mesh_geometry: ParticleMeshGeometry | None,
+                                birth_times: Callable[[Mapping[str, object], Mapping[str, object], float, int,
+                                                       random.Random], tuple[float, ...]]) -> ParticleSnapshot:
     system = _record(system_value, "System")
     age = _number(snapshot_age, "snapshotAge")
     gravity = _vector3(gravity_local_unity, "gravityLocalUnity")
     if age < 0 or not identity or max_particles <= 0 or max_events <= 0:
         raise ParticleSnapshotError("Snapshot age, identity, or limits are invalid")
+    speed_multiplier = _number(_field(system, "SimulationSpeed", "System"), "System.SimulationSpeed")
+    if speed_multiplier < 0:
+        raise ParticleSnapshotError(f"Simulation speed must be nonnegative: speed={speed_multiplier}")
+    # Playback speed scales the emission schedule and particle aging together.
+    age *= speed_multiplier
+    if not math.isfinite(age):
+        raise ParticleSnapshotError(f"Scaled simulation time is not finite: age={snapshot_age}, speed={speed_multiplier}")
     if "Parameters" not in system:
         raise UnsupportedParticleSnapshot("unsupported_parameter_schema: Parameters missing")
     if not isinstance(system["Parameters"], dict):
@@ -510,7 +652,7 @@ def generate_particle_snapshot(system_value: object, snapshot_age: float, identi
                 f"unsupported_parameter_schema: required field missing: Parameters.{module_name}")
     initial = _record(_field(parameters, "Initial", "Parameters"), "Initial")
     emission = _record(_field(parameters, "Emission", "Parameters"), "Emission")
-    shape = _field(parameters, "Shape", "Parameters")
+    shape = _record(_field(parameters, "Shape", "Parameters"), "Shape")
     size = _record(_field(parameters, "SizeOverLifetime", "Parameters"), "SizeOverLifetime")
     color = _record(_field(parameters, "ColorOverLifetime", "Parameters"), "ColorOverLifetime")
     trail = _record(_field(parameters, "Trail", "Parameters"), "Trail")
@@ -533,6 +675,14 @@ def generate_particle_snapshot(system_value: object, snapshot_age: float, identi
     if not enabled["InitialModule"]:
         raise UnsupportedParticleSnapshot("InitialModule disabled; lifetime and speed semantics are unavailable")
     unsupported = [name for name, active in enabled.items() if active and name not in modeled]
+    shape_enabled = _boolean(_field(shape, "Enabled", "Shape"), "Shape.Enabled")
+    if shape_enabled != enabled["ShapeModule"]:
+        raise ParticleSnapshotError("Shape module state disagrees with typed parameters")
+    mesh_emission = shape_enabled and _integer(_field(shape, "Type", "Shape"), "Shape.Type") == 6
+    if mesh_emission:
+        unsupported.extend(_mesh_shape(shape, initial, mesh_geometry))
+    elif mesh_geometry is not None:
+        raise ParticleSnapshotError("Shape mesh geometry supplied to a non-mesh emitter")
     velocity_curves, velocity_issues = _constant_velocity_curves(
         velocity_parameters, enabled["VelocityModule"])
     unsupported.extend(velocity_issues)
@@ -563,12 +713,9 @@ def generate_particle_snapshot(system_value: object, snapshot_age: float, identi
         raise UnsupportedParticleSnapshot(
             f"Gravity modifier varies over time and requires trajectory integration: mode={gravity_curve.mode}")
     system_seed = _integer(_field(system, "RandomSeed", "System"), "System.RandomSeed")
-    births = (_birth_times(system, emission, age, max_events, random.Random(_seed(identity, system_seed)))
+    births = (birth_times(system, emission, age, max_events, random.Random(_seed(identity, system_seed)))
               if enabled["EmissionModule"] else ())
     duration = _number(_field(system, "LengthInSec", "System"), "System.LengthInSec")
-    speed_multiplier = _number(_field(system, "SimulationSpeed", "System"), "System.SimulationSpeed")
-    if speed_multiplier != 1:
-        raise UnsupportedParticleSnapshot(f"Simulation speed is unsupported: speed={speed_multiplier}")
     alive: list[SnapshotParticle] = []
     for index, birth in enumerate(births):
         rng = random.Random(_seed(f"{identity}:{index}", system_seed))
@@ -576,11 +723,11 @@ def generate_particle_snapshot(system_value: object, snapshot_age: float, identi
         life = _curve(initial, "StartLifetime", emitter_time, rng, "Initial")
         if life <= 0:
             raise ParticleSnapshotError(f"Particle lifetime must be positive: index={index}, lifetime={life}")
-        elapsed = (age - birth) * speed_multiplier
+        elapsed = age - birth
         if elapsed < 0 or elapsed >= life:
             continue
         fraction = elapsed / life
-        position, direction = _shape(shape, rng)
+        position, direction, mesh_color = _shape(shape, rng, mesh_geometry)
         start_speed = _curve(initial, "StartSpeed", emitter_time, rng, "Initial")
         initial_velocity = tuple(component * start_speed for component in direction)
         if velocity_curves:
@@ -616,7 +763,7 @@ def generate_particle_snapshot(system_value: object, snapshot_age: float, identi
             x_scale = y_scale = z_scale = 1.0
         initial_color = _color(_field(initial, "StartColor", "Initial"), emitter_time, rng, "Initial.StartColor")
         lifetime_color = _color(_field(color, "Gradient", "ColorOverLifetime"), fraction, rng, "ColorOverLifetime.Gradient") if _boolean(_field(color, "Enabled", "ColorOverLifetime"), "ColorOverLifetime.Enabled") else (1.0, 1.0, 1.0, 1.0)
-        rgba = tuple(a * b for a, b in zip(initial_color, lifetime_color))
+        rgba = tuple(a * b * c for a, b, c in zip(initial_color, lifetime_color, mesh_color))
         trail_points = _trail(trail, birth_position, initial_velocity, acceleration, elapsed,
                               fraction, rgba, random.Random(_seed(f"{identity}:{index}:trail", system_seed))) if enabled["TrailModule"] else ()
         streams = _sequence(_field(custom, "Streams", "CustomData"), "CustomData.Streams")
@@ -624,7 +771,7 @@ def generate_particle_snapshot(system_value: object, snapshot_age: float, identi
             raise ParticleSnapshotError(f"CustomData stream count invalid: count={len(streams)}")
         custom_values = tuple(_custom_stream(stream, fraction, rng, f"CustomData.Streams[{stream_index}]")
                               for stream_index, stream in enumerate(streams)) if enabled["CustomDataModule"] else (None, None)
-        tile = _uv_rect(uv, fraction, rng) if enabled["UVModule"] else (0.0, 0.0, 1.0, 1.0)
+        tile = _uv_rect(uv, fraction, elapsed, rng) if enabled["UVModule"] else (0.0, 0.0, 1.0, 1.0)
         alive.append(SnapshotParticle(index, birth, position, velocity,
                                       (start_size * x_scale, initial_y * y_scale, initial_z * z_scale),
                                       rgba, fraction, rotation, trail_points,
@@ -636,3 +783,30 @@ def generate_particle_snapshot(system_value: object, snapshot_age: float, identi
     kept = min(max_particles, system_limit)
     return ParticleSnapshot(tuple(alive[:kept]), count, max(0, count - kept),
                             tuple(unsupported), "deterministic_static_preview_not_unity_simulation")
+
+
+def generate_fixed_emitter_particle_snapshot(system_value: object, snapshot_age: float, identity: str,
+                                             max_particles: int, max_events: int,
+                                             gravity_local_unity: tuple[float, float, float],
+                                             mesh_geometry: ParticleMeshGeometry | None) -> ParticleSnapshot:
+    """Preview a fixed emitter; world-space births have no emitter motion history."""
+    system = _record(system_value, "System")
+    space = _integer(_field(system, "MoveWithTransform", "System"), "System.MoveWithTransform")
+    if space not in (0, 1):
+        raise UnsupportedParticleSnapshot(f"Fixed emitter preview cannot map custom simulation space: mode={space}")
+    # A fixed coordinate basis permits the local solver without claiming emitter history.
+    snapshot = _generate_particle_snapshot({**system, "MoveWithTransform": 0}, snapshot_age, identity,
+                                           max_particles, max_events, gravity_local_unity, mesh_geometry,
+                                           _fixed_emitter_birth_times)
+    parameters = _record(_field(system, "Parameters", "System"), "Parameters")
+    emission = _record(_field(parameters, "Emission", "Parameters"), "Emission")
+    distance_rate = parse_minmax_curve(_field(emission, "RateOverDistance", "Emission"), "Emission.RateOverDistance")
+    limitations = snapshot.unsupported_modules
+    if distance_rate.mode != 0 or distance_rate.scalar != 0:
+        limitations += ("EmissionModule.RateOverDistance_zero_fixed_emitter_displacement",)
+    if space == 0:
+        return ParticleSnapshot(snapshot.particles, snapshot.generated, snapshot.truncated, limitations,
+                                snapshot.preview_scope)
+    return ParticleSnapshot(snapshot.particles, snapshot.generated, snapshot.truncated,
+                            limitations + ("SimulationSpace.World_fixed_emitter_no_motion_history",),
+                            "deterministic_fixed_world_emitter_preview_not_unity_simulation")

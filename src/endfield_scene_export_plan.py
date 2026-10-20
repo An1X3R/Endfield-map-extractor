@@ -44,6 +44,7 @@ from endfield_scene_slot_contract import (
     runtime_submesh_slots, runtime_submesh_passes, validate_ordered_surface_passes,
 )
 from endfield_scene_vfxrefract_contract import SceneColorSnapshotPlan, read_scene_color_snapshot
+from endfield_effect_presentation import FlowPresentation, read_flow_presentation
 from endfield_scene_spatial_plan import (StaticSpatialRow, StaticSpatialSelection, WorldBounds,
                                          owns_static_footprint, select_static_source_rows)
 from endfield_scene_spatial_cache import (read_spatial_source_records, require_spatial_source_version,
@@ -304,6 +305,7 @@ class SceneExportPlan(TypedDict):
     water_transport_lighting_status: NotRequired[Literal["not_applicable"]]
     fog_depth: NotRequired[FogDepthPlan]
     scene_color_snapshot: NotRequired[SceneColorSnapshotPlan]
+    effect_flow_presentation: NotRequired[FlowPresentation]
     pending: list[Pending]
     source_sha256: dict[str, str]
     summary: dict[str, int]
@@ -1294,15 +1296,15 @@ def prepare_scene_export_plan(
     prefab_bounds_payload: dict[str, object] | None = None
     if allowed_categories:
         from extractor_core.dynamic_models import read_dynamic_scene_models
-        from endfield_scene_prefab_bounds import select_prefab_geometry_inventory
+        from endfield_scene_prefab_selection_cache import select_cached_prefab_geometry_inventory
         from endfield_scene_resources import describe_file, ensure_prefab_bounds_manifests
 
         all_models = read_dynamic_scene_models(vfs, path_hash, map_id, effect_cancelled)
         bounds_manifests = ensure_prefab_bounds_manifests(runtime_path,
             frozenset(record.prefab_path.replace("\\", "/").casefold() for record in all_models.records), effect_cancelled)
-        model_selection = select_prefab_geometry_inventory(all_models, bounds_manifests,
+        model_selection = select_cached_prefab_geometry_inventory(all_models, bounds_manifests,
             tuple(bounds[name] for name in ("xmin", "xmax", "zmin", "zmax")),
-            tuple(selection[name] for name in ("xmin", "xmax", "zmin", "zmax")))
+            tuple(selection[name] for name in ("xmin", "xmax", "zmin", "zmax")), cache_root)
         model_inventory = model_selection.inventory
         prefab_plan = build_prefab_geometry_plan(model_inventory, tuple(manifest_paths), allowed_categories,
             containers, mesh_exports, materials, textures, uv_catalog, model_selection.evidence)
@@ -1555,6 +1557,11 @@ def load_scene_export_plan(path: Path) -> SceneExportPlan:
         raise ValueError("Water transport lighting cannot be both active and not_applicable")
     if "fog_depth" in source:
         source["fog_depth"] = read_fog_depth_options(source["fog_depth"])
+    if "effect_flow_presentation" in source:
+        source["effect_flow_presentation"] = read_flow_presentation(source["effect_flow_presentation"])
+        selected_categories = _list(source.get("category_filter"), "scene export category_filter")
+        if not any(category in ("all", "effects") for category in selected_categories):
+            raise ValueError("effect_flow_presentation plan requires the effects export group")
     if "scene_color_snapshot" in source:
         source["scene_color_snapshot"] = read_scene_color_snapshot(source["scene_color_snapshot"])
         selected_categories = _list(source.get("category_filter"), "scene export category_filter")

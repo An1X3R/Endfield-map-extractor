@@ -12,6 +12,21 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from blender_scene_water_foam import reconnect_source_water_foam
 
 
+def depends_on(node: bpy.types.Node, target: bpy.types.Node) -> bool:
+    pending = [node]
+    visited: set[int] = set()
+    while pending:
+        current = pending.pop()
+        pointer = current.as_pointer()
+        if pointer in visited:
+            continue
+        visited.add(pointer)
+        if current == target:
+            return True
+        pending.extend(link.from_node for socket in current.inputs for link in socket.links)
+    return False
+
+
 def verify_export(path: Path, expected_targets: set[str]) -> dict[str, object]:
     bpy.ops.wm.open_mainfile(filepath=str(path), use_scripts=False)
     waters = [obj for obj in bpy.context.scene.objects
@@ -25,16 +40,20 @@ def verify_export(path: Path, expected_targets: set[str]) -> dict[str, object]:
         outputs = [node for node in tree.nodes if node.type == "OUTPUT_MATERIAL"]
         if {node.target for node in outputs} != expected_targets:
             raise AssertionError(f"Unexpected foam render targets: material={material.name}")
-        before = len(tree.nodes)
         reconnect_source_water_foam(material)
-        if len(tree.nodes) != before:
+        after_first_reconnect = len(tree.nodes)
+        reconnect_source_water_foam(material)
+        if len(tree.nodes) != after_first_reconnect:
             raise AssertionError(f"Repeated foam connection creates nodes: material={material.name}")
         underlying: list[str] = []
         for output in outputs:
             surface = output.inputs["Surface"]
             if len(surface.links) != 1 or surface.links[0].from_node.type != "MIX_SHADER":
-                raise AssertionError(f"Missing foam mix: material={material.name}, target={output.target}")
-            mix = surface.links[0].from_node
+                raise AssertionError(f"Missing connected water surface: material={material.name}, target={output.target}")
+            mix_name = "EF_Water_Foam_Mix" + ("" if output.target == "ALL" else "_" + output.target)
+            mix = tree.nodes.get(mix_name)
+            if mix is None or not depends_on(surface.links[0].from_node, mix):
+                raise AssertionError(f"Source foam mix is not active at output: material={material.name}, target={output.target}")
             for index, name in ((0, "EF_Water_Foam_Coverage"), (2, "EF_Water_Foam_Surface")):
                 links = mix.inputs[index].links
                 if len(links) != 1 or links[0].from_node.name != name:
@@ -45,6 +64,24 @@ def verify_export(path: Path, expected_targets: set[str]) -> dict[str, object]:
             underlying.append(base[0].from_node.name)
         if len(set(underlying)) != len(outputs):
             raise AssertionError("Engine-specific water bases were collapsed into one surface")
+        readability = tree.nodes.get("EF_Water_Host_Foam_Readability")
+        tint = tree.nodes.get("EF_Water_Host_Foam_Tint")
+        foam = tree.nodes.get("EF_Water_Foam_Surface")
+        frame = tree.nodes.get("EF Layout Host Presentation")
+        if readability is None or readability.bl_idname != "ShaderNodeValue":
+            raise AssertionError(f"Host foam readability control is missing: material={material.name}")
+        if readability.outputs[0].default_value != 0.0:
+            raise AssertionError(f"Host foam readability is not neutral by default: material={material.name}")
+        if tint is None or tint.bl_idname != "ShaderNodeRGB" or foam is None:
+            raise AssertionError(f"Host foam presentation controls are incomplete: material={material.name}")
+        if frame is None or "Host Presentation" not in frame.label:
+            raise AssertionError(f"Host presentation frame is missing: material={material.name}")
+        emission_color_links = foam.inputs["Emission Color"].links
+        emission_strength_links = foam.inputs["Emission Strength"].links
+        if len(emission_color_links) != 1 or emission_color_links[0].from_node != tint:
+            raise AssertionError(f"Host foam tint is disconnected: material={material.name}")
+        if len(emission_strength_links) != 1 or emission_strength_links[0].from_node != readability:
+            raise AssertionError(f"Host foam emission is disconnected: material={material.name}")
         for node in tree.nodes:
             if node.type == "TEX_IMAGE" and (node.image is None or len(node.image.pixels) == 0):
                 raise AssertionError(f"Water texture unavailable after reopen: node={node.name}")

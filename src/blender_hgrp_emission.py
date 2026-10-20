@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+import json
 from typing import NamedTuple
 
 import bpy
@@ -189,7 +190,8 @@ def _sweep_intensity(material: bpy.types.Material, record: MaterialRecord,
 
 def preserve_projected_sweep_origin(material: bpy.types.Material) -> None:
     """Read each projected triangle's receiver origin instead of the decal origin."""
-    if material.get("endfield_emissive_motion_status") != "source_formula_preview_runtime_unresolved":
+    if material.get("endfield_emissive_motion_status") not in (
+            "source_formula_preview_runtime_unresolved", "blender_approximation_runtime_unresolved"):
         return
     nodes, links = material.node_tree.nodes, material.node_tree.links
     origin = nodes.get("EF_SweepObjectOrigin")
@@ -205,6 +207,28 @@ def preserve_projected_sweep_origin(material: bpy.types.Material) -> None:
         links.new(attribute.outputs["Vector"], target)
     nodes.remove(origin)
     material["endfield_emissive_coordinate_status"] = "view_y_relative_to_projected_receiver_origin_blender_camera_proxy"
+
+
+def mark_lit_sweep_approximation(material: bpy.types.Material, record: MaterialRecord) -> None:
+    """Separate the reused Lit core from evidence about the selected source variant."""
+    state = record.get("RenderState")
+    keywords = sorted(state["ValidKeywords"]) if state is not None else []
+    features = [keyword for keyword in keywords if keyword not in (
+        "_EMISSIVE_ANIM_SWEEP", "_EMISSIVE_MAP", "_EMISSIVE_NOMAP", "_EMISSIVE_MASK")]
+    material["endfield_emissive_motion_status"] = "blender_approximation_runtime_unresolved"
+    material["endfield_emissive_motion_reason"] = (
+        "shared_lit_sweep_preview_variant_surface_and_draw_inputs_unverified")
+    material["endfield_emissive_motion_keywords"] = json.dumps(keywords)
+    material["endfield_emissive_approximation_features"] = json.dumps(features)
+    material["endfield_emissive_source_pass"] = "unverified_variant_shared_lit_core"
+    material["endfield_emissive_albedo_status"] = "authored_material_albedo_shared_lit_core_approximation"
+    material["endfield_emissive_albedo_enable_status"] = "source_values_shared_lit_core_approximation"
+    if record["Floats"]["_EmissiveMaskChannel"] in (1, 2, 3):
+        material["endfield_emissive_remap_status"] = "shared_lit_packed_mask_remap_approximation"
+    values = lit_sweep_values(record)
+    material["endfield_emissive_sweep_source_values"] = json.dumps(values._asdict())
+    material["endfield_emissive_preview_status"] = (
+        "authored_sweep_values_blender_camera_and_clock_variant_formula_unverified")
 
 
 def apply_lit_sweep(material: bpy.types.Material, record: MaterialRecord,

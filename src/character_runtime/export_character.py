@@ -18,6 +18,9 @@ from character_geometry_source import geometry_source
 from character_material_options import (
     CharacterMaterialOptions, parse_character_material_options,
 )
+from character_appearance_options import (
+    CharacterAppearanceOptions, parse_character_appearance_options, verify_character_appearance_report,
+)
 
 
 @dataclass(frozen=True)
@@ -53,6 +56,9 @@ class ExportRequest:
     authoring: Path | None
     fur_curves_settings: Path | None
     material_options: CharacterMaterialOptions | None
+    appearance_options: CharacterAppearanceOptions | None
+    potential_json_reader: Path | None
+    potential_scene_probe: Path | None
 
 
 @dataclass(frozen=True)
@@ -118,7 +124,17 @@ def read_request(path: Path) -> ExportRequest:
         source('authoring') if raw.get('authoring') is not None else None,
         source('fur_curves_settings') if raw.get('fur_curves_settings') is not None else None,
         parse_character_material_options(raw['material_options']) if 'material_options' in raw else None,
+        parse_character_appearance_options(raw['appearance_options']) if 'appearance_options' in raw else None,
+        source('potential_json_reader') if 'appearance_options' in raw else None,
+        source('potential_scene_probe') if 'appearance_options' in raw else None,
     )
+    if request.appearance_options is not None:
+        if request.variant != 'characters':
+            raise ValueError('Appearance export currently requires a standalone character selection')
+        if request.material_options is not None and request.material_options.mode != 'original':
+            raise ValueError('Appearance export currently requires original character materials')
+        if request.appearance_options.fur != 'existing' and request.fur_curves_settings is None:
+            raise ValueError('Source-shell appearance requires the installed Fur preparation settings')
     if request.output.exists():
         raise FileExistsError(request.output)
     if request.output.is_relative_to(request.game_root):
@@ -189,6 +205,9 @@ def build_arguments(request: ExportRequest, sample: Path, target: Path,
         arguments.extend(('--fur-curves-preparation', str(sample / 'fur_curves/preparation.json')))
     if material_options_path is not None:
         arguments.extend(('--material-options', str(material_options_path)))
+    if request.appearance_options is not None:
+        arguments.extend(('--appearance-options', str(request.output / 'appearance_options.json'),
+                          '--potential-manifest', str(request.output / 'potential/potential_manifest.json')))
     return tuple(arguments)
 
 
@@ -310,6 +329,12 @@ def main(request_path: Path) -> None:
                 0, 'published_and_copied', str(publish_log), ()))
         sample = job_sample
     print(json.dumps({'stage': 'prepared_ready', 'seconds': time.perf_counter() - started, 'disposition': 'private_prepared_copy_complete'}), flush=True)
+    if request.appearance_options is not None:
+        (request.output / 'appearance_options.json').write_text(
+            json.dumps(request.appearance_options.as_json(), sort_keys=True) + '\n', encoding='utf-8')
+        execute('potential_source', (str(request.python), '-B',
+            str(request.repository_src / 'endfield_character_potential_prepare.py'),
+            '--request', str(request_path), '--output', str(request.output / 'potential')))
     material_options_path = write_material_options(request)
     build_args = build_arguments(request, sample, target, material_options_path)
     common = (str(request.blender), '--background', '--factory-startup', '--disable-autoexec', '--python-exit-code', '1', '--python')
@@ -335,6 +360,16 @@ def main(request_path: Path) -> None:
         report['material_options_sha256'] = hashlib.sha256(request.material_options.canonical_json().encode('utf-8')).hexdigest()
         if cache_identity is not None:
             report['prepared_cache_key'] = cache_identity.key
+    if request.appearance_options is not None:
+        built = require_object(json.loads((target / 'build_receipt.json').read_text(encoding='utf-8')), 'build receipt')
+        expected = request.appearance_options.as_json()
+        if built.get('appearance_options') != expected or audited.get('appearance_options') != expected:
+            raise AssertionError('Saved-file appearance settings differ from the export request')
+        appearance = verify_character_appearance_report(request.appearance_options, built.get('appearance_report'))
+        if audited.get('appearance_report') != appearance:
+            raise AssertionError('Saved-file appearance verification differs from the build receipt')
+        report['appearance_options'] = expected
+        report['appearance_report'] = appearance
     (request.output / 'export_receipt.json').write_text(json.dumps(report, indent=2), encoding='utf-8')
     print(json.dumps({'status': report['status'], 'blend': str(blend), 'completed_seconds': completed_seconds}), flush=True)
 

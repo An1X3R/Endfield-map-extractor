@@ -15,7 +15,7 @@
 
 ## 开始使用
 
-在 [Releases](https://github.com/An1X3R/Endfield-map-extractor/releases/latest) 下载 **Endfield-Extractor-v3.2-windows-x64.zip**，解压后按 [安装与升级说明](docs/INSTALL.md) 完成一次环境准备。
+在 [Releases](https://github.com/An1X3R/Endfield-map-extractor/releases/latest) 下载 **Endfield-Extractor-v3.3-windows-x64.zip**，解压后按 [安装与升级说明](docs/INSTALL.md) 完成一次环境准备。
 
 | 依赖 | 要求 |
 |---|---|
@@ -41,6 +41,8 @@ GitHub 自动生成的 Source code ZIP 不含预编译工具。开发者可查�
 ## 角色材质与 Blender 插件
 
 网页导出可选择原始或精简材质。精简模式可分别选择光照与天气精度，并按需保留湿润、覆雪、雨水效果；原始模式保留完整选项。精简模式侧重修改与迁移便利，效果采用近似实现；组合式 NPC 暂不支持精简材质。
+
+可操控角色使用原始材质时，还可选择基础／满潜外观及绒毛表现。实际支持情况由源数据决定；无对应变体时会在结果中说明，部分附属特效采用快照或近似实现。
 
 角色工作台可作为独立扩展安装，提供骨骼分类、IK、手腕／脚踝旋转、表情及材质天气入口。支持 Blender 4.3+；适用于本提取器导出且带有相应控制数据的文件，不会自动给普通模型绑定骨架或补回旧文件缺少的控制器。
 

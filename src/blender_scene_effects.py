@@ -14,9 +14,10 @@ from blender_build_map02_chunk_20260727 import import_obj, unity_matrix
 from blender_scene_effect_vertex_offset import apply_material_vertex_offset, UnsupportedVertexOffset
 from endfield_scene_material_contract import resolve_export_path
 from extractor_core.particle_curves import UnsupportedParticleCurve, parse_minmax_curve
+from extractor_core.particle_mesh_geometry import load_particle_shape_geometry
 from extractor_core.particle_snapshot import (
     ParticleSnapshotError, SnapshotParticle, UnsupportedParticleSnapshot,
-    generate_particle_snapshot,
+    generate_fixed_emitter_particle_snapshot,
 )
 
 
@@ -371,8 +372,30 @@ def _mesh_templates(manifest: Mapping[str, object], manifest_path: Path,
     return tuple(slots)
 
 
+def _particle_mesh_rotations(particles: tuple[SnapshotParticle, ...],
+                              alignment: int) -> tuple[Quaternion, ...]:
+    """Orient local Unity +Z along velocity while preserving the authored axial spin."""
+    forward = Vector((0.0, -1.0, 0.0))
+    if alignment not in (0, 2, 4):
+        raise UnsupportedParticleSnapshot(f"Unsupported mesh particle alignment: alignment={alignment}")
+    rotations: list[Quaternion] = []
+    for particle in particles:
+        spin = Quaternion(forward, particle.rotation_radians)
+        if alignment == 4:
+            velocity = _vector(particle.velocity)
+            if velocity.length_squared < 1e-16:
+                raise UnsupportedParticleSnapshot(
+                    f"Velocity-aligned mesh has no direction: particle={particle.particle_id}, velocity={particle.velocity}")
+            spin = forward.rotation_difference(velocity.normalized()) @ spin
+        rotations.append(spin)
+    return tuple(rotations)
+
+
 def _particle_mesh_instances(name: str, particles: tuple[SnapshotParticle, ...],
-                             templates: tuple[tuple[bpy.types.Mesh, ...], ...]) -> bpy.types.Mesh:
+                             templates: tuple[tuple[bpy.types.Mesh, ...], ...],
+                             rotations: tuple[Quaternion, ...]) -> bpy.types.Mesh:
+    if len(rotations) != len(particles):
+        raise ValueError("Each mesh particle requires an explicit orientation")
     vertices: list[tuple[float, float, float]] = []
     faces: list[tuple[int, ...]] = []
     face_uvs: list[tuple[tuple[float, float], ...]] = []
@@ -384,7 +407,7 @@ def _particle_mesh_instances(name: str, particles: tuple[SnapshotParticle, ...],
         if any(size < 0 for size in particle.size):
             raise ParticleSnapshotError(f"Negative mesh particle size: size={particle.size}")
         center = _vector(particle.position)
-        rotation = Quaternion(Vector((0.0, -1.0, 0.0)), particle.rotation_radians)
+        rotation = rotations[index]
         for template in templates[particle.particle_id % len(templates)]:
             offset = len(vertices)
             for vertex in template.vertices:
@@ -552,7 +575,8 @@ def build_scene_effects(effect_instances: Sequence[Mapping[str, object]], collec
             if remaining == 0:
                 audit.append(row | {"status": "truncated_particle_limit", "limit": max_particle_objects})
                 continue
-            if render_alignment not in (0, 2) or (render_alignment == 2 and render_mode == 1):
+            if ((render_alignment not in (0, 2) and not (render_alignment == 4 and render_mode == 4))
+                    or (render_alignment == 2 and render_mode == 1)):
                 audit.append(row | {"status": "unsupported_renderer_alignment"})
                 continue
             if _finite(_field(renderer, "CameraVelocityScale", "Renderer"), "Renderer.CameraVelocityScale") != 0.0:
@@ -564,9 +588,10 @@ def build_scene_effects(effect_instances: Sequence[Mapping[str, object]], collec
                     _integer(_field(system, "ScalingMode", "System"), "System.ScalingMode"))
                 world = _blender_matrix(unity_world)
                 local_gravity = _system_gravity_local(gravity_world_unity, unity_world, system)
-                snapshot = generate_particle_snapshot(system, snapshot_age_seconds,
+                shape_geometry = load_particle_shape_geometry(manifest, manifest_path, system)
+                snapshot = generate_fixed_emitter_particle_snapshot(system, snapshot_age_seconds,
                                                      f"{entity_id}:{system_key[0]}:{system_key[1]}",
-                                                     remaining, 100000, local_gravity)
+                                                     remaining, 100000, local_gravity, shape_geometry)
             except (UnsupportedParticleSnapshot, UnsupportedParticleCurve) as error:
                 audit.append(row | {"status": "unsupported_particle_parameters", "reason": str(error)})
                 continue
@@ -598,6 +623,7 @@ def build_scene_effects(effect_instances: Sequence[Mapping[str, object]], collec
                 raise ValueError(f"FX material limitations must be a string array: material={material.name}")
             if not snapshot.particles:
                 audit.append(row | {"status": "no_alive_particles_at_snapshot", "generated": snapshot.generated,
+                                    "preview_scope": snapshot.preview_scope,
                                     "unsupported_modules": list(snapshot.unsupported_modules)})
                 continue
             custom_channels_value = material.get("endfield_fx_custom1_channels")
@@ -612,8 +638,13 @@ def build_scene_effects(effect_instances: Sequence[Mapping[str, object]], collec
                 continue
             if render_mode == 4:
                 templates = _mesh_templates(manifest, manifest_path, renderer, mesh_templates)
+                try:
+                    rotations = _particle_mesh_rotations(snapshot.particles, render_alignment)
+                except UnsupportedParticleSnapshot as error:
+                    audit.append(row | {"status": "unsupported_renderer_alignment", "reason": str(error)})
+                    continue
                 mesh = _particle_mesh_instances(f"EF_FX_{entity_id}_{system_key[1]}",
-                                                snapshot.particles, templates)
+                                                snapshot.particles, templates, rotations)
             else:
                 mesh = _particle_mesh_aligned(f"EF_FX_{entity_id}_{system_key[1]}", snapshot.particles, world,
                                               snapshot_camera, render_mode, render_alignment,
@@ -671,10 +702,12 @@ def build_scene_effects(effect_instances: Sequence[Mapping[str, object]], collec
                                 "trail_segments": len(trail_mesh.polygons) if trail_mesh is not None else 0,
                                 "truncated_particles": snapshot.truncated,
                                 "unsupported_modules": list(snapshot.unsupported_modules),
+                                "preview_scope": snapshot.preview_scope,
                                 "material_limitations": material_limitations,
                                 "vertex_offset_scope": mesh.get("endfield_fx_vertex_offset_scope"),
                                 "render_mode": render_mode,
-                                "render_approximation": ("local_transform_static_quad" if render_alignment == 2 and render_mode == 0
+                                "render_approximation": ("velocity_aligned_source_mesh_host_forward_axis" if render_alignment == 4
+                                                         else "local_transform_static_quad" if render_alignment == 2 and render_mode == 0
                                                          else "local_transform_mesh_slot_static_geometry" if render_alignment == 2
                                                          else {0: "camera_facing_static_quad",
                                                                1: "camera_facing_stretched_static_quad",

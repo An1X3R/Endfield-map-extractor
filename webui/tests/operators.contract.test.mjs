@@ -106,4 +106,44 @@ assert.throws(() => api.parseCharacterJob({ ...job, result: { ...result, materia
 const combined = { materials: actual, basic_mmd: true, raw_expressions: true, animation: { action_id: 'action-current', maximum_stored_frames: 300 } }
 assert.deepEqual(api.parseCharacterExportRequest({ ...request, options: combined }).options, combined)
 
+const { assertAppearanceAcknowledgement, appearanceRestriction, describeAppearance } = await import('../src/features/operators/appearance.ts')
+const withAppearance = appearance => api.parseCharacterExportRequest({ ...request, options: { materials: original, appearance } }).options.appearance
+for (const potential of ['base', 'maximum']) {
+  for (const fur of ['existing', 'source_shell', 'charcoal_embers']) {
+    const appearance = { potential, fur }
+    assert.deepEqual(withAppearance({ ...appearance, extra: 'discard' }), appearance)
+    assert.doesNotThrow(() => assertAppearanceAcknowledgement(appearance, { fur, potential }))
+    assert.throws(() => assertAppearanceAcknowledgement(appearance, undefined), /停止提交/)
+    assert.throws(() => assertAppearanceAcknowledgement(appearance, { potential: potential === 'base' ? 'maximum' : 'base', fur }), /停止提交/)
+  }
+}
+for (const invalid of [null, {}, { potential: 'base' }, { fur: 'existing' }, { potential: 'max', fur: 'existing' }, { potential: 'base', fur: 'native' }]) {
+  assert.throws(() => withAppearance(invalid), /appearance/)
+}
+assert.doesNotThrow(() => assertAppearanceAcknowledgement(undefined, undefined))
+assert.throws(() => assertAppearanceAcknowledgement(undefined, { potential: 'base', fur: 'existing' }), /停止提交/)
+assert.throws(() => api.parseCharacterExportRequest({ ...request, options: { materials: actual, appearance: { potential: 'base', fur: 'existing' } } }), /appearance/)
+assert.match(appearanceRestriction(npc, original), /普通角色/)
+assert.match(appearanceRestriction({ ...npc, entry_kind: 'playable' }, actual), /原始材质/)
+assert.equal(appearanceRestriction({ ...npc, entry_kind: 'playable' }, original), null)
+const appearanceOptions = { potential: 'maximum', fur: 'charcoal_embers' }
+const appearanceReport = {
+  format: 'EndfieldCharacterAppearance/1', status: 'partial',
+  potential: { requested: 'maximum', status: 'partial', scope: 'fixed emitter snapshot', pending: [{ reason: 'runtime particle limits' }] },
+  fur: { requested: 'charcoal_embers', status: 'applied', verification: { artist_applied_count: 1, artist_skipped_count: 2 } },
+}
+const appearanceResult = { ...result, appearance_options: appearanceOptions, appearance_report: appearanceReport }
+const parsedAppearance = api.parseCharacterJob({ ...job, result: appearanceResult }).result
+assert.deepEqual(parsedAppearance.appearance_options, appearanceOptions)
+assert.equal(parsedAppearance.appearance_report.potential.pending[0], '{"reason":"runtime particle limits"}')
+assert.match(describeAppearance(parsedAppearance.appearance_report), /满潜外观：部分应用；炭绒暗燃：已应用/)
+for (const invalid of [
+  { ...result, appearance_options: appearanceOptions },
+  { ...result, appearance_report: appearanceReport },
+  { ...appearanceResult, appearance_report: { ...appearanceReport, status: 'completed' } },
+  { ...appearanceResult, appearance_options: { ...appearanceOptions, potential: 'base' } },
+  { ...appearanceResult, appearance_report: { ...appearanceReport, fur: { ...appearanceReport.fur, status: 'native' } } },
+  { ...appearanceResult, appearance_report: { ...appearanceReport, fur: { ...appearanceReport.fur, verification: { artist_applied_count: -1 } } } },
+]) assert.throws(() => api.parseCharacterJob({ ...job, result: invalid }), /appearance/)
+
 process.stdout.write('Operator category, capability, rejection, binding and request contracts passed.\n')

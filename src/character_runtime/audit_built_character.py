@@ -29,7 +29,7 @@ def main(args: argparse.Namespace) -> None:
     if io_path(args.output).exists():
         raise FileExistsError(args.output)
     sys.path.insert(0, str(args.repository_src))
-    from audit_character_materials import source_geometry_digest
+    from audit_character_materials import source_geometry_digest_with_visibility
     from attach_character_live_shadows import SHADOW_MODIFIER
     from preview_character import verify_saved_static_bind_pose
     from review_character_skin_lights import refresh
@@ -106,8 +106,12 @@ def main(args: argparse.Namespace) -> None:
         hair_fur_snow_audit = (verify_profile_hair_fur_snow(object_value(receipt['hair_fur_snow'], 'Hair/Fur snow'))
                                if 'hair_fur_snow' in receipt else None)
     from character_fur_curves_profile import verify_profile_fur_curves
-    fur_curves_snow_audit = verify_profile_fur_curves(
-        object_value(receipt.get('fur_curves_snow', {'status': 'not_requested'}), 'Fur Curves snow'))
+    fur_receipt = object_value(receipt.get('fur_curves_snow', {'status': 'not_requested'}), 'Fur Curves snow')
+    if fur_receipt.get('format') == 'EndfieldPreparedSourceFurShells/1':
+        from character_fur_backend import verify_backend_fur_shells
+        fur_curves_snow_audit = verify_backend_fur_shells(fur_receipt)
+    else:
+        fur_curves_snow_audit = verify_profile_fur_curves(fur_receipt)
     special_lights = object_value(receipt['special_lights'], 'special lights')
     special_lights_audit = None
     if special_lights.get('status') == 'not_applicable':
@@ -123,6 +127,13 @@ def main(args: argparse.Namespace) -> None:
     names = tuple(original_geometry)
     if not names or any(name not in bpy.data.objects or bpy.data.objects[name].type != 'MESH' for name in names):
         raise AssertionError('Saved character is missing a source mesh')
+    source_visibility: dict[str, tuple[bool, bool, bool]] = {}
+    if 'appearance_options' in receipt:
+        from character_potential_build import verify_potential_appearance
+        from character_rig_authoring import _potential_source_visibility
+        appearance = object_value(receipt['appearance_report'], 'appearance report')
+        verify_potential_appearance(object_value(appearance['potential'], 'potential appearance'), bpy.context.scene)
+        source_visibility = _potential_source_visibility(tuple(bpy.data.objects[name] for name in names))
     visibility = {name: [bpy.data.objects[name].hide_render, bpy.data.objects[name].hide_viewport, bpy.data.objects[name].hide_get()] for name in names}
     if visibility != receipt['source_visibility']:
         raise AssertionError('Source visibility differs after scripts-disabled reopening')
@@ -197,7 +208,7 @@ def main(args: argparse.Namespace) -> None:
             raise AssertionError(f'Missing live shadow receiver modifier: {name}')
         obj.modifiers.remove(modifier)
     refresh()
-    after = source_geometry_digest(names)
+    after = source_geometry_digest_with_visibility(names, source_visibility)
     if after != original_geometry:
         changed = tuple(name for name in names if after[name] != original_geometry[name])
         raise AssertionError(f'Saved geometry, UVs, weights or shape keys differ: {changed}')
@@ -224,6 +235,16 @@ def main(args: argparse.Namespace) -> None:
               'build_receipt_sha256': hashlib.sha256(io_path(args.build_receipt).read_bytes()).hexdigest()}
     if material_variant_declared:
         report['material_variant'] = material_variant_audit
+    if 'appearance_options' in receipt:
+        from character_appearance_options import parse_character_appearance_options, verify_character_appearance_report
+        from character_potential_build import verify_potential_appearance
+        appearance_options = parse_character_appearance_options(receipt['appearance_options'])
+        appearance_report = verify_character_appearance_report(appearance_options, receipt.get('appearance_report'))
+        verify_potential_appearance(appearance_report['potential'], bpy.context.scene)
+        if appearance_options.fur != 'existing' and fur_receipt.get('presentation_mode') != appearance_options.fur:
+            raise AssertionError('Reopened Fur presentation differs from the requested appearance')
+        report['appearance_options'] = appearance_options.as_json()
+        report['appearance_report'] = appearance_report
     io_path(args.output).write_text(json.dumps(report, indent=2), encoding='utf-8')
     print(json.dumps({'status': 'passed', 'source_renderers': len(names), 'packed_image_roles': len(images)}))
 

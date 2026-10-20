@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -11,10 +12,13 @@ import unittest
 from uuid import uuid4
 
 from endfield_character_cache import CharacterSourceChangedError, source_stamp
+from endfield_character_runtime import configure_character_runtime
 from endfield_character_service import (
     CharacterService, CharacterServiceError, _PATH_DEFAULTS, _VALUE_DEFAULTS, require_character_export_blender,
 )
 from endfield_character_sources import CharacterSourceContext, game_source_stamps, prepare_character_sources
+from endfield_character_tools import character_tool_source_identity
+from endfield_dependency_bootstrap import helper_source_identity
 from webui_character_worker import CharacterJobCancelled
 
 
@@ -62,6 +66,141 @@ class CharacterServiceTests(unittest.TestCase):
                 key: asdict(source_stamp(getattr(self.context, key))) for key in
                 ("provider_index", "resource_database", "cab_inventory")}}
 
+    def _runtime2_service(self, export_defaults: dict[str, object],
+                          npc_assembly_tools: dict[str, object] | None) -> CharacterService:
+        reader = self.root / "json-reader.exe"
+        reader.write_bytes(b"verified reader fixture")
+        receipt = self.root / "character_tools.json"
+        receipt.write_text(json.dumps({
+            "format": "EndfieldCharacterTools/1", "status": "built",
+            "source_identity": character_tool_source_identity(),
+            "files": {reader.name: {"bytes": reader.stat().st_size,
+                                    "sha256": hashlib.sha256(reader.read_bytes()).hexdigest()}},
+            "tools": {"json_reader": reader.name},
+        }), encoding="utf-8")
+        config = {**self.config, "format": "EndfieldCharacterRuntime/2", "tools_receipt": str(receipt),
+                  "export_defaults": {**self.config["export_defaults"], **export_defaults},
+                  "npc_assembly_tools": npc_assembly_tools}
+        self.config_path.write_text(json.dumps(config), encoding="utf-8")
+        return CharacterService(self.config_path)
+
+    def _write_scene_helper_receipt(self) -> Path:
+        identity = helper_source_identity(Path(__file__).resolve().parents[1])
+        helper_root = self.context.cache_root / "helpers" / identity[:16]
+        outputs: dict[str, object] = {}
+
+        def descriptor(path: Path, parent: Path) -> dict[str, object]:
+            payload = path.read_bytes()
+            return {"path": path.relative_to(parent).as_posix(), "bytes": len(payload),
+                    "sha256": hashlib.sha256(payload).hexdigest().upper()}
+
+        for name in ("bundleScanner", "sceneProbe"):
+            executable_root = helper_root / "bin" / name
+            executable_root.mkdir(parents=True, exist_ok=True)
+            files = {f"{name}.exe": f"{name} executable fixture".encode(),
+                     f"{name}.dll": f"{name} assembly fixture".encode(),
+                     f"{name}.runtimeconfig.json": b'{"fixture":true}'}
+            for filename, payload in files.items():
+                (executable_root / filename).write_bytes(payload)
+            executable = executable_root / f"{name}.exe"
+            assembly = executable.with_suffix(".dll")
+            outputs[name] = {
+                **descriptor(executable, helper_root),
+                "assembly": descriptor(assembly, helper_root),
+                "runtimeFiles": [descriptor(executable_root / filename, executable_root) for filename in files],
+            }
+        receipt = helper_root / "current.json"
+        receipt.write_text(json.dumps({"sourceIdentity": identity, "outputs": outputs}), encoding="utf-8")
+        return receipt
+
+    def test_appearance_runtime_defaults_normalize_configured_tool_paths(self) -> None:
+        reader = self.root / "json-reader.exe"
+        reader.write_bytes(b"reader")
+        scene_probe = self.root / "sceneProbe.exe"
+        scene_probe.write_bytes(b"scene probe")
+        service = self._runtime2_service({"potential_json_reader": reader.name,
+                                          "potential_scene_probe": scene_probe.name}, None)
+
+        _, defaults = service._runtime_defaults(
+            {"appearance": {"potential": "base", "fur": "existing"}}, self.context)
+
+        self.assertEqual(str(reader.resolve()), defaults["potential_json_reader"])
+        self.assertEqual(str(scene_probe.resolve()), defaults["potential_scene_probe"])
+
+    def test_appearance_runtime_defaults_resolve_legacy_tools_from_verified_receipts(self) -> None:
+        self._write_scene_helper_receipt()
+        reader = self.root / "json-reader.exe"
+        service = self._runtime2_service({}, {"json_reader": str(reader)})
+
+        _, defaults = service._runtime_defaults(
+            {"appearance": {"potential": "base", "fur": "existing"}}, self.context)
+
+        self.assertEqual(str(reader.resolve()), defaults["potential_json_reader"])
+        self.assertEqual(str((self.context.cache_root / "helpers" /
+                              helper_source_identity(Path(__file__).resolve().parents[1])[:16] /
+                              "bin" / "sceneProbe" / "sceneProbe.exe").resolve()),
+                         defaults["potential_scene_probe"])
+
+    def test_runtime_generation_includes_verified_appearance_tool_paths(self) -> None:
+        self._write_scene_helper_receipt()
+        names = ("static_reader", "shader_reader", "visibility_reader", "json_reader", "animation_reader",
+                 "auxiliary_sampler", "controller_audit", "expression_reader", "snow_channel_reader",
+                 "npc_assembly_probe", "npc_shader_probe", "npc_animation_reader", "weather_reader")
+        files: dict[str, object] = {}
+        tool_paths: dict[str, str] = {}
+        for name in names:
+            path = self.root / f"{name}.exe"
+            path.write_bytes(f"{name} fixture".encode())
+            files[path.name] = {"bytes": path.stat().st_size,
+                                "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+            tool_paths[name] = path.name
+        receipt = self.root / "runtime_tools.json"
+        receipt.write_text(json.dumps({
+            "format": "EndfieldCharacterTools/1", "status": "built",
+            "source_identity": character_tool_source_identity(), "files": files, "tools": tool_paths,
+        }), encoding="utf-8")
+        destination = self.root / "generated_runtime.json"
+
+        configure_character_runtime(receipt, self.context.blender, self.context.blender,
+                                    self.context.cache_root, destination)
+
+        document = json.loads(destination.read_text(encoding="utf-8"))
+        defaults = document["export_defaults"]
+        json_reader = (destination.parent / defaults["potential_json_reader"]).resolve()
+        scene_probe = (destination.parent / defaults["potential_scene_probe"]).resolve()
+        self.assertEqual((self.root / tool_paths["json_reader"]).resolve(), json_reader)
+        self.assertEqual((self.context.cache_root / "helpers" /
+                          helper_source_identity(Path(__file__).resolve().parents[1])[:16] /
+                          "bin" / "sceneProbe" / "sceneProbe.exe").resolve(), scene_probe)
+        self.assertEqual("EndfieldCharacterRuntime/2", document["format"])
+
+    def test_missing_appearance_tool_fields_do_not_affect_legacy_requests(self) -> None:
+        service = CharacterService(self.config_path)
+
+        _, defaults = service._runtime_defaults({}, None)
+
+        self.assertNotIn("potential_json_reader", defaults)
+        self.assertNotIn("potential_scene_probe", defaults)
+        upgraded_config = self._runtime2_service(
+            {"potential_json_reader": "missing-reader.exe", "potential_scene_probe": "missing-probe.exe"}, None)
+        _, upgraded_defaults = upgraded_config._runtime_defaults({}, None)
+        self.assertNotIn("potential_json_reader", upgraded_defaults)
+        self.assertNotIn("potential_scene_probe", upgraded_defaults)
+
+    def test_appearance_runtime_defaults_fail_for_missing_configured_tools(self) -> None:
+        missing_reader = self._runtime2_service(
+            {"potential_json_reader": "missing-reader.exe", "potential_scene_probe": "missing-probe.exe"},
+            {"json_reader": str(self.root / "json-reader.exe")})
+        with self.assertRaisesRegex(CharacterServiceError, "满潜源配置读取器"):
+            missing_reader._runtime_defaults(
+                {"appearance": {"potential": "base", "fur": "existing"}}, self.context)
+
+        missing_probe = self._runtime2_service(
+            {"potential_json_reader": "json-reader.exe", "potential_scene_probe": "missing-probe.exe"}, None)
+        with self.assertRaisesRegex(CharacterServiceError, "满潜场景探针"):
+            missing_probe._runtime_defaults(
+                {"appearance": {"potential": "base", "fur": "existing"}}, self.context)
+
     def test_validation_rejects_both_overlap_directions_and_relative_paths(self) -> None:
         source = self.request["source"]
         for field in ("cache_root", "output_root"):
@@ -86,11 +225,11 @@ class CharacterServiceTests(unittest.TestCase):
         values = {**self.config, 'export_defaults': {
             **self.config['export_defaults'], 'fur_curves_settings': 'fur.json'}}
         self.config_path.write_text(json.dumps(values), encoding='utf-8')
-        _, defaults = CharacterService(self.config_path)._runtime_defaults()
+        _, defaults = CharacterService(self.config_path)._runtime_defaults({}, None)
         self.assertEqual(defaults['fur_curves_settings'], str(settings))
         settings.unlink()
         with self.assertRaisesRegex(CharacterServiceError, 'fur_curves_settings'):
-            CharacterService(self.config_path)._runtime_defaults()
+            CharacterService(self.config_path)._runtime_defaults({}, None)
 
     def test_prefab_actions_require_only_their_actual_reader_tools(self) -> None:
         tool = self.context.blender

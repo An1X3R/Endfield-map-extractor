@@ -12,6 +12,7 @@ type Props = {
   active: boolean
   previousMap: CanvasMapSnapshot | null
   overviewUrl: string | null
+  emptyLabel: string
   metadata: LevelMap | null
   preview: boolean
   onImageReady: (ready: boolean) => void
@@ -24,7 +25,7 @@ type Props = {
   disabled: boolean
 }
 
-export function PaintingMap({ active, previousMap, overviewUrl, metadata, preview, onImageReady, onImageError, onHandoffChange, layers, selection, onSelectionChange, revision, disabled }: Props) {
+export function PaintingMap({ active, previousMap, overviewUrl, emptyLabel, metadata, preview, onImageReady, onImageError, onHandoffChange, layers, selection, onSelectionChange, revision, disabled }: Props) {
   const svgRef = useRef<SVGSVGElement>(null)
   const stageRef = useRef<HTMLElement>(null)
   const oldMaskRef = useRef<SVGPathElement>(null)
@@ -182,6 +183,6 @@ export function PaintingMap({ active, previousMap, overviewUrl, metadata, previe
     <button type="button" className="si-replay-entrance" data-testid="si-replay-entrance" onClick={() => { setShowPrevious(false); setReplay(value => value + 1) }}>↗ 重播入画</button>
     <div className="si-map-tools"><button type="button" data-testid="si-zoom-in" aria-label="放大地图" onClick={() => setBoundedZoom(zoom + .15)}>+</button><button type="button" data-testid="si-zoom-out" aria-label="缩小地图" onClick={() => setBoundedZoom(zoom - .15)}>−</button><button type="button" data-testid="si-zoom-reset" aria-label="复位地图视图" onClick={() => setZoom(1)}>⌖</button></div>
     <div className="si-map-instructions">DRAG / 框选 <span>WHEEL / 缩放</span><b>{Math.round(zoom * 100)}%</b></div>
-    {!overviewUrl && <div className="si-map-scale"><i>{preview ? '构图占位 · 不能用于真实导出' : '画境地图尚未准备'}</i></div>}
+    {!overviewUrl && <div className="si-map-scale"><i>{preview ? '构图占位 · 不能用于真实导出' : emptyLabel}</i></div>}
   </section>
 }

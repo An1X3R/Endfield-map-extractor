@@ -22,17 +22,27 @@ def prepare_providers_bundles(context: CharacterSourceContext, providers: tuple[
                               output: Path, check_cancelled: Callable[[], None],
                               progress: Callable[[str, float, str], None]) -> tuple[CharacterExtractedBundle, ...]:
     """Extract the union of exact providers without duplicate dependency payloads."""
+    return prepare_source_provider_bundles(context.game_root, context.provider_index, context.resource_database,
+        context.cab_inventory, context.cache_root, providers, output, check_cancelled, progress)
+
+
+def prepare_source_provider_bundles(game_root: Path, provider_index: Path, resource_database: Path,
+                                   cab_inventory: Path, cache_root: Path,
+                                   providers: tuple[CharacterResourceProvider, ...], output: Path,
+                                   check_cancelled: Callable[[], None],
+                                   progress: Callable[[str, float, str], None]) -> tuple[CharacterExtractedBundle, ...]:
+    """Extract exact resource providers independently of any character selection model."""
     check_cancelled()
-    validate_character_storage(context.game_root, output)
+    validate_character_storage(game_root, output)
     if output.exists() or output.is_symlink():
         raise FileExistsError(f"Provider bundle output already exists: {output}")
     roots = tuple(sorted({_logical_bundle_name(provider.logical_name, "selected provider") for provider in providers}))
     if not roots:
         raise CharacterPreparationError("Provider extraction requires at least one exact source")
-    inputs = (context.provider_index, context.resource_database, context.cab_inventory)
+    inputs = (provider_index, resource_database, cab_inventory)
     before = tuple(source_stamp(path) for path in inputs)
-    cache = CharacterDataCache(context.cache_root)
-    index, _ = cache.read_character_cab_index(context.cab_inventory, check_cancelled)
+    cache = CharacterDataCache(cache_root)
+    index, _ = cache.read_character_cab_index(cab_inventory, check_cancelled)
     for provider in providers:
         serialized = dict(index.bundle_serialized).get(provider.logical_name)
         expected = {cab.name.replace("\\", "/").rsplit("/", 1)[-1].casefold() for cab in provider.serialized_cabs}
@@ -52,8 +62,8 @@ def prepare_providers_bundles(context: CharacterSourceContext, providers: tuple[
     def extraction_progress(stage: str, fraction: float, message: str, details: dict[str, object] | None) -> None:
         progress("extracting", fraction, message)
 
-    result = extract_candidate_bundles(context.resource_database,
-        context.game_root / "Endfield_Data/StreamingAssets/VFS", list(names), output,
+    result = extract_candidate_bundles(resource_database,
+        game_root / "Endfield_Data/StreamingAssets/VFS", list(names), output,
         progress=extraction_progress, cancelled=cancelled)
     if tuple(source_stamp(path) for path in inputs) != before:
         raise CharacterSourceChangedError("Character provider inputs changed during extraction")

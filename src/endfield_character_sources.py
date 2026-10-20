@@ -113,7 +113,7 @@ def prepare_character_sources(
             progress("preparing", .2 + .5 * (current / total if total else 1.), "Scanning character providers and dependencies")
 
         run_scanner_shards(scanner, index, scan_work, workspace / "scan.log", 0, count,
-                           scanner_capacity(count), check_cancelled, scan_progress, observe_helper)
+                           scanner_capacity(count), ("assets/",), check_cancelled, scan_progress, observe_helper)
         result = CharacterSourceContext(source.game_root, source.blender, source.cache_root, source.output_root,
                                         scan_work / "bundle_candidates.jsonl", database,
                                         scan_work / "bundle_cab_inventory.jsonl")

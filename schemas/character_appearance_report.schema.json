@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "EndfieldCharacterAppearanceReport-1",
+  "title": "Endfield character appearance completion report",
+  "type": "object",
+  "required": ["format", "status", "potential", "fur"],
+  "properties": {
+    "format": {"const": "EndfieldCharacterAppearance/1"},
+    "status": {"type": "string", "enum": ["completed", "partial"]},
+    "potential": {
+      "type": "object",
+      "required": ["requested", "status"],
+      "properties": {
+        "requested": {"type": "string", "enum": ["base", "maximum"]},
+        "status": {"type": "string", "enum": ["applied", "not_applicable", "partial"]}
+      },
+      "additionalProperties": true
+    },
+    "fur": {
+      "type": "object",
+      "required": ["requested", "status"],
+      "properties": {
+        "requested": {"type": "string", "enum": ["existing", "source_shell", "charcoal_embers"]},
+        "status": {"type": "string", "enum": ["applied", "not_applicable", "partial", "unchanged"]}
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true
+}

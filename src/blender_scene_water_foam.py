@@ -17,6 +17,46 @@ from blender_scene_water_waves import (
 from endfield_scene_water_materials import WaterMaterialRow
 
 
+_HOST_SECTION = "Host Presentation"
+_HOST_NOTE = "Optional foam emission; 0 is neutral."
+_HOST_READABILITY_NODE = "EF_Water_Host_Foam_Readability"
+_HOST_TINT_NODE = "EF_Water_Host_Foam_Tint"
+
+
+def _ensure_host_foam_emission(
+    tree: bpy.types.NodeTree,
+    foam: bpy.types.Node,
+) -> None:
+    readability = tree.nodes.get(_HOST_READABILITY_NODE)
+    if readability is None:
+        readability = tree.nodes.new("ShaderNodeValue")
+        readability.name = _HOST_READABILITY_NODE
+        readability.outputs[0].default_value = 0.0
+    elif readability.bl_idname != "ShaderNodeValue":
+        raise TypeError(f"Water foam readability control has the wrong type: type={readability.bl_idname}")
+    readability.label = "Host Foam Readability (0 = neutral)"
+
+    tint = tree.nodes.get(_HOST_TINT_NODE)
+    if tint is None:
+        tint = tree.nodes.new("ShaderNodeRGB")
+        tint.name = _HOST_TINT_NODE
+        tint.outputs[0].default_value = (1.0, 1.0, 1.0, 1.0)
+    elif tint.bl_idname != "ShaderNodeRGB":
+        raise TypeError(f"Water foam tint control has the wrong type: type={tint.bl_idname}")
+    tint.label = "Host Foam Tint"
+
+    emission_color = foam.inputs.get("Emission Color")
+    emission_strength = foam.inputs.get("Emission Strength")
+    if emission_color is None or emission_strength is None:
+        raise ValueError(f"Water foam surface does not support host emission: node={foam.name}")
+    tree.links.new(tint.outputs[0], emission_color)
+    tree.links.new(readability.outputs[0], emission_strength)
+
+    for node in (readability, tint):
+        node["endfield_layout_section"] = _HOST_SECTION
+        node["endfield_layout_note"] = _HOST_NOTE
+
+
 def _clamp(tree: bpy.types.NodeTree, name: str,
            value: bpy.types.NodeSocket) -> bpy.types.NodeSocket:
     return _math(tree, name + "_Upper", "MINIMUM",
@@ -38,6 +78,25 @@ def _small_alpha(tree: bpy.types.NodeTree, use_flow_map: bool) -> bpy.types.Node
                       first.outputs["Alpha"], second.outputs["Alpha"])
 
 
+def _depends_on(node: bpy.types.Node, target: bpy.types.Node) -> bool:
+    pending = [node]
+    visited: set[int] = set()
+    while pending:
+        current = pending.pop()
+        pointer = current.as_pointer()
+        if pointer in visited:
+            continue
+        visited.add(pointer)
+        if current == target:
+            return True
+        pending.extend(
+            link.from_node
+            for socket in current.inputs
+            for link in socket.links
+        )
+    return False
+
+
 def reconnect_source_water_foam(material: bpy.types.Material) -> None:
     """Retain the source mask when the underlying portable/transport surface changes."""
     tree = material.node_tree
@@ -56,6 +115,7 @@ def reconnect_source_water_foam(material: bpy.types.Material) -> None:
     mask = tree.nodes.get("EF_Water_Foam_Coverage")
     if mask is None:
         raise ValueError("Water foam surface has no source coverage output")
+    _ensure_host_foam_emission(tree, foam)
     for output in outputs:
         target = output.inputs["Surface"]
         source = target.links[0].from_socket
@@ -66,11 +126,18 @@ def reconnect_source_water_foam(material: bpy.types.Material) -> None:
             mix.name = name
             mix.label = "Source foam coverage / " + output.target
             mix["endfield_layout_section"] = "08 Source Foam"
+        elif mix.bl_idname != "ShaderNodeMixShader":
+            raise TypeError(f"Water foam mix has the wrong type: target={output.target}, type={mix.bl_idname}")
+        if _depends_on(source.node, mix):
+            if not mix.inputs[1].is_linked or _depends_on(mix.inputs[1].links[0].from_node, mix):
+                raise ValueError(f"Water foam base surface is missing or recursive: target={output.target}")
+            tree.links.new(mask.outputs[0], mix.inputs[0])
+            tree.links.new(foam.outputs["BSDF"], mix.inputs[2])
+            continue
+        tree.links.new(source, mix.inputs[1])
         tree.links.new(mask.outputs[0], mix.inputs[0])
         tree.links.new(foam.outputs["BSDF"], mix.inputs[2])
-        if source.node != mix:
-            tree.links.new(source, mix.inputs[1])
-            tree.links.new(mix.outputs[0], target)
+        tree.links.new(mix.outputs[0], target)
     layout_shader_node_tree(tree)
 
 
@@ -138,6 +205,6 @@ def build_source_water_foam(material: bpy.types.Material, spec: WaterMaterialRow
     for node in set(tree.nodes) - start:
         node["endfield_layout_section"] = "08 Source Foam"
     material["endfield_water_foam_status"] = "source_mask_host_surface"
-    material["endfield_water_foam_boundary"] = "Source field-B/wave-alpha mask and authored foam color; Blender camera distance and Principled illumination. Native GBuffer lighting, anonymous descriptor binding and camera-relative atlas edge fade remain unverified."
+    material["endfield_water_foam_boundary"] = "Source field-B/wave-alpha mask and authored foam color; Blender camera distance and Principled illumination. Optional host emission accent defaults to zero. Native GBuffer lighting, anonymous descriptor binding and camera-relative atlas edge fade remain unverified."
     reconnect_source_water_foam(material)
     return "source_mask_host_surface"

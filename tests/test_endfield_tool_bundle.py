@@ -117,9 +117,14 @@ class ToolBundleIntegrationTests(unittest.TestCase):
             moved.parent.parent.mkdir(parents=True)
             destination.parent.rename(moved.parent)
             repaired = self.configure_release(moved)
-            _, defaults = CharacterService(repaired)._runtime_defaults()
+            _, defaults = CharacterService(repaired)._runtime_defaults({}, None)
             self.assertEqual(self.python, Path(str(defaults["python"])))
             self.assertEqual(moved.parent / "src", Path(str(defaults["repository_src"])))
+            runtime_config = json.loads(repaired.read_text(encoding="utf-8"))
+            for field in ("potential_json_reader", "potential_scene_probe"):
+                value = Path(runtime_config["export_defaults"][field])
+                resolved = (repaired.parent / value).resolve() if not value.is_absolute() else value.resolve()
+                self.assertTrue(resolved.is_file(), f"{field}={resolved}")
             self.assertEqual(state_before, (repaired.parent / "state" / state.name).read_bytes())
 
     def test_upgrade_rebinds_replaced_readers_and_preserves_artist_options(self) -> None:
@@ -141,6 +146,10 @@ class ToolBundleIntegrationTests(unittest.TestCase):
             installed = read_character_tools(read_tool_bundle(destination).character_receipt)
             self.assertEqual(installed["json_reader"], (runtime.parent / updated["authoring_tools"]["controller_json_reader"]).resolve())
             self.assertEqual(37, updated["export_defaults"]["cycles_samples"])
+            potential_reader = (runtime.parent / updated["export_defaults"]["potential_json_reader"]).resolve()
+            scene_probe = (runtime.parent / updated["export_defaults"]["potential_scene_probe"]).resolve()
+            self.assertEqual(installed["json_reader"], potential_reader)
+            self.assertTrue(scene_probe.is_file())
             snow = json.loads(settings_path.read_text(encoding="utf-8"))["tools"]["snow_channel_probe"]
             self.assertEqual(installed["snow_channel_reader"], (runtime.parent / snow["path"]).resolve())
             self.assertNotEqual("0" * 64, snow["sha256"])
