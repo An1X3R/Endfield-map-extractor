@@ -26,7 +26,7 @@ def validate_dither_mesh(record: MaterialRecord, vertex_color_components: int) -
     disabled = state.get("DisabledShaderPasses")
     if not isinstance(disabled, list) or "DepthOnly" in disabled or "HGBuffer" in disabled:
         raise NotImplementedError(f"Dither requires source HGBuffer and DepthOnly passes: material={record['Name']}")
-    if state.get("CustomRenderQueue") != 2000:
+    if state.get("CustomRenderQueue") not in (2000, 2450):
         raise NotImplementedError(f"Dither source queue is not verified: material={record['Name']}")
     floats, colors = record["Floats"], record["Colors"]
     for name in ("_InParticle", "_DisableVertColor", "_TintColorIntensity", "_TintColorAlpha",
@@ -97,6 +97,7 @@ def make_dither_mesh_material(record: MaterialRecord, textures: dict[tuple[str, 
     alpha = _math(tree, "Dither Source Tint Alpha", "MULTIPLY", sample.rgba.alpha, tint[3] * floats["_TintColorAlpha"])
     limitations = [*sample.limitations,
         "Compiled VFXDitherAlpha HGBuffer RGB and DepthOnly discard are combined into one Blender surface; Unity equal-depth/stencil and deferred GBuffer pipeline are approximated",
+        "Source Geometry/AlphaTest queue ordering is retained as evidence; Blender does not reproduce Unity draw ordering",
         "Game exposure is an explicit reference of one; game grading is not captured",
         "Source TAA noise phase is an editable zero reference; Blender raster sample positions and game TAA differ",
         "Runtime instance vertex-color attenuation and disappearance are explicit zero references; source streams are unchanged"]

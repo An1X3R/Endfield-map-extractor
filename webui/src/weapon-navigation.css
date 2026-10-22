@@ -1,0 +1,53 @@
+/* Keep the two entity workspaces adjacent in the existing navigation. */
+.app-shell .map-switch.map-switch-with-painting.map-switch-with-weapons {
+  grid-template-columns: repeat(3, minmax(0, 1fr)) 24px minmax(0, 1.05fr) 24px repeat(2, minmax(0, 1fr));
+  width: clamp(1060px, 56vw, 1400px);
+  min-width: 0;
+}
+.app-shell .map-switch-with-weapons button { grid-template-columns: 30px minmax(0, 1fr) 10px; gap: 7px; padding-inline: 9px; }
+.app-shell .map-switch-with-weapons .map-switch-copy strong { font-size: clamp(15px, .82vw, 21px); }
+.app-shell .map-switch-with-weapons .map-thumb { width: 30px; }
+.app-shell .weapon-navigation-tab { color: #bcc8cf; background: #171c22; border-left: 1px solid #ffffff29; }
+.app-shell .weapon-navigation-tab .map-switch-copy strong { color: #bcc8cf; }
+.app-shell .weapon-navigation-tab .map-switch-copy small { color: #aeb8ba; }
+.app-shell .weapon-navigation-tab.active { color: white; background: #202a33; box-shadow: inset 0 -3px #ffad34; }
+.app-shell .weapon-navigation-tab.active .map-switch-copy strong { color: white; }
+.weapon-navigation-icon { width: 22px; height: 22px; justify-self: center; }
+.weapon-navigation-tab.active .weapon-navigation-icon { color: #ffad34; }
+.app-shell.mode-weapons { --accent: #ffad34; --paper: #edf1f5; --ink: #17232d; }
+.mode-weapons .ambient-contours-canvas { opacity: .03; }
+.mode-weapons > .ambient-grid { display: none; }
+.mode-weapons .brand-mark { background: #ffad34; }
+.app-shell.mode-weapons > .workspace { display: block; height: var(--instanced-workspace-height); min-height: 0; padding: 0; }
+.app-shell.mode-weapons > .workspace::before, .app-shell.mode-weapons > .workspace::after { display: none; }
+.app-shell > .workspace:is(.handoff-hammer, .handoff-cleave) { overflow: hidden; isolation: isolate; }
+.app-shell.mode-weapons > .workspace:has(.settings.drawer-visible) { z-index: 60; }
+@media (min-width: 1200px) {
+  .app-shell.mode-weapons > .workspace { height: max(760px, var(--instanced-workspace-height)); }
+}
+@media (max-width: 1850px) {
+  .app-shell:has(.map-switch-with-weapons) .topbar { grid-template-areas: "brand actions" "switch switch"; grid-template-columns: minmax(0,1fr) auto; grid-template-rows: auto auto; gap: 10px 14px; padding-bottom: 12px; }
+  .app-shell:has(.map-switch-with-weapons) .brand-lockup { grid-area: brand; }
+  .app-shell:has(.map-switch-with-weapons) .map-switch-zone { grid-area: switch; width: 100%; }
+  .app-shell:has(.map-switch-with-weapons) .top-actions { grid-area: actions; justify-self: end; }
+  .app-shell .map-switch.map-switch-with-painting.map-switch-with-weapons { width: min(100%, 1250px); }
+}
+@media (max-width: 1199px) {
+  .app-shell .map-switch.map-switch-with-painting.map-switch-with-weapons { grid-template-columns: repeat(3, minmax(0, 1fr)) 14px minmax(0, 1.05fr) 14px repeat(2, minmax(0, 1fr)); }
+  .app-shell .map-switch-with-weapons button { grid-template-columns: 20px minmax(0, 1fr); padding-inline: 5px; gap: 4px; }
+  .app-shell .map-switch-with-weapons button > i { display: none; }
+  .app-shell .map-switch-with-weapons .map-switch-copy strong { font-size: clamp(11px, 1.3vw, 15px); }
+  .app-shell .map-switch-with-weapons .map-switch-copy small { font-size: 8px; }
+  .app-shell .map-switch-with-weapons .map-thumb { width: 20px; }
+}
+@media (max-width: 700px) {
+  .app-shell .map-switch-with-weapons button { grid-template-columns: minmax(0, 1fr); }
+  .app-shell .map-switch-with-weapons .weapon-navigation-icon { display: none; }
+  .app-shell .map-switch-with-weapons .map-switch-copy strong { font-size: clamp(8px, 1.6vw, 11px); }
+  .app-shell .map-switch-with-weapons .map-switch-copy small { font-size: 7px; }
+}
+.hammer-curtain{position:absolute;inset:0;z-index:70;background:#12191f;border-bottom:22px solid #4a6b7c;box-shadow:0 3px #ff6b2b,0 10px 30px #ff7a3744;animation:hammer-down 520ms both cubic-bezier(.75,.02,.92,.65);clip-path:polygon(0 0,100% 0,100% calc(100% - 25px),94% 100%,0 100%)}.hammer-curtain>span{position:absolute;bottom:45px;right:5%;font:12px var(--mono);letter-spacing:.2em;color:#68818f}.hammer-curtain>i,.hammer-curtain>b,.hammer-curtain>em{position:absolute;bottom:0;background:#ff9a30;width:18%;height:2px;transform:rotate(-10deg);animation:transition-spark 520ms both}.hammer-curtain>b{left:50%;transform:rotate(12deg)}.hammer-curtain>em{left:78%;transform:rotate(-20deg)}@keyframes hammer-down{0%{transform:translateY(-110%)}48%{transform:translateY(0)}54%{transform:translateY(1%)}62%{transform:translateY(0)}100%{transform:translateY(110%)}}@keyframes transition-spark{0%,47%{opacity:0}49%{opacity:1;width:2%}75%{opacity:.7;width:20%}100%{opacity:0;transform:translateX(200px) rotate(-15deg)}}
+.handoff-hammer .weapon-workspace-shell{animation:impact-settle 130ms 250ms both}@keyframes impact-settle{0%{transform:translateY(0)}35%{transform:translateY(5px)}70%{transform:translateY(-2px)}100%{transform:none}}.cleave-snapshots{position:absolute;inset:0;z-index:65;pointer-events:none;overflow:hidden}.cleave-half{position:absolute;inset:0;overflow:hidden}.cleave-half>.operator-workspace-shell{position:absolute;inset:0;min-width:0}.cleave-left{clip-path:polygon(0 0,52% 0,48% 100%,0 100%);animation:cleave-left 580ms cubic-bezier(.16,1,.3,1) both}.cleave-right{clip-path:polygon(52% 0,100% 0,100% 100%,48% 100%);animation:cleave-right 580ms cubic-bezier(.16,1,.3,1) both}.cleave-cut{position:absolute;z-index:66;width:3px;top:0;bottom:0;left:50%;background:#ffe600;box-shadow:0 0 10px white;transform:rotate(4deg);animation:cleave-flash 580ms both}.handoff-cleave>.operator-workspace-shell:not(.weapon-workspace-shell){animation:operator-reveal 580ms cubic-bezier(.16,1,.3,1) both}@keyframes operator-reveal{from{transform:scale(.92);opacity:.4}to{transform:scale(1);opacity:1}}@keyframes cleave-left{0%,20%{transform:none}100%{transform:translateX(-105%) rotate(-1.5deg)}}@keyframes cleave-right{0%,20%{transform:none}100%{transform:translateX(105%) rotate(1.5deg)}}@keyframes cleave-flash{0%{opacity:0}15%,25%{opacity:1}65%,100%{opacity:0}}
+@media (prefers-reduced-motion: reduce) {
+  .hammer-curtain, .cleave-half, .cleave-cut { animation: none; }
+}

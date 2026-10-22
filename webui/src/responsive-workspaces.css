@@ -1,0 +1,210 @@
+/* Shared desktop density, independent of device pixel ratio and browser zoom. */
+@media (min-width: 1200px) {
+  .app-shell {
+    --ui-control: clamp(14px, .72vw, 18px);
+    --ui-body: clamp(13px, .63vw, 16px);
+    --ui-note: clamp(11px, .52vw, 13px);
+    --ui-micro: clamp(10px, .47vw, 12px);
+    --ui-left-rail: clamp(300px, 19vw, 488px);
+    --ui-right-rail: clamp(340px, 21vw, 538px);
+    --ui-gap: clamp(22px, 1.5vw, 38px);
+    --ui-inset: clamp(22px, 1.5vw, 38px);
+  }
+
+  /* Short windows scroll the page instead of crushing all three content panes. */
+  .app-shell:is(.mode-maps, .mode-operators, .mode-instanced, .mode-painting) > .workspace {
+    height: max(760px, var(--instanced-workspace-height));
+    min-height: 0;
+  }
+
+  .app-shell.mode-painting .si-workspace {
+    height: max(760px, var(--instanced-workspace-height));
+    min-height: 0;
+  }
+
+  .operator-workspace-shell .workspace.workspace,
+  .isc-layout {
+    grid-template-columns: var(--ui-left-rail) minmax(0, 1fr) var(--ui-right-rail);
+    column-gap: var(--ui-gap);
+    padding-inline: var(--ui-inset);
+  }
+
+  .operator-workspace-shell .workspace.workspace { grid-template-rows: minmax(0, 1fr); }
+  .operator-workspace-shell .directory { min-height: 0; }
+  .app-shell .top-status { white-space: nowrap; }
+  .operator-workspace-shell .archive { container-type: inline-size; }
+  .operator-workspace-shell .archive-heading h1 { font-size: clamp(34px, 5.8cqw, 68px); }
+  .operator-workspace-shell .archive-heading h2 { font-size: clamp(24px, 3cqw, 34px); }
+  .operator-workspace-shell .archive-number { font-size: clamp(72px, 9cqw, 112px); }
+  .operator-workspace-shell .figure-stage:has(.portrait > img) {
+    flex: 1 0 auto;
+    min-height: clamp(290px, 36dvh, 550px);
+    padding: 16px 0 48px;
+  }
+  .operator-workspace-shell .portrait:has(> img) {
+    width: clamp(220px, min(42cqw, 31dvh), 420px);
+    max-width: calc(100% - 56px);
+  }
+  .operator-workspace-shell .archive > :not(.figure-stage) { flex-shrink: 0; }
+  .operator-workspace-shell .section-title h2,
+  .operator-workspace-shell .settings-header h2 { font-size: clamp(24px, 1.2vw, 30px); }
+  .operator-workspace-shell .entity-row .entity-copy b,
+  .operator-workspace-shell .block-title > h3,
+  .operator-workspace-shell .variant-option > span,
+  .operator-workspace-shell .config-block select,
+  .operator-workspace-shell .config-block input[type="text"],
+  .operator-workspace-shell .checkbox-option,
+  .operator-workspace-shell .export-button { font-size: var(--ui-control); }
+  .operator-workspace-shell .entity-row { min-height: clamp(70px, 4vw, 94px); }
+  .operator-workspace-shell .avatar-mini { width: clamp(48px, 2.6vw, 66px); height: clamp(54px, 3vw, 76px); }
+  .operator-workspace-shell .avatar-mini img { width: 100%; height: 100%; }
+  .operator-workspace-shell .entity-row { grid-template-columns: clamp(48px, 2.6vw, 66px) minmax(0, 1fr) auto; }
+  .operator-workspace-shell .config-block .help,
+  .operator-workspace-shell .action-dock > p,
+  .operator-workspace-shell .readiness,
+  .operator-workspace-shell .search-field input,
+  .operator-workspace-shell .text-button { font-size: var(--ui-body); }
+  .operator-workspace-shell .entity-row .entity-copy small,
+  .operator-workspace-shell .readiness-grid,
+  .operator-workspace-shell .dossier strong,
+  .operator-workspace-shell .pipeline,
+  .operator-workspace-shell .catalog-expand-toggle { font-size: var(--ui-note); }
+  .operator-workspace-shell .block-title small,
+  .operator-workspace-shell .settings-header small,
+  .operator-workspace-shell .variant-option small,
+  .operator-workspace-shell .archive-top,
+  .operator-workspace-shell .archive-heading small,
+  .operator-workspace-shell .dossier span,
+  .operator-workspace-shell .stage-caption,
+  .operator-workspace-shell .portrait-label { font-size: var(--ui-micro); }
+  .operator-workspace-shell .config-block select,
+  .operator-workspace-shell .config-block input[type="text"] { min-height: 44px; }
+  .operator-workspace-shell .export-button { min-height: clamp(54px, 3vw, 72px); }
+
+  .isc-layout { grid-template-rows: minmax(0, 1fr) clamp(240px, 22dvh, 280px); }
+  .isc-heading h1 { font-size: clamp(44px, 2.65vw, 68px); }
+  .isc-stage-title h2 { font-size: clamp(42px, 3vw, 76px); }
+  .isc-stage-title p,
+  .isc-index-note,
+  .isc-settings-body,
+  .isc-settings-body p,
+  .isc-settings-body label,
+  .isc-settings-body select,
+  .isc-settings-body input,
+  .isc-scene-entry strong,
+  .isc-group-toggle,
+  .isc-action-selection strong,
+  .isc-action button strong { font-size: var(--ui-control); }
+  .isc-action > button:not(.isc-dev-action) { min-height: clamp(54px, 3vw, 72px); }
+  .isc-action button small,
+  .isc-action .isc-dev-action,
+  .isc-runtime-row button { font-size: var(--ui-micro); }
+  .isc-action .isc-dev-action { min-height: 34px; }
+  .isc-runtime-row button { min-height: 30px; }
+  .isc-stage-meta,
+  .isc-index-head,
+  .isc-action p { font-size: var(--ui-note); }
+
+  .app-shell .settings-drawer,
+  .si-surface .si-settings {
+    width: clamp(340px, 26vw, 620px);
+    height: min(850px, calc(100% - 230px));
+  }
+  .si-surface .si-settings {
+    --si-settings-top: calc(37px + clamp(198px, 10vw, 224px));
+    top: var(--si-settings-top);
+    height: min(850px, calc(100% - var(--si-settings-top) - 72px));
+    max-height: calc(100% - var(--si-settings-top) - 72px);
+  }
+  .app-shell .launch-pod,
+  .si-surface .si-export-panel { width: clamp(370px, 28vw, 640px); }
+  .app-shell .settings-scroll,
+  .si-surface .si-settings-body { padding: 16px clamp(15px, 1vw, 26px) 20px; }
+  .app-shell .setting-section summary strong,
+  .si-surface .si-section-caption { font-size: clamp(16px, .82vw, 21px); }
+  .app-shell .layer-grid strong,
+  .app-shell .export-grid button strong,
+  .app-shell .setting-label,
+  .app-shell .field-pair label > span,
+  .app-shell .full-field > span,
+  .app-shell .path-field label,
+  .app-shell .path-input input,
+  .app-shell .select-shell select,
+  .app-shell .full-field > input,
+  .si-surface .si-layer-list b,
+  .si-surface .si-field,
+  .si-surface .si-field select,
+  .si-surface .si-field input { font-size: var(--ui-control); }
+  .app-shell .capability-disclaimer,
+  .app-shell .strategy-note,
+  .app-shell .strategy-note > span,
+  .app-shell .launch-pod > p,
+  .app-shell .launch-subtitle,
+  .si-surface .si-settings-note { font-size: var(--ui-body); }
+  .app-shell .layer-grid small,
+  .app-shell .export-grid button small,
+  .app-shell .phase-track span,
+  .app-shell .phase-track small,
+  .app-shell .map-data-ribbon span,
+  .app-shell .map-data-ribbon small,
+  .si-surface .si-layer-list small,
+  .si-surface .si-pipeline,
+  .si-surface .si-export-meta { font-size: var(--ui-micro); }
+  .app-shell .launch-title,
+  .si-surface #si-export strong { font-size: clamp(30px, 1.65vw, 42px); }
+  .app-shell .map-title-lockup h1 { font-size: clamp(64px, 5.2vw, 112px); }
+  .app-shell .map-heading,
+  .si-surface .si-region-title { width: min(820px, 49vw); }
+  .si-surface .si-region-title { height: clamp(198px, 10vw, 224px); }
+  .app-shell .map-heading-meta,
+  .app-shell .map-heading > span,
+  .si-surface .si-region-title > small,
+  .si-surface .si-region-title p { font-size: var(--ui-micro); }
+  .app-shell .region-cartouche,
+  .si-surface .si-cartouche { width: clamp(280px, 18vw, 440px); }
+  .app-shell .cartouche-body p,
+  .si-surface .si-cartouche-content p { font-size: var(--ui-body); }
+}
+
+@media (min-width: 1600px) and (max-height: 1150px) {
+  /* Put secondary facts side by side before shrinking the primary portrait. */
+  .operator-workspace-shell .archive:not(.scan-active):has(.portrait > img) {
+    display: grid;
+    grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr);
+    grid-template-rows: auto auto auto minmax(300px, 1fr) auto auto;
+    column-gap: 24px;
+    align-content: stretch;
+  }
+  .operator-workspace-shell .archive > :is(.archive-top, .archive-heading, .dossier, .figure-stage, .archive-bottom) { grid-column: 1 / -1; }
+  .operator-workspace-shell .archive-top { padding-bottom: 10px; }
+  .operator-workspace-shell .archive-heading { padding: 12px 0; }
+  .operator-workspace-shell .archive-heading h1 { font-size: clamp(34px, 4.8cqw, 52px); margin: 6px 0; }
+  .operator-workspace-shell .archive-heading h2 { font-size: 26px; }
+  .operator-workspace-shell .dossier { margin-top: 8px; padding-block: 8px; }
+  .operator-workspace-shell .figure-stage:has(.portrait > img) { min-height: 0; padding: 12px 0 40px; }
+  .operator-workspace-shell .portrait:has(> img) { width: auto; height: 100%; max-height: 360px; }
+  .operator-workspace-shell .budget-display { margin-top: 0; padding-top: 10px; }
+  .operator-workspace-shell .pipeline { margin-top: 0; padding-block: 10px; align-self: end; }
+  .operator-workspace-shell .archive-bottom { padding-top: 8px; }
+}
+
+@media (min-width: 2100px) {
+  .app-shell .topbar { min-height: 114px; }
+  .app-shell .map-switch.map-switch-with-painting { width: 1250px; height: 78px; }
+  .app-shell .map-switch-copy strong { font-size: 22px; }
+  .app-shell .map-switch-copy small,
+  .app-shell .top-actions button,
+  .app-shell .top-status { font-size: 14px; }
+  .app-shell .settings-drawer { --settings-top: 210px; }
+  .si-surface .si-title-row h1 { font-size: 100px; }
+  .si-surface .si-cartouche-content { height: 220px; }
+  .si-surface .si-cartouche-content h2 { font-size: 44px; }
+  .si-surface .si-annotation { top: 385px; }
+  .si-surface .si-replay-entrance { top: 430px; }
+  .si-surface .si-map-tools { top: 480px; }
+}
+
+@media (min-width: 801px) and (max-width: 1199px) {
+  .app-shell.mode-operators > .workspace,
+  .app-shell.mode-instanced > .workspace { height: max(680px, var(--instanced-workspace-height)); }
+}

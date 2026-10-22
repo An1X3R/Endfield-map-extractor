@@ -16,6 +16,10 @@ const MUTATING_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE'])
 const MAX_REQUEST_BODY_BYTES = 1024 * 1024
 
 const bridgeMethods = (pathname: string): string[] | null => {
+  if (/^\/api\/v2\/asset-catalogs\/(weapon|illustration|display_prop)$/.test(pathname) ||
+      /^\/api\/v2\/asset-jobs\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(pathname)) return ['GET']
+  if (pathname === '/api/v2/asset-jobs' || pathname === '/api/v2/asset-jobs/validate' ||
+      /^\/api\/v2\/asset-jobs\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\/cancel$/.test(pathname)) return ['POST']
   if (pathname === '/api/v2/first-run' || pathname === '/api/v2/level-map-preparation') return ['GET', 'POST']
   if (/^\/api\/v2\/level-map-preparation\/[a-f0-9]{32}$/.test(pathname)) return ['GET']
   if (/^\/api\/v2\/level-map-preparation\/[a-f0-9]{32}\/cancel$/.test(pathname)) return ['POST']
@@ -30,7 +34,7 @@ const bridgeMethods = (pathname: string): string[] | null => {
   return null
 }
 
-const bridgeFamilies = /^\/api\/v2\/(level-maps|level-map-preparation|instanced-scenes|characters|character-jobs|character-preparation|instanced-scene-jobs|first-run|export-jobs)(\/|$)/
+const bridgeFamilies = /^\/api\/v2\/(asset-catalogs|asset-jobs|level-maps|level-map-preparation|instanced-scenes|characters|character-jobs|character-preparation|instanced-scene-jobs|first-run|export-jobs)(\/|$)/
 
 const bridgeUrl = (pathname: string, search: string): URL | null => {
   const root = process.env.ENDFIELD_PATH_PICKER_URL?.trim() ?? ''
@@ -236,8 +240,8 @@ const installRuntimeApi = (middlewares: { use: (handler: (request: IncomingMessa
           ? { publicRoot: '/api/v2/instanced-scenes', bridgeRoot: '/instanced-scenes', methods: ['GET', 'POST'], binary: false, kind: 'instanced_scene' }
           : pathname === '/api/v2/instanced-scene-jobs' || pathname.startsWith('/api/v2/instanced-scene-jobs/')
             ? { publicRoot: '/api/v2/instanced-scene-jobs', bridgeRoot: '/instanced-scene-jobs', methods: ['GET', 'POST'], binary: false, kind: 'instanced_scene' }
-            : ['/characters', '/character-jobs', '/character-preparation', '/level-map-preparation']
-              .map((bridgeRoot) => ({ publicRoot: `/api/v2${bridgeRoot}`, bridgeRoot, methods: ['GET', 'POST'], binary: false, kind: 'instanced_scene' }))
+            : ['/asset-catalogs', '/asset-jobs', '/characters', '/character-jobs', '/character-preparation', '/level-map-preparation']
+              .map((bridgeRoot) => ({ publicRoot: `/api/v2${bridgeRoot}`, bridgeRoot, methods: ['GET', 'POST'], binary: false, kind: bridgeRoot.startsWith('/asset-') ? 'asset' : 'instanced_scene' }))
               .find((route) => pathname === route.publicRoot || pathname.startsWith(`${route.publicRoot}/`)) ?? null
     if (sceneBridgeRoute) {
       if (!sceneBridgeRoute.methods.includes(method)) {
@@ -256,7 +260,9 @@ const installRuntimeApi = (middlewares: { use: (handler: (request: IncomingMessa
         targetUrl = bridgeUrl(`${sceneBridgeRoute.bridgeRoot}${suffix}`, requestUrl.search)
       } catch { /* unavailable response below */ }
       if (!targetUrl || targetUrl.hostname !== '127.0.0.1' || !bridgeToken) {
-        sendJson(response, 503, sceneBridgeRoute.kind === 'level_map'
+        sendJson(response, 503, sceneBridgeRoute.kind === 'asset'
+          ? { error: 'asset_bridge_unavailable', message: 'Asset bridge unavailable; start the WebUI with launch_webui.py.' }
+          : sceneBridgeRoute.kind === 'level_map'
           ? { error: 'level_map_bridge_unavailable', message: 'Level map bridge unavailable.' }
           : { error: 'instanced_scene_bridge_unavailable', message: 'Independent scene bridge unavailable.' })
         return
@@ -282,7 +288,7 @@ const installRuntimeApi = (middlewares: { use: (handler: (request: IncomingMessa
       })().catch((error) => {
         if (sendBodySizeError(response, error)) return
         sendJson(response, 502, {
-          error: sceneBridgeRoute.kind === 'level_map' ? 'level_map_bridge_failed' : 'instanced_scene_bridge_failed',
+          error: sceneBridgeRoute.kind === 'asset' ? 'asset_bridge_failed' : sceneBridgeRoute.kind === 'level_map' ? 'level_map_bridge_failed' : 'instanced_scene_bridge_failed',
           message: error instanceof Error ? error.message : String(error),
         })
       })
@@ -466,6 +472,8 @@ const installRuntimeApi = (middlewares: { use: (handler: (request: IncomingMessa
 
 export default defineConfig(({ mode }) => {
   const fileEnv = loadEnv(mode, projectRoot, '')
+  const bridgeOrigin = process.env.ENDFIELD_PATH_PICKER_URL?.trim()
+  const cacheScope = bridgeOrigin ? `bridge-${new URL(bridgeOrigin).port}` : 'standalone'
   const backendValue = process.env.ENDFIELD_BACKEND_URL ?? fileEnv.ENDFIELD_BACKEND_URL ?? ''
   const assetValue = process.env.ENDFIELD_PREVIEW_ASSET_ROOT ?? fileEnv.ENDFIELD_PREVIEW_ASSET_ROOT ?? ''
   const sceneAssetValue = process.env.ENDFIELD_SCENE_PREVIEW_ASSET_ROOT ?? fileEnv.ENDFIELD_SCENE_PREVIEW_ASSET_ROOT ?? ''
@@ -480,6 +488,7 @@ export default defineConfig(({ mode }) => {
     '/api/v3': { target: backend, changeOrigin: true },
   } : undefined
   return {
+    cacheDir: path.join(projectRoot, 'node_modules', '.vite', cacheScope),
     plugins: backend
       ? [apiMutationOriginGuard(), react(), devInstancedScenePreviewApi(sceneAssetRoot)]
       : [apiMutationOriginGuard(), react(), devPreviewAssetApi(assetRoot), devInstancedScenePreviewApi(sceneAssetRoot), mapOverviewApi(), endfieldMapRuntimeApi(), stage119LayerApi(projectRoot), apiBoundary()],

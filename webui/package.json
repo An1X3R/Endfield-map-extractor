@@ -1,13 +1,14 @@
 {
   "name": "endfield-atlas-composer-webui-2",
   "private": true,
-  "version": "3.3.0",
+  "version": "3.5.0",
   "license": "MIT",
   "type": "module",
   "scripts": {
     "dev": "vite --host 127.0.0.1",
     "build": "tsc -b && vite build",
     "preview": "vite preview --host 127.0.0.1",
+    "test:assets": "node --experimental-strip-types tests/assets.contract.test.mjs",
     "test:stage119": "node --experimental-strip-types tests/stage119LayerApi.contract.test.mjs",
     "test:first-run-stage-pointer": "node --experimental-strip-types tests/stage119DynamicPointer.contract.test.mjs",
     "test:instanced-scenes": "node --experimental-strip-types tests/instancedScenes.contract.test.mjs",

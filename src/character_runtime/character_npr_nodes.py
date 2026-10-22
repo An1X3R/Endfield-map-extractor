@@ -153,7 +153,7 @@ def shadow_color(tree: bpy.types.NodeTree, albedo: bpy.types.NodeSocket, floats:
     return color_mix(tree, "ADD", 1.0, scaled, lum, "Source ComputeShadowColor", "Source Shadow Color")
 
 
-def apply_diffuse_response(tree: bpy.types.NodeTree, shader_name: str, floats: Mapping[str, float], samples: Mapping[str, bpy.types.Node], albedo: bpy.types.NodeSocket, bsdf: bpy.types.Node, lighting_tree: bpy.types.ShaderNodeTree) -> bpy.types.NodeSocket:
+def apply_diffuse_response(tree: bpy.types.NodeTree, shader_name: str, floats: Mapping[str, float], samples: Mapping[str, bpy.types.Node], albedo: bpy.types.NodeSocket, bsdf: bpy.types.Node, lighting_tree: bpy.types.ShaderNodeTree, null_texture_defaults: Mapping[str, str]) -> bpy.types.NodeSocket:
     """Return a shared-engine shader; source sampling feeds an artist lighting approximation."""
     lighting = node(tree, "ShaderNodeGroup", "Artist global state - not game constants", "Artist Lighting")
     lighting.node_tree = lighting_tree
@@ -170,10 +170,17 @@ def apply_diffuse_response(tree: bpy.types.NodeTree, shader_name: str, floats: M
     signed = math_node(tree, "MINIMUM", math_node(tree, "MAXIMUM", adjusted, -1.0, "Source ramp lower clamp", "Artist Ramp Coordinates"), 1.0, "Source ramp upper clamp", "Artist Ramp Coordinates")
     ramp_u = math_node(tree, "ADD", math_node(tree, "MULTIPLY", signed, 0.5, "Source ramp half scale", "Artist Ramp Coordinates"), 0.5, "Source signed ramp to U", "Artist Ramp Coordinates")
     if floats["_UseDiffRampMap"] == 1.0:
-        if "_DiffRampMap" not in samples or samples["_DiffRampMap"].image is None:
+        if "_DiffRampMap" in samples and samples["_DiffRampMap"].image is not None:
+            ramp = sample_image(tree, samples["_DiffRampMap"].image, ramp_u, 0.5, "Source diffuse ramp RGB and alpha", "Source Diffuse Ramp")
+            ramp_color, ramp_alpha = ramp.outputs["Color"], ramp.outputs["Alpha"]
+        elif "_DiffRampMap" not in samples and null_texture_defaults.get("_DiffRampMap") == "white":
+            ramp = node(tree, "ShaderNodeRGB", "Source Shader default white diffuse ramp", "Source Diffuse Ramp")
+            ramp.outputs[0].default_value = (1.0, 1.0, 1.0, 1.0)
+            ramp_color = ramp.outputs[0]
+            ramp_alpha = math_node(tree, "ADD", 1.0, 0.0, "Source white ramp alpha", "Source Diffuse Ramp")
+            ramp["source_default_evidence"] = "Null material texture pointer and exact Shader property default white"
+        else:
             raise ValueError("Source enables DiffRampMap without its verified image")
-        ramp = sample_image(tree, samples["_DiffRampMap"].image, ramp_u, 0.5, "Source diffuse ramp RGB and alpha", "Source Diffuse Ramp")
-        ramp_color, ramp_alpha = ramp.outputs["Color"], ramp.outputs["Alpha"]
     elif floats["_UseDiffRampMap"] == 0.0:
         ramp = node(tree, "ShaderNodeMapRange", "Source procedural ramp branch", "Source Diffuse Ramp")
         ramp.interpolation_type = "SMOOTHSTEP"

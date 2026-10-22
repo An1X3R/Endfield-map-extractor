@@ -892,7 +892,7 @@ def material_group(source: MaterialSource, packet: SourcePacket, environment: bp
             raise ValueError(f"Unsupported source surface type: {source.identity}")
         alpha = math_node(tree, "MULTIPLY", alpha, entry.outputs["Approx Pass Opacity"], "Editable surface coverage", "Source Alpha Rules")
         tree.links.new(alpha, output.inputs["Coverage"])
-        lit_shader = apply_diffuse_response(tree, source.shader, source.floats, samples, color, bsdf, lighting)
+        lit_shader = apply_diffuse_response(tree, source.shader, source.floats, samples, color, bsdf, lighting, source.null_texture_defaults)
         from character_special_vfx import attach_special_vfx, source_from_material
         special_source = source_from_material(source, samples)
         if special_source is not None:

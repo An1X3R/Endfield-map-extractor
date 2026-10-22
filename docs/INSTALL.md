@@ -2,7 +2,7 @@
 
 ## 普通用户：预编译发行包
 
-从 [GitHub Releases](https://github.com/An1X3R/Endfield-map-extractor/releases/latest) 下载 `Endfield-Extractor-v3.3-windows-x64.zip`，完整解压到可写目录。请保留 `.tools` 文件夹；GitHub 自动生成的 Source code ZIP 不包含它。
+从 [GitHub Releases](https://github.com/An1X3R/Endfield-map-extractor/releases/latest) 下载 `Endfield-Extractor-v3.5-windows-x64.zip`，完整解压到可写目录。请保留 `.tools` 文件夹；GitHub 自动生成的 Source code ZIP 不包含它。
 
 需要 Windows x64、Python 3.11+、Node.js/npm、.NET 9 x64 运行时和 Blender 4.4+（已验证 4.4.3）。读取工具已预编译，不需要 Git 或 .NET SDK。工具运行依赖以随包回执校验。
 

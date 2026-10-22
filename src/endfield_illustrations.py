@@ -73,11 +73,14 @@ class IllustrationArtifact:
 
 @dataclass(frozen=True)
 class IllustrationExportResult:
+    """Resolve every files[].relative_path against the absolute image_directory."""
+
     format: str
     status: str
     catalog_id: str
     files: tuple[IllustrationArtifact, ...]
     elapsed_seconds: float
+    image_directory: str
 
 
 def _object(value: object, label: str) -> dict[str, object]:
@@ -287,7 +290,7 @@ def export_illustrations(context: CharacterSourceContext, catalog: IllustrationC
     shutil.copyfile(work / "probe.log", output / "decode.log")
     _remove_completed_work(output, work)
     result = IllustrationExportResult("EndfieldIllustrationExport/1", "completed", catalog.catalog_id,
-                                      tuple(files), time.perf_counter() - start)
+                                      tuple(files), time.perf_counter() - start, str(output.resolve()))
     with (output / "illustrations.json").open("x", encoding="utf-8") as stream:
         json.dump(asdict(result), stream, ensure_ascii=False, indent=2)
     progress("completed", 1., "Illustration PNG export completed")

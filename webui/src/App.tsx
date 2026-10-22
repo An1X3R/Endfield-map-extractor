@@ -47,6 +47,8 @@ import type { ExportJob } from './lib/mapExportJob'
 import { useDraggablePanel } from './hooks/useDraggablePanel'
 import { InstancedSceneWorkspace } from './features/instanced-scenes/InstancedSceneWorkspace'
 import { OperatorWorkspace } from './features/operators/OperatorWorkspace'
+import { WeaponWorkspace } from './features/weapons/WeaponWorkspace'
+import './weapon-navigation.css'
 import type { OperatorDevelopmentPreview } from './features/operators/developmentPreview'
 import type { InstancedSceneDevelopmentPreview, InstancedSceneSourcePaths } from './features/instanced-scenes/types'
 import { PaintingWorkspace } from './features/si-painting/PaintingWorkspace'
@@ -537,8 +539,8 @@ function LegalArchive() {
 export default function App() {
   const reduceMotion = useReducedMotion()
   const [mapId, setMapId] = useState<MapId>('map01')
-  const [workspaceMode, setWorkspaceMode] = useState<'maps' | 'instanced' | 'operators' | 'painting'>(() => new URLSearchParams(window.location.search).get('painting-preview') === '1' ? 'painting' : 'maps')
-  const [workspaceTransition, setWorkspaceTransition] = useState<{ phase: 'retract' | 'deploy'; target: 'maps' | 'instanced' | 'operators' | 'painting' } | null>(null)
+  const [workspaceMode, setWorkspaceMode] = useState<'maps' | 'instanced' | 'operators' | 'painting' | 'weapons'>(() => new URLSearchParams(window.location.search).get('painting-preview') === '1' ? 'painting' : 'maps')
+  const [workspaceTransition, setWorkspaceTransition] = useState<{ phase: 'retract' | 'deploy'; target: 'maps' | 'instanced' | 'operators' | 'painting' | 'weapons' } | null>(null)
   const [workspaceTransitionTitle, setWorkspaceTransitionTitle] = useState<string | null>(null)
   const [instancedWorkspaceHeight, setInstancedWorkspaceHeight] = useState(0)
   const [paintingBusy, setPaintingBusy] = useState(false)
@@ -558,6 +560,14 @@ export default function App() {
   const [operatorResetRevision, setOperatorResetRevision] = useState(0)
   const [operatorTaskReturnRevision, setOperatorTaskReturnRevision] = useState(0)
   const [operatorJobBusy, setOperatorJobBusy] = useState(false)
+  const [weaponJobBusy, setWeaponJobBusy] = useState(false)
+  const [weaponCatalogCount, setWeaponCatalogCount] = useState<number | null>(null)
+  const [weaponTask, setWeaponTask] = useState<string | null>(null)
+  const [weaponResetRevision, setWeaponResetRevision] = useState(0)
+  const [weaponTaskReturnRevision, setWeaponTaskReturnRevision] = useState(0)
+  const [weaponPreviewRevision, setWeaponPreviewRevision] = useState(0)
+  const [entityHandoff, setEntityHandoff] = useState<'hammer' | 'cleave' | null>(null)
+  const entitySnapshot = useRef<HTMLDivElement | null>(null)
   const [layers, setLayers] = useState<LayerState>(DEFAULT_LAYERS)
   const [selection, setSelection] = useState<ChunkSelection | null>(null)
   const [sourcePaths, setSourcePaths] = useState(loadSourcePaths)
@@ -628,6 +638,8 @@ export default function App() {
     blender_exe: sourcePaths.blender,
   }), [sourcePaths.game, sourcePaths.cache, sourcePaths.blender])
   const firstRunRunning = firstRunStatus?.state === 'queued' || firstRunStatus?.state === 'running'
+  const taskBusy = launchState === 'running' || instancedJobBusy || operatorJobBusy || paintingBusy || weaponJobBusy || firstRunRunning
+  const navigationLocked = taskBusy || mapNavigationBusy || workspaceTransition !== null || entityHandoff !== null
   const overviewRevision = [
     String(firstRunStatus?.result?.runtime_config ?? ''),
     firstRunStatus?.ready ? 'ready' : 'pending',
@@ -660,6 +672,16 @@ export default function App() {
     if (busy) setWorkspaceMode('instanced')
   }, [])
 
+  useEffect(() => {
+    if (operatorJobBusy && workspaceMode !== 'operators') {
+      setWorkspaceMode('operators')
+      setOperatorTaskReturnRevision(value => value + 1)
+    } else if (weaponJobBusy && workspaceMode !== 'weapons') {
+      setWorkspaceMode('weapons')
+      setWeaponTaskReturnRevision(value => value + 1)
+    }
+  }, [operatorJobBusy, weaponJobBusy, workspaceMode])
+
   useLayoutEffect(() => {
     const updateHeight = (): void => {
       const workspace = workspaceRef.current
@@ -679,11 +701,47 @@ export default function App() {
 
   useEffect(() => () => {
     workspaceTransitionTimers.current.forEach((timer) => window.clearTimeout(timer))
+    entitySnapshot.current?.remove()
   }, [])
 
-  const switchWorkspace = (target: 'maps' | 'instanced' | 'operators' | 'painting', mapTitle: string): void => {
-    if (target === workspaceMode || workspaceTransition || mapNavigationBusy) return
-    if (launchState === 'running' || instancedJobBusy || operatorJobBusy || paintingBusy) return
+  const switchWorkspace = (target: 'maps' | 'instanced' | 'operators' | 'painting' | 'weapons', mapTitle: string): void => {
+    if (target === workspaceMode || navigationLocked) return
+    if ((workspaceMode === 'operators' && target === 'weapons') || (workspaceMode === 'weapons' && target === 'operators')) {
+      if (reduceMotion) { setWorkspaceMode(target); return }
+      const direction = target === 'weapons' ? 'hammer' : 'cleave'
+      if (direction === 'cleave') {
+        const origin = workspaceRef.current?.querySelector<HTMLElement>('.weapon-workspace-shell')
+        if (!origin || !workspaceRef.current) throw new Error('Weapon handoff cannot start: workspace surface is missing.')
+        const layers = document.createElement('div')
+        layers.className = 'cleave-snapshots'
+        layers.setAttribute('aria-hidden', 'true')
+        layers.inert = true
+        for (const side of ['left', 'right']) {
+          const half = document.createElement('div')
+          half.className = `cleave-half cleave-${side}`
+          const snapshot = origin.cloneNode(true) as HTMLElement
+          snapshot.removeAttribute('hidden')
+          snapshot.removeAttribute('data-testid')
+          snapshot.querySelectorAll('[id],[data-testid]').forEach(node => { node.removeAttribute('id'); node.removeAttribute('data-testid') })
+          snapshot.querySelectorAll('dialog').forEach(node => node.remove())
+          half.append(snapshot)
+          layers.append(half)
+        }
+        workspaceRef.current.append(layers)
+        entitySnapshot.current = layers
+        setWorkspaceMode(target)
+      } else {
+        workspaceTransitionTimers.current.push(window.setTimeout(() => setWorkspaceMode(target), 250))
+      }
+      setEntityHandoff(direction)
+      workspaceTransitionTimers.current.push(window.setTimeout(() => {
+        entitySnapshot.current?.remove()
+        entitySnapshot.current = null
+        setEntityHandoff(null)
+        workspaceTransitionTimers.current = []
+      }, direction === 'hammer' ? 530 : 590))
+      return
+    }
     if (target === 'painting') {
       const canvas = workspaceMode === 'maps' ? workspaceRef.current?.querySelector('.pixi-host canvas') : null
       setPaintingPreviousMap(canvas instanceof HTMLCanvasElement ? captureCanvasMap(canvas) : null)
@@ -693,7 +751,7 @@ export default function App() {
       if (!stage) throw new Error('Cannot leave painting: map stage is missing')
       setPaintingExitSnapshot(capturePaintingMap(stage))
     }
-    if (target === 'operators' || workspaceMode === 'operators' ||
+    if (target === 'operators' || workspaceMode === 'operators' || target === 'weapons' || workspaceMode === 'weapons' ||
       (target === 'painting' && workspaceMode === 'maps') || (workspaceMode === 'painting' && target === 'maps')) {
       setWorkspaceMode(target)
       return
@@ -870,17 +928,9 @@ export default function App() {
   }, [])
 
   const handleMapChange = (nextMap: MapId) => {
-    if (mapNavigationBusy) return
-    if (instancedJobBusy) {
-      notify('独立场景任务仍在运行；请先请求安全取消')
-      return
-    }
+    if (navigationLocked) return
     switchWorkspace('maps', MAPS[nextMap].title)
     if (nextMap === mapId) return
-    if (launchState === 'running') {
-      notify('任务运行中不能切换地图；请先请求安全取消')
-      return
-    }
     stopJob()
     setTransitionDirection(nextMap === 'map02' ? 'forward' : 'back')
     setOverviewSource('loading')
@@ -1105,7 +1155,7 @@ export default function App() {
       (allGroupsSelected || selectedGroups.length > 0) &&
       (exportMode !== 'blend' || (sourcePaths.blender.trim() && reconstructableSelection)) &&
       outputLabel.trim() &&
-      launchState !== 'running',
+      !taskBusy,
   )
 
   useEffect(() => {
@@ -1469,7 +1519,7 @@ export default function App() {
 
         <div className="map-switch-zone">
           <span className="map-switch-hint">选择地图 · 点击切换场景</span>
-          <nav className="map-switch map-switch-with-instanced map-switch-with-operators map-switch-with-painting" aria-label="选择地图、独立场景或角色档案">
+          <nav className="map-switch map-switch-with-instanced map-switch-with-operators map-switch-with-painting map-switch-with-weapons" aria-label="选择地图、独立场景、角色或武器">
             {(Object.keys(MAPS) as MapId[]).map((id) => {
               const item = MAPS[id]
               const active = workspaceMode === 'maps' && id === mapId
@@ -1480,7 +1530,7 @@ export default function App() {
                   data-testid={`map-tab-${id}`}
                   className={active ? 'active' : ''}
                   aria-pressed={active}
-                  disabled={launchState === 'running' || instancedJobBusy || paintingBusy || mapNavigationBusy || workspaceTransition !== null}
+                  disabled={navigationLocked}
                   onClick={() => handleMapChange(id)}
                 >
                   {active && (
@@ -1497,7 +1547,7 @@ export default function App() {
                 </button>
               )
             })}
-            <button type="button" className={`painting-navigation-tab ${workspaceMode === 'painting' ? 'active' : ''}`} data-testid="painting-tab" aria-pressed={workspaceMode === 'painting'} disabled={launchState === 'running' || instancedJobBusy || paintingBusy || mapNavigationBusy || workspaceTransition !== null} onClick={() => switchWorkspace('painting', 'SI’S PAINTING')}>
+            <button type="button" className={`painting-navigation-tab ${workspaceMode === 'painting' ? 'active' : ''}`} data-testid="painting-tab" aria-pressed={workspaceMode === 'painting'} disabled={navigationLocked} onClick={() => switchWorkspace('painting', 'SI’S PAINTING')}>
               <span className="painting-navigation-icon" aria-hidden="true"><i /><i /><i /></span><span className="map-switch-copy"><strong>SI’S PAINTING</strong><small>祀的画 / 画境</small></span><i aria-hidden="true">→</i>
             </button>
             <span className="instanced-navigation-datum" aria-hidden="true"><b>//</b><small>IDX // DISCRETE</small></span>
@@ -1506,7 +1556,7 @@ export default function App() {
               data-testid="instanced-tab"
               className={`instanced-navigation-tab ${workspaceMode === 'instanced' ? 'active' : ''}`}
               aria-pressed={workspaceMode === 'instanced'}
-              disabled={launchState === 'running' || instancedJobBusy || paintingBusy || mapNavigationBusy || workspaceTransition !== null}
+              disabled={navigationLocked}
               onClick={() => switchWorkspace('instanced', map.title)}
             >
               <span className="instanced-navigation-icon" aria-hidden="true"><i /><i /><i /><i /></span>
@@ -1514,19 +1564,25 @@ export default function App() {
               <i aria-hidden="true">→</i>
             </button>
             <span className="instanced-navigation-datum operator-navigation-datum" aria-hidden="true"><b>//</b><small>CAT // ENTITY</small></span>
-            <button type="button" data-testid="operators-tab" className={`operator-navigation-tab ${workspaceMode === 'operators' ? 'active' : ''}`} aria-pressed={workspaceMode === 'operators'} disabled={launchState === 'running' || instancedJobBusy || paintingBusy || mapNavigationBusy || workspaceTransition !== null} onClick={() => switchWorkspace('operators', map.title)}>
+            <button type="button" data-testid="operators-tab" className={`operator-navigation-tab ${workspaceMode === 'operators' ? 'active' : ''}`} aria-pressed={workspaceMode === 'operators'} disabled={navigationLocked} onClick={() => switchWorkspace('operators', map.title)}>
               <svg className="operator-navigation-icon" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor"><circle cx="12" cy="7" r="4" /><path d="M4 22v-3a8 8 0 0 1 16 0v3M4 22h16" /></svg>
               <span className="map-switch-copy"><strong>OPERATORS</strong><small>角色档案 / {operatorCatalogCount ?? '--'}</small></span><i aria-hidden="true">→</i>
+            </button>
+            <button type="button" data-testid="weapons-tab" className={`weapon-navigation-tab ${workspaceMode === 'weapons' ? 'active' : ''}`} aria-pressed={workspaceMode === 'weapons'} disabled={navigationLocked} onClick={() => switchWorkspace('weapons', 'WEAPONS')}>
+              <svg className="weapon-navigation-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor"><path d="m12 2 6 6-6 14L6 8zM6 8h12M12 2v20" /></svg>
+              <span className="map-switch-copy"><strong>WEAPONS</strong><small>武器 / {weaponCatalogCount ?? '—'}</small></span><i aria-hidden="true">→</i>
             </button>
           </nav>
         </div>
 
           <div className="top-actions">
-          {operatorTask && <button type="button" className="operator-task-pill" data-testid="operator-task-pill" onClick={() => { setWorkspaceMode('operators'); setOperatorTaskReturnRevision(value => value + 1) }}>{operatorTask}</button>}
+          {weaponTask && <button type="button" className="operator-task-pill" data-testid="weapon-task-pill" disabled={entityHandoff !== null || workspaceTransition !== null || (taskBusy && !weaponJobBusy)} onClick={() => { setWorkspaceMode('weapons'); setWeaponTaskReturnRevision(value => value + 1) }}>{weaponTask}</button>}
+          {operatorTask && <button type="button" className="operator-task-pill" data-testid="operator-task-pill" disabled={entityHandoff !== null || workspaceTransition !== null || (taskBusy && !operatorJobBusy)} onClick={() => { setWorkspaceMode('operators'); setOperatorTaskReturnRevision(value => value + 1) }}>{operatorTask}</button>}
           <div className={`top-status ${sourceReady ? 'ready' : ''}`}>
               <i />
               <span>{sourceReady ? 'DATA / READY' : firstRunRunning ? 'DATA / PREPARING' : 'FIRST RUN / REQUIRED'}</span>
             </div>
+          {import.meta.env.DEV && workspaceMode === 'weapons' && <button type="button" className="dev-review-button" data-testid="weapon-preview-entry" disabled={taskBusy} onClick={() => setWeaponPreviewRevision(value => value + 1)}><Play size={14} /><span>完成动画</span></button>}
           {import.meta.env.DEV && workspaceMode === 'painting' && <button type="button" className="dev-review-button" data-testid="si-preview-entry" onClick={() => setPaintingPreviewRevision(value => value + 1)}><Play size={14} /><span>完成动画</span></button>}
           {import.meta.env.DEV && workspaceMode === 'maps' && (
             <button
@@ -1553,16 +1609,16 @@ export default function App() {
           {import.meta.env.DEV && workspaceMode === 'operators' && <button type="button" className="dev-review-button" data-testid="operator-preview-entry" disabled={operatorJobBusy} onClick={() => void loadOperatorDevelopmentPreview()} title="开发样例，不执行提取"><Play size={14} /><span>开发预览</span></button>}
           {import.meta.env.DEV && workspaceMode === 'operators' && operatorDevelopmentPreview && <button type="button" data-testid="operator-live-entry" onClick={() => setOperatorDevelopmentPreview(null)}>返回实时目录</button>}
           <button type="button" onClick={copyRequest} hidden={workspaceMode !== 'maps'} aria-label="复制请求摘要"><Clipboard size={14} /><span>复制摘要</span></button>
-          <button type="button" data-testid="reset-app" disabled={workspaceTransition !== null || paintingBusy} onClick={() => workspaceMode === 'painting' ? setPaintingResetRevision(value => value + 1) : workspaceMode === 'operators' ? setOperatorResetRevision(value => value + 1) : resetPrototype()} aria-label="复位页面"><RefreshCw size={14} /><span>复位</span></button>
+          <button type="button" data-testid="reset-app" disabled={navigationLocked} onClick={() => workspaceMode === 'weapons' ? setWeaponResetRevision(value => value + 1) : workspaceMode === 'painting' ? setPaintingResetRevision(value => value + 1) : workspaceMode === 'operators' ? setOperatorResetRevision(value => value + 1) : resetPrototype()} aria-label="复位页面"><RefreshCw size={14} /><span>复位</span></button>
         </div>
       </header>
 
       <main
-        className={`workspace ${workspaceTransition ? `workspace-transition-${workspaceTransition.phase}` : ''} ${workspaceTransitionTitle ? 'workspace-title-rebuilding' : ''}`}
+        className={`workspace ${entityHandoff ? `handoff-${entityHandoff}` : ''} ${workspaceTransition ? `workspace-transition-${workspaceTransition.phase}` : ''} ${workspaceTransitionTitle ? 'workspace-title-rebuilding' : ''}`}
         ref={workspaceRef}
         data-transition-to={workspaceTransition?.target}
         data-testid="workspace-surface"
-        inert={workspaceTransition !== null}
+        inert={workspaceTransition !== null || entityHandoff !== null}
         style={{ '--instanced-workspace-height': `${instancedWorkspaceHeight}px` } as CSSProperties}
       >
         {workspaceTransition && <div className="workspace-transition-datum" aria-hidden="true" />}
@@ -2021,7 +2077,7 @@ export default function App() {
           active={workspaceMode === 'instanced'}
           firstRunReady={sourceReady && preparedPathsMatch}
           firstRunBusy={firstRunRunning}
-          mapJobBusy={launchState === 'running'}
+          mapJobBusy={launchState === 'running' || operatorJobBusy || weaponJobBusy || paintingBusy}
           source={instancedSource}
           outputRoot={sourcePaths.output}
           preparationIdentity={firstRunStatus?.request_identity?.sha256 ?? null}
@@ -2040,13 +2096,16 @@ export default function App() {
           onCatalogCountChange={setInstancedCatalogCount}
           developmentPreview={instancedDevelopmentPreview}
         />
-        <OperatorWorkspace active={workspaceMode === 'operators'} developmentPreview={operatorDevelopmentPreview} resetRevision={operatorResetRevision} taskReturnRevision={operatorTaskReturnRevision} onCatalogCountChange={setOperatorCatalogCount} onTaskChange={setOperatorTask} onBusyChange={setOperatorJobBusy} onNotify={notify} />
+        <OperatorWorkspace active={workspaceMode === 'operators'} blocked={launchState === 'running' || instancedJobBusy || paintingBusy || weaponJobBusy || firstRunRunning} developmentPreview={operatorDevelopmentPreview} resetRevision={operatorResetRevision} taskReturnRevision={operatorTaskReturnRevision} onCatalogCountChange={setOperatorCatalogCount} onTaskChange={setOperatorTask} onBusyChange={setOperatorJobBusy} onNotify={notify} />
+        <WeaponWorkspace active={workspaceMode === 'weapons'} blocked={launchState === 'running' || instancedJobBusy || operatorJobBusy || paintingBusy || firstRunRunning} resetRevision={weaponResetRevision} taskReturnRevision={weaponTaskReturnRevision} previewRevision={weaponPreviewRevision} onCatalogCountChange={setWeaponCatalogCount} onBusyChange={setWeaponJobBusy} onTaskChange={setWeaponTask} onNotify={notify} />
+        {entityHandoff === 'hammer' && <div className="hammer-curtain" aria-hidden="true"><span>WEAPON / FABRICATION</span><i /><b /><em /></div>}
+        {entityHandoff === 'cleave' && <div className="cleave-cut" aria-hidden="true" />}
       </main>
 
       <footer className="footer-strip">
         <strong>ENDFIELD / ATLAS</strong>
         <i />
-        <span>{workspaceMode === 'painting' ? `SI’S PAINTING · ${paintingRuntime.map ? 'MAP METADATA READY' : 'MAP PREPARATION REQUIRED'} / ${paintingRuntime.sourceReady ? '场景已准备' : '场景准备待完成'}` : workspaceMode === 'operators' ? `OPERATORS · ${operatorDevelopmentPreview ? 'DEV VISUAL PREVIEW' : operatorCatalogCount !== null ? 'CHARACTER CATALOG READY' : 'CHARACTER SETUP REQUIRED'} · ENTITY ARCHIVE / CHARACTER JOBS` : `${workspaceMode === 'instanced' ? 'INSTANCED SCENES' : map.title} · ${sourceReady ? 'FIRST RUN READY' : firstRunRunning ? 'DATA PREPARING' : 'SETUP REQUIRED'} · ${workspaceMode === 'instanced' ? 'DISCRETE SCENE INDEX / SCENE JOBS' : `SECTOR128 RESOLVED · ${exportMode === 'blend' ? 'BLENDER SCENE + DATA PACKAGE' : 'DATA PACKAGE EXPORT'}`}`}</span>
+        <span>{workspaceMode === 'weapons' ? `WEAPONS · ${weaponCatalogCount !== null ? 'ASSET CATALOG READY' : 'CATALOG PENDING'} · FABRICATION / ASSET JOBS` : workspaceMode === 'painting' ? `SI’S PAINTING · ${paintingRuntime.map ? 'MAP METADATA READY' : 'MAP PREPARATION REQUIRED'} / ${paintingRuntime.sourceReady ? '场景已准备' : '场景准备待完成'}` : workspaceMode === 'operators' ? `OPERATORS · ${operatorDevelopmentPreview ? 'DEV VISUAL PREVIEW' : operatorCatalogCount !== null ? 'CHARACTER CATALOG READY' : 'CHARACTER SETUP REQUIRED'} · ENTITY ARCHIVE / CHARACTER JOBS` : `${workspaceMode === 'instanced' ? 'INSTANCED SCENES' : map.title} · ${sourceReady ? 'FIRST RUN READY' : firstRunRunning ? 'DATA PREPARING' : 'SETUP REQUIRED'} · ${workspaceMode === 'instanced' ? 'DISCRETE SCENE INDEX / SCENE JOBS' : `SECTOR128 RESOLVED · ${exportMode === 'blend' ? 'BLENDER SCENE + DATA PACKAGE' : 'DATA PACKAGE EXPORT'}`}`}</span>
       </footer>
 
       <LegalArchive />

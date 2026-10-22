@@ -1,0 +1,1036 @@
+.weapon-completion[open] {
+  --weapon-ink: #f0f2ef;
+  --weapon-muted: #99a6ad;
+  --weapon-steel: #3a5a6b;
+  --weapon-steel-light: #7897a3;
+  --weapon-steel-dark: #1c2b33;
+  --weapon-fire: #ff6b2b;
+  --weapon-amber: #ffb84d;
+  --weapon-mono: Consolas, "Cascadia Mono", monospace;
+  position: fixed;
+  inset: 0;
+  box-sizing: border-box;
+  width: min(1180px, calc(100vw - 48px));
+  height: 610px;
+  max-width: none;
+  max-height: calc(100dvh - 48px);
+  margin: auto;
+  padding: 0;
+  overflow: hidden;
+  border: 0;
+  background: transparent;
+  color: var(--weapon-ink);
+  font-family: "Segoe UI", "Microsoft YaHei", sans-serif;
+  display: flex;
+}
+
+.weapon-completion[open]::backdrop {
+  background: #090d10e8;
+  backdrop-filter: blur(7px);
+}
+
+.weapon-completion-frame {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  border: 1px solid #53616a;
+  background: #0f1317;
+  box-shadow: 0 28px 110px #000b;
+  opacity: var(--window-reveal, 1);
+}
+
+.weapon-completion-header {
+  position: relative;
+  z-index: 4;
+  display: flex;
+  flex: 0 0 42px;
+  align-items: center;
+  gap: 18px;
+  min-width: 0;
+  padding: 0 19px;
+  border-bottom: 1px solid #38434a;
+  background: #10161a;
+  color: #a7b1b5;
+  font: 10px/1 var(--weapon-mono);
+  letter-spacing: .12em;
+}
+
+.weapon-completion-wordmark,
+.weapon-completion-header-state {
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
+  white-space: nowrap;
+}
+
+.weapon-completion-wordmark {
+  gap: 9px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.weapon-completion-wordmark i {
+  width: 7px;
+  height: 7px;
+  flex: 0 0 7px;
+  background: linear-gradient(135deg, var(--weapon-steel-light) 0 70%, var(--weapon-fire) 70%);
+}
+
+.weapon-completion-header-state {
+  margin-left: auto;
+  color: #71818a;
+}
+
+.weapon-completion-header-state b {
+  margin-left: 12px;
+  padding-left: 12px;
+  border-left: 1px solid #46535b;
+  color: #c5cdd0;
+  font-weight: 400;
+}
+
+.weapon-completion-header button {
+  display: grid;
+  width: 32px;
+  height: 32px;
+  flex: 0 0 32px;
+  place-items: center;
+  margin-left: 6px;
+  border: 1px solid #4d5960;
+  background: #151c21;
+  color: #e3e8e8;
+  font: 25px/1 "Segoe UI", sans-serif;
+  cursor: pointer;
+}
+
+.weapon-completion-header button:hover {
+  border-color: #a7b6bd;
+  background: #202a30;
+}
+
+.weapon-completion-layout {
+  display: grid;
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  grid-template-columns: 40% minmax(0, 1fr);
+}
+
+.weapon-completion-stage {
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  border-right: 1px solid #3e4d55;
+  background:
+    radial-gradient(ellipse at 47% 82%, #28333a 0, #141b20 37%, #0d1215 82%);
+  isolation: isolate;
+}
+
+.weapon-completion-stage::before {
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  background: radial-gradient(ellipse at 54% 87%, #ff7a2954, #fa511319 37%, transparent 65%);
+  opacity: var(--pool-fill, 0);
+  content: "";
+  pointer-events: none;
+}
+
+.weapon-completion-vessel {
+  position: absolute;
+  z-index: 1;
+  right: 7%;
+  bottom: 0;
+  left: 15%;
+  height: 40%;
+  overflow: hidden;
+  border: 1px solid #6c7d83;
+  border-bottom: 0;
+  background: linear-gradient(180deg, #1d272c80, #12191d80);
+  box-shadow: 0 -5px 28px #ff92283d, 0 0 48px #ff5b2726;
+  opacity: var(--window-reveal, 1);
+}
+
+.weapon-completion-vessel::before,
+.weapon-completion-vessel::after {
+  position: absolute;
+  z-index: 2;
+  top: 0;
+  width: 12%;
+  height: 7px;
+  background: #8a9aa0;
+  content: "";
+}
+
+.weapon-completion-vessel::before {
+  left: -1px;
+}
+
+.weapon-completion-vessel::after {
+  right: -1px;
+}
+
+.weapon-completion-pool {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  height: 100%;
+  transform: scaleY(var(--pool-fill, 0));
+  transform-origin: bottom;
+  background:
+    repeating-conic-gradient(#fff1 0 25%, transparent 0 50%) 0 0 / 5px 5px,
+    radial-gradient(ellipse at 25% 0%, #fff0a1c4, transparent 65%),
+    linear-gradient(180deg, #ffd77a 0, #ffab3f 12%, #ff732c 46%, #d74d22 100%);
+  box-shadow: inset 0 12px 35px #ffec9b80, inset 0 -20px 36px #b338181c;
+  filter: drop-shadow(0 0 14px #ff6b2b80);
+}
+
+.weapon-completion-pool::before {
+  position: absolute;
+  top: 0;
+  right: 0;
+  left: 0;
+  height: 3px;
+  background: #fff2c8;
+  box-shadow: 0 0 9px 3px #fff0a3, 0 0 24px 9px #ff9c42b0;
+  content: "";
+}
+
+.weapon-completion-pool::after {
+  position: absolute;
+  top: 3px;
+  right: 0;
+  left: 0;
+  height: 45px;
+  background: radial-gradient(ellipse at 12% 0, #fff7c9c0, #ffd78640 45%, transparent 75%);
+  content: "";
+  opacity: calc(.6 + var(--pool-impact, 0) * .4);
+}
+
+.weapon-completion-stream {
+  position: absolute;
+  z-index: 2;
+  top: 0;
+  left: 22%;
+  width: 12px;
+  opacity: var(--stream-strength, 0);
+  pointer-events: none;
+}
+
+.weapon-completion-stream::before,
+.weapon-completion-stream::after,
+.weapon-completion-stream i,
+.weapon-completion-stream b {
+  position: absolute;
+  inset: 0;
+  content: "";
+}
+
+.weapon-completion-stream::before {
+  left: -8px;
+  right: -8px;
+  background: linear-gradient(90deg, transparent, #ff6b2b50, transparent);
+}
+
+.weapon-completion-stream::after {
+  left: 3px;
+  right: 3px;
+  background: linear-gradient(180deg, #fff4d1, #ffcf7a 28%, #ff7a32 88%, #ffb04a);
+}
+
+.weapon-completion-stream i {
+  left: -3px;
+  right: -3px;
+  background: linear-gradient(90deg, transparent, #ff9a3b80, transparent);
+}
+
+.weapon-completion-stream b {
+  left: 5px;
+  right: 5px;
+  background: #fff5dc;
+  opacity: .82;
+}
+
+.weapon-completion-ruler {
+  position: absolute;
+  z-index: 4;
+  top: 14%;
+  bottom: 43%;
+  left: 5%;
+  width: 46px;
+  opacity: var(--die-reveal, 0);
+  color: #a6b4ba;
+  font: 8px/1 var(--weapon-mono);
+  letter-spacing: .03em;
+}
+
+.weapon-completion-ruler::before,
+.weapon-completion-ruler-live {
+  position: absolute;
+  top: 17px;
+  bottom: 0;
+  left: 32px;
+  width: 1px;
+  background: #87969c52;
+  content: "";
+}
+
+.weapon-completion-ruler-live {
+  top: 17px;
+  bottom: 0;
+  z-index: 1;
+  background: linear-gradient(0deg, #ffb84d, #ff6b2b);
+  box-shadow: 0 0 6px #ff7e3370;
+  clip-path: inset(calc(100% - var(--cooling-progress, 0%)) 0 0);
+}
+
+.weapon-completion-ruler-label {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 46px;
+  color: #72828a;
+  font-size: 7px;
+  letter-spacing: 0;
+  white-space: nowrap;
+}
+
+.weapon-completion-ruler-value {
+  position: absolute;
+  top: 21px;
+  left: 0;
+  width: 27px;
+  text-align: right;
+}
+
+.weapon-completion-ruler-value--mid {
+  top: 50%;
+}
+
+.weapon-completion-ruler-value--low {
+  top: auto;
+  bottom: 0;
+}
+
+.weapon-completion-ruler-tick {
+  position: absolute;
+  top: 20px;
+  left: 29px;
+  width: 7px;
+  height: 1px;
+  background: #93a3a9;
+}
+
+.weapon-completion-ruler-tick--mid {
+  top: 52%;
+  width: 5px;
+}
+
+.weapon-completion-ruler-tick--low {
+  top: auto;
+  bottom: 2px;
+  width: 7px;
+}
+
+.weapon-completion-die {
+  position: absolute;
+  z-index: 3;
+  top: 13%;
+  right: 7%;
+  bottom: 43%;
+  left: 15%;
+  opacity: var(--die-reveal, 0);
+  transform: translateY(var(--plate-lift, 0px));
+}
+
+.weapon-completion-die-inset {
+  position: absolute;
+  inset: 9px 7px;
+  overflow: hidden;
+  border: 1px solid #71858e80;
+  background: #17232a;
+  box-shadow: 0 10px 32px #0007, inset 0 -12px 28px #ff7a2815;
+}
+
+.weapon-completion-die-mark {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.weapon-completion-die-mark text {
+  user-select: none;
+}
+
+.weapon-completion-die-face {
+  filter: drop-shadow(0 0 4px #ff702c88);
+}
+
+.weapon-completion-clamp {
+  position: absolute;
+  z-index: 2;
+  right: -11px;
+  left: -11px;
+  height: 27px;
+  background: linear-gradient(180deg, #b8c4c5 0, #80949a 23%, #4a636c 54%, #293f48 100%);
+  box-shadow: 0 2px 7px #0009, inset 0 1px #d3dcdb88;
+  clip-path: polygon(0 0, 100% 0, 100% 44%, 88% 44%, 82% 100%, 18% 100%, 12% 44%, 0 44%);
+}
+
+.weapon-completion-clamp--top {
+  top: 0;
+}
+
+.weapon-completion-clamp--bottom {
+  bottom: 0;
+  clip-path: polygon(0 56%, 12% 56%, 18% 0, 82% 0, 88% 56%, 100% 56%, 100% 100%, 0 100%);
+}
+
+.weapon-completion-clamp::before,
+.weapon-completion-clamp::after {
+  position: absolute;
+  top: 2px;
+  bottom: 2px;
+  width: 8%;
+  background: linear-gradient(90deg, #adc0c2, #607781 55%, #354d56);
+  content: "";
+}
+
+.weapon-completion-clamp::before {
+  left: 4%;
+}
+
+.weapon-completion-clamp::after {
+  right: 4%;
+}
+
+.weapon-completion-stage-state {
+  position: absolute;
+  z-index: 5;
+  right: 8%;
+  bottom: calc(40% + 12px);
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: #c0c9ca;
+  font: 8px/1 var(--weapon-mono);
+  letter-spacing: .12em;
+  opacity: var(--die-reveal, 0);
+}
+
+.weapon-completion-stage-state i {
+  width: 5px;
+  height: 5px;
+  background: var(--weapon-fire);
+}
+
+.weapon-completion-sparks {
+  position: absolute;
+  z-index: 5;
+  right: auto;
+  bottom: -64px;
+  left: -36px;
+  width: 128px;
+  height: 128px;
+  overflow: visible;
+  pointer-events: none;
+  transform-origin: center;
+}
+
+.weapon-completion-sparks line {
+  stroke: #ffb84d;
+  stroke-linecap: square;
+  stroke-width: 1.7;
+  vector-effect: non-scaling-stroke;
+}
+
+.weapon-completion-plain-state {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: center;
+  gap: 12px;
+  padding: 36px;
+  background: linear-gradient(150deg, #192127, #0e1317 74%);
+}
+
+.weapon-completion-plain-kicker {
+  color: #a6b1b6;
+  font: 10px/1 var(--weapon-mono);
+  letter-spacing: .14em;
+}
+
+.weapon-completion-plain-state strong {
+  color: #e6e9e7;
+  font: 800 clamp(38px, 4.2vw, 64px)/1 "Bahnschrift", "Segoe UI", sans-serif;
+  letter-spacing: -.04em;
+}
+
+.weapon-completion-plain-state > span:not(.weapon-completion-plain-kicker) {
+  max-width: 100%;
+  overflow: hidden;
+  color: #aab4b8;
+  font-size: 15px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.weapon-completion-plain-state code {
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  color: #7e9099;
+  font: 11px/1.4 var(--weapon-mono);
+}
+
+.weapon-completion--failed .weapon-completion-plain-kicker {
+  color: #d88d7a;
+}
+
+.weapon-completion-report {
+  position: relative;
+  display: grid;
+  min-width: 0;
+  min-height: 0;
+  grid-template-rows: 14px 125px minmax(0, 1fr) 35px;
+  gap: 7px;
+  overflow: hidden;
+  padding: 17px 34px 15px;
+  background:
+    linear-gradient(90deg, #27333a 0, #27333a 1px, transparent 1px) 0 0 / 17px 100% no-repeat,
+    radial-gradient(ellipse at 100% 7%, #23313a 0, transparent 43%),
+    #11171b;
+  isolation: isolate;
+}
+
+.weapon-completion-report::after {
+  position: absolute;
+  z-index: -1;
+  top: 15px;
+  right: 16px;
+  width: 1px;
+  height: 76px;
+  background: linear-gradient(#78909b70, transparent);
+  content: "";
+  pointer-events: none;
+}
+
+.weapon-completion-kicker {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  min-width: 0;
+  color: #91a0a7;
+  font: 11px/1 var(--weapon-mono);
+  letter-spacing: .08em;
+  text-transform: uppercase;
+}
+
+.weapon-completion-kicker span:first-child {
+  overflow: hidden;
+  color: #c3ccce;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.weapon-completion-kicker span:last-child {
+  flex: 0 0 auto;
+  color: #708089;
+}
+
+.weapon-completion-impression {
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+  overflow: visible;
+}
+
+.weapon-completion-impression::before {
+  position: absolute;
+  z-index: 0;
+  inset: 0;
+  background:
+    linear-gradient(135deg, transparent 0 18%, #91a7b016 18.15% 18.35%, transparent 18.5% 79%, #91a7b00d 79.15% 79.35%, transparent 79.5%),
+    linear-gradient(45deg, transparent 0 41%, #91a7b00d 41.15% 41.35%, transparent 41.5%);
+  content: "";
+  opacity: var(--engineering-print, 0);
+  pointer-events: none;
+}
+
+.weapon-completion-impression::after {
+  position: absolute;
+  z-index: 0;
+  top: 19px;
+  left: 14px;
+  color: #91a7b0;
+  content: "TOOLING / IMPRESSION";
+  font: 8px/1 var(--weapon-mono);
+  letter-spacing: .14em;
+  opacity: calc(var(--engineering-print, 0) * .35);
+  pointer-events: none;
+}
+
+.weapon-completion-hammer {
+  position: absolute;
+  z-index: 1;
+  bottom: 0;
+  left: 0;
+  box-sizing: border-box;
+  display: block;
+  min-width: 56px;
+  min-height: 54px;
+  overflow: hidden;
+  border: 1px solid #88a2ad;
+  background: linear-gradient(105deg, #2b4654, #496a79 42%, #314d5a);
+  box-shadow: inset 0 0 0 2px #1b2d35, inset 7px 0 #6f8c96;
+  clip-path: polygon(0 0, 100% 0, 100% 84%, 96% 100%, 0 100%);
+}
+
+.weapon-completion-title {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0 20px;
+  overflow: hidden;
+  color: #fff8e9;
+  font: 800 clamp(30px, 2.05vw, 42px)/1.2 "Bahnschrift", "Segoe UI", "Microsoft YaHei", sans-serif;
+  letter-spacing: -.035em;
+  text-shadow: 0 1px 0 #e8874a, 0 0 10px #ff9e4a30;
+  white-space: nowrap;
+  clip-path: inset(0 calc(100% - var(--title-reveal, 0%)) 0 0);
+}
+
+.weapon-completion-title::after {
+  position: absolute;
+  top: 8px;
+  bottom: 8px;
+  left: var(--title-reveal, 0%);
+  width: 2px;
+  background: #fff1c9;
+  box-shadow: 0 0 8px 2px #ff9f4a8a;
+  content: "";
+}
+
+.weapon-completion-plain-title {
+  display: flex;
+  height: 100%;
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: flex-end;
+  gap: 13px;
+  padding: 0 0 16px;
+  border-bottom: 1px solid #53616a;
+}
+
+.weapon-completion-plain-title > span {
+  color: #94a1a7;
+  font: 9px/1 var(--weapon-mono);
+  letter-spacing: .14em;
+}
+
+.weapon-completion-plain-title h1 {
+  max-width: 100%;
+  margin: 0;
+  color: #e8ecea;
+  font: 750 clamp(28px, 2.8vw, 42px)/1.12 "Bahnschrift", "Segoe UI", "Microsoft YaHei", sans-serif;
+  letter-spacing: -.04em;
+  overflow-wrap: anywhere;
+}
+
+.weapon-completion--failed .weapon-completion-plain-title h1 {
+  color: #e3b1a2;
+}
+
+.weapon-completion-data-scroll {
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+  padding-right: 8px;
+  overscroll-behavior: contain;
+  scrollbar-color: #52626a #182126;
+  scrollbar-width: thin;
+}
+
+.weapon-completion-data-row {
+  display: grid;
+  min-height: 34px;
+  grid-template-columns: 104px minmax(0, 1fr);
+  align-items: center;
+  gap: 12px;
+  border-bottom: 1px solid #43515a55;
+  color: #e1e6e5;
+  font: 14px/1.4 var(--weapon-mono);
+}
+
+.weapon-completion-data-row > span,
+.weapon-completion-group-title {
+  color: #8999a0;
+  font: 11px/1.3 var(--weapon-mono);
+  letter-spacing: .05em;
+}
+
+.weapon-completion-data-row strong {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: #edf0ee;
+  font: 500 14px/1.4 var(--weapon-mono);
+}
+
+.weapon-completion-meta-strip {
+  display: grid;
+  grid-template-columns: minmax(0, 1.45fr) minmax(84px, .72fr) minmax(0, 1fr);
+  gap: 12px;
+  padding: 10px 0;
+  border-bottom: 1px solid #43515a55;
+}
+
+.weapon-completion-meta-strip > div {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.weapon-completion-meta-strip span {
+  color: #8999a0;
+  font: 11px/1.3 var(--weapon-mono);
+  letter-spacing: .05em;
+}
+
+.weapon-completion-meta-strip strong {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: #edf0ee;
+  font: 500 14px/1.4 var(--weapon-mono);
+}
+
+.weapon-completion--partial .weapon-completion-data-row:nth-child(3) strong,
+.weapon-completion--partial .weapon-completion-data-group--pending .weapon-completion-group-title {
+  color: #ffbd73;
+}
+
+.weapon-completion-data-group {
+  padding: 10px 0 7px;
+  border-bottom: 1px solid #43515a55;
+}
+
+.weapon-completion-group-title {
+  margin: 0 0 4px;
+}
+
+.weapon-completion-file,
+.weapon-completion-pending {
+  min-width: 0;
+  padding: 3px 0;
+  color: #d6dddc;
+  font: 14px/1.4 var(--weapon-mono);
+  overflow-wrap: anywhere;
+}
+
+.weapon-completion-file code {
+  color: inherit;
+  font: inherit;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.weapon-completion-artifact-kind {
+  display: block;
+  margin-bottom: 2px;
+  color: #94a7ad;
+  font-size: 10px;
+  letter-spacing: .12em;
+}
+
+.weapon-completion-data-group--pending .weapon-completion-pending {
+  color: #e9b37f;
+}
+
+.weapon-completion--partial .weapon-completion-data-group--pending {
+  border-left: 2px solid #e58a48;
+  padding-left: 9px;
+}
+
+.weapon-completion-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+  border-top: 1px solid #3d4a51;
+  color: #7f8f96;
+  font: 8px/1 var(--weapon-mono);
+  letter-spacing: .11em;
+}
+
+.weapon-completion-actions > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.weapon-completion-actions-buttons {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 8px;
+}
+
+.forge-chamber {
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  overflow: hidden;
+  pointer-events: none;
+  opacity: var(--die-reveal, 0);
+}
+
+.forge-chamber > span {
+  position: absolute;
+  top: 5%;
+  left: 15%;
+  color: #a9b8be;
+  font: 10px/1 var(--weapon-mono);
+  letter-spacing: .16em;
+}
+
+.forge-chamber > b {
+  position: absolute;
+  top: -10%;
+  right: -3%;
+  color: transparent;
+  -webkit-text-stroke: 1px #8ea3af18;
+  font: 900 340px/1 var(--display);
+  transform: translateY(calc(var(--plate-lift, 0px) * -1));
+}
+
+.forge-chamber > i {
+  position: absolute;
+  inset: 10% 7% 0 15%;
+  border-left: 1px solid #8fa4af28;
+  border-right: 1px solid #8fa4af28;
+}
+
+.forge-chamber > em {
+  position: absolute;
+  top: 8%;
+  left: 15%;
+  color: #70818c;
+  font: normal 8px/1 var(--weapon-mono);
+  letter-spacing: .14em;
+}
+
+.forge-report-art {
+  position: absolute;
+  z-index: -1;
+  inset: 0;
+  overflow: hidden;
+  color: #a3b9c5;
+  pointer-events: none;
+  opacity: var(--engineering-print, 0);
+  transform: translateX(calc((1 - var(--engineering-print, 0)) * 32px));
+  mask-image: linear-gradient(90deg, transparent, #0006 45%, #000 100%);
+}
+
+.forge-report-art > b {
+  position: absolute;
+  right: -6px;
+  top: -18px;
+  color: transparent;
+  -webkit-text-stroke: 1px #a9bdcc38;
+  font: 900 148px/.9 var(--display);
+  letter-spacing: -.06em;
+}
+
+.forge-report-art > svg {
+  width: 100%;
+  height: 100%;
+  opacity: .18;
+}
+
+.forge-report-art > span {
+  position: absolute;
+  right: 15px;
+  top: 165px;
+  writing-mode: vertical-rl;
+  font: 9px/1 var(--weapon-mono);
+  letter-spacing: .22em;
+  opacity: .5;
+}
+
+.forge-report-art > small {
+  position: absolute;
+  right: 40px;
+  bottom: 53px;
+  color: #9fb1bb55;
+  text-align: right;
+  font: 9px/1.8 var(--weapon-mono);
+  letter-spacing: .1em;
+}
+
+.weapon-completion-actions button[aria-pressed="true"] {
+  color: #ffc580;
+  border-color: #c48c53;
+}
+
+.weapon-completion-actions button {
+  flex: 0 0 auto;
+  min-height: 28px;
+  padding: 0 11px;
+  border: 1px solid #5b6870;
+  background: #182126;
+  color: #e1e6e5;
+  font: 12px/1 "Segoe UI", "Microsoft YaHei", sans-serif;
+  letter-spacing: .02em;
+  cursor: pointer;
+}
+
+.weapon-completion-actions button:hover {
+  border-color: #94a7ae;
+  background: #202a30;
+}
+
+.weapon-completion-actions .weapon-completion-return {
+  border-color: #ea7b3a;
+  background: #df7132;
+  color: #151a1c;
+  font-weight: 650;
+}
+
+.weapon-completion-actions .weapon-completion-return:hover {
+  border-color: #ff9a55;
+  background: #f08a45;
+}
+
+.weapon-completion button:focus-visible,
+.weapon-completion-data-scroll:focus-visible,
+.weapon-completion-plain-title h1:focus-visible {
+  outline: 2px solid #f1a05d;
+  outline-offset: 3px;
+}
+
+.weapon-completion[data-forge-active="true"] .weapon-completion-kicker {
+  opacity: var(--report-reveal, 0);
+}
+
+.weapon-completion[data-forge-active="true"] .weapon-completion-data-scroll,
+.weapon-completion[data-forge-active="true"] .weapon-completion-actions {
+  opacity: var(--report-reveal, 0);
+}
+
+.weapon-completion[data-forge-active="true"] .weapon-completion-actions > span {
+  opacity: var(--report-reveal, 0);
+}
+
+.weapon-completion[data-forge-active="true"] .weapon-completion-actions-buttons {
+  opacity: var(--report-reveal, 0);
+}
+
+.weapon-completion[data-forge-active="true"]:not([data-actions-ready="true"]) .weapon-completion-actions-buttons {
+  pointer-events: none;
+}
+
+.weapon-completion[data-forge-active="true"]:not([data-print-ready="true"]) .weapon-completion-data-scroll {
+  scrollbar-width: none;
+}
+
+.weapon-completion[data-forge-active="true"]:not([data-print-ready="true"]) .weapon-completion-data-scroll::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+}
+
+.weapon-completion[data-forge-active="true"] .weapon-completion-frame {
+  opacity: var(--window-reveal, 0);
+}
+
+.weapon-completion[data-forge-active="true"] .weapon-completion-hammer {
+  opacity: var(--hammer-visibility, 0);
+}
+
+.weapon-completion[data-forge-active="true"] .weapon-completion-sparks {
+  opacity: var(--spark-visibility, 0);
+}
+
+.weapon-completion[data-forge-active="true"] [data-print-row] {
+  clip-path: inset(0 100% 0 0);
+  opacity: .2;
+}
+
+.weapon-completion[data-state="partial"] .weapon-completion-title {
+  color: #fff1d7;
+}
+
+@media (max-width: 900px) {
+  .weapon-completion-header {
+    gap: 10px;
+    padding: 0 12px;
+    font-size: 8px;
+    letter-spacing: .08em;
+  }
+
+  .weapon-completion-report {
+    grid-template-rows: 14px 105px minmax(0, 1fr) 35px;
+    gap: 6px;
+    padding: 16px 23px 13px;
+  }
+
+  .weapon-completion-impression {
+    height: 105px;
+  }
+
+  .weapon-completion-title {
+    padding: 0 13px;
+    font-size: clamp(25px, 2.7vw, 34px);
+  }
+
+  .weapon-completion-data-row {
+    min-height: 32px;
+    grid-template-columns: 88px minmax(0, 1fr);
+    gap: 8px;
+    font-size: 12px;
+  }
+
+  .weapon-completion-data-row strong {
+    font-size: 12px;
+  }
+
+  .weapon-completion-meta-strip {
+    gap: 8px;
+  }
+
+  .weapon-completion-meta-strip strong {
+    font-size: 12px;
+  }
+
+  .weapon-completion-file,
+  .weapon-completion-pending {
+    font-size: 12px;
+  }
+}
+
+@media (max-height: 650px) {
+  .weapon-completion {
+    height: calc(100dvh - 24px);
+    max-height: calc(100dvh - 24px);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .weapon-completion-frame,
+  .weapon-completion-hammer,
+  .weapon-completion-sparks,
+  .weapon-completion button {
+    transition: none !important;
+    animation: none !important;
+  }
+}

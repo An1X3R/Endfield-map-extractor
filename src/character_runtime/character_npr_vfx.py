@@ -10,7 +10,7 @@ if TYPE_CHECKING:
 
 
 CHARACTER_VFX_SHADER = 'HGRP/CharacterNPR_VFX'
-MESH_EFFECT_SHADERS = frozenset(('HGRP/Effect/VFXBaseV2', CHARACTER_VFX_SHADER))
+MESH_EFFECT_SHADERS = frozenset(('HGRP/Effect/VFXBaseV2', 'HGRP/Effect/VFXDitherAlpha', CHARACTER_VFX_SHADER))
 ROLE_SOURCES = (
     ('_UseDisturb', 0, '_DisturbTex1', '_DisturbUVSpeed1', '_DisturbUVWeights1', '_DisturbUVRotateMat1'),
     ('_UseMask', 3, '_MaskTex', '_MaskTexUVSpeed', '_MaskTexUVWeights', '_MaskTexUVRotateMat'),

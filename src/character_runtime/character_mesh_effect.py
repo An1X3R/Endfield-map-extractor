@@ -232,7 +232,7 @@ def _scene_record(source: MaterialSource, packet: SourcePacket) -> tuple[Materia
     keywords = [_string(keyword, "character.material_tree.keyword") for keyword in raw_keywords]
     if tuple(keywords) != source.keywords:
         raise ValueError(f"Material keywords changed after source parsing: material={source.identity}")
-    raw_disabled = raw_tree.get("m_DisabledShaderPasses")
+    raw_disabled = raw_tree.get("disabledShaderPasses", raw_tree.get("m_DisabledShaderPasses"))
     if raw_disabled is None:
         disabled: list[str] = []
     else:
@@ -268,6 +268,27 @@ def _scene_record(source: MaterialSource, packet: SourcePacket) -> tuple[Materia
     return record, MappingProxyType(path_map), raw_state
 
 
+def _is_raster_dimension_driver(tree: bpy.types.NodeTree, curve: bpy.types.FCurve) -> bool:
+    """Recognize only the shared dither factory's scene raster-size controls."""
+    for axis in ('x', 'y'):
+        node = tree.nodes.get(f'Dither Raster Resolution {axis.upper()}')
+        if node is None or curve.data_path != node.outputs[0].path_from_id('default_value'):
+            continue
+        driver = curve.driver
+        names = (f'resolution_{axis}', 'resolution_percentage')
+        if driver.type != 'SCRIPTED' or driver.expression != f'resolution_{axis} * resolution_percentage / 100':
+            return False
+        if len(driver.variables) != 2:
+            return False
+        for variable, name in zip(driver.variables, names, strict=True):
+            target = variable.targets[0]
+            if (variable.name != name or variable.type != 'SINGLE_PROP' or target.id_type != 'SCENE'
+                    or target.id != bpy.context.scene or target.data_path != f'render.{name}'):
+                return False
+        return True
+    return False
+
+
 def _tree_animation_paths(tree: bpy.types.NodeTree, trail: frozenset[int]) -> tuple[str, ...]:
     pointer = tree.as_pointer()
     if pointer in trail:
@@ -277,7 +298,8 @@ def _tree_animation_paths(tree: bpy.types.NodeTree, trail: frozenset[int]) -> tu
     if animation is not None:
         if animation.action is not None:
             paths.append(f"{tree.name}:action={animation.action.name}")
-        paths.extend(f"{tree.name}:{driver.data_path}" for driver in animation.drivers)
+        paths.extend(f"{tree.name}:{driver.data_path}" for driver in animation.drivers
+                     if not _is_raster_dimension_driver(tree, driver))
     for item in tree.nodes:
         if item.type == "GROUP" and item.node_tree is not None:
             paths.extend(_tree_animation_paths(item.node_tree, trail | {pointer}))
@@ -395,7 +417,7 @@ def _group_factory_surface(
     if not material.use_nodes or material.node_tree is None:
         raise ValueError(f"Scene VFX factory returned a material without nodes: material={material.name}")
     tree = material.node_tree
-    if source.shader == CHARACTER_VFX_SHADER:
+    if source.shader in (CHARACTER_VFX_SHADER, 'HGRP/Effect/VFXDitherAlpha'):
         for uv in (item for item in tree.nodes if item.type == 'UVMAP'):
             if uv.uv_map == 'UVMap':
                 uv.uv_map = 'UV0'
