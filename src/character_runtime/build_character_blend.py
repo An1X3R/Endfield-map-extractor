@@ -35,7 +35,8 @@ from preview_character import (
     pack_referenced_mesh_images, write_static_bind_pose_audit,
 )
 from rebuild_character_materials import (
-    SourcePacket, read_packet, build_loaded_materials, configure_render_view, file_hash, SUPPORTED_SHADERS,
+    SourcePacket, read_packet, build_loaded_materials, configure_render_view, file_hash,
+    optional_standalone_vfx_renderer_skips, SUPPORTED_SHADERS,
 )
 from character_npr_nodes import ArtistLighting
 from review_character_cross_hgrp import build_loaded_hgrp, CharacterFrameSettings
@@ -46,6 +47,9 @@ from attach_skin_shadow import attach_skin_shadow
 from attach_skin_specular_light import SpecularLightParameters, attach_skin_specular_light
 from character_skin_specular_light import build_skin_specular_light
 from attach_skin_special_lights import RampedLightParameters, attach_skin_ramped_light
+from character_vfx_vertex_offset import (
+    install_vertex_offsets, verify_offset_surface_bindings, verify_vertex_offsets,
+)
 from character_skin_ramped_light import build_body_skin_ramped_light, build_face_skin_ramped_light
 from attach_character_live_shadows import make_proxy_collection, attach_live_shadows
 from character_shadow_proxy_alpha import read_shadow_alpha_evidence, attach_shadow_proxy_alpha
@@ -471,7 +475,12 @@ def main(args: argparse.Namespace) -> None:
     stage_times['source_selection_and_bind_pose'] = time.perf_counter() - mark
     mark = time.perf_counter()
     packet = read_packet(args.source_dir, args.shader_identities, selection, args.renderer_visibility)
-    materials = build_loaded_materials(packet, ArtistLighting((.7,-1.,.6),.9,.15,0.,.25,.75), layout_shader_node_tree)
+    skipped_effect_materials, skipped_effect_renderers = optional_standalone_vfx_renderer_skips(packet)
+    vertex_offsets = install_vertex_offsets(packet, bpy.context.scene, frozenset(skipped_effect_materials))
+    materials = build_loaded_materials(packet, ArtistLighting((.7,-1.,.6),.9,.15,0.,.25,.75),
+        layout_shader_node_tree, skipped_effect_materials, skipped_effect_renderers)
+    verify_offset_surface_bindings(vertex_offsets, bpy.context.scene)
+    vertex_offset_validation = verify_vertex_offsets(vertex_offsets, bpy.context.scene)
     stage_times['source_materials'] = time.perf_counter() - mark
     mark = time.perf_counter()
     frames = CharacterFrameSettings(args.head_bone, tuple(args.face_right), tuple(args.face_up),
@@ -616,7 +625,7 @@ def main(args: argparse.Namespace) -> None:
                          'audit_character_materials.py','character_late_materials.py','character_wetfilm_profile.py',
                          'character_standard_snow_profile.py','character_hair_fur_snow_profile.py','character_hair_fur_snow.py',
                          'character_fur_curves_profile.py','character_fur_curve_weather.py','character_fur_geometry.py',
-                         'character_fur_texture_contract.py','character_fur_source_shell.py','character_fur_transmission.py','character_fur_appearance.py','character_fur_microfibres.py','character_mesh_effect.py','character_npr_vfx.py','character_special_vfx.py',
+                         'character_fur_texture_contract.py','character_fur_source_shell.py','character_fur_transmission.py','character_fur_appearance.py','character_fur_microfibres.py','character_mesh_effect.py','character_npr_vfx.py','character_special_vfx.py','character_vfx_vertex_offset.py',
                          'character_hair_wet.py','character_hair_wet_profile.py','character_rain_droplets.py',
                          'character_fur_wet.py','character_fur_wet_profile.py',
                           'character_weather_nodes.py','character_weather_per_draw.py',
@@ -626,6 +635,7 @@ def main(args: argparse.Namespace) -> None:
     source_hashes.update({str(Path(__file__).parent/name): file_hash(Path(__file__).parent/name)
                          for name in ('character_emotion_atlas.py', 'character_expression_material_controls.py',
                                       'character_authoring_workspace.py', 'character_material_authoring.py',
+                                      'character_shader_uniforms.py',
                                       'character_rig_authoring.py', 'character_viewport_preview.py',
                                       'character_rig_panel.py', 'character_rig_ik.py', 'character_weather_panel.py')})
     if material_variant is not None:
@@ -656,10 +666,16 @@ def main(args: argparse.Namespace) -> None:
               'source_import': imported, 'static_bind_pose_audit': str(pose), 'selection_report': artifact(selection),
               'source_artifact_refs': source_artifact_refs,
               'source_materials': len(packet.materials), 'actual_shader_families': sorted({source.shader for source in packet.materials}),
-              'material_support': {'visible_supported': [{'identity': source.identity, 'shader': source.shader} for source in packet.materials if source.identity in packet.visible_materials],
+              'material_support': {'visible_supported': [{'identity': source.identity, 'shader': source.shader} for source in packet.materials if source.identity in packet.visible_materials and source.identity in materials.groups],
                                    'inactive_unsupported': [{'identity': source.identity, 'shader': source.shader, 'status': 'archived_unsupported_shader'} for source in packet.materials if source.shader not in SUPPORTED_SHADERS]},
               'material_bindings': materials.renderer_rows, 'hgrp': dict(hgrp.details), 'special_lights': modes,
+              'vertex_offsets': vertex_offsets, 'vertex_offset_validation': vertex_offset_validation,
               'late_materials': late_materials,
+              'skipped_optional_resources': [json.loads(tree['skipped_optional_resource'])
+                                             for tree in materials.groups.values()
+                                             if 'skipped_optional_resource' in tree],
+              'skipped_optional_material_passes': list(materials.skipped_optional_material_passes),
+              'skipped_optional_effect_renderers': list(materials.skipped_optional_effect_renderers),
               'emotion_atlas': emotion_atlas,
               'standard_wetfilm': wetfilm,
               'standard_snow': standard_snow,

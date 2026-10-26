@@ -407,6 +407,60 @@ def _bind_vertex_color_nodes(
         raise ValueError(f"Unsupported VFX mesh color evidence: material={source.identity}, components={color_source.components}")
 
 
+def _extra_pass_layer(tree: bpy.types.ShaderNodeTree, source: MaterialSource) -> None:
+    """Expose source-over layering while retaining the original standalone surface."""
+    if source.shader not in (CHARACTER_VFX_SHADER, VFX_SHADER) or source.floats['_SurfaceType'] != 1.0:
+        return
+    composites = tuple(item for item in tree.nodes if item.type == 'GROUP'
+                       and item.node_tree.get('endfield_fx_contract') == 'premultiplied_source_destination/1')
+    if len(composites) != 1:
+        raise ValueError(f'Transparent character FX requires one source/destination composite: {source.identity}')
+    original = composites[0]
+    layered = original.node_tree.copy()
+    layered.name = 'Character FX Previous Surface / host approximation'
+    layered.interface.new_socket(name='Previous Shader', in_out='INPUT', socket_type='NodeSocketShader')
+    entry, = (item for item in layered.nodes if item.type == 'GROUP_INPUT')
+    destination = layered.nodes['Destination Factor']
+    added = layered.nodes['Add Shader']
+    attenuated = layered.nodes.new('ShaderNodeMixShader')
+    attenuated.label = 'Previous surface times source destination factor / host approximation'
+    layered.links.new(destination.outputs[0], attenuated.inputs[0])
+    layered.links.new(entry.outputs['Previous Shader'], attenuated.inputs[2])
+    layered.links.new(attenuated.outputs[0], added.inputs[0])
+    tree.interface.new_socket(name='Previous Shader', in_out='INPUT', socket_type='NodeSocketShader')
+    tree.interface.new_socket(name='Layer Shader', in_out='OUTPUT', socket_type='NodeSocketShader')
+    entries = tuple(item for item in tree.nodes if item.type == 'GROUP_INPUT')
+    inputs = entries[0] if len(entries) == 1 else tree.nodes.new('NodeGroupInput')
+    output, = (item for item in tree.nodes if item.type == 'GROUP_OUTPUT' and item.is_active_output)
+    layer = tree.nodes.new('ShaderNodeGroup')
+    layer.node_tree = layered
+    layer.label = 'Transparent source over previous surface / host approximation'
+    for name in ('Source RGB', 'Coverage', 'Output Alpha'):
+        original_input = original.inputs[name]
+        if len(original_input.links) != 1:
+            raise ValueError(f'Transparent FX composite input is not source-bound: {source.identity}/{name}')
+        tree.links.new(original_input.links[0].from_socket, layer.inputs[name])
+    tree.links.new(inputs.outputs['Previous Shader'], layer.inputs['Previous Shader'])
+    result = layer.outputs['Surface']
+    if source.floats['_CullMode'] == 2.0:
+        surface, = output.inputs['Shader'].links
+        cull = surface.from_node
+        if cull.type != 'MIX_SHADER' or len(cull.inputs[0].links) != 1:
+            raise ValueError(f'Transparent FX culling route is ambiguous: {source.identity}')
+        selected = tree.nodes.new('ShaderNodeMixShader')
+        selected.label = 'Backface FX retains previous surface / host approximation'
+        tree.links.new(cull.inputs[0].links[0].from_socket, selected.inputs[0])
+        tree.links.new(result, selected.inputs[1])
+        tree.links.new(inputs.outputs['Previous Shader'], selected.inputs[2])
+        result = selected.outputs[0]
+    tree.links.new(result, output.inputs['Layer Shader'])
+    tree['source_fx_layer'] = json.dumps({'format': 'EndfieldCharacterFxLayer/1',
+        'source_surface_type': source.floats['_SurfaceType'], 'source_blend_mode': source.floats['_BlendMode'],
+        'formula': 'sourceRGB * coverage + previousShader * (1 - outputAlpha)',
+        'source_premultiplied_once': True, 'standalone_shader_unchanged': True,
+        'scope': 'Blender surface-over approximation; native framebuffer, depth and raster pass equivalence is unverified.'}, sort_keys=True)
+
+
 def _group_factory_surface(
     material: bpy.types.Material,
     source: MaterialSource,
@@ -471,6 +525,7 @@ def _group_factory_surface(
     if interface_names != {"Shader", "Coverage", "Multiply Factor"}:
         raise ValueError(f"Scene VFX group outputs differ from character pass contract: material={material.name}, outputs={sorted(interface_names)}")
 
+    _extra_pass_layer(group_tree, source)
     group_tree.name = "EF Character VFX " + source.name + " " + str(source.identity[1])
     group_node.label = source.shader + " / scene factory surface"
     group_tree["source_shader"] = source.shader
@@ -525,12 +580,23 @@ def material_group(
     preview_record = character_vfx_preview_record(surface_record) if source.shader == CHARACTER_VFX_SHADER else record
     factory_record = preview_record
     if source.shader == CHARACTER_VFX_SHADER:
-        from character_npr_vfx_uv import character_vfx_mesh_uv_record
+        from character_npr_vfx_uv import character_vfx_mesh_uv_record, install_missing_uv1_reference
+        install_missing_uv1_reference(preview_record, color_source.mesh_names)
         factory_record = character_vfx_mesh_uv_record(preview_record, color_source.mesh_names)
     material = make_mesh_effect_material(factory_record, dict(texture_paths), VFX_SNAPSHOT_TIME, color_source.components)
     if source.shader == CHARACTER_VFX_SHADER:
-        from character_npr_vfx_uv import apply_character_vfx_mesh_uv_weights
+        from character_npr_vfx_uv import apply_character_vfx_disturbance, apply_character_vfx_mesh_uv_weights
         apply_character_vfx_mesh_uv_weights(material, preview_record, color_source.mesh_names)
+        apply_character_vfx_disturbance(material, record)
+        if source.floats['_UseFresnel'] == 1.0:
+            # Blender already faces its shading normal toward the viewed side.
+            # The CharacterNPR_VFX reference performs that same facing step once.
+            normal = material.node_tree.nodes.get('Fresnel Source Normal')
+            if normal is None or normal.type != 'VECT_MATH' or normal.operation != 'SCALE':
+                raise ValueError(f'Character VFX Fresnel source normal is absent: material={source.identity}')
+            for link in tuple(normal.inputs[3].links):
+                material.node_tree.links.remove(link)
+            normal.inputs[3].default_value = 1.0
     if source.shader == CHARACTER_VFX_SHADER and source.floats['_EnableNormalMap'] == 1.0:
         from character_npr_vfx_normal import apply_character_vfx_fresnel_normal
         apply_character_vfx_fresnel_normal(material, record, source, packet, texture_paths, color_source.mesh_names, VFX_SNAPSHOT_TIME)
@@ -540,6 +606,25 @@ def material_group(
         group['source_adapter'] = 'EndfieldCharacterNprVfxNamedRoles/1'
         group['endfield_fx_source_material_json'] = json.dumps(record, sort_keys=True)
         group['source_vfx_preview_record'] = json.dumps(preview_record, sort_keys=True)
+        group['source_character_vfx_exposure'] = json.dumps({
+            'format': 'EndfieldCharacterVfxExposure/1',
+            'source_threshold': source.floats['_ExpThreshold'],
+            'source_intensity': source.floats['_ExpIntensity'],
+            'preview_intensity': preview_record['Floats']['_ExpIntensity'],
+            'reference': 'shaders_1.2.4/characternpr_vfx.shader ForwardOnly programs',
+            'reference_sha256': '99254e596c6de5270d3cbb28bc7d75663b3642bcf86a62c8dc9fb7e93033c3b8',
+            'current_compiled_variant_verified': False,
+            'scope': 'Family host approximation: reference CharacterNPR_VFX programs do not consume threshold/excess gain; original source values remain archived.',
+        }, sort_keys=True)
+        if source.floats['_UseFresnel'] == 1.0:
+            group['source_character_vfx_fresnel'] = json.dumps({
+                'format': 'EndfieldCharacterVfxFresnel/1',
+                'view_direction': 'surface_to_camera',
+                'normal_orientation': 'Blender shading normal already faced to the viewed side',
+                'source_facing_applied_once': True,
+                'reference': 'shaders_1.2.4/characternpr_vfx.shader ForwardOnly facing normal and camera-minus-position dot',
+                'current_compiled_variant_verified': False,
+            }, sort_keys=True)
         if source.floats.get('_UsePosYAsScreenV', 0.0) != preview_record['Floats'].get('_UsePosYAsScreenV', 0.0):
             group['source_inactive_screen_modifier'] = 'Source _UsePosYAsScreenV is retained in source_floats; the host adapter prunes it only when every active named texture role has zero screen-UV weight.'
         group['source_sampler_slot_scope'] = 'Sampler source_slot names refer to host preview aliases; the native bindings are preserved in endfield_fx_source_material_json.'
@@ -547,12 +632,22 @@ def material_group(
         group['native_shader_semantics_verified'] = False
         limitations = _array(json.loads(group['endfield_fx_limitations']), 'VFX limitations')
         limitations.append('CharacterNPR_VFX named roles use the shared host preview graph; current compiled shader equivalence is not audited.')
+        limitations.append('CharacterNPR_VFX omits the VFXBaseV2 threshold/excess gain following the 1.2.4 ForwardOnly reference; current compiled variant byte equivalence remains unverified.')
         if source.floats['_UseVertexOffset'] == 1.0:
             from character_vfx_vertex_offset import CONTRACT, LIMITATION
             group['source_vertex_offset_geometry_contract'] = CONTRACT
             limitations.append(LIMITATION)
-        if source.floats['_Bi_Disturb'] == 1.0:
-            limitations.append('Bidirectional disturbance uses two opposed half-strength samples of the actual source texture; native time phases and flow composition remain unverified.')
+        if source.floats['_UseDisturb'] == 1.0:
+            group['source_character_vfx_disturbance'] = json.dumps({
+                'format': 'EndfieldCharacterVfxDisturbance/1',
+                'sample_count': 1,
+                'red_remap': 'R * (1 + Bi) - Bi',
+                'normal_decode': '(2 * remapped_R * A - 1, 2 * G - 1) * U',
+                'scalar_decode': 'remapped_R * (U, V)',
+                'source_bi': source.floats['_Bi_Disturb'],
+                'reference_shader_sha256': '5929470f17d70752bddbea10b0347ec87b4d872b4474b00d127a547efd8c6312',
+                'scope': 'Current CharacterNPR_VFX disturbance arithmetic only; runtime timing and the complete rendering pipeline remain approximated.',
+            }, sort_keys=True)
         if source.floats['_ZWriteWithAlphaTest'] == 1.0:
             limitations.append('Separate native alpha-tested depth draw is archived; the color material remains visible in host single-surface composition.')
         group['endfield_fx_limitations'] = json.dumps(limitations)

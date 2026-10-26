@@ -1,7 +1,7 @@
 """Build compact stock Blender surfaces from retained character source evidence.
 
-Only pre-lighting albedo, original UV/atlas controls, source coverage, and packed
-surface channels survive. Image samplers stay outside semantic calculation
+Pre-lighting albedo, original UV/atlas controls, source coverage, packed surface
+channels, and selected additive special effects survive. Image samplers stay outside semantic calculation
 groups. Face SDF and Principled lobes are explicit host approximations, not HGRP
 lighting. Geometry, rigging, actions, source materials, and source images are not
 edited. Callers decide whether unused original datablocks belong in an export.
@@ -18,6 +18,7 @@ import bpy
 from mathutils import Vector
 
 from character_node_graph import color_mix, math_node, node
+from character_shader_uniforms import INPUT_MARKER, MARKER, resolve_shader_uniform_socket
 from character_simple_layout import layout_simple_character_material
 from rebuild_character_materials import decode_normal
 
@@ -36,6 +37,7 @@ LIMITATIONS = (
     'Overlay passes retain the source multiplicative transparent transmission bridge; native framebuffer multiply, stencil and depth queues remain approximated.',
     'Head surfaces retain explicit source no-cast flags; mixed caster ownership uses separate material variants. Missing renderer metadata retains stock casting. Native shadow-only proxy reconstruction remains outside compact shading.',
     'Weather is intentionally absent from this kernel and must be composed explicitly by the caller.',
+    'Source-selected additive clothing effects retain their texture, time and strength arithmetic independently of simplified surface lighting.',
     'Original full materials are left unedited; callers must remove unused originals explicitly for a compact standalone export.',
 )
 
@@ -294,6 +296,26 @@ def _copy_node(tree: bpy.types.ShaderNodeTree, original: bpy.types.Node) -> bpy.
     return result
 
 
+def _remap_input_receipts(tree: bpy.types.ShaderNodeTree) -> None:
+    """Bind cloned matrix receipts to actual destination nodes and socket paths."""
+    for attribute in tree.nodes:
+        if INPUT_MARKER not in attribute:
+            continue
+        document = _json_object(attribute[INPUT_MARKER], tree.name + '/' + attribute.name)
+        links = tuple(attribute.outputs['Vector'].links)
+        if len(links) != 1 or links[0].to_node.bl_idname != 'ShaderNodeSeparateXYZ':
+            raise ValueError(f'Cloned matrix uniform requires one exact component extractor: {tree.name}/{attribute.name}')
+        component = links[0].to_node
+        destinations = tuple(component.outputs['X'].links)
+        if (len(destinations) != 1 or destinations[0].to_node.bl_idname != 'ShaderNodeCombineXYZ'
+                or destinations[0].to_socket.is_output):
+            raise ValueError(f'Cloned matrix uniform requires one Combine XYZ input: {tree.name}/{attribute.name}')
+        destination = destinations[0].to_socket
+        attribute[INPUT_MARKER] = json.dumps({**document, 'tree': tree.name,
+            'node': destination.node.name, 'path': destination.path_from_id('default_value'),
+            'result_node': component.name}, sort_keys=True)
+
+
 def _slice_socket_retained(tree: bpy.types.ShaderNodeTree, socket: bpy.types.NodeSocket,
     callers: tuple[bpy.types.Node, ...], cache: dict[tuple[int, tuple[int, ...]], bpy.types.Node],
     constants: dict[tuple[int, tuple[int, ...]], bpy.types.NodeSocket],
@@ -309,6 +331,9 @@ def _slice_socket_retained(tree: bpy.types.ShaderNodeTree, socket: bpy.types.Nod
         if key not in constants:
             constants[key] = _constant(tree, socket)
         return constants[key]
+    if MARKER in socket.node:
+        source = resolve_shader_uniform_socket(socket.id_data, socket)
+        return _slice_socket_retained(tree, source, callers, cache, constants, retained_groups)
     original = socket.node
     if original.type == 'GROUP_INPUT':
         if not callers:
@@ -660,12 +685,31 @@ def _build_pass(material: bpy.types.Material, source: SourcePass, options: Simpl
         else:
             bsdf.label = 'Editable weather surface channels / ' + source.family
             bsdf.hide = True
+    if original.get('source_special_vfx') is not None:
+        special = _json_object(original['source_special_vfx'], original.name + '.source_special_vfx')
+        emitted = original.nodes[str(special['emission_node'])]
+        if emitted.type != 'EMISSION':
+            raise ValueError(f'Source special effect requires its recorded emission: {original.name}')
+        effect = node(tree, 'ShaderNodeEmission', 'Source clothing effect / retained arithmetic', 'Simple clothing effects')
+        for label in ('Color', 'Strength'):
+            tree.links.new(_slice_socket(tree, emitted.inputs[label], callers, cache, constants), effect.inputs[label])
+        closure = tree.nodes[channels['surface_closure']]
+        combined = node(tree, 'ShaderNodeAddShader', 'Compact surface plus source clothing effect', 'Simple clothing effects')
+        tree.links.new(closure.outputs[0], combined.inputs[0])
+        tree.links.new(effect.outputs[0], combined.inputs[1])
+        channels['surface_closure'] = combined.name
+        channels['source_special_vfx_identity'] = special['material_identity']
     return SimpleMaterialSurface(material, bsdf, channels, source.family, original, source.instance)
 
 
 def _build_material(source: bpy.types.Material, passes: tuple[SourcePass, ...], options: SimpleMaterialOptions) -> tuple[bpy.types.Material, SimpleMaterialRow]:
     retained = tuple(item.family for item in passes if item.family in {'retained_vfx', 'retained_non_character'})
-    if retained:
+    # A verified transparent extra layer can preserve its source arithmetic over
+    # a compact body. Standalone FX and other retained stacks keep their route.
+    layered = bool(retained and passes[0].family not in {'retained_vfx', 'retained_non_character', 'overlay'}
+        and all(item.family != 'overlay' and (item.family not in {'retained_vfx', 'retained_non_character'}
+            or item.family == 'retained_vfx' and 'source_fx_layer' in item.instance.node_tree) for item in passes))
+    if retained and not layered:
         tree = source.node_tree
         textures = sum(item.type == 'TEX_IMAGE' for item in tree.nodes)
         drivers = len(tree.animation_data.drivers) if tree.animation_data else 0
@@ -682,7 +726,7 @@ def _build_material(source: bpy.types.Material, passes: tuple[SourcePass, ...], 
     material['source_material_stack'] = source['source_material_stack']
     material['lighting_precision'] = 'simple'
     material['fidelity'] = 'Stock Blender surface approximation with compact face SDF; original source maps and atlas controls.'
-    material.surface_render_method = 'DITHERED'
+    material.surface_render_method = source.surface_render_method if layered else 'DITHERED'
     material.use_backface_culling = source.use_backface_culling
     material.use_transparency_overlap = source.use_transparency_overlap
     tree = material.node_tree
@@ -697,7 +741,26 @@ def _build_material(source: bpy.types.Material, passes: tuple[SourcePass, ...], 
         material.surface_render_method = 'BLENDED'
         material['overlay_scope'] = 'Original source multiplicative transmission; native stencil/depth/framebuffer behavior remains approximate.'
     else:
-        for source_pass in passes:
+        for index, source_pass in enumerate(passes):
+            if source_pass.family == 'retained_vfx':
+                original = source_pass.instance
+                effect = _copy_node(tree, original)
+                effect.label = 'Retained transparent FX over compact surface / host approximation'
+                for source_input, target in zip(original.inputs, effect.inputs, strict=True):
+                    if source_input.name == 'Previous Shader':
+                        tree.links.new(previous, target)
+                    elif source_input.is_linked:
+                        tree.links.new(_slice_socket(tree, source_input, (), {}, {}), target)
+                    elif hasattr(source_input, 'default_value'):
+                        target.default_value = source_input.default_value
+                        _copy_driver(source_input, target)
+                control = _label(source.node_tree, 'Approx Extra Pass ' + str(index) + ' Enable (0 / 1)')
+                mix = node(tree, 'ShaderNodeMixShader', 'Optional transparent FX over compact surface', 'Simple pass composition')
+                tree.links.new(_slice_socket(tree, control.outputs[0], (), {}, {}), mix.inputs[0])
+                tree.links.new(previous, mix.inputs[1])
+                tree.links.new(effect.outputs['Layer Shader'], mix.inputs[2])
+                previous = mix.outputs[0]
+                continue
             surface = _build_pass(material, source_pass, options)
             mix = node(tree, 'ShaderNodeMixShader', 'Source ordered compact pass', 'Simple pass composition')
             tree.links.new(surface.channels.outputs['Coverage'], mix.inputs[0])
@@ -714,6 +777,7 @@ def _build_material(source: bpy.types.Material, passes: tuple[SourcePass, ...], 
         material['source_shadow_casting'] = 'disabled_by_unanimous_source_renderers'
     output = node(tree, 'ShaderNodeOutputMaterial', 'Simple material output', 'Simple output')
     tree.links.new(previous, output.inputs['Surface'])
+    _remap_input_receipts(tree)
     layout_simple_character_material(material)
     textures = tuple(item for item in tree.nodes if item.type == 'TEX_IMAGE')
     calculations = sum(len(item.node_tree.nodes) for item in tree.nodes if item.get('endfield_simple_channels'))
@@ -803,7 +867,9 @@ def clone_source_socket(destination: bpy.types.ShaderNodeTree, source: bpy.types
     This deliberately does not copy shader closures, color ramps, curve widgets,
     or keyed material actions. Unsupported source nodes fail explicitly.
     """
-    return _slice_socket(destination, source, caller_instances, {}, {})
+    result = _slice_socket(destination, source, caller_instances, {}, {})
+    _remap_input_receipts(destination)
+    return result
 
 
 def clone_source_sockets(destination: bpy.types.ShaderNodeTree, sources: tuple[bpy.types.NodeSocket, ...],
@@ -811,7 +877,9 @@ def clone_source_sockets(destination: bpy.types.ShaderNodeTree, sources: tuple[b
     """Share upstream dependencies and explicitly retain selected replacement groups."""
     cache: dict[tuple[int, tuple[int, ...]], bpy.types.Node] = {}
     constants: dict[tuple[int, tuple[int, ...]], bpy.types.NodeSocket] = {}
-    return tuple(_slice_socket_retained(destination, source, caller_instances, cache, constants, retained_groups) for source in sources)
+    results = tuple(_slice_socket_retained(destination, source, caller_instances, cache, constants, retained_groups) for source in sources)
+    _remap_input_receipts(destination)
+    return results
 
 
 def bind_simple_face_light(scene: bpy.types.Scene, light: bpy.types.Object) -> int:

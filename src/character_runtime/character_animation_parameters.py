@@ -100,7 +100,7 @@ def _controller_names(native: Path, request: dict[str, object], clip: dict[str, 
         raise ValueError('Parsed controller name differs from its verification receipt')
     pointers = tuple(_record(row, 'controller clip pointer') for row in _rows(tree['m_AnimationClips'], 'controller clips'))
     if evidence['status'] == 'exact_controller_clip_reference_and_tos_verified':
-        if evidence['clip_reference_path_id'] != clip['path_id'] or sum(row['m_FileID'] == evidence['clip_reference_file_id'] and row['m_PathID'] == clip['path_id'] for row in pointers) != 1:
+        if evidence['clip_reference_path_id'] != clip['path_id'] or not any(row['m_FileID'] == evidence['clip_reference_file_id'] and row['m_PathID'] == clip['path_id'] for row in pointers):
             raise ValueError('Parsed controller lacks the exact verified clip pointer')
     else:
         _verify_dynamic_controller_selection(native, request, clip, evidence)

@@ -46,16 +46,29 @@ def _height(item: bpy.types.Node) -> float:
 def _ordered(tree: bpy.types.NodeTree, members: tuple[bpy.types.Node, ...]) -> tuple[bpy.types.Node, ...]:
     """Keep each bounded frame in upstream order with stable disconnected nodes."""
     pending = {item.name: item for item in members}
+    upstream: dict[str, set[str]] = {name: set() for name in pending}
+    downstream: dict[str, set[str]] = {name: set() for name in pending}
+    for link in tree.links:
+        source, target = link.from_node.name, link.to_node.name
+        if source in pending and target in pending:
+            upstream[target].add(source)
+            downstream[source].add(target)
     result: list[bpy.types.Node] = []
-    while pending:
-        ready = tuple(sorted((item for item in pending.values() if not any(
-            link.from_node.name in pending for socket in item.inputs for link in socket.links)),
-            key=lambda item: (str(item.get('source_slot', '')), item.label, item.name)))
-        if not ready:
-            raise ValueError(f'Cannot lay out a cyclic shader frame: tree={tree.name}, nodes={sorted(pending)}')
-        result.extend(ready)
-        for item in ready:
+    ready = {name for name in pending if not upstream[name]}
+    while ready:
+        ordered = tuple(sorted((pending[name] for name in ready),
+                               key=lambda item: (str(item.get('source_slot', '')), item.label, item.name)))
+        result.extend(ordered)
+        following: set[str] = set()
+        for item in ordered:
             del pending[item.name]
+            for target in downstream[item.name]:
+                upstream[target].remove(item.name)
+                if not upstream[target]:
+                    following.add(target)
+        ready = following
+    if pending:
+        raise ValueError(f'Cannot lay out a cyclic shader frame: tree={tree.name}, nodes={sorted(pending)}')
     return tuple(result)
 
 

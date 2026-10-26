@@ -2,10 +2,10 @@
 import bpy
 from bpy.app.handlers import persistent
 
-from . import character_rig_ik, character_rig_panel, character_weather_panel, character_postprocess_panel
+from . import character_rig_ik, character_rig_panel, character_weather_panel, character_postprocess_panel, character_appearance_panel
 
 
-SHARED_MODULES = (character_rig_ik, character_rig_panel, character_weather_panel, character_postprocess_panel)
+SHARED_MODULES = (character_rig_ik, character_rig_panel, character_weather_panel, character_postprocess_panel, character_appearance_panel)
 SHARED_CLASSES = (
     character_rig_ik.ENDFIELD_OT_setup_character_ik,
     character_rig_ik.ENDFIELD_OT_snap_character_ik,
@@ -16,7 +16,8 @@ SHARED_CLASSES = (
     character_rig_panel.ENDFIELD_OT_keyframe_expression_controller,
     character_rig_panel.ENDFIELD_PT_character_rig_panel,
     character_weather_panel.ENDFIELD_PT_material_weather,
-) + character_postprocess_panel.CLASSES
+    character_weather_panel.ENDFIELD_PT_material_clothing_effects,
+) + character_postprocess_panel.CLASSES + character_appearance_panel.CLASSES
 
 
 def refresh_panels() -> None:
@@ -37,10 +38,13 @@ class ENDFIELD_AP_character_tools(bpy.types.AddonPreferences):
 
     def draw(self, context: bpy.types.Context) -> None:
         layout = self.layout
-        layout.label(text='终末地 · 角色工具 0.1.4')
+        layout.label(text='终末地 · 角色工具 0.1.9')
         layout.label(text='选择提取器导出的角色或骨架：N 侧栏 → 终末地。')
         layout.label(text='天气参数位于材质属性 → 终末地 · 天气。')
+        layout.label(text='服装特效位于材质属性 → 终末地 · 服装特效；0 关闭，1 为源强度。')
         layout.label(text='场景后处理位于 N 侧栏 → 终末地 → 后处理，手动启用。')
+        layout.label(text='描边和满潜开关位于 N 侧栏 → 终末地 → 外观与描边。')
+        layout.label(text='材质切换或动画卡顿：外观与描边 → 优化材质刷新。')
         layout.label(text='无需运行文件内嵌脚本；插件不修改全局脚本信任设置。')
         layout.label(text='旧文件缺少的控制器需重新导出；不自动改绑、不重建材质。')
 
@@ -70,7 +74,7 @@ class ENDFIELD_PT_character_tools_addon(bpy.types.Panel):
     bl_order = 10
 
     def draw(self, context: bpy.types.Context) -> None:
-        self.layout.label(text='角色工具 0.1.4 · 已启用', icon='CHECKMARK')
+        self.layout.label(text='角色工具 0.1.9 · 已启用', icon='CHECKMARK')
         self.layout.label(text='选择导出的角色网格或骨架')
         self.layout.operator('endfield.refresh_character_tools', icon='FILE_REFRESH')
 

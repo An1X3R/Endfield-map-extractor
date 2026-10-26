@@ -5,6 +5,13 @@
   "type": "object",
   "additionalProperties": false,
   "required": ["format", "map_id", "selection", "layers", "water_mode", "effects", "output"],
+  "allOf": [{
+    "if": {"required": ["export_mode"], "properties": {"export_mode": {"const": "blend"}}},
+    "then": {"properties": {
+      "water_mode": {"const": "stable_eevee"},
+      "effects": {"properties": {"selection_mode": {"const": "full_system_by_anchor"}}}
+    }}
+  }],
   "properties": {
     "format": {"const": "EndfieldWebUIExportJob/2"},
     "request_id": {"type": ["string", "null"]},

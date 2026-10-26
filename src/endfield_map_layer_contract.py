@@ -24,6 +24,7 @@ MANIFEST_FORMAT = "EndfieldRegionMapLayerManifest/1"
 DATASET_FORMAT = "EndfieldMapLayerDataset/1"
 VALIDATION_FORMAT = "EndfieldMapLayerValidation/1"
 GENERATOR_VERSION = "stage119-v1"
+ENTITY_CATEGORY_VERSION = "entity-name-tokens-v2"
 SECTOR_SIZE = 128
 
 def is_hlod_name(value: str | None) -> bool:
@@ -86,7 +87,6 @@ _CATEGORY_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
             "flower",
             "bamboo",
             "vine",
-            "farmod",
         ),
     ),
     (
@@ -267,10 +267,12 @@ def parse_matrix_blob(blob: bytes | bytearray | memoryview) -> list[float]:
 
 
 def classify_entity(entity_base: str) -> tuple[str, str | None]:
+    """Use complete name words; asset-family names alone do not establish vegetation."""
     lowered = str(entity_base or "").casefold()
+    words = frozenset(re.findall(r"[a-z]+", lowered))
     for category, tokens in _CATEGORY_RULES:
         for token in tokens:
-            if token in lowered:
+            if token in words:
                 return category, token
     return "unknown", None
 

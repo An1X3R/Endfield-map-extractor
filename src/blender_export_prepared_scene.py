@@ -20,7 +20,7 @@ from blender_scene_materials import create_material, layout_shader_node_trees
 from blender_scene_terrain import adapt_scene_terrain, adapt_scene_terrain_mesh_normals
 from blender_terrain_atlas import crop_terrain_atlases
 from blender_terrain_detail import apply_scene_detail
-from endfield_scene_material_contract import MaterialRecord, reference_key, resolve_export_path
+from endfield_scene_material_contract import MaterialRecord, reference_key, resolve_export_path, supported_slots
 from endfield_scene_material_handoff import load_plan_material_catalog
 from endfield_scene_export_plan import load_scene_export_plan, PlanInstance
 from endfield_scene_dynamic_geometry_plan import DynamicGeometryRow
@@ -310,17 +310,51 @@ def build_instances(
     collection: bpy.types.Collection,
     materials: dict[tuple[str, int], MaterialRecord],
     textures: dict[tuple[str, int], tuple[Path, str]],
-) -> None:
+) -> list[dict[str, object]]:
     """Reuse exact scene slots for visible assets and temporary water bottoms."""
     material_cache: dict[tuple[str, int], bpy.types.Material] = {}
     ordered_cache: dict[tuple[tuple[str, int], ...], bpy.types.Material] = {}
     mesh_cache: dict[str, bpy.types.Mesh] = {}
     placements: list[tuple[bpy.types.Object, Matrix]] = []
     prefab_nodes: dict[str, dict[tuple[str, int], Mapping[str, object]]] = {}
+    skipped: list[dict[str, object]] = []
+    missing_texture_cache: dict[tuple[str, int], list[dict[str, object]]] = {}
     for row in rows:
         placement_identity = row.get("mesh_part_key", row.get("source_key", row.get("entity_id")))
         selected = set(row.get("selected_submeshes", range(len(row["material_refs"]))))
         material_passes = row.get("submesh_material_passes", [[ref] if ref is not None else [] for ref in row["material_refs"]])
+        missing_materials = [list(reference_key(reference)) for index, references in enumerate(material_passes)
+                             if index in selected for reference in references if reference_key(reference) not in materials]
+        mesh_path = resolve_export_path(Path(row["mesh_file"]))
+        missing_textures: list[dict[str, object]] = []
+        for index, references in enumerate(material_passes):
+            if index not in selected:
+                continue
+            for reference in references:
+                material_key = reference_key(reference)
+                if material_key not in materials:
+                    continue
+                if material_key not in missing_texture_cache:
+                    absent: list[dict[str, object]] = []
+                    for slot in supported_slots(materials[material_key]):
+                        texture_key = reference_key(slot["Texture"])
+                        entry = textures.get(texture_key)
+                        if entry is None or not resolve_export_path(entry[0] / entry[1]).is_file():
+                            absent.append({"material": list(material_key), "texture": list(texture_key),
+                                           "property": slot["Property"]})
+                    missing_texture_cache[material_key] = absent
+                missing_textures.extend(missing_texture_cache[material_key])
+        if missing_materials or missing_textures or not mesh_path.is_file():
+            diagnostic: dict[str, object] = {
+                "status": "skipped_missing_resource", "placement": placement_identity,
+                "collection": collection.name, "mesh_file": str(mesh_path),
+                "missing_mesh": not mesh_path.is_file(), "missing_materials": missing_materials,
+                "missing_textures": missing_textures,
+                "reason": "Required mesh, material or texture was not extracted",
+            }
+            skipped.append(diagnostic)
+            print(json.dumps({"level": "WARNING", "event": "scene_resource_skipped", **diagnostic}), flush=True)
+            continue
         needed_uv = {channel for index, references in enumerate(material_passes) if index in selected
                      for reference in references
                      for channel in required_uv_channels(materials[reference_key(reference)])}
@@ -439,6 +473,7 @@ def build_instances(
     for obj, matrix in placements:
         collection.objects.link(obj)
         obj.matrix_world = matrix
+    return skipped
 
 
 def effect_preview_camera(instances: Sequence[Mapping[str, object]], scene: bpy.types.Scene) -> bpy.types.Object:
@@ -528,6 +563,10 @@ def build_effect_previews(plan: Mapping[str, object], materials: dict[tuple[str,
                                         2000, 100000, tuple(float(component) for component in gravity)))
     audit.extend(build_scene_effect_meshes(mesh_instances, collection, mesh_material_factory, 2000, age, camera))
     audit.extend(build_direct_effect_meshes(direct, collection, mesh_material_factory, age, camera))
+    skipped = [row for row in audit if row["status"] == "skipped_missing_resource"]
+    for row in skipped:
+        print(json.dumps({"level": "WARNING", "event": "scene_resource_skipped", **row}), flush=True)
+    scene["endfield_skipped_effect_resources"] = len(skipped)
     return audit
 
 
@@ -554,14 +593,14 @@ def _build_prepared_scene() -> None:
 
         create_scene_color_camera(bpy.context.scene, plan["scene_color_snapshot"])
     collection = bpy.data.collections.new("Endfield_Scene")
-    build_instances(plan["instances"], collection, materials, textures)
+    skipped_resources = build_instances(plan["instances"], collection, materials, textures)
     dynamic_collection = bpy.data.collections.new("Endfield_Dynamic_Geometry_Reference")
-    build_instances(plan["dynamic_geometry_instances"], dynamic_collection, materials, textures)
+    skipped_resources.extend(build_instances(plan["dynamic_geometry_instances"], dynamic_collection, materials, textures))
     prefab_collection = bpy.data.collections.new("Endfield_Prefab_Geometry_Reference")
     prefab_collection["endfield_source_placements_json"] = json.dumps(plan["prefab_placements"])
     prefab_collection["endfield_source_exclusions_json"] = json.dumps(plan["prefab_geometry_exclusions"])
     prefab_collection["endfield_snapshot_status"] = "source_lod_zero_reference_runtime_visibility_and_animation_unverified"
-    build_instances(plan["prefab_geometry_instances"], prefab_collection, materials, textures)
+    skipped_resources.extend(build_instances(plan["prefab_geometry_instances"], prefab_collection, materials, textures))
     bpy.context.scene.collection.children.link(collection)
     bpy.context.scene.collection.children.link(dynamic_collection)
     bpy.context.scene.collection.children.link(prefab_collection)
@@ -602,7 +641,7 @@ def _build_prepared_scene() -> None:
                 obj.data.materials.clear()
                 obj["endfield_source_heightfield"] = True
                 obj["endfield_water_bottom_context"] = "source_heightfield_without_surface_material"
-    build_instances(plan.get("water_depth_instances", []), depth_collection, materials, textures)
+    skipped_resources.extend(build_instances(plan.get("water_depth_instances", []), depth_collection, materials, textures))
     bpy.context.view_layer.update()
     water = build_scene_water(plan.get("water_geometry", []), plan.get("water_materials", []), plan["bounds"])
     for obj in tuple(depth_collection.objects):
@@ -729,7 +768,7 @@ def _build_prepared_scene() -> None:
                + sum(row["status"] != "restored" for row in decals)
                + sum(row["status"] not in ("restored", "outside_clipped_mesh", "covered_by_terrain") for row in water)
                + sum(row["status"] not in ("static_preview", "renderer_disabled", "game_object_inactive", "no_alive_particles_at_snapshot") for row in effects)
-               + len(lights) + len(material_pending))
+               + len(lights) + len(material_pending) + len(skipped_resources))
     scene["endfield_unresolved_resources"] = pending
     scene["endfield_source_axis"] = "Blender (X,Y,Z) = Unity (X,-Z,Y)"
     empty = not any((obj.type == "MESH" and obj.data.polygons) or obj.type == "LIGHT" for obj in scene.objects)
@@ -788,6 +827,7 @@ def _build_prepared_scene() -> None:
             for row in plan["dynamic_geometry_instances"] for exclusion in row.get("excluded_source_draw_roles", [])],
         "dynamic_geometry_status": "authored_base_lod_reference_with_unverified_runtime_activation",
         "material_pending": material_pending,
+        "skipped_resources": skipped_resources + [row for row in effects if row["status"] == "skipped_missing_resource"],
         "ordered_material_passes": ordered_materials,
         "light_summary": {"source_instances": len(plan["light_instances"]),
                           "preview_lights": sum(row["status"] == "source_light_preview_partial" for row in lights),
@@ -798,6 +838,7 @@ def _build_prepared_scene() -> None:
             "preview_components": sum(row["status"] in ("static_preview", "static_preview_partial") for row in effects),
             "preview_particles": sum(int(row.get("particles", 0)) for row in effects),
             "partial_components": sum(row["status"] == "static_preview_partial" for row in effects),
+            "skipped_missing_resources": sum(row["status"] == "skipped_missing_resource" for row in effects),
             "pending_includes_partial_previews": True,
         },
         "effect_snapshot": {"age_seconds": bpy.context.scene["endfield_fx_snapshot_age_seconds"],

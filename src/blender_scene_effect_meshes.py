@@ -176,6 +176,11 @@ def build_scene_effect_meshes(effect_instances: Sequence[Mapping[str, object]],
         if not isinstance(path_value, str) or not Path(path_value).is_absolute():
             raise ValueError(f"MeshRenderer FX scene_manifest must be absolute: entity_id={entity_id}, value={path_value}")
         manifest_path = resolve_export_path(Path(path_value))
+        if not manifest_path.is_file():
+            audit.append({"entity_id": entity_id, "status": "skipped_missing_resource",
+                          "resource": "mesh_effect_manifest", "path": str(manifest_path),
+                          "reason": "Effect SceneProbe manifest was not extracted"})
+            continue
         if manifest_path not in manifests:
             manifests[manifest_path] = _record(json.loads(manifest_path.read_text(encoding="utf-8-sig")), "FX manifest")
         manifest = manifests[manifest_path]
@@ -230,6 +235,10 @@ def build_scene_effect_meshes(effect_instances: Sequence[Mapping[str, object]],
             if cache_key not in templates:
                 try:
                     templates[cache_key] = _source_mesh_templates(export, manifest_path)
+                except FileNotFoundError as error:
+                    audit.append(row | {"status": "skipped_missing_resource", "resource": "mesh_effect_geometry",
+                                        "mesh": list(mesh_key), "reason": str(error)})
+                    continue
                 except UnsupportedMeshVertexMapping:
                     audit.append(row | {"status": "unsupported_mesh_vertex_mapping", "mesh": list(mesh_key)})
                     continue
@@ -265,6 +274,10 @@ def build_scene_effect_meshes(effect_instances: Sequence[Mapping[str, object]],
                     material = material_factory(ref, node, int(export["VertexColorComponents"]))
                     if zero_uv1_reference:
                         material = make_missing_mesh_uv1_reference(material, int(export["Uv1Components"]))
+                except FileNotFoundError as error:
+                    audit.append(row | {"status": "skipped_missing_resource", "resource": "mesh_effect_material",
+                                        "material": list(material_key), "reason": str(error)})
+                    continue
                 except NotImplementedError as error:
                     audit.append(row | {"status": "unsupported_material", "material": list(material_key), "reason": str(error)})
                     continue
@@ -328,6 +341,11 @@ def build_direct_effect_meshes(rows: Sequence[Mapping[str, object]], collection:
         if row.get("matrix_space") != "dynamic_renderer_world":
             raise ValueError(f"Direct FX matrix space unsupported: identity={identity}")
         manifest_path = resolve_export_path(Path(str(row["scene_manifest"])))
+        if not manifest_path.is_file():
+            audit.append({"placement_key": identity, "status": "skipped_missing_resource",
+                          "resource": "direct_effect_manifest", "path": str(manifest_path),
+                          "reason": "Effect SceneProbe manifest was not extracted"})
+            continue
         if manifest_path not in manifests:
             manifests[manifest_path] = _record(json.loads(manifest_path.read_text("utf-8-sig")), "Direct FX manifest")
         mesh_key = _asset(row["mesh_asset"], "Mesh", "Direct FX mesh asset")
@@ -364,6 +382,10 @@ def build_direct_effect_meshes(rows: Sequence[Mapping[str, object]], collection:
             material_record = _record(json.loads(material["endfield_fx_source_material_json"]), "Direct FX material evidence")
             if mesh_material_requires_uv1(material_record) and source_meshes[submesh].uv_layers.get("EF_FX_UV1") is None:
                 material = make_missing_mesh_uv1_reference(material, int(export["Uv1Components"]))
+        except FileNotFoundError as error:
+            audit.append(evidence | {"status": "skipped_missing_resource", "resource": "direct_effect_asset",
+                                    "mesh": list(mesh_key), "reason": str(error)})
+            continue
         except NotImplementedError as error:
             audit.append(evidence | {"status": "unsupported_direct_effect", "reason": str(error)})
             continue

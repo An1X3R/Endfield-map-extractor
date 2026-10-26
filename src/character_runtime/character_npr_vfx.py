@@ -16,6 +16,12 @@ ROLE_SOURCES = (
     ('_UseMask', 3, '_MaskTex', '_MaskTexUVSpeed', '_MaskTexUVWeights', '_MaskTexUVRotateMat'),
     ('_UseBlend', 4, '_BlendTex', '_BlendTexUVSpeed', '_BlendTexUVWeights', '_BlendTexUVRotateMat'),
 )
+UNSUPPORTED_CHARACTER_VFX_PREVIEW_FLAGS = (
+    '_UseHeightColorGradient', '_UseEmission', '_UseVertexOffset', '_UseDissolve', '_UseCutOff', '_MainTexUseFlowmap',
+)
+UNSUPPORTED_CHARACTER_VFX_RENDERER_FLAGS = tuple(
+    flag for flag in UNSUPPORTED_CHARACTER_VFX_PREVIEW_FLAGS if flag != '_UseVertexOffset'
+)
 
 
 def validate_character_vfx_shader(shader_row: dict[str, object]) -> None:
@@ -56,7 +62,7 @@ def character_vfx_preview_record(record: MaterialRecord) -> MaterialRecord:
     for flag in ('_UseDisturb', '_UseMask', '_UseBlend', '_Bi_Disturb', '_EnableNormalMap'):
         if floats[flag] not in (0.0, 1.0):
             raise ValueError(f'Character VFX source feature switch is not binary: material={record["Name"]}; property={flag}; value={floats[flag]}')
-    for flag in ('_UseHeightColorGradient', '_UseEmission', '_UseVertexOffset', '_UseDissolve', '_UseCutOff', '_MainTexUseFlowmap'):
+    for flag in UNSUPPORTED_CHARACTER_VFX_PREVIEW_FLAGS:
         if floats[flag] != 0.0:
             raise ValueError(f'Character VFX source branch has no host implementation: material={record["Name"]}; property={flag}; value={floats[flag]}')
     if floats['_EnableNormalMap'] == 1.0:
@@ -76,21 +82,6 @@ def character_vfx_preview_record(record: MaterialRecord) -> MaterialRecord:
     source_slots = list(record['Textures'])
     preview_floats = dict(floats)
     preview_colors = {key: list(value) for key, value in colors.items()}
-    if floats['_UseDisturb'] == 1.0 and floats['_Bi_Disturb'] == 1.0:
-        bindings = tuple(slot for slot in record['Textures'] if slot['Property'] == '_DisturbTex1')
-        if len(bindings) != 1:
-            raise ValueError(f'Bidirectional Character VFX requires its source disturbance map: material={record["Name"]}')
-        source_slots.append({**bindings[0], 'Property': '_DisturbTex2'})
-        active = (active[0], ('_UseDisturb', 1, '_DisturbTex2', '_DisturbUVSpeed2', '_DisturbUVWeights2', '_DisturbUVRotateMat2'), *active[1:])
-        speed = colors['_DisturbUVSpeed1']
-        preview_colors.update({'_DisturbUVSpeed2': [-speed[0], -speed[1], speed[2], speed[3]],
-                               '_DisturbUVWeights2': list(colors['_DisturbUVWeights1']),
-                               '_DisturbUVRotateMat2': list(colors['_DisturbUVRotateMat1'])})
-        preview_floats.update({'_DisturbUIntensity1': floats['_DisturbUIntensity1'] * 0.5,
-                               '_DisturbVIntensity1': floats['_DisturbVIntensity1'] * 0.5,
-                               '_DisturbUIntensity2': floats['_DisturbUIntensity1'] * 0.5,
-                               '_DisturbVIntensity2': floats['_DisturbVIntensity1'] * 0.5,
-                               '_DisturbTex2Normal': floats['_DisturbTex1Normal']})
     for index, (_, role, texture, speed, weights, rotation) in enumerate(active):
         name = f'_SampleTex{index}'
         bindings = tuple(slot for slot in source_slots if slot['Property'] == texture)
@@ -110,9 +101,13 @@ def character_vfx_preview_record(record: MaterialRecord) -> MaterialRecord:
     if all(weights[3] == 0.0 for weights in active_uv_weights):
         # A screen-coordinate modifier cannot affect named roles that never sample screen UVs.
         derived_floats['_UsePosYAsScreenV'] = 0.0
-    # The host preview represents bidirectional flow as two opposed half-strength samples.
-    derived_floats.update({'_UseDisturb2': float(any(row[1] == 1 for row in active)),
+    # CharacterNPR remaps one sample's red channel before scalar/normal decoding.
+    # The family-specific node adapter owns that remap after the shared factory.
+    derived_floats.update({'_UseDisturb2': 0.0,
                            '_Bi_Disturb': 0.0, '_UseWeightTex': 0.0})
+    # CharacterNPR_VFX's reference ForwardOnly programs omit the VFXBaseV2
+    # threshold/excess gain. Keep serialized values in the original record.
+    derived_floats['_ExpIntensity'] = 0.0
     if floats['_SurfaceType'] == 1.0 and floats['_ZWriteWithAlphaTest'] == 1.0:
         # Blender composites the color pass; its separate native depth draw is archived.
         derived_floats['_ZWrite'] = 0.0

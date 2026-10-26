@@ -16,6 +16,36 @@ def _uv_names(record: MaterialRecord) -> tuple[str, ...]:
                           if record['Floats'].get(f'_UseSampleTex{index}', 0.0) != 0.0))
 
 
+def apply_character_vfx_disturbance(material: bpy.types.Material, record: MaterialRecord) -> None:
+    """Remap the single source red sample before either disturbance decoder."""
+    if record['Floats']['_UseDisturb'] == 0.0:
+        return
+    tree = material.node_tree
+    if tree is None:
+        raise ValueError(f'Character VFX disturbance graph is absent: material={material.name}')
+    normal = record['Floats']['_DisturbTex1Normal'] != 0.0
+    target_name = 'Disturb 1 Normal Alpha Red' if normal else 'Disturb 1 Particle Weight'
+    target = tree.nodes.get(target_name)
+    if target is None or target.type != 'MATH' or target.operation != 'MULTIPLY':
+        raise ValueError(f'Character VFX disturbance decoder is absent: material={material.name}; node={target_name}')
+    socket = target.inputs[1 if normal else 0]
+    incoming = tuple(socket.links)
+    if len(incoming) != 1 or incoming[0].from_node.type != 'SEPXYZ':
+        raise ValueError(f'Character VFX disturbance red input is unexpected: material={material.name}')
+    bias = record['Floats']['_Bi_Disturb']
+    scale = tree.nodes.new('ShaderNodeMath')
+    scale.name = scale.label = 'Character Disturb Red Scale'
+    scale.operation = 'MULTIPLY'
+    scale.inputs[1].default_value = 1.0 + bias
+    shift = tree.nodes.new('ShaderNodeMath')
+    shift.name = shift.label = 'Character Disturb Signed Red'
+    shift.operation = 'SUBTRACT'
+    shift.inputs[1].default_value = bias
+    tree.links.new(incoming[0].from_socket, scale.inputs[0])
+    tree.links.new(scale.outputs[0], shift.inputs[0])
+    tree.links.new(shift.outputs[0], socket)
+
+
 def character_vfx_mesh_uv_record(record: MaterialRecord, mesh_names: tuple[str, ...]) -> MaterialRecord:
     """Validate actual UV layers and delegate signed UV0 scaling to explicit nodes."""
     if record['Floats'].get('_InParticle', 0.0) != 0.0:
@@ -36,6 +66,30 @@ def character_vfx_mesh_uv_record(record: MaterialRecord, mesh_names: tuple[str, 
             if len(coordinates) != len(obj.data.loops) or any(not math.isfinite(value) for item in coordinates for value in item.uv):
                 raise ValueError(f'Character VFX imported UV layer has invalid corner data: material={record["Name"]}; mesh={mesh_name}; layer={layer}')
     return {**record, 'Colors': colors}
+
+
+def install_missing_uv1_reference(record: MaterialRecord, mesh_names: tuple[str, ...]) -> None:
+    """Install the existing zero-input approximation only for source-absent UV1."""
+    if record['Floats'].get('_InParticle', 0.0) != 0.0:
+        return
+    if not any(record['Colors'][name + 'UVWeights'] == [0.0, 1.0, 0.0, 0.0] for name in _uv_names(record)):
+        return
+    for mesh_name in mesh_names:
+        obj = bpy.data.objects.get(mesh_name)
+        if obj is None or obj.type != 'MESH':
+            raise ValueError(f'Character VFX mesh is absent: material={record["Name"]}; mesh={mesh_name}')
+        if obj.data.uv_layers.get('UV1') is not None:
+            continue
+        proof = obj.data.get('endfield_source_uv_channels')
+        channels = json.loads(proof) if isinstance(proof, str) else None
+        if not isinstance(channels, list) or any(type(value) is not int for value in channels) or 1 in channels:
+            raise ValueError(f'Cannot establish source-absent UV1: material={record["Name"]}; mesh={mesh_name}; channels={channels}')
+        layer = obj.data.uv_layers.new(name='UV1', do_init=False)
+        layer.data.foreach_set('uv', [0.0] * (2 * len(obj.data.loops)))
+        obj.data['endfield_source_missing_uv1_reference'] = json.dumps({
+            'status': 'absent_source_uv1_constant_zero_reference/1', 'source_uv1': None,
+            'source_uv_channels': channels, 'native_shader_semantics_verified': False,
+        }, sort_keys=True)
 
 
 def apply_character_vfx_mesh_uv_weights(material: bpy.types.Material, record: MaterialRecord,

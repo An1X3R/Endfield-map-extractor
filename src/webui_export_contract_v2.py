@@ -172,11 +172,15 @@ def canonicalize_job(payload: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError(f"Unsupported map_id: {map_id!r}")
     spec.validate()
     bounds = _resolve_bounds(dict(payload.get("selection") or {}), spec)
-    layers = dict(payload.get("layers") or {})
-    normalized_layers = {
-        name: bool(layers.get(name, True))
-        for name in ("terrain", "instances", "roads", "vegetation", "water", "effects", "lights")
-    }
+    layers: object = payload.get("layers", {})
+    if not isinstance(layers, Mapping):
+        raise ValueError(f"layers must be an object of boolean flags, received {layers!r}")
+    normalized_layers: dict[str, bool] = {}
+    for name in ("terrain", "instances", "roads", "vegetation", "water", "effects", "lights"):
+        enabled: object = layers.get(name, True)
+        if not isinstance(enabled, bool):
+            raise ValueError(f"layers.{name} must be boolean, received {enabled!r}")
+        normalized_layers[name] = enabled
     if not any(normalized_layers.values()):
         raise ValueError("At least one export layer must be enabled")
     water_mode = str(payload.get("water_mode") or "stable_eevee")
@@ -196,6 +200,10 @@ def canonicalize_job(payload: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError(f"Unsupported export_mode: {export_mode!r}")
     if export_mode == "blend" and (source is None or not source.get("blender_exe")):
         raise ValueError("Blender scene export requires source.blender_exe and source.game_root")
+    if export_mode == "blend" and water_mode != "stable_eevee":
+        raise ValueError("Blender scene export reconstructs source water automatically; water_mode must be stable_eevee. Other water modes are data-package metadata only.")
+    if export_mode == "blend" and selection_mode != "full_system_by_anchor":
+        raise ValueError("Blender scene export requires effects.selection_mode=full_system_by_anchor; alternative selection modes are data-package metadata only.")
     export_groups = normalize_export_groups(payload.get("export_groups"))
     water_transport_lighting: WaterTransportLighting | None = None
     if "water_transport_lighting" in payload:

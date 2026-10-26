@@ -151,6 +151,24 @@ class NpcAnimationBindingTests(unittest.TestCase):
             validate_npc_generic_target(generic_avatar_source(False, 0.), generic_avatar_source(True, 2e-6),
                                         (generic_clip((12,)),))
 
+    def test_generic_target_accessory_does_not_change_driven_binding(self) -> None:
+        target = generic_avatar_source(True, 0.)
+        avatar = target.value['m_Avatar']
+        skeleton = avatar['m_AvatarSkeleton']
+        value = {**target.value, 'm_TOS': {**target.value['m_TOS'], '15': 'Root/Bone/Accessory'},
+            'm_Avatar': {**avatar,
+                'm_AvatarSkeleton': {'m_ID': [*skeleton['m_ID'], 15],
+                    'm_Node': [*skeleton['m_Node'], {'m_ParentId': 2}]},
+                'm_DefaultPose': {'m_X': [*avatar['m_DefaultPose']['m_X'], avatar['m_DefaultPose']['m_X'][0]]},
+                'm_AvatarSkeletonPose': {'m_X': [*avatar['m_AvatarSkeletonPose']['m_X'], avatar['m_AvatarSkeletonPose']['m_X'][0]]}}}
+        expanded = replace(target, value=value)
+        proof = validate_npc_generic_target(generic_avatar_source(False, 0.), expanded, (generic_clip((11, 12)),))
+        self.assertEqual(proof.target_only_path_count, 1)
+        self.assertEqual(proof.validated_path_count, 3)
+        self.assertEqual(proof.max_default_pose_delta, 0.)
+        with self.assertRaisesRegex(NpcAnimationBindingError, 'lacks source transform paths'):
+            validate_npc_generic_target(expanded, generic_avatar_source(False, 0.), (generic_clip((11, 12)),))
+
     def test_generic_avatar_equivalence_rejects_missing_transform_path_hash(self) -> None:
         target = generic_avatar_source(True, 0.)
         value = {**target.value,

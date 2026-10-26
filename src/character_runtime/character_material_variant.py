@@ -16,6 +16,7 @@ from character_simple_materials import (
 )
 from character_simple_weather import attach_simple_weather_surface
 from character_simple_layout import layout_simple_character_material
+from character_shader_uniforms import migrate_shader_uniforms, verify_shader_uniforms
 
 
 def read_material_options(path: Path | None) -> CharacterMaterialOptions | None:
@@ -146,8 +147,12 @@ def apply_material_variant(scene: bpy.types.Scene, options: CharacterMaterialOpt
         if material.get('endfield_simple_material'):
             layout_simple_character_material(material)
         material['endfield_material_options'] = options.canonical_json()
+    materials = source_materials(scene)
+    uniforms = migrate_shader_uniforms(materials, tuple(scene.objects), scene)
+    uniform_check = verify_shader_uniforms(materials, tuple(scene.objects), scene)
     report = {'format': 'EndfieldMaterialVariant/1', 'options': options.as_json(),
               'materials': rows, 'weather': weather_rows, 'limits': limits,
+              'uniforms': uniforms, 'uniform_check': uniform_check,
               'stored_graph_nodes': {material.name: sum(len(tree.nodes) for tree in material_trees(material))
                                      for material in source_materials(scene)}}
     scene['endfield_material_variant'] = json.dumps(report, ensure_ascii=False)
@@ -198,4 +203,6 @@ def verify_material_variant(report: dict[str, object]) -> dict[str, object]:
         checked.append(material.name)
     if options.weather.effects and not weather_checked:
         raise AssertionError('Weather was requested but no live selected weather controls were saved')
+    verify_shader_uniforms(tuple(bpy.data.materials[name] for name in checked),
+                           tuple(bpy.context.scene.objects), bpy.context.scene)
     return {'status': 'passed', 'materials': checked, 'weather_groups': sorted(weather_checked), 'options': options.as_json()}

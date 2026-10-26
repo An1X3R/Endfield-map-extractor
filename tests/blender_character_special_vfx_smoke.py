@@ -142,15 +142,29 @@ def main() -> None:
     selected = source_from_material(source, samples)
     if selected is None or source_from_material(ordinary, samples) is not None:
         raise AssertionError('Exact source keyword selection changed')
-    for switch in ('_VFXFresnelUseNormalMap', '_VFXAlphaAffectTotalMat', '_VFXMainUVSet', '_EnableVFXColorAdjustment'):
-        invalid = replace(source, floats={**source.floats, switch: 1.0})
+    unsupported = [('_VFXAlphaAffectTotalMat', 1.0), ('_EnableVFXColorAdjustment', 1.0),
+                   ('_VFXBlendUVSet', 1.0)]
+    if '_VFXSpecialMainTex' not in source.null_texture_defaults:
+        unsupported.extend(('_VFXMainUVSet', value) for value in (2.0, 3.0))
+    else:
+        for value in (2.0, 3.0):
+            source_from_material(replace(source, floats={**source.floats, '_VFXMainUVSet': value}), samples)
+    for switch, value in unsupported:
+        invalid = replace(source, floats={**source.floats, switch: value})
         try:
             source_from_material(invalid, samples)
         except ValueError as error:
             if 'Active source special VFX switches are unsupported' not in str(error):
                 raise
         else:
-            raise AssertionError(f'Unsupported active source switch was accepted: {switch}')
+            raise AssertionError(f'Unsupported active source switch was accepted: {switch}={value}')
+    try:
+        source_from_material(replace(source, floats={**source.floats, '_VFXFresnelUseNormalMap': 0.5}), samples)
+    except ValueError as error:
+        if 'normal-map Fresnel requires a source toggle' not in str(error):
+            raise
+    else:
+        raise AssertionError('Nonbinary normal-map Fresnel toggle was accepted')
     record = json.loads(group['source_special_vfx'])
     verify_special_vfx(group, record)
     if '_CHARACTER_FUR' in source.keywords:

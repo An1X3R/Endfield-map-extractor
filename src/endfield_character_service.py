@@ -1363,8 +1363,20 @@ class CharacterService:
         pending = [{"code": "native_runtime_approximation", "message": "使用可编辑 HGRP 主机近似；原生运行时布料、动画层混合及部分特效尚未完整还原。"}]
         pending.extend(character_source_pending(_read(payload / "prepared/static_probe/receipt.json"),
                                                 _read(payload / "prepared/static_probe/source_audit.json")))
+        for skipped in build.get("skipped_optional_resources", []):
+            pending.append({"code": "optional_material_resource_skipped",
+                            "message": f"已跳过缺少资源的附加材质效果，保留基础表面：{skipped['material']}；{skipped['reason']}"})
+        for skipped in build.get("skipped_optional_material_passes", []):
+            pending.append({"code": "optional_material_pass_skipped",
+                            "message": f"已跳过当前未实现的可选材质附加通道，保留基础材质及其它支持通道；原始参数与 TypeTree 已归档：{skipped['material']}（{skipped['shader']}）；{skipped['reason']}"})
+        for skipped in build.get("skipped_optional_effect_renderers", []):
+            paths = "、".join(skipped.get("selected_renderer_paths", []))
+            pending.append({"code": "optional_effect_renderer_skipped",
+                            "message": f"已跳过独立且当前未实现的可选特效渲染器，保留角色身体、动作、来源网格及原始材质参数/TypeTree：{skipped['material']}（{paths}）；{skipped['reason']}"})
         if isinstance(late, list) and any(isinstance(row, dict) and row.get("status") == "source_variant_not_implemented" for row in late):
             pending.append({"code": "material_variant_unimplemented", "message": "部分源材质分支仍保留基础表现，详情待后续还原。"})
+        if isinstance(late, list) and any(isinstance(row, dict) and row.get("lighting_fidelity") == "host_isotropic_approximation" for row in late):
+            pending.append({"code": "special_specular_approximation", "message": "清漆或各向异性材质已连接基础高光；专用高光形状仍为主机近似。"})
         check_cancelled()
         final_context, _, _, final_identity = self._catalog_source()
         if final_context != context or final_identity != identity:

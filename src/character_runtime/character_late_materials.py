@@ -50,11 +50,13 @@ def _source_switches(tree: bpy.types.ShaderNodeTree) -> dict[str, bool]:
 def _supported_standard_reason(switches: dict[str, bool]) -> str | None:
     if not switches['_UseBumpMap']:
         return 'Unmapped normal variant has no attachment proof'
-    special = ('_UseCharacterFur', '_ClearCoat', '_Pantyhose', '_UseAnisotropy')
+    special = ('_UseCharacterFur', '_Pantyhose')
     enabled = tuple(name for name in special if name in switches and switches[name])
     if enabled:
         return f'Special source branches outside the current Standard path: {enabled}'
     silk = switches['_SilkStockings']
+    if silk and (switches['_ClearCoat'] or switches['_UseAnisotropy']):
+        return 'Combined Silk and special specular variant has no attachment proof'
     mapped = switches['_UseMetallicGlossMap']
     ramped = switches['_UseSpecRampMap']
     if silk and (switches['_SilkStockingsAdvance'] or not mapped):
@@ -200,6 +202,8 @@ def attach_supported_late_materials(
             'source_features': features,
             'source_switches_absent_and_unconsumed': [name for name in REQUIRED_SWITCHES if name not in switches],
             'main': main,
+            'lighting_fidelity': main['lighting_fidelity'],
+            'unimplemented_specular_features': main['unimplemented_specular_features'],
             'silk': silk,
             'additional_mode': 0,
             'additional_lights': light_names,

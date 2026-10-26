@@ -49,6 +49,50 @@ def main(args: argparse.Namespace) -> None:
         raise AssertionError(f'Built file differs from its receipt: {blend}')
     bpy.ops.wm.open_mainfile(filepath=extended_path(blend), use_scripts=False)
     refresh()
+    effect_skips_raw = receipt.get('skipped_optional_effect_renderers', [])
+    if not isinstance(effect_skips_raw, list):
+        raise TypeError('Optional effect renderer skips must be an array')
+    expected_effect_renderers: set[str] = set()
+    for raw_skip in effect_skips_raw:
+        skip = object_value(raw_skip, 'optional effect renderer skip')
+        renderer_ids = skip.get('renderer_identities')
+        if not isinstance(renderer_ids, list):
+            raise TypeError('Optional effect renderer identities must be an array')
+        expected_effect_renderers.update(string_value(renderer_id, 'optional effect renderer identity').casefold()
+                                         for renderer_id in renderer_ids)
+    binding_rows_raw = receipt['material_bindings']
+    if not isinstance(binding_rows_raw, list):
+        raise TypeError('Material binding rows must be an array')
+    reopened_effect_renderers: set[str] = set()
+    for raw_binding in binding_rows_raw:
+        binding = object_value(raw_binding, 'material binding')
+        if 'skipped_optional_effect_renderer' not in binding:
+            continue
+        renderer_identity = string_value(binding['renderer_identity'], 'renderer identity')
+        obj = bpy.data.objects.get(string_value(binding['object'], 'renderer object'))
+        skip = object_value(binding['skipped_optional_effect_renderer'], 'optional effect renderer binding')
+        if obj is None or obj.type != 'MESH' or not obj.hide_render:
+            raise AssertionError(f'Optional unsupported effect renderer is missing or visible after reopen: {renderer_identity}')
+        if json.loads(obj.get('skipped_optional_effect_renderer_json', '{}')) != skip:
+            raise AssertionError(f'Optional effect renderer evidence changed after reopen: {renderer_identity}')
+        if renderer_identity.casefold() in reopened_effect_renderers:
+            raise AssertionError(f'Duplicate optional effect renderer receipt: {renderer_identity}')
+        reopened_effect_renderers.add(renderer_identity.casefold())
+    if reopened_effect_renderers != expected_effect_renderers:
+        raise AssertionError('Saved optional effect renderer set differs from its build receipt')
+    for raw_skip in effect_skips_raw:
+        skip = object_value(raw_skip, 'optional effect renderer skip')
+        material = string_value(skip['material'], 'optional effect material')
+        for prefix in ('SOURCE MATERIAL ', 'SOURCE TYPETREE '):
+            if bpy.data.texts.get(prefix + material + '.json') is None:
+                raise AssertionError(f'Optional effect source evidence is missing after reopen: {prefix}{material}')
+    from character_vfx_vertex_offset import verify_offset_surface_bindings, verify_vertex_offsets
+    vertex_offsets = receipt.get('vertex_offsets', [])
+    vertex_offset_audit = verify_vertex_offsets(vertex_offsets, bpy.context.scene)
+    verify_offset_surface_bindings(vertex_offsets, bpy.context.scene)
+    if ('vertex_offset_validation' in receipt
+            and vertex_offset_audit != receipt['vertex_offset_validation']):
+        raise AssertionError('Reopened character vertex-offset evaluation differs from its build receipt')
     workspace_audit = None
     if 'authoring_workspace' in receipt:
         workspace = object_value(receipt['authoring_workspace'], 'authoring workspace')
@@ -228,6 +272,8 @@ def main(args: argparse.Namespace) -> None:
               'skin_rain': skin_rain_audit,
               'hair_fur_snow': hair_fur_snow_audit,
               'fur_curves_snow': fur_curves_snow_audit,
+              'skipped_optional_effect_renderers': effect_skips_raw,
+              'vertex_offsets': vertex_offset_audit,
               'special_lights': special_lights_audit,
               'scripts_enabled_on_reopen': False, 'render_count': 0, 'save_count': 0,
               'authoring': authoring_audit,

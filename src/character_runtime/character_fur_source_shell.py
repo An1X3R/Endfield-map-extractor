@@ -242,14 +242,21 @@ def activate_source_fur_shell(receipt: Mapping[str, object]) -> dict[str, object
     """Select the explicit shell representation while retaining original geometry and Curves."""
     if receipt.get('format') != 'EndfieldExpandedSourceFurShell/1' or receipt.get('status') != 'built':
         raise ValueError('Source shell activation requires a newly built shell receipt')
+    layers = receipt.get('layer_count')
+    if type(layers) is not int or layers < 1:
+        raise ValueError(f'Source shell activation requires a positive layer count: {layers!r}')
+    candidate = bpy.data.objects[_text(receipt.get('shell_mesh'), 'shell_mesh')]
+    # A camera ray can cross both sides of every layer before reaching the substrate.
+    transparent_bounces = 2 * layers + 8
+    for scene in candidate.users_scene:
+        scene.cycles.transparent_max_bounces = max(scene.cycles.transparent_max_bounces, transparent_bounces)
     for key in ('source_mesh', 'curves'):
         obj = bpy.data.objects[_text(receipt.get(key), key)]
         obj.hide_render = True
         obj.hide_set(True)
-    candidate = bpy.data.objects[_text(receipt.get('shell_mesh'), 'shell_mesh')]
     candidate.hide_render = False
     candidate.hide_set(False)
-    result = {**receipt, 'status': 'active',
+    result = {**receipt, 'status': 'active', 'cycles_transparent_bounces_required': transparent_bounces,
               'retained_source_digest': source_geometry_digest((_text(receipt.get('source_mesh'), 'source_mesh'),)),
               'shell_geometry_digest': source_geometry_digest((candidate.name,))}
     candidate['source_fur_shell'] = json.dumps(result, sort_keys=True)

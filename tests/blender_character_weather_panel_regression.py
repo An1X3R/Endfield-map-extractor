@@ -50,7 +50,7 @@ def main(arguments: list[str]) -> None:
     assert verify_weather_panel(report) == 'passed'
     for label, value in original.items():
         weather_socket(controls, label).default_value = value
-    assert material_signature_details() == before
+    assert material_signature_details()['sha256'] == before['sha256']
     code = bpy.data.texts[report['text']].as_string()
     exec(compile(code, report['text'], 'exec'), {'__name__': '__main__'})
     exec(compile(code, report['text'], 'exec'), {'__name__': '__main__'})

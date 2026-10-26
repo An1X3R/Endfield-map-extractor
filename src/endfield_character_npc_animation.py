@@ -67,6 +67,7 @@ class NpcGenericAvatarEquivalence:
     transform_binding_count: int
     driven_path_count: int
     validated_path_count: int
+    target_only_path_count: int
     max_default_pose_delta: float
     max_avatar_skeleton_pose_delta: float
 
@@ -81,6 +82,7 @@ class NpcGenericAvatarEquivalence:
             "transform_binding_count": self.transform_binding_count,
             "driven_path_count": self.driven_path_count,
             "validated_path_count": self.validated_path_count,
+            "target_only_path_count": self.target_only_path_count,
             "max_default_pose_delta": self.max_default_pose_delta,
             "max_avatar_skeleton_pose_delta": self.max_avatar_skeleton_pose_delta,
         }
@@ -246,11 +248,11 @@ def validate_npc_generic_target(source_avatar: NpcSourceObject, target_avatar: N
     target_nodes, target_digest = _generic_avatar_rig(target_avatar, "target")
     source_paths = frozenset(source_nodes)
     target_paths = frozenset(target_nodes)
-    if source_paths != target_paths:
+    if not source_paths <= target_paths:
         missing_target = tuple(sorted(source_paths - target_paths)[:8])
-        missing_source = tuple(sorted(target_paths - source_paths)[:8])
         raise NpcAnimationBindingError(
-            f"Generic Avatar transform path sets differ: source_only={missing_target}, target_only={missing_source}")
+            f"Generic target Avatar lacks source transform paths: source_only={missing_target}")
+    # Extra target accessories retain their local rest poses under the matched parents.
     parent_mismatches = tuple(path for path in sorted(source_paths)
         if source_nodes[path].parent_path != target_nodes[path].parent_path)
     if parent_mismatches:
@@ -290,7 +292,7 @@ def validate_npc_generic_target(source_avatar: NpcSourceObject, target_avatar: N
                 raise NpcAnimationBindingError(
                     f"Generic Avatar {pose_name} differs on a driven path or ancestor: path={path!r}, max_delta={delta:.9g}, tolerance={NPC_GENERIC_AVATAR_POSE_TOLERANCE}")
     return NpcGenericAvatarEquivalence(source_digest, target_digest, len(clips), binding_count,
-        len(driven_paths), len(validated_paths), maximum_default_delta, maximum_skeleton_delta)
+        len(driven_paths), len(validated_paths), len(target_paths - source_paths), maximum_default_delta, maximum_skeleton_delta)
 
 
 def _cpu_animation_template(template: str) -> tuple[Literal["Humanoid", "Generic"], str]:

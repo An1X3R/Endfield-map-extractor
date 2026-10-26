@@ -9,7 +9,9 @@ import zipfile
 
 
 RUNTIME_FILES = ('character_rig_ik.py', 'character_rig_panel.py', 'character_weather_panel.py',
-                 'character_postprocess.py', 'character_postprocess_panel.py')
+                 'character_postprocess.py', 'character_postprocess_panel.py',
+                 'character_outline.py', 'character_appearance_panel.py',
+                 'character_shader_uniforms.py')
 
 
 def build_addon(repository: Path, output_directory: Path) -> Path:

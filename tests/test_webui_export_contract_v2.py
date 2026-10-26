@@ -50,6 +50,24 @@ def scene_color_snapshot() -> dict[str, object]:
 
 
 class ContractTests(unittest.TestCase):
+    def test_layer_flags_reject_non_boolean_values(self) -> None:
+        schema = json.loads((SCHEMA_ROOT / "webui_export_job_v2.schema.json").read_text())
+        for invalid in ("false", "true", 0, 1, None, [], {}):
+            value = {**payload(), "layers": {"water": invalid}}
+            with self.subTest(invalid=invalid):
+                with self.assertRaisesRegex(ValueError, "layers.water must be boolean"):
+                    contract.canonicalize_job(value)
+                with self.assertRaises(jsonschema.ValidationError):
+                    jsonschema.validate(value, schema)
+        for invalid in (None, [], "false", False):
+            with self.subTest(container=invalid), self.assertRaisesRegex(ValueError, "layers must be an object"):
+                contract.canonicalize_job({**payload(), "layers": invalid})
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled):
+                result = contract.canonicalize_job({**payload(), "layers": {"water": enabled}})
+                self.assertIs(result["layers"]["water"], enabled)
+                self.assertIs(result["layers"]["terrain"], True)
+
     def test_browser_batch_modes_match_schema_and_canonicalizer(self) -> None:
         schema = json.loads((SCHEMA_ROOT / "webui_export_job_v2.schema.json").read_text())
         for mode in ("per_sector", "cluster_4x4_sectors", "merged_selection"):
@@ -78,8 +96,22 @@ class ContractTests(unittest.TestCase):
             self.assertEqual(result["export_mode"], "blend")
             self.assertEqual(result["source"]["blender_exe"], str(blender.resolve()))
             self.assertEqual(result["export_groups"], ["building", "prop"])
+            with self.assertRaisesRegex(ValueError, "source water automatically"):
+                contract.canonicalize_job({**value, "water_mode": "flowmap_fresnel"})
+            for mode in ("anchor_overlap", "all_active"):
+                with self.subTest(selection_mode=mode), self.assertRaisesRegex(ValueError, "metadata only"):
+                    contract.canonicalize_job({**value, "effects": {"selection_mode": mode}})
+            recorded = contract.canonicalize_job({**value, "export_mode": "data_package",
+                "water_mode": "flowmap_fresnel", "effects": {"selection_mode": "all_active"}})
+            self.assertEqual(recorded["water_mode"], "flowmap_fresnel")
+            self.assertEqual(recorded["effects"]["selection_mode"], "all_active")
             schema = json.loads((SCHEMA_ROOT / "webui_export_job_v2.schema.json").read_text())
             jsonschema.validate(value, schema)
+            with self.assertRaises(jsonschema.ValidationError):
+                jsonschema.validate({**value, "water_mode": "flowmap_fresnel"}, schema)
+            for mode in ("anchor_overlap", "all_active"):
+                with self.subTest(schema_selection_mode=mode), self.assertRaises(jsonschema.ValidationError):
+                    jsonschema.validate({**value, "effects": {"selection_mode": mode}}, schema)
 
             value["export_groups"] = ["building", "effects"]
             value["fog_depth"] = {"subdivision_level": 4}

@@ -142,9 +142,16 @@ def main(argv: Sequence[str]) -> None:
     if before != after:
         raise ValueError("Rebuilt blend changed source coordinates, topology, UV, skin weights, shape keys, armature bind matrices, or visibility")
     groups = tuple(group for group in bpy.data.node_groups if "source_shader" in group)
-    if len(groups) != report["source_materials"]:
+    skipped_passes = tuple(report.get("skipped_optional_material_passes", []))
+    skipped_identities = {tuple(row["identity"]) for row in skipped_passes}
+    expected_identities = {tuple(identity) for identity in report["source_material_identities"]}
+    group_identities = {tuple(json.loads(group["source_identity"])) for group in groups}
+    if group_identities != expected_identities - skipped_identities:
+        raise ValueError("Reopened material groups differ from source identities and optional pass skips")
+    if len(groups) != report["source_materials"] - len(skipped_identities):
         raise ValueError("Reopened blend lost source material groups")
-    actual_shaders = sorted({group["source_shader"] for group in groups})
+    actual_shaders = sorted({group["source_shader"] for group in groups}
+                            | {row["shader"] for row in skipped_passes})
     if actual_shaders != report["actual_shader_families"]:
         raise ValueError("Reopened shader-family selection differs from source")
     archived = tuple(group for group in groups if group.get("archived_unsupported_shader"))
@@ -161,7 +168,7 @@ def main(argv: Sequence[str]) -> None:
         links = tuple(outputs[0].inputs["Shader"].links)
         if len(links) != 1 or links[0].from_node.type != "BSDF_TRANSPARENT":
             raise ValueError(f"Archive shader is not a transparent evidence carrier: {group.name}")
-    images = {node.image for group in groups for node in group.nodes if node.type == "TEX_IMAGE"}
+    images = {image for image in bpy.data.images if image.name.startswith("EFCHAR ")}
     if None in images or len(images) != report["packed_image_roles"] or any(image.packed_file is None for image in images):
         raise ValueError("Reopened blend has missing or unpacked source images")
     environment = bpy.data.node_groups["EF Character Environment - APPROXIMATION"]

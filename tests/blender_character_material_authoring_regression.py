@@ -1,4 +1,5 @@
 """Compare real saved character shading and exercise live outer artist controls."""
+# ruff: noqa: E402
 from __future__ import annotations
 
 import argparse
@@ -19,6 +20,7 @@ from character_material_authoring import (
 )
 from character_expression_material_controls import inherited_expression_material_controls
 from character_authoring_validation import material_signature
+from character_shader_uniforms import verify_shader_uniforms
 
 
 def render(output: Path, name: str, engine: str) -> tuple[float, ...]:
@@ -99,6 +101,7 @@ def main(argv: list[str]) -> None:
     materials = tuple(sorted({slot.material for obj in bpy.context.scene.objects if obj.type == 'MESH'
                             for slot in obj.material_slots if slot.material is not None and slot.material.use_nodes},
                             key=lambda item: item.name))
+    material_names = tuple(material.name for material in materials)
     invalid_source_links = [(tree.name, link.from_node.name, link.from_socket.name,
                              link.to_node.name, link.to_socket.name)
                             for tree in bpy.data.node_groups for link in tree.links if not link.is_valid]
@@ -109,12 +112,27 @@ def main(argv: list[str]) -> None:
     report = package_material_authoring(materials, layout_shader_node_tree)
     bpy.context.scene.frame_set(bpy.context.scene.frame_current)
     graph_check = verify_material_authoring(report)
+    uniform_check = verify_shader_uniforms(materials, tuple(bpy.context.scene.objects), bpy.context.scene)
+    uniform_entries = report['uniforms']['entries']
+    if (uniform_check['status'] != 'verified'
+            or uniform_check['entries'] != len(uniform_entries)):
+        raise AssertionError(f'Native shader uniform migration did not verify: {report["uniforms"]}/{uniform_check}')
     after_expression = inherited_expression_material_controls()
     if before_expression != after_expression:
         raise AssertionError('Source expression material receipts changed')
     after_drivers = frozenset(drivers())
-    if any(item not in after_drivers for item in before_drivers):
-        raise AssertionError('Original material driver definition changed')
+    migrated_driver_keys = frozenset((entry['tree'], entry['path'], 0) for entry in uniform_entries)
+    before_driver_rows = {(row[0], row[1], row[2]): row for row in before_drivers}
+    for entry in uniform_entries:
+        original = before_driver_rows.get((entry['tree'], entry['path'], 0))
+        if original is not None and original[4] != entry['expression']:
+            raise AssertionError(f'Native uniform receipt changed its source expression: {entry}')
+    preserved_source_drivers = frozenset(row for key, row in before_driver_rows.items()
+                                         if key not in migrated_driver_keys)
+    if not preserved_source_drivers.issubset(after_drivers):
+        raise AssertionError('An unrelated original material driver definition changed')
+    if any((row[0], row[1], row[2]) in migrated_driver_keys for row in after_drivers):
+        raise AssertionError('A migrated scalar Value output still has its legacy driver')
     after_cycles = render(output, 'materials_after_cycles', 'CYCLES')
     cycles_comparison = delta(reference_cycles, after_cycles)
     if cycles_comparison['mean'] > cycles_control['mean'] + 0.0001 or cycles_comparison['maximum'] > cycles_control['maximum'] + 1. / 255.:
@@ -174,13 +192,28 @@ def main(argv: list[str]) -> None:
     bpy.context.view_layer.update()
     signature = material_signature()
     repeated = package_material_authoring(materials, layout_shader_node_tree)
-    if repeated != report or material_signature() != signature:
-        raise AssertionError('Repeated material packaging changed an already packaged graph')
+    repeated_uniforms = repeated['uniforms']
+    repeated_entries = tuple(sorted(json.dumps(entry, sort_keys=True) for entry in repeated_uniforms['entries']))
+    original_entries = tuple(sorted(json.dumps(entry, sort_keys=True) for entry in uniform_entries))
+    if repeated['materials'] != report['materials'] or repeated_entries != original_entries:
+        raise AssertionError('Repeated material packaging changed its material or native uniform receipts')
+    if repeated_uniforms['migrated'] != 0 or repeated_uniforms['bindings'] != 0:
+        raise AssertionError(f'Second packaging call performed native changes: {repeated_uniforms}')
+    if repeated_uniforms['skipped'] != report['uniforms']['skipped']:
+        raise AssertionError('Repeated material packaging changed the unrelated-driver audit')
+    repeated_uniform_check = verify_shader_uniforms(materials, tuple(bpy.context.scene.objects), bpy.context.scene)
+    if repeated_uniform_check != uniform_check or material_signature() != signature or frozenset(drivers()) != after_drivers:
+        raise AssertionError('Repeated material packaging changed shader graphs, driver definitions, or native bindings')
     packed = output / 'material_authoring_verified.blend'
     bpy.ops.wm.save_as_mainfile(filepath=str(packed))
     bpy.ops.wm.open_mainfile(filepath=str(packed))
     reopened = verify_material_authoring(report)
     inherited_expression_material_controls()
+    reopened_materials = tuple(bpy.data.materials[name] for name in material_names)
+    reopened_scene = bpy.context.scene
+    reopened_uniform_check = verify_shader_uniforms(reopened_materials, tuple(reopened_scene.objects), reopened_scene)
+    if reopened_uniform_check != uniform_check:
+        raise AssertionError(f'Saved native uniform bindings changed after reopen: {reopened_uniform_check}')
     if material_signature() != signature:
         raise AssertionError('Saved material graph changed after reopen')
     result = {'status': 'passed', 'packaging': report, 'graph': graph_check,
@@ -190,6 +223,7 @@ def main(argv: list[str]) -> None:
               'source_invalid_links': invalid_source_links, 'source_cycles_correction': source_cycles_correction,
               'outer_texture_replacement': replacement_comparison,
               'original_parameter_response': parameter_comparison, 'original_drivers': len(before_drivers),
+              'native_uniform_migration': report['uniforms'], 'native_uniform_verification': uniform_check,
               'expression_receipt_preserved': before_expression is not None, 'reopened': reopened,
               'live_expression_bindings': live_expression_bindings,
               'second_call_changed_nothing': True, 'blend': str(packed)}

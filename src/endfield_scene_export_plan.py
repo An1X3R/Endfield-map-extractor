@@ -18,7 +18,7 @@ from typing import Callable, Literal, Mapping, NotRequired, TypedDict, cast
 
 from extractor_core.scene_identity import validate_scene_id
 from extractor_core.vfs import VfsFile
-from endfield_map_layer_contract import classify_entity, is_hlod_name
+from endfield_map_layer_contract import ENTITY_CATEGORY_VERSION, classify_entity, is_hlod_name
 from endfield_scene_material_contract import (reference_key, resolve_export_path,
                                              resolve_existing_export_files, supported_slots)
 from endfield_scene_material_handoff import (MaterialCatalogHandoff, build_material_catalog_handoff,
@@ -376,7 +376,7 @@ def _cached_spatial_selection(
             for row in water_geometry_rows
         ],
     }, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
-    qualifiers = ("scene-spatial-selection-v2", str(cache_root.resolve()), parser_identity,
+    qualifiers = ("scene-spatial-selection-v2", ENTITY_CATEGORY_VERSION, str(cache_root.resolve()), parser_identity,
                   filter_qualifier, *entry_qualifiers,
                   *(spatial_identities[source].metadata for source in sorted(spatial_identities)))
 

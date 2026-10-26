@@ -150,12 +150,11 @@ def _static_scalar(socket: bpy.types.NodeSocket, seen: frozenset[int]) -> float:
 
 def attach_standard_main_light(tree: bpy.types.ShaderNodeTree, camera_forward: Vector,
     world_up: Vector, cp13_w: Scalar, layout: Callable[[bpy.types.NodeTree], None]) -> dict[str, object]:
-    """Append the ordinary term on the NPR bus; preserve the outer PBR blend."""
+    """Append isotropic specular; identify unimplemented special lobes explicitly."""
     if tree.get('source_shader') != 'HGRP/CharacterNPR' or any(n.label == LABEL for n in tree.nodes):
         raise ValueError(f'Expected an unpatched Standard source material: {tree.name}')
     values = json.loads(tree['source_floats'])
-    expected = {'_UseBumpMap': True,
-                '_UseCharacterFur': False, '_ClearCoat': False, '_Pantyhose': False, '_UseAnisotropy': False}
+    expected = {'_UseBumpMap': True, '_UseCharacterFur': False, '_Pantyhose': False}
     for field, enabled in expected.items():
         if (_number(values, field) > .5) != enabled:
             raise ValueError(f'Standard ordinary GGX variant not implemented: {field}={values[field]}')
@@ -168,9 +167,15 @@ def attach_standard_main_light(tree: bpy.types.ShaderNodeTree, camera_forward: V
         raise ValueError('Standard SpecRamp source switch and keyword disagree')
     if '_NORMALMAP' not in keywords:
         raise ValueError(f'Standard mapped keyword proof incomplete: {sorted(keywords)}')
-    if keywords & {'_CHARACTER_FUR', '_CLEARCOAT', '_PANTYHOSE', '_ANISOTROPY_SPECULAR_ON'}:
+    if keywords & {'_CHARACTER_FUR', '_PANTYHOSE'}:
         raise ValueError(f'Standard special branch is not ordinary GGX: {sorted(keywords)}')
+    special_features = tuple(field for field in ('_ClearCoat', '_UseAnisotropy') if _number(values, field) > .5)
+    for field, keyword in (('_ClearCoat', '_CLEARCOAT'), ('_UseAnisotropy', '_ANISOTROPY_SPECULAR_ON')):
+        if (_number(values, field) > .5) != (keyword in keywords):
+            raise ValueError(f'Standard special specular source switch and keyword disagree: {field}')
     silk = _number(values, '_SilkStockings') > .5
+    if silk and special_features:
+        raise ValueError('Combined Silk and special specular variant has no attachment proof')
     if silk != ('_SILK_STOCKINGS' in keywords) or (silk and _number(values, '_SilkStockingsAdvance') > .5):
         raise ValueError('Standard Silk switch/keyword disagree or advanced Silk is not implemented')
     if silk and not mapped:
@@ -216,6 +221,13 @@ def attach_standard_main_light(tree: bpy.types.ShaderNodeTree, camera_forward: V
     added = color_mix(tree, 'ADD', 1., _upstream(emission, 'Color'), group.outputs['Ordinary Specular'],
         'NPR bus plus ordinary Standard GGX', SECTION)
     tree.links.new(added, emission.inputs['Color'])
+    fidelity = 'host_isotropic_approximation' if special_features else 'verified_ordinary_isotropic_terms'
+    scope = ('Host isotropic SpecRamp/GGX lighting for a source special-specular material; '
+             'native anisotropic and clearcoat lobes are not reconstructed.'
+             if special_features else group.node_tree['source_scope'])
+    group['lighting_fidelity'] = fidelity
+    group['unimplemented_specular_features'] = json.dumps(special_features)
+    group['source_scope'] = scope
     layout(group.node_tree)
     layout(tree)
     return {'source_identity': tree['source_identity'], 'kernel': group.node_tree.name,
@@ -223,7 +235,9 @@ def attach_standard_main_light(tree: bpy.types.ShaderNodeTree, camera_forward: V
         'spec_ramp_enabled': ramped,
         'silk_additive_preserved': silk, 'npr_response_weight': response, 'remaining_physical_response_weight': 1. - response,
         'albedo_opacity_source_controls_unchanged': True,
-        'scope': group.node_tree['source_scope'],
+        'lighting_fidelity': fidelity,
+        'unimplemented_specular_features': list(special_features),
+        'scope': scope,
         'limitations': ['outer PBR blend retained; ordinary source term is weighted only on NPR branch',
             'dry surface inputs; rain post-composition/environment BRDF are separate',
             'source Full Diffuse and explicit host camera/up/CP13; not a runtime uniform capture',

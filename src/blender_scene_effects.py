@@ -531,7 +531,10 @@ def build_scene_effects(effect_instances: Sequence[Mapping[str, object]], collec
             raise ValueError(f"Effect SceneProbe manifest must be absolute: entity_id={entity_id}, path={manifest_source}")
         manifest_path = resolve_export_path(manifest_source)
         if not manifest_path.is_file():
-            raise FileNotFoundError(f"Effect SceneProbe manifest missing: entity_id={entity_id}, path={manifest_source}")
+            audit.append({"entity_id": entity_id, "status": "skipped_missing_resource",
+                          "resource": "effect_manifest", "path": str(manifest_source),
+                          "reason": "Effect SceneProbe manifest was not extracted"})
+            continue
         if manifest_path not in manifests:
             manifests[manifest_path] = _record(json.loads(manifest_path.read_text(encoding="utf-8-sig")), "Manifest")
         manifest = manifests[manifest_path]
@@ -592,6 +595,10 @@ def build_scene_effects(effect_instances: Sequence[Mapping[str, object]], collec
                 snapshot = generate_fixed_emitter_particle_snapshot(system, snapshot_age_seconds,
                                                      f"{entity_id}:{system_key[0]}:{system_key[1]}",
                                                      remaining, 100000, local_gravity, shape_geometry)
+            except FileNotFoundError as error:
+                audit.append(row | {"status": "skipped_missing_resource", "resource": "particle_geometry",
+                                    "reason": str(error)})
+                continue
             except (UnsupportedParticleSnapshot, UnsupportedParticleCurve) as error:
                 audit.append(row | {"status": "unsupported_particle_parameters", "reason": str(error)})
                 continue
@@ -611,6 +618,10 @@ def build_scene_effects(effect_instances: Sequence[Mapping[str, object]], collec
                 continue
             try:
                 material = material_factory(material_ref, renderer, system)
+            except FileNotFoundError as error:
+                audit.append(row | {"status": "skipped_missing_resource", "resource": "particle_material",
+                                    "material_refs": [list(key) for key in identities], "reason": str(error)})
+                continue
             except NotImplementedError as error:
                 audit.append(row | {"status": "unsupported_material", "reason": str(error)})
                 continue

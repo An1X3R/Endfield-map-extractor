@@ -10,6 +10,8 @@ import bpy
 
 from attach_character_weather_surface import linked_source, outgoing
 from character_node_graph import color_mix, math_node, node
+from character_hair_lighting import hair_cast_shadow_source
+from character_shader_uniforms import MARKER as UNIFORM_MARKER, resolve_shader_uniform_socket
 from character_weather_nodes import combine_vector, smoothstep, vector_math
 from patch_character_hgrp import by_label
 from patch_native_character_weather import coordinates
@@ -124,7 +126,7 @@ def _main_lighting(tree: bpy.types.ShaderNodeTree, wet: bpy.types.Node,
         by_label(tree, 'HGRP source light Y cast-shadow blend').outputs[0], camera_xyz.outputs['Z']),
         'Hair wet camera and cast plane')
     camera_plane = _vector(tree, 'NORMALIZE', camera_plane, (0., 0., 0.), 'Hair wet camera plane unit')
-    cast = by_label(tree, 'Hair HGRP Cast Shadow Preview - Explicit').outputs[0]
+    cast = hair_cast_shadow_source(tree)
     half = _vector(tree, 'ADD', light_cast, _scale(tree, camera_plane, 2., 'Hair wet camera plane times two'), 'Hair wet half light camera')
     half = _vector(tree, 'ADD', half, _scale(tree, view, _math(tree, 'ADD', 2., cast, 'Hair wet view factor'), 'Hair wet weighted view'), 'Hair wet half sum')
     half = _vector(tree, 'NORMALIZE', half, (0., 0., 0.), 'Hair wet half vector')
@@ -244,9 +246,13 @@ def verify_hair_wet_before_snow(tree: bpy.types.ShaderNodeTree, receipt: dict[st
     wet = tree.nodes[receipt['instance']]
     if wet.node_tree.name != receipt['kernel'] or wet.node_tree.get('source_shader_sha256') != receipt['shader_sha256']:
         raise AssertionError('Saved Hair wet kernel source differs')
+    cast_target = by_label(tree, 'Hair wet view factor').inputs[1]
     for row in receipt['links']:
-        source = tree.nodes[row['source']['node']].outputs[row['source']['index']]
         target = tree.nodes[row['target']['node']].inputs[row['target']['index']]
+        # The live shadow bridge replaces the initial shared cast producer.
+        source = (hair_cast_shadow_source(tree) if target == cast_target else
+                  tree.nodes[row['source']['node']].outputs[row['source']['index']])
+        source = resolve_shader_uniform_socket(tree, source)
         if linked_source(target) != source:
             raise AssertionError('Saved Hair wet live link differs: ' + target.node.label + '/' + target.name)
     lighting = receipt['lighting']
@@ -265,9 +271,14 @@ def verify_hair_wet_before_snow(tree: bpy.types.ShaderNodeTree, receipt: dict[st
         raise AssertionError('Saved Hair host camera binding type/fit changed')
     if camera.data.type == 'ORTHO' and (wet.inputs['View Distance'].is_linked or wet.inputs['View Distance'].default_value != 1.0):
         raise AssertionError('Saved Hair orthographic source view distance must remain one')
-    drivers = tuple(curve for curve in tree.animation_data.drivers if curve.data_path == tree.nodes[receipt['projection_node']].outputs[0].path_from_id('default_value'))
-    if len(drivers) != 1 or not drivers[0].driver.is_valid:
-        raise AssertionError('Saved Hair camera projection driver is missing or invalid')
+    projection = tree.nodes[receipt['projection_node']].outputs[0]
+    if UNIFORM_MARKER in projection.node:
+        resolve_shader_uniform_socket(tree, projection)
+    else:
+        drivers = tuple(curve for curve in tree.animation_data.drivers
+                        if curve.data_path == projection.path_from_id('default_value')) if tree.animation_data else ()
+        if len(drivers) != 1 or not drivers[0].driver.is_valid:
+            raise AssertionError('Saved Hair camera projection driver is missing or invalid')
     return {'status': 'passed', 'wet_to_snow_channels': 2, 'live_links_checked': len(receipt['links']),
         'main_lighting_consumers': len(lighting['targets']), 'additional_light_consumers': len(receipt['additional_light_consumers']),
         'ordinary_and_snow_normals_preserved': True, 'native_runtime_state_verified': False}

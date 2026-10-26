@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 from endfield_map_layer_contract import (
     RuntimeResolver,
+    classify_entity,
     convex_hull,
     ensure_new_output_root,
     sector_for_point,
@@ -23,6 +24,23 @@ from endfield_map_layer_contract import (
 
 
 class MapLayerContractTests(unittest.TestCase):
+    def test_entity_categories_require_complete_name_words(self) -> None:
+        cases = (
+            ("P_prop_streetlamp+1_002_02a", ("prop", "prop")),
+            ("P_prop_newplant_001", ("prop", "prop")),
+            ("P_farmod_tundra_medium+1_001_14", ("unknown", None)),
+            ("P_road_tundra_lv007road+1_001_05", ("road", "road")),
+            ("P_road_map01_lv007bridge+1_002_02a", ("road", "road")),
+            ("P_tree_oak+1_001", ("vegetation", "tree")),
+            ("P_prop_tree01_lod0", ("vegetation", "tree")),
+            ("P_vegetation_grass_001", ("vegetation", "vegetation")),
+            ("P_farmod_tree+1_001", ("vegetation", "tree")),
+            ("P_terrain_rock_001", ("terrain-structure", "terrain")),
+        )
+        for name, expected in cases:
+            with self.subTest(name=name):
+                self.assertEqual(classify_entity(name), expected)
+
     def test_sector_formula_handles_negative_and_boundaries(self) -> None:
         self.assertEqual(sector_for_point(-0.001, -128.001), (-1, -2))
         self.assertEqual(sector_for_point(0.0, 127.999), (0, 0))

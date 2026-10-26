@@ -10,7 +10,7 @@ import sys
 import bpy
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src' / 'character_runtime'))
-from character_simple_layout import _height, layout_simple_character_material
+from character_simple_layout import _height, _ordered, _section, layout_simple_character_material
 
 
 def _value(value: object) -> object:
@@ -72,6 +72,33 @@ def _intersects(first: tuple[float, float, float, float], second: tuple[float, f
     return first[0] < second[2] and second[0] < first[2] and first[1] > second[3] and second[1] > first[3]
 
 
+def _verify_stable_order(trees: tuple[bpy.types.NodeTree, ...]) -> int:
+    """Compare indexed traversal with the prior socket-based layer ordering."""
+    checked = 0
+    for tree in trees:
+        sections: dict[tuple[int, str], list[bpy.types.Node]] = {}
+        for item in tree.nodes:
+            if item.type != 'FRAME':
+                sections.setdefault(_section(item), []).append(item)
+        for members in sections.values():
+            pending = {item.name: item for item in members}
+            expected: list[bpy.types.Node] = []
+            while pending:
+                ready = tuple(sorted((item for item in pending.values() if not any(
+                    link.from_node.name in pending for socket in item.inputs for link in socket.links)),
+                    key=lambda item: (str(item.get('source_slot', '')), item.label, item.name)))
+                if not ready:
+                    raise AssertionError(f'Real compact fixture has a cyclic frame: {tree.name}/{sorted(pending)}')
+                expected.extend(ready)
+                for item in ready:
+                    del pending[item.name]
+            actual = _ordered(tree, tuple(members))
+            if actual != tuple(expected):
+                raise AssertionError(f'Indexed layout changed stable node order: {tree.name}')
+            checked += 1
+    return checked
+
+
 def _verify_geometry(tree: bpy.types.NodeTree) -> int:
     frames = tuple(item for item in tree.nodes if item.get('endfield_simple_layout_frame'))
     if not frames:
@@ -109,6 +136,7 @@ def main() -> None:
     if not materials:
         raise AssertionError('The real fixture contains no simplified character materials')
     trees = _trees(materials)
+    ordered_sections = _verify_stable_order(trees)
     before = _semantics(trees)
     for material in materials:
         layout_simple_character_material(material)
@@ -123,6 +151,7 @@ def main() -> None:
     document = {'status': 'passed', 'blend': bpy.data.filepath, 'materials': len(materials),
                 'reachable_trees': len(trees), 'frames': frame_count, 'semantic_sha256': before,
                 'semantic_invariance': True, 'idempotent': True, 'overlapping_nodes': 0,
+                'stable_order_sections': ordered_sections,
                 'overlapping_frames': 0, 'bounds': 'conservative panel/socket estimates and stored dimensions'}
     args.report.parent.mkdir(parents=True, exist_ok=True)
     args.report.write_text(json.dumps(document, ensure_ascii=False, indent=2), encoding='utf-8')

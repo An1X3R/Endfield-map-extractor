@@ -50,6 +50,9 @@ def _graph(tree: bpy.types.NodeTree) -> dict[str, object]:
     """Fingerprint saved node wiring, constants and sampling roles independently of time."""
     nodes: list[dict[str, object]] = []
     for node in sorted(tree.nodes, key=lambda item: item.name):
+        # Authoring layout frames have no sockets or geometry evaluation semantics.
+        if node.type == 'FRAME':
+            continue
         values: dict[str, object] = {}
         for index, socket in enumerate(node.inputs):
             if hasattr(socket, 'default_value'):
@@ -175,7 +178,7 @@ def _make_group(source: MaterialSource, image: bpy.types.Image,
     return tree
 
 
-def install_vertex_offsets(packet: SourcePacket, scene: bpy.types.Scene) -> list[dict[str, object]]:
+def install_vertex_offsets(packet: SourcePacket, scene: bpy.types.Scene, skipped_material_identities: frozenset[tuple[str, int]]) -> list[dict[str, object]]:
     """Install exact renderer/submesh-bound modifiers before material adaptation."""
     from rebuild_character_materials import array_value, identity, int_value, object_value, string_value
     sources = {source.identity: source for source in packet.materials
@@ -190,6 +193,8 @@ def install_vertex_offsets(packet: SourcePacket, scene: bpy.types.Scene) -> list
         count = int_value(renderer['submesh_count'], 'submesh_count')
         obj = scene.objects[string_value(decision['fbx_object_name'], 'mesh')]
         for key in sorted(set(refs).intersection(sources)):
+            if key in skipped_material_identities:
+                continue
             source = sources[key]
             validate_offset_controls(source.floats, source.colors)
             if '_USE_VERTOFFSET' not in source.keywords:

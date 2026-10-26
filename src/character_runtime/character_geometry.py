@@ -208,6 +208,9 @@ def _mesh(row: dict[str, object], payload: bytes, world: Matrix, rig: bpy.types.
             polygon.use_smooth = True
         offset += len(indices)
     loop_vertices = np.array([loop.vertex_index for loop in data.loops])
+    data['endfield_source_uv_channels'] = json.dumps([
+        integer(fields(raw, 'uv')['channel'], 'uv.channel') for raw in rows(row['uvs'], 'uvs')
+    ])
     for raw in rows(row['uvs'], 'uvs'):
         uv = fields(raw, 'uv')
         coordinates = _array(uv['values'], payload, 2, 'float32')

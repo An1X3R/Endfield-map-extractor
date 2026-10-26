@@ -17,6 +17,7 @@ SCOPE = ('Host layered RGB texture approximation, not native parallax marching. 
          'UV0/ST, texture, depth scale, march count and tint are retained. Equally spaced '
          'depth layers, equal RGB weights, UV-derived tangent frame, grazing clamp and '
          'the editable half-strength mix over the original surface are host choices. '
+         'BaseMap alpha times BaseColor alpha bounds this approximation to the source effect mask. '
          'Texture RGB is sampled as color, not interpreted as height or alpha coverage. '
          'Source HDR tint is retained; the host color/BSDF response may clamp it. Native '
          'color composition, sampler, ray traversal and lighting equivalence remain unverified.')
@@ -63,6 +64,9 @@ def apply_parallax_preview(tree: bpy.types.ShaderNodeTree, source: MaterialSourc
     binding = bindings[0]
     if binding.uv_index != 0:
         raise NotImplementedError(f'Source parallax preview currently requires UV0: material={source.identity}; uv={binding.uv_index}')
+    base_sample = samples.get('_BaseMap')
+    if base_sample is None or base_sample.image is None:
+        raise ValueError(f'Enabled source parallax needs its BaseMap alpha mask: material={source.identity}')
     input_socket(tree, 'Source Parallax Scale', 'NodeSocketFloat', scale, 'Exact source depth-range parameter; host layer offsets approximate the native march.')
     input_socket(tree, 'Source Parallax Color', 'NodeSocketColor', tint, 'Exact source HDR tint; native color-layer composition is unverified.')
     input_socket(tree, 'Preview Parallax Strength', 'NodeSocketFloat', 0.5, 'Host RGB mix: zero restores the original complete base surface; one selects the layered source texture preview.')
@@ -120,13 +124,16 @@ def apply_parallax_preview(tree: bpy.types.ShaderNodeTree, source: MaterialSourc
     if combined is None:
         raise AssertionError('Validated parallax layer count did not produce a sample')
     colored = color_mix(tree, 'MULTIPLY', 1.0, combined, entry.outputs['Source Parallax Color'], 'Parallax host texture tint from source color', 'Approx Source Parallax')
-    result = color_mix(tree, 'MIX', entry.outputs['Preview Parallax Strength'], base, colored, 'Parallax host layer mix over original base', 'Approx Source Parallax')
+    coverage = math_node(tree, 'MULTIPLY', base_sample.outputs['Alpha'], entry.outputs['Base Tint Alpha'], 'Parallax source BaseMap alpha times tint alpha', 'Approx Source Parallax')
+    strength = math_node(tree, 'MULTIPLY', coverage, entry.outputs['Preview Parallax Strength'], 'Parallax masked host strength', 'Approx Source Parallax')
+    result = color_mix(tree, 'MIX', strength, base, colored, 'Parallax host layer mix over original base', 'Approx Source Parallax')
     tree['source_parallax_preview'] = json.dumps({
         'format': CONTRACT, 'source_identity': source.identity, 'texture_identity': binding.identity,
         'source_scale': scale, 'source_color': tint, 'source_march_count': int(count),
         'source_texture_scale': binding.scale, 'source_texture_offset': binding.offset,
         'host_layer_depths': [(index + 0.5) / count for index in range(int(count))],
         'host_rgb_weights': [1.0 / count] * int(count), 'host_strength': 0.5,
+        'coverage': 'BaseMap.a * BaseColor.a',
         'host_grazing_floor': 0.25, 'native_shader_semantics_verified': False, 'scope': SCOPE,
     }, sort_keys=True)
     return result

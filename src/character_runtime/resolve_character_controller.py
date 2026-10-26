@@ -182,16 +182,14 @@ def clip_reference_matches(tree: dict[str, object], receipt: dict[str, object], 
     if not isinstance(externals, list) or any(not isinstance(item, str) for item in externals):
         raise ControllerSourceError("Controller external CAB inventory is invalid")
     matches: list[dict[str, object]] = []
-    for pointer in rows(tree.get("m_AnimationClips"), "m_AnimationClips"):
+    for slot, pointer in enumerate(rows(tree.get("m_AnimationClips"), "m_AnimationClips")):
         file_id = integer(pointer.get("m_FileID"), "clip FileID")
         path_id = integer(pointer.get("m_PathID"), "clip PathID")
         if file_id < 0 or file_id > len(externals):
             raise ControllerSourceError("Controller clip pointer has invalid external FileID")
         cab = text(receipt.get("cab"), "controller CAB") if file_id == 0 else externals[file_id - 1]
         if normalize(cab) == normalize(text(clip.get("sourceFile"), "clip CAB")) and path_id == integer(clip.get("pathId"), "selected clip PathID"):
-            matches.append({"file_id": file_id, "path_id": path_id, "cab": cab})
-    if len(matches) > 1:
-        raise ControllerSourceError("Selected clip has duplicate static controller pointers")
+            matches.append({"file_id": file_id, "path_id": path_id, "cab": cab, "controller_slot": slot})
     return tuple(matches)
 
 
@@ -278,6 +276,7 @@ def resolve_controller(request: ControllerRequest) -> dict[str, object]:
         "controller_resource_path": controller_path, "controller_bundle": str(bundle), "controller_bundle_sha256": sha(bundle),
         "reader_controller_bundle": str(bundle),
         "controller": receipt, "selected_clip_source": source_identity(clips[0].metadata), "clip_reference": references[0] if references else None,
+        "clip_references": list(references),
         "boundary": "Normal source controller is proven through selected CharacterData components independently of static clip membership. Dynamic clips may use its exact parameter names and source-authored clothing layers. Optional controller, active state/layers/montage and runtime parameter writes remain unresolved."}
     (request.output / "receipt.json").write_text(json.dumps(result, indent=2, allow_nan=False), encoding="utf-8")
     return result

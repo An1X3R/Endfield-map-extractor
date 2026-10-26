@@ -143,12 +143,12 @@ def build_weapon(source: Path, shader: Path, visibility: Path, output: Path) -> 
     selection = select_weapon_renderers(source, visibility, output)
     before = source_geometry_digest(meshes)
     packet = read_packet(source, shader, selection, visibility)
-    vertex_offsets = install_vertex_offsets(packet, bpy.context.scene)
+    vertex_offsets = install_vertex_offsets(packet, bpy.context.scene, frozenset())
     verify_vertex_offsets(vertex_offsets, bpy.context.scene)
     if source_geometry_digest_with_modifiers(meshes, source_modifiers_without_offsets) != before:
         raise ValueError('Weapon vertex offset installation changed immutable source geometry')
     lighting = ArtistLighting((0.4, -0.7, 0.6), 1.0, 0.35, 0.0, 0.2, 0.0)
-    built = build_loaded_materials(packet, lighting, layout_shader_node_tree)
+    built = build_loaded_materials(packet, lighting, layout_shader_node_tree, {}, {})
     parallax_previews = [json.loads(group['source_parallax_preview']) for group in built.groups.values()
                          if 'source_parallax_preview' in group]
     materials = tuple(sorted({slot.material for obj in built.bound_objects

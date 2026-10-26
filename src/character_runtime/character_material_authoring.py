@@ -9,6 +9,8 @@ from typing import TypedDict
 
 import bpy
 
+from character_shader_uniforms import ShaderUniformReport, migrate_shader_uniforms
+
 
 class MaterialPackagingRow(TypedDict):
     material: str
@@ -24,6 +26,7 @@ class MaterialPackagingReport(TypedDict):
     format: str
     materials: list[MaterialPackagingRow]
     scope: str
+    uniforms: ShaderUniformReport
 
 
 @dataclass(frozen=True)
@@ -377,7 +380,9 @@ def package_material_authoring(materials: Sequence[bpy.types.Material],
             instance['endfield_authoring_packaging'] = json.dumps(row, sort_keys=True)
             rows.append(row)
         layout_material_authoring(material)
-    return {'format': 'EndfieldMaterialAuthoring/1', 'materials': rows,
+    scene = bpy.context.scene
+    uniforms = migrate_shader_uniforms(materials, tuple(scene.objects), scene)
+    return {'format': 'EndfieldMaterialAuthoring/1', 'materials': rows, 'uniforms': uniforms,
             'scope': 'Actual root image samplers and dependency-stage calculation groups; original parameter/atlas evidence carriers retained.'}
 
 

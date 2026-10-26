@@ -23,7 +23,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from character_windows_paths import extended_path, io_path
 from character_node_graph import node, math_node, color_mix, input_socket
 from character_npr_nodes import ArtistLighting, make_artist_lighting, apply_diffuse_response
-from character_npr_vfx import CHARACTER_VFX_SHADER, MESH_EFFECT_SHADERS, validate_character_vfx_shader
+from character_npr_vfx import (
+    CHARACTER_VFX_SHADER, MESH_EFFECT_SHADERS, UNSUPPORTED_CHARACTER_VFX_RENDERER_FLAGS,
+    validate_character_vfx_shader,
+)
 
 Identity = tuple[str, int]
 SUPPORTED_SHADERS = frozenset(("HGRP/CharacterNPR", "HGRP/CharacterNPR_Skin", "HGRP/CharacterNPR_Hair", "HGRP/CharacterNPR_Eye", "HGRP/CharacterNPR_OverlayShadow", "HGRP/LitEffect", *MESH_EFFECT_SHADERS))
@@ -153,6 +156,144 @@ def visible_material_identities(renderers: tuple[dict[str, object], ...], select
     if seen != set(renderer_map):
         raise ValueError(f"Selection does not cover every source renderer: missing={sorted(set(renderer_map) - seen)}")
     return frozenset(visible)
+
+
+def optional_extra_material_identities(packet: SourcePacket) -> frozenset[Identity]:
+    """Find visible extra-pass materials that are never required as a submesh base."""
+    renderer_map = {identity(row["object"], "renderer.object"): row for row in packet.renderers}
+    if len(renderer_map) != len(packet.renderers):
+        raise ValueError("Duplicate source renderer identity")
+    required: set[Identity] = set()
+    visible_extras: set[Identity] = set()
+    seen: set[Identity] = set()
+    for decision in packet.selection:
+        renderer_text = string_value(decision["renderer_identity"], "renderer_identity")
+        cab, path_id = renderer_text.rsplit(":", 1)
+        renderer_key = (cab.casefold(), int(path_id))
+        if renderer_key not in renderer_map or renderer_key in seen:
+            raise ValueError(f"Selection renderer is absent or duplicated: {renderer_key}")
+        seen.add(renderer_key)
+        if type(decision["visible"]) is not bool:
+            raise TypeError(f"Selection visibility must be boolean: {renderer_key}")
+        renderer = renderer_map[renderer_key]
+        submesh_count = int_value(renderer["submesh_count"], "renderer.submesh_count")
+        if submesh_count < 1:
+            raise ValueError(f"Source renderer has no submeshes: {renderer_key}")
+        refs = tuple(identity(object_value(pointer, "material.pointer")["resolved"], "material.resolved")
+                     for pointer in array_value(renderer["materials"], "renderer.materials"))
+        if len(refs) < submesh_count:
+            raise ValueError(f"Source renderer has fewer materials than submeshes: {renderer_key}")
+        required.update(refs[:submesh_count])
+        if decision["visible"] is True:
+            visible_extras.update(refs[submesh_count:])
+    if seen != set(renderer_map):
+        raise ValueError(f"Selection does not cover every source renderer: missing={sorted(set(renderer_map) - seen)}")
+    return frozenset(visible_extras - required)
+
+
+def optional_standalone_vfx_renderer_skips(
+    packet: SourcePacket,
+) -> tuple[dict[Identity, dict[str, object]], dict[Identity, dict[str, object]]]:
+    """Identify unsupported VFX-only meshes isolated from every non-FX renderer."""
+    sources = {source.identity: source for source in packet.materials}
+    renderer_map = {identity(row["object"], "renderer.object"): row for row in packet.renderers}
+    if len(renderer_map) != len(packet.renderers):
+        raise ValueError("Duplicate source renderer identity")
+    mesh_counts: dict[Identity, int] = {}
+    renderer_refs: dict[Identity, tuple[Identity, ...]] = {}
+    renderer_paths: dict[Identity, str] = {}
+    for renderer_key, renderer in renderer_map.items():
+        mesh_key = identity(renderer["mesh"], "renderer.mesh")
+        mesh_counts[mesh_key] = mesh_counts.get(mesh_key, 0) + 1
+        renderer_refs[renderer_key] = tuple(
+            identity(object_value(pointer, "material.pointer")["resolved"], "material.resolved")
+            for pointer in array_value(renderer["materials"], "renderer.materials"))
+        renderer_paths[renderer_key] = string_value(renderer["path"], "renderer.path")
+    dedicated: set[Identity] = set()
+    non_fx_materials: set[Identity] = set()
+    for renderer_key, renderer in renderer_map.items():
+        refs = renderer_refs[renderer_key]
+        mesh_key = identity(renderer["mesh"], "renderer.mesh")
+        path = renderer_paths[renderer_key].casefold()
+        is_vfx_mesh = ("_fx_" in path and mesh_counts[mesh_key] == 1
+                       and int_value(renderer["submesh_count"], "renderer.submesh_count") == 1
+                       and len(refs) == 1 and refs[0] in sources
+                       and sources[refs[0]].shader in (CHARACTER_VFX_SHADER, "HGRP/Effect/VFXBaseV2"))
+        if is_vfx_mesh:
+            dedicated.add(renderer_key)
+        else:
+            non_fx_materials.update(refs)
+    visible_fx = set()
+    seen: set[Identity] = set()
+    for decision in packet.selection:
+        renderer_text = string_value(decision["renderer_identity"], "renderer_identity")
+        cab, path_id = renderer_text.rsplit(":", 1)
+        renderer_key = (cab.casefold(), int(path_id))
+        if renderer_key not in renderer_map or renderer_key in seen:
+            raise ValueError(f"Selection renderer is absent or duplicated: {renderer_key}")
+        seen.add(renderer_key)
+        if type(decision["visible"]) is not bool:
+            raise TypeError(f"Selection visibility must be boolean: {renderer_key}")
+        if decision["visible"] is True and renderer_key in dedicated:
+            visible_fx.add(renderer_key)
+    if seen != set(renderer_map):
+        raise ValueError(f"Selection does not cover every source renderer: missing={sorted(set(renderer_map) - seen)}")
+    unsupported_materials: dict[Identity, dict[str, object]] = {}
+    for renderer_key in visible_fx:
+        source = sources[renderer_refs[renderer_key][0]]
+        if source.identity in non_fx_materials:
+            continue
+        active = tuple((name, source.floats.get(name, 0.0)) for name in UNSUPPORTED_CHARACTER_VFX_RENDERER_FLAGS
+                       if source.shader == CHARACTER_VFX_SHADER and source.floats.get(name, 0.0) != 0.0)
+        if active:
+            invalid = tuple((name, value) for name, value in active if value != 1.0)
+            if invalid:
+                raise ValueError(f"Dedicated VFX source switches must be binary before optional skipping: material={source.identity}; fields={invalid}")
+            features = tuple(name for name, _ in active)
+        else:
+            from blender_scene_effect_layers import vfx_mesh_feature_issues
+            from character_mesh_effect import _scene_record
+            from character_npr_vfx import character_vfx_preview_record
+            record, _, _ = _scene_record(source, packet)
+            if source.shader == CHARACTER_VFX_SHADER:
+                # Geometry Nodes own this stage in the production surface adapter.
+                surface_record = {**record, "Floats": {**record["Floats"], "_UseVertexOffset": 0.0}}
+                preview = character_vfx_preview_record(surface_record)
+            else:
+                preview = record
+            # Particle/custom-UV inputs are unsupported with either valid mesh color layout.
+            # Do not infer missing streams or preempt the adapter's supported UV branches.
+            without_color = frozenset(vfx_mesh_feature_issues(preview, 0))
+            features = tuple(issue for issue in vfx_mesh_feature_issues(preview, 4) if issue in without_color)
+            if "particle_input_on_mesh_renderer" not in features:
+                continue
+        reason = (f"Dedicated VFX source branch has no host implementation: material={source.name}; "
+                  f"shader={source.shader}; features={features}")
+        renderer_rows = tuple(key for key in dedicated if renderer_refs[key] == (source.identity,))
+        selected_rows = tuple(key for key in renderer_rows if key in visible_fx)
+        diagnostic = {
+            "status": "skipped_unsupported_optional_effect_renderer",
+            "component": "dedicated_vfx_renderer",
+            "material": source.name,
+            "shader": source.shader,
+            "material_identity": list(source.identity),
+            "reason": reason,
+            "unsupported_features": list(features),
+            "retained": "character_body_and_source_mesh_geometry",
+            "renderer_identities": [f"{key[0]}:{key[1]}" for key in sorted(renderer_rows)],
+            "renderer_paths": [renderer_paths[key] for key in sorted(renderer_rows)],
+            "selected_renderer_identities": [f"{key[0]}:{key[1]}" for key in sorted(selected_rows)],
+            "selected_renderer_paths": [renderer_paths[key] for key in sorted(selected_rows)],
+        }
+        unsupported_materials[source.identity] = diagnostic
+    unsupported_renderers = {
+        renderer_key: {**unsupported_materials[renderer_refs[renderer_key][0]],
+                       "renderer_identity": f"{renderer_key[0]}:{renderer_key[1]}",
+                       "renderer_path": renderer_paths[renderer_key]}
+        for renderer_key in dedicated
+        if renderer_refs[renderer_key][0] in unsupported_materials
+    }
+    return unsupported_materials, unsupported_renderers
 
 
 def read_material_sources(
@@ -893,16 +1034,30 @@ def material_group(source: MaterialSource, packet: SourcePacket, environment: bp
         alpha = math_node(tree, "MULTIPLY", alpha, entry.outputs["Approx Pass Opacity"], "Editable surface coverage", "Source Alpha Rules")
         tree.links.new(alpha, output.inputs["Coverage"])
         lit_shader = apply_diffuse_response(tree, source.shader, source.floats, samples, color, bsdf, lighting, source.null_texture_defaults)
-        from character_special_vfx import attach_special_vfx, source_from_material
-        special_source = source_from_material(source, samples)
+        from character_special_vfx import attach_special_vfx, source_from_material, MissingSpecialVfxTextureError
+        try:
+            special_source = source_from_material(source, samples)
+        except MissingSpecialVfxTextureError as error:
+            diagnostic = {"status": "skipped_missing_resource", "component": "character_special_vfx",
+                          "material": source.name, "identity": source.identity, "reason": str(error),
+                          "retained": "base_surface"}
+            tree["skipped_optional_resource"] = json.dumps(diagnostic, sort_keys=True)
+            print(json.dumps({"level": "WARNING", "event": "character_resource_skipped", **diagnostic}), flush=True)
+            special_source = None
         if special_source is not None:
             special_uv = node(tree, "ShaderNodeUVMap", "Special VFX source UV0", "Approx Character Special VFX")
             special_uv.uv_map = "UV0"
             special_geometry = node(tree, "ShaderNodeNewGeometry", "Special VFX geometric frame", "Approx Character Special VFX")
             source_alpha = math_node(tree, "MULTIPLY", base_alpha, entry.outputs["Base Tint Alpha"], "Special VFX unmodified source alpha", "Approx Character Special VFX")
             premultiply = math_node(tree, "ADD", math_node(tree, "MULTIPLY", math_node(tree, "SUBTRACT", source_alpha, 1.0, "Special VFX alpha minus one", "Approx Character Special VFX"), source_float(source, "_AlphaPremultiply"), "Special VFX selected alpha premultiply", "Approx Character Special VFX"), 1.0, "Special VFX source alpha multiplier", "Approx Character Special VFX")
+            special_normal = special_geometry.outputs["Normal"]
+            if special_source.floats["_VFXFresnelUseNormalMap"] == 1.0:
+                links = tuple(bsdf.inputs["Normal"].links)
+                if len(links) != 1:
+                    raise ValueError(f"Special VFX mapped Fresnel requires a connected BSDF normal: {source.identity}")
+                special_normal = links[0].from_socket
             lit_shader = attach_special_vfx(tree, special_source, lit_shader, special_uv.outputs[0],
-                special_geometry.outputs["Normal"], special_geometry.outputs["Incoming"], premultiply, bpy.context.scene)
+                special_normal, special_geometry.outputs["Incoming"], premultiply, bpy.context.scene)
         tree.links.new(lit_shader, output.inputs["Shader"])
         tree.links.new(color, output.inputs["Multiply Factor"])
         from character_fur_transmission import attach_fur_transmission
@@ -949,6 +1104,19 @@ def surface_stack(sources: tuple[MaterialSource, ...], groups: Mapping[Identity,
                 "render_state": group["source_render_state"],
             })
         material["source_vfx_render_state"] = json.dumps(render_states, sort_keys=True)
+        depth_writers = tuple(source for source in vfx_sources
+                              if source.shader == CHARACTER_VFX_SHADER and source_float(source, "_ZWrite") == 1.0)
+        if surface_type == 1.0 and depth_writers:
+            # A single host surface cannot reproduce separate native depth draws.
+            material.use_transparency_overlap = False
+            material["source_vfx_depth_approximation"] = json.dumps({
+                "format": "EndfieldCharacterVfxDepth/1",
+                "source_depth_writers": [source.identity for source in depth_writers],
+                "source_zwrite": 1.0,
+                "host_transparency_overlap": False,
+                "native_depth_pass_verified": False,
+                "scope": "Blender non-overlapping surface approximation for explicit CharacterNPR_VFX depth writers; separate native depth and inter-object ordering are not reproduced.",
+            }, sort_keys=True)
     material["source_shader"] = sources[0].shader
     material["source_material_stack"] = json.dumps([source.identity for source in sources])
     material["fidelity"] = "Editable source-sampling approximation; game lighting, stencil and render queues are not reproduced"
@@ -973,7 +1141,14 @@ def surface_stack(sources: tuple[MaterialSource, ...], groups: Mapping[Identity,
             enabled["evidence_note"] = "Native material order retained on last submesh; single-surface composition replaces repeated draws"
             control = enabled.outputs[0]
         coverage = math_node(tree, "MULTIPLY", group.outputs["Coverage"], control, "Source pass coverage times enable", "Ordered Source Material Passes")
-        if source.shader == "HGRP/CharacterNPR_OverlayShadow":
+        if index > 0 and "source_fx_layer" in group.node_tree:
+            tree.links.new(previous, group.inputs["Previous Shader"])
+            mix = node(tree, "ShaderNodeMixShader", "Optional transparent FX over retained source surface", "Ordered Source Material Passes")
+            tree.links.new(control, mix.inputs[0])
+            tree.links.new(previous, mix.inputs[1])
+            tree.links.new(group.outputs["Layer Shader"], mix.inputs[2])
+            previous = mix.outputs[0]
+        elif source.shader == "HGRP/CharacterNPR_OverlayShadow":
             factor = color_mix(tree, "MIX", control, (1.0, 1.0, 1.0, 1.0), group.outputs["Multiply Factor"], "Optional source multiply overlay", "Overlay Composition - APPROXIMATION")
             overlay_factor = factor if overlay_factor is None else color_mix(tree, "MULTIPLY", 1.0, overlay_factor, factor, "Multiply ordered source overlay factors", "Overlay Composition - APPROXIMATION")
             overlay_alpha = coverage if overlay_alpha is None else math_node(tree, "SUBTRACT", 1.0, math_node(tree, "MULTIPLY", math_node(tree, "SUBTRACT", 1.0, overlay_alpha, "Remaining prior coverage", "Overlay Composition - APPROXIMATION"), math_node(tree, "SUBTRACT", 1.0, coverage, "Remaining next coverage", "Overlay Composition - APPROXIMATION"), "Combined uncovered fraction", "Overlay Composition - APPROXIMATION"), "Combined overlay coverage", "Overlay Composition - APPROXIMATION")
@@ -998,7 +1173,7 @@ def geometry_signature(objects: Sequence[bpy.types.Object]) -> dict[str, tuple[i
     return {obj.name: (len(obj.data.vertices), len(obj.data.polygons), len(obj.vertex_groups), len(obj.data.shape_keys.key_blocks) if obj.data.shape_keys is not None else 0) for obj in objects}
 
 
-def bind_sources(packet: SourcePacket, groups: Mapping[Identity, bpy.types.ShaderNodeTree], layout: Callable[[bpy.types.NodeTree], None]) -> tuple[list[dict[str, object]], tuple[bpy.types.Object, ...]]:
+def bind_sources(packet: SourcePacket, groups: Mapping[Identity, bpy.types.ShaderNodeTree], skipped_material_passes: Mapping[Identity, dict[str, object]], skipped_effect_renderers: Mapping[Identity, dict[str, object]], layout: Callable[[bpy.types.NodeTree], None]) -> tuple[list[dict[str, object]], tuple[bpy.types.Object, ...]]:
     sources = {source.identity: source for source in packet.materials}
     renderer_map = {identity(renderer["object"], "renderer.object"): renderer for renderer in packet.renderers}
     stacks: dict[tuple[Identity, ...], bpy.types.Material] = {}
@@ -1016,35 +1191,81 @@ def bind_sources(packet: SourcePacket, groups: Mapping[Identity, bpy.types.Shade
             raise ValueError(f"Audited renderer mesh not present in blend: {renderer_key}, {name}")
         if obj.hide_render != (decision["visible"] is False):
             raise ValueError(f"Audited source visibility changed: {name}")
-        if not obj.data.uv_layers or obj.data.uv_layers[0].name != "UV0":
-            raise ValueError(f"Research source binding requires audited UV0: {name}")
         submesh_count = int_value(renderer["submesh_count"], "renderer.submesh_count")
         if submesh_count < 1 or len(obj.material_slots) != submesh_count:
             raise ValueError(f"FBX/source submesh slot count mismatch: {name}, FBX={len(obj.material_slots)}, source={submesh_count}")
         refs = tuple(identity(object_value(pointer, "material.pointer")["resolved"], "material.resolved") for pointer in array_value(renderer["materials"], "renderer.materials"))
-        if decision["visible"] is True and any("source_fur_shell_coverage" in groups[ref] for ref in refs):
-            layer = obj.data.uv_layers.get("UV1")
-            if layer is None or len(layer.data) != len(obj.data.loops) or not layer.data:
-                raise ValueError(f"Source Fur coverage requires imported TEXCOORD1 as UV1: {name}")
-            if any(not math.isfinite(corner.uv.x) or not 0.0 <= corner.uv.x <= 1.0 for corner in layer.data):
-                raise ValueError(f"Source Fur shell layer UV1.x is not finite within [0,1]: {name}")
-        if any("source_uv2_alpha_mask" in groups[ref] for ref in refs) and "UV1" not in obj.data.uv_layers:
-            raise ValueError(f"Source UV2 alpha feature requires imported UV1: {name}")
         if len(refs) < submesh_count:
             raise ValueError(f"Source renderer has fewer materials than submeshes: {name}")
-        for index in range(submesh_count):
-            slot_refs = refs[index:] if index == submesh_count - 1 else (refs[index],)
-            if slot_refs not in stacks:
-                stacks[slot_refs] = surface_stack(tuple(sources[ref] for ref in slot_refs), groups, layout)
-            obj.material_slots[index].link = "OBJECT"
-            obj.material_slots[index].material = stacks[slot_refs]
         obj["source_renderer_identity"] = renderer_key_text
         obj["source_renderer_pipeline_json"] = json.dumps(pipeline, sort_keys=True)
         text = bpy.data.texts.new("SOURCE RENDERER " + renderer_key_text + ".json")
         text.write(json.dumps(pipeline, sort_keys=True))
         pipeline_names = ("m_CastShadows", "m_ReceiveShadows", "m_RenderingLayerMask", "m_EnableCharacterOutline", "m_EnablePerRendererLighting", "m_PerRendererLightingOffset", "m_PerRendererLightingAnchor", "m_LightModeMask", "m_ProbeAnchor", "m_SortingOrder", "m_RendererSortingFudge")
-        native_pipeline = {name: pipeline[name] for name in pipeline_names if name in pipeline}
-        rows.append({"renderer_identity": renderer_key_text, "object": name, "source_materials": [list(ref) for ref in refs], "submesh_count": submesh_count, "extra_pass_count": len(refs) - submesh_count, "visible": decision["visible"], "native_pipeline_fields": native_pipeline, "unavailable_pipeline_fields": [name for name in pipeline_names if name not in pipeline], "composition": "Single-surface approximation preserving native material order; extra materials apply to final source submesh"})
+        native_pipeline = {field: pipeline[field] for field in pipeline_names if field in pipeline}
+        effect_skip = skipped_effect_renderers.get(renderer_key)
+        if effect_skip is not None:
+            if len(refs) != 1 or refs[0] not in sources:
+                raise ValueError(f"Optional effect skip no longer identifies one source material: {renderer_key}")
+            if tuple(effect_skip["material_identity"]) != refs[0]:
+                raise ValueError(f"Optional effect skip material identity changed: {renderer_key}")
+            obj.hide_render = True
+            obj["skipped_optional_effect_renderer_json"] = json.dumps(effect_skip, sort_keys=True)
+            rows.append({"renderer_identity": renderer_key_text, "object": name,
+                         "source_materials": [list(ref) for ref in refs], "bound_material_stacks": [],
+                         "submesh_count": submesh_count, "extra_pass_count": len(refs) - submesh_count,
+                         "connected_extra_pass_count": 0, "skipped_optional_material_passes": [],
+                         "skipped_optional_effect_renderer": effect_skip,
+                         "visible": decision["visible"], "effective_visible": False,
+                         "native_pipeline_fields": native_pipeline,
+                         "unavailable_pipeline_fields": [field for field in pipeline_names if field not in pipeline],
+                         "composition": "Unsupported dedicated optional VFX renderer hidden; source mesh and material evidence retained"})
+            bound.append(obj)
+            continue
+        if not obj.data.uv_layers or obj.data.uv_layers[0].name != "UV0":
+            raise ValueError(f"Research source binding requires audited UV0: {name}")
+        bound_refs = tuple(ref for ref in refs if ref not in skipped_material_passes)
+        if decision["visible"] is True and any("source_fur_shell_coverage" in groups[ref] for ref in bound_refs):
+            layer = obj.data.uv_layers.get("UV1")
+            if layer is None or len(layer.data) != len(obj.data.loops) or not layer.data:
+                raise ValueError(f"Source Fur coverage requires imported TEXCOORD1 as UV1: {name}")
+            if any(not math.isfinite(corner.uv.x) or not 0.0 <= corner.uv.x <= 1.0 for corner in layer.data):
+                raise ValueError(f"Source Fur shell layer UV1.x is not finite within [0,1]: {name}")
+        if any("source_uv2_alpha_mask" in groups[ref] for ref in bound_refs) and "UV1" not in obj.data.uv_layers:
+            raise ValueError(f"Source UV2 alpha feature requires imported UV1: {name}")
+        for ref in bound_refs:
+            special_record = groups[ref].get("source_special_vfx")
+            if special_record is None:
+                continue
+            main_uv = json.loads(special_record).get("host_inputs", {}).get("main_uv", {})
+            if main_uv.get("route") == "source_uv1":
+                layer = obj.data.uv_layers.get("UV1")
+                if (layer is None or not layer.data or len(layer.data) != len(obj.data.loops)
+                        or any(not math.isfinite(value) for corner in layer.data for value in corner.uv)):
+                    raise ValueError(f"Special VFX main UV2 requires actual finite imported UV1: object={name}, material={ref}")
+        bound_stacks: list[list[list[str | int]]] = []
+        for index in range(submesh_count):
+            source_slot_refs = refs[index:] if index == submesh_count - 1 else (refs[index],)
+            slot_refs = tuple(ref for ref in source_slot_refs if ref not in skipped_material_passes)
+            if not slot_refs:
+                raise ValueError(f"Optional material-pass filtering removed a required source submesh: renderer={renderer_key}, submesh={index}")
+            if slot_refs not in stacks:
+                stacks[slot_refs] = surface_stack(tuple(sources[ref] for ref in slot_refs), groups, layout)
+            obj.material_slots[index].link = "OBJECT"
+            obj.material_slots[index].material = stacks[slot_refs]
+            bound_stacks.append([list(ref) for ref in slot_refs])
+        renderer_skips = [skipped_material_passes[ref] for ref in dict.fromkeys(refs) if ref in skipped_material_passes]
+        composition = "Single-surface approximation preserving native material order; extra materials apply to final source submesh"
+        if renderer_skips:
+            composition += "; unsupported optional extra passes omitted while original source references and TypeTrees remain archived"
+        rows.append({"renderer_identity": renderer_key_text, "object": name,
+                     "source_materials": [list(ref) for ref in refs], "bound_material_stacks": bound_stacks,
+                     "submesh_count": submesh_count, "extra_pass_count": len(refs) - submesh_count,
+                     "connected_extra_pass_count": max(0, len(bound_stacks[-1]) - 1),
+                     "skipped_optional_material_passes": renderer_skips,
+                     "visible": decision["visible"], "native_pipeline_fields": native_pipeline,
+                     "unavailable_pipeline_fields": [name for name in pipeline_names if name not in pipeline],
+                     "composition": composition})
         bound.append(obj)
     return rows, tuple(bound)
 
@@ -1110,30 +1331,65 @@ class LoadedMaterialBuild:
     lighting: bpy.types.ShaderNodeTree
     image_cache: Mapping[tuple[Identity, str, str], bpy.types.Image]
     groups: Mapping[Identity, bpy.types.ShaderNodeTree]
+    skipped_optional_material_passes: tuple[dict[str, object], ...]
+    skipped_optional_effect_renderers: tuple[dict[str, object], ...]
     renderer_rows: tuple[dict[str, object], ...]
     bound_objects: tuple[bpy.types.Object, ...]
     center: Vector
     extent: float
 
 
-def build_loaded_materials(packet: SourcePacket, lighting_settings: ArtistLighting, layout_shader_node_tree: Callable[[bpy.types.NodeTree], None]) -> LoadedMaterialBuild:
+def build_loaded_materials(packet: SourcePacket, lighting_settings: ArtistLighting, layout_shader_node_tree: Callable[[bpy.types.NodeTree], None], skipped_effect_materials: Mapping[Identity, dict[str, object]], skipped_effect_renderers: Mapping[Identity, dict[str, object]]) -> LoadedMaterialBuild:
     """Load, pack and bind source materials without rendering or saving a blend."""
     environment = make_environment(layout_shader_node_tree)
     lighting = make_artist_lighting(lighting_settings, layout_shader_node_tree)
     image_cache = load_images(packet)
     from character_mesh_effect import collect_character_mesh_color_sources
     color_sources = collect_character_mesh_color_sources(packet)
-    groups = {source.identity: material_group(source, packet, environment, image_cache, lighting, layout_shader_node_tree, color_sources.get(source.identity)) for source in packet.materials}
+    optional_extra_identities = optional_extra_material_identities(packet)
+    if set(skipped_effect_materials).intersection(optional_extra_identities):
+        raise ValueError("A standalone optional VFX material cannot also be an optional extra pass")
+    for diagnostic in skipped_effect_materials.values():
+        print(json.dumps({"level": "WARNING", "event": "character_optional_effect_renderer_skipped",
+                          **diagnostic}, sort_keys=True), flush=True)
+    groups: dict[Identity, bpy.types.ShaderNodeTree] = {}
+    skipped_optional_material_passes: dict[Identity, dict[str, object]] = {}
+    for source in packet.materials:
+        if source.identity in skipped_effect_materials:
+            continue
+        try:
+            groups[source.identity] = material_group(source, packet, environment, image_cache, lighting,
+                layout_shader_node_tree, color_sources.get(source.identity))
+        except NotImplementedError as error:
+            if source.identity not in optional_extra_identities:
+                raise
+            diagnostic = {
+                "status": "skipped_unsupported_optional_material_pass",
+                "component": "optional_source_material_pass",
+                "material": source.name,
+                "shader": source.shader,
+                "identity": list(source.identity),
+                "reason": str(error),
+                "retained": "base_and_supported_material_passes",
+                "source_material_datablock": "SOURCE MATERIAL " + source.name + ".json",
+                "source_typetree_datablock": "SOURCE TYPETREE " + source.name + ".json",
+            }
+            skipped_optional_material_passes[source.identity] = diagnostic
+            print(json.dumps({"level": "WARNING", "event": "character_optional_material_pass_skipped",
+                              **diagnostic}, sort_keys=True), flush=True)
     for source in packet.materials:
         text = bpy.data.texts.new("SOURCE MATERIAL " + source.name + ".json")
         text.write(source.source_json)
         tree = bpy.data.texts.new("SOURCE TYPETREE " + source.name + ".json")
         tree.write(source.tree_json)
+        if source.identity in skipped_optional_material_passes or source.identity in skipped_effect_materials:
+            continue
         material = surface_stack((source,), groups, layout_shader_node_tree)
         material.use_fake_user = True
     mesh_objects = tuple(obj for obj in bpy.data.objects if obj.type == "MESH" and not obj.name.startswith("PREVIEW_ONLY_"))
     before = geometry_signature(mesh_objects)
-    renderer_rows, bound_objects = bind_sources(packet, groups, layout_shader_node_tree)
+    renderer_rows, bound_objects = bind_sources(packet, groups, skipped_optional_material_passes,
+                                                skipped_effect_renderers, layout_shader_node_tree)
     if geometry_signature(mesh_objects) != before:
         raise ValueError("Material rebuild changed source mesh, shape keys, or vertex-group counts")
     visible = tuple(obj for obj in bound_objects if not obj.hide_render)
@@ -1152,7 +1408,9 @@ def build_loaded_materials(packet: SourcePacket, lighting_settings: ArtistLighti
         ground.hide_render = True
     for light in (obj for obj in bpy.data.objects if obj.type == "LIGHT"):
         light.data.use_shadow = True
-    return LoadedMaterialBuild(environment, lighting, image_cache, MappingProxyType(groups), tuple(renderer_rows), bound_objects, center, extent)
+    return LoadedMaterialBuild(environment, lighting, image_cache, MappingProxyType(groups),
+        tuple(skipped_optional_material_passes.values()), tuple(skipped_effect_materials.values()),
+        tuple(renderer_rows), bound_objects, center, extent)
 
 
 def build_material_sample(argv: Sequence[str], render_samples: Callable[[Path, Vector, float, int, int, int, bpy.types.ShaderNodeTree, bpy.types.ShaderNodeTree, ArtistLighting], list[dict[str, object]]]) -> None:
@@ -1180,7 +1438,7 @@ def build_material_sample(argv: Sequence[str], render_samples: Callable[[Path, V
     bpy.ops.wm.open_mainfile(filepath=extended_path(args.blend.resolve()))
     io_path(output).mkdir(parents=True)
     lighting_settings = ArtistLighting(tuple(args.npr_light_direction), args.npr_direct_intensity, args.npr_ambient_intensity, args.npr_ramp_bias, args.npr_wrap, args.npr_weight)
-    built = build_loaded_materials(packet, lighting_settings, layout_shader_node_tree)
+    built = build_loaded_materials(packet, lighting_settings, layout_shader_node_tree, {}, {})
     environment, lighting, image_cache = built.environment, built.lighting, built.image_cache
     renderer_rows, center, extent = built.renderer_rows, built.center, built.extent
     visible = tuple(obj for obj in built.bound_objects if not obj.hide_render)
@@ -1192,7 +1450,14 @@ def build_material_sample(argv: Sequence[str], render_samples: Callable[[Path, V
     if actual_images != expected_images or any(image.packed_file is None for image in image_cache.values()):
         raise ValueError("Referenced source image packing is incomplete")
     report = {"format": "EndfieldCharacterMaterialRebuild/1", "status": "approximation_smoke_passed", "game_material_fidelity_complete": False, "source_blend": str(args.blend.resolve()), "source_blend_sha256": file_hash(args.blend), "input_hashes": dict(packet.input_hashes), "script_sha256": file_hash(Path(__file__)), "layout_helper_sha256": file_hash(args.scene_source_dir / "blender_scene_materials.py"), "reference_glsl": str(args.ruri_glsl.resolve()), "reference_glsl_sha256": file_hash(args.ruri_glsl), "source_materials": len(packet.materials), "actual_shader_families": sorted({source.shader for source in packet.materials}), "verified_texture_identities": len(actual_images), "packed_image_roles": len(image_cache), "source_geometry_counts_preserved": True, "visible_renderer_count": len(visible), "renderers": renderer_rows, "extra_material_passes_connected": sum(cast(int, row["extra_pass_count"]) for row in renderer_rows), "source_parameters": "All original float/color/texture fields and complete material and renderer TypeTrees retained in blend Text datablocks; active basic parameters exposed on source material groups", "pipeline_support": {"integrated": ["Exact five source Shader identities and CAB/PathID material/texture bindings", "Base tint, UV0/ST sampling, RG/R*A-G packed normal channels, metallic/gloss/spec/AO and keyword-gated emission", "Source opaque/transparent alpha distinction and source alpha-clip threshold", "Ordered extra source material references retained as adjustable Blender composition", "Native LOD0/active/enabled/shadows-only visibility inherited from the audited preview", "Connected source 32-slice skin shadow LUT sampling and source-enabled diffuse ramp RGB/alpha with local chroma normalization; shared artist lighting composition"], "preserved_not_integrated": ["SpecRampMap, native hair strand lobes and skin SDF lighting", "Character light loop types, main/additional-light parameters and game exposure", "Native rendering-layer masks including 258; no equivalent HGRP light filtering implemented", "Per-renderer lighting enable, offset, anchor, light-mode mask and probe anchor", "Stencil/depth, render queues, fog and screen-space overlay multiply/culling", "Global wet/rain binding and response; controls remain artist approximations", "Global snow consumption formula is unknown; no fabricated snow nodes"]}, "control_entry_points": {"source_parameters": "Select mesh material; top-level EF Character <source material name> group inputs; Tab into group for verified texture channels", "artist_lighting": lighting.name + " internal Value nodes (Light Direction X/Y/Z, Direct Intensity, Ambient Intensity, Ramp Bias, Wrap, Response Weight, Shadow LUT Weight)", "wetness": environment.name + " internal Value nodes (Wetness, Rain Wetness, Water Height Meters, Submersion Strength, Wet Darkening, Wet Roughness)", "extra_passes": "Composite EFCHAR material top-level Approx Extra Pass 1 Enable (0 / 1) Value node", "complete_source_parameters": "Blend Text datablocks SOURCE MATERIAL / SOURCE TYPETREE / SOURCE RENDERER"}, "renders": renders, "output_blend": str(blend), "output_blend_bytes": io_path(blend).stat().st_size, "output_blend_sha256": file_hash(blend), "limitations": ["Source ramp/LUT sampling and local chroma arithmetic are connected; their diffuse composition and shared artist light are approximate, with unknown game global uniforms, screen shadows, SDF, matcap/parallax, light loops and outlines unimplemented", "Hair uses source split-normal RG for diffuse normal; source BA specular normal and exact strand lobes are preserved but not reconstructed", "Additional native material passes use adjustable single-surface composition on the final submesh; stencil, depth, fog and render queue semantics are not replicated", "OverlayShadow uses original red/alpha mask and source tint with transparency; framebuffer multiply is approximated by an unlit translucent surface", "Wetness controls are explicitly approximate artist inputs; original wet/rain fields are preserved without an unverified binding", "Snow has no recovered consumption formula and no artificial snow control or node", "Standard source Toggle(_ALPHATEST_ON), active keyword and explicit _EnableAlphaTest=1 select host BaseMap alpha thresholding; legacy _AlphaClip remains supported. Current native shader program equivalence is unverified", "General source textures require UV0; Fur shell coverage reads source UV1.x as the layer, and explicit _UV2_COLOR uses the source UV1 Alpha/Root/Depth/ID red mask with its original ST before alpha thresholding. Missing required inputs or unsupported UV indices fail explicitly"]}
-    report["material_support"] = {"visible_supported": [{"identity": list(source.identity), "shader": source.shader} for source in packet.materials if source.identity in packet.visible_materials], "inactive_unsupported": [{"identity": list(source.identity), "shader": source.shader, "status": "archived_unsupported_shader"} for source in packet.materials if source.shader not in SUPPORTED_SHADERS]}
+    report["source_extra_material_passes"] = sum(cast(int, row["extra_pass_count"]) for row in renderer_rows)
+    report["extra_material_passes_connected"] = sum(cast(int, row["connected_extra_pass_count"]) for row in renderer_rows)
+    report["source_material_identities"] = [list(source.identity) for source in packet.materials]
+    support = cast(dict[str, object], report["pipeline_support"])
+    cast(list[str], support["integrated"])[3] = "Supported ordered extra source material references are adjustable; unsupported optional passes remain archived in source metadata"
+    cast(list[str], report["limitations"]).append("Unsupported optional material passes are omitted from the bound stack and listed separately in the build receipt")
+    report["material_support"] = {"visible_supported": [{"identity": list(source.identity), "shader": source.shader} for source in packet.materials if source.identity in packet.visible_materials and source.identity in built.groups], "inactive_unsupported": [{"identity": list(source.identity), "shader": source.shader, "status": "archived_unsupported_shader"} for source in packet.materials if source.shader not in SUPPORTED_SHADERS]}
+    report["skipped_optional_material_passes"] = list(built.skipped_optional_material_passes)
     report["research_modules"] = {name: file_hash(Path(__file__).with_name(name)) for name in ("character_npr_nodes.py", "character_node_graph.py")}
     report["artist_lighting"] = {"direction": list(lighting_settings.direction), "direct_intensity": lighting_settings.direct_intensity, "ambient_intensity": lighting_settings.ambient_intensity, "ramp_bias": lighting_settings.ramp_bias, "wrap": lighting_settings.wrap, "response_weight": lighting_settings.response_weight, "shadow_lut_weight": 1.0}
     report["npr_evidence"] = {"shadow_lut_lines": [1385, 1397], "diffuse_ramp_lines": [1985, 2000], "skin_ramp_lines": [1684, 1705], "local_chroma_normalization_lines": [1460, 1492], "transfer_reference": "https://raw.githubusercontent.com/Unity-Technologies/Graphics/2021.3/staging/Packages/com.unity.render-pipelines.core/ShaderLibrary/Color.hlsl", "transfer_boundary": "Unity 2021.3 reference piecewise transfer; HGRP/Substance helper binary not recovered", "binding_boundary": "Source flags choose native LUT/ramp branches. Geometric surface N, artist bias/wrap/direct/ambient replace unbound SDF/global/light-loop state. Source AO and approximate wetness feed the preview albedo."}

@@ -46,6 +46,8 @@ def main() -> None:
             raise AssertionError('Host parallax layer depths differ from their declared formula')
         if metadata['host_rgb_weights'] != [1.0 / count] * count:
             raise AssertionError('Host parallax layer weights differ from their declared formula')
+        if metadata.get('coverage') != 'BaseMap.a * BaseColor.a':
+            raise AssertionError('Parallax must retain the source effect coverage mask')
         assigned = {slot.material for obj in bpy.context.scene.objects if obj.type == 'MESH'
                     for slot in obj.material_slots if slot.material is not None}
         affected = tuple(material for material in assigned if material.use_nodes and any(
@@ -61,6 +63,11 @@ def main() -> None:
                 raise AssertionError('Source parallax layer samplers are missing, inactive or unpacked')
             if {tuple(json.loads(item['source_identity'])) for item in samplers} != {binding.identity}:
                 raise AssertionError('Parallax layer texture identity changed')
+            masks = [item for tree in (material.node_tree, *bpy.data.node_groups)
+                     for item in tree.nodes if item.label == 'Parallax source BaseMap alpha times tint alpha'
+                     and (tree.as_pointer(), item.as_pointer()) in active]
+            if not masks or any(item.operation != 'MULTIPLY' or not item.inputs[0].is_linked for item in masks):
+                raise AssertionError('Active parallax material lost its connected source alpha mask')
             instance = next(item for item in material.node_tree.nodes if item.type == 'GROUP' and item.node_tree == group)
             if abs(instance.inputs['Preview Parallax Strength'].default_value - 0.5) > 1e-8:
                 raise AssertionError('Host parallax strength is not the declared editable half-strength')

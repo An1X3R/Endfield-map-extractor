@@ -208,7 +208,8 @@ class HairBranchReceipt:
     source_exponents: tuple[int, int]
     specular_line_pass_ported: bool
     shader_frame: HairShaderFrame
-    cast_shadow_preview: float
+    cast_shadow_preview: float | None
+    cast_shadow_binding: str
     specular_normal_uv_map: str
     metallic_tangent_blend: bool
     metallic_tangent_handedness: str
@@ -509,6 +510,16 @@ def _constant_scalar(tree: bpy.types.NodeTree, value: float, label: str) -> bpy.
     return node.outputs[0]
 
 
+def hair_cast_shadow_source(tree: bpy.types.NodeTree) -> bpy.types.NodeSocket:
+    """Share the exact live cast-visibility producer used by Hair diffuse."""
+    if tree.get("source_shader") != "HGRP/CharacterNPR_Hair":
+        raise ValueError(f"Hair cast visibility requires the exact source shader: {tree.name}")
+    diffuse = _find_node(tree, "Verified local HGRP diffuse equations", "ShaderNodeGroup")
+    if "Cast Shadow" not in diffuse.inputs or len(diffuse.inputs["Cast Shadow"].links) != 1:
+        raise ValueError(f"Hair diffuse cast visibility must have one explicit source: {tree.name}")
+    return diffuse.inputs["Cast Shadow"].links[0].from_socket
+
+
 def _edge_fade(
     tree: bpy.types.NodeTree,
     specular_normal: bpy.types.NodeSocket,
@@ -600,7 +611,7 @@ def _line_modulated_diffuse(
             1.0 if parameters.use_line_map else 0.0,
             "HGRP source LineMap blend gate",
         ),
-        _math(tree, "MULTIPLY", line_proc, 0.0 if parameters.use_line_map else 1.0, "HGRP source procedural line blend gate"),
+        line_proc,
         "HGRP source LineMap/procedural blend",
     )
     line_blend = _math(
@@ -620,8 +631,9 @@ def _line_modulated_diffuse(
     )
     line_tangent = _normalize(tree, line_tangent_sum.outputs[0], "Normalize HGRP source line tangent")
     line_tdot_h = _dot(tree, line_tangent, half_vector, "HGRP source line tangent dot half")
-    line_sin_sq = _math(tree, "MAXIMUM", _math(tree, "SUBTRACT", 1.0, _math(tree, "MULTIPLY", line_tdot_h, line_tdot_h, "HGRP source line TdotH squared"), "HGRP source line sin squared raw"), 0.0001, "HGRP source line sin squared minimum")
-    line_sin = _math(tree, "SQRT", line_sin_sq, 0.0, "HGRP source line sin T H")
+    line_sin_sq = _math(tree, "MAXIMUM", _math(tree, "SUBTRACT", 1.0, _math(tree, "MULTIPLY", line_tdot_h, line_tdot_h, "HGRP source line TdotH squared"), "HGRP source line sin squared raw"), 0.0, "HGRP source line sin squared minimum")
+    line_sin_root = _math(tree, "SQRT", line_sin_sq, 0.0, "HGRP source line sin T H root")
+    line_sin = _math(tree, "MAXIMUM", line_sin_root, 0.0001, "HGRP source line sin T H")
     line_exponent = float(math.trunc(max(1.0 - parameters.line_range, 0.0) * 200.0))
     line_lobe = _math(tree, "POWER", line_sin, line_exponent, "HGRP source line exponent result")
     line_mix = _math(
@@ -738,17 +750,16 @@ def apply_hair_specular_branch(
         "HGRP source world Y axis in Blender world",
     )
     light_y_source = _dot(hair_tree, light_direction, source_world_y, "HGRP adjusted light source-world Y")
-    cast_shadow = _node(hair_tree, "ShaderNodeValue", "Hair HGRP Cast Shadow Preview - Explicit")
-    cast_shadow.outputs[0].default_value = 1.0
-    one_minus_cast = _math(hair_tree, "SUBTRACT", 1.0, cast_shadow.outputs[0], "HGRP inverse cast-shadow preview")
+    cast_shadow = hair_cast_shadow_source(hair_tree)
+    one_minus_cast = _math(hair_tree, "SUBTRACT", 1.0, cast_shadow, "HGRP inverse cast-shadow preview")
     light_y_blend = _math(
         hair_tree,
         "ADD",
         _math(hair_tree, "MULTIPLY", 0.5, one_minus_cast, "HGRP shadow fallback light Y"),
-        _math(hair_tree, "MULTIPLY", light_y_source, cast_shadow.outputs[0], "HGRP cast-shadow light Y"),
+        _math(hair_tree, "MULTIPLY", light_y_source, cast_shadow, "HGRP cast-shadow light Y"),
         "HGRP source light Y cast-shadow blend",
     )
-    light_cast = _scale(hair_tree, light_direction, cast_shadow.outputs[0], "HGRP adjusted light direction times cast shadow")
+    light_cast = _scale(hair_tree, light_direction, cast_shadow, "HGRP adjusted light direction times cast shadow")
     view_x = _dot(hair_tree, view_direction, source_axis_x, "HGRP view source X projection")
     view_z = _dot(hair_tree, view_direction, source_axis_z, "HGRP view source Z projection")
     world_contrib_x = _scale(hair_tree, source_axis_x, view_x, "HGRP world contribution source X")
@@ -931,7 +942,8 @@ def apply_hair_specular_branch(
         source_exponents=(200, int(math.trunc(max(1.0 - parameters.anisotropy_range2, 0.0) * 200.0))),
         specular_line_pass_ported=parameters.use_specular_line,
         shader_frame=parameters.shader_frame,
-        cast_shadow_preview=float(cast_shadow.outputs[0].default_value),
+        cast_shadow_preview=None,
+        cast_shadow_binding="Same live upstream producer as verified Hair diffuse Cast Shadow",
         specular_normal_uv_map="UV0",
         metallic_tangent_blend=parameters.use_metallic_gloss_map,
         metallic_tangent_handedness="+1 host preview; native tangent handedness is not captured",
