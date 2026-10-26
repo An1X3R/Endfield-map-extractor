@@ -17,7 +17,7 @@
 
 ## 开始使用
 
-在 [Releases](https://github.com/An1X3R/Endfield-map-extractor/releases/latest) 下载 **Endfield-Extractor-v3.5-windows-x64.zip**，解压后按 [安装与升级说明](docs/INSTALL.md) 完成一次环境准备。
+在 [Releases](https://github.com/An1X3R/Endfield-map-extractor/releases/latest) 下载 **Endfield-Extractor-v3.6-windows-x64.zip**，解压后按 [安装与升级说明](docs/INSTALL.md) 完成一次环境准备。
 
 | 依赖 | 要求 |
 |---|---|
@@ -48,7 +48,7 @@ GitHub 自动生成的 Source code ZIP 不含预编译工具。开发者可查�
 
 角色工作台可作为独立扩展安装，提供骨骼分类、IK、手腕／脚踝旋转、表情及材质天气入口。支持 Blender 4.3+；适用于本提取器导出且带有相应控制数据的文件，不会自动给普通模型绑定骨架或补回旧文件缺少的控制器。
 
-在同版本 Release 下载 **endfield_character_tools-0.1.4.zip**。在 Blender 的「编辑 → 偏好设置 → 插件」菜单选择「从磁盘安装」，选中 ZIP 并启用，无需解压或另外安装依赖。选择角色网格或骨架后，在 **N 侧栏 → 终末地** 调整；天气参数位于 **材质属性 → 终末地 · 天气**。源码构建命令：`python src/build_character_tools_addon.py --output-dir output/blender-addons`。
+在同版本 Release 下载 **endfield_character_tools-0.1.9.zip**。在 Blender 的「编辑 → 偏好设置 → 插件」菜单选择「从磁盘安装」，选中 ZIP 并启用，无需解压或另外安装依赖。选择角色网格或骨架后，在 **N 侧栏 → 终末地** 调整；天气参数位于 **材质属性 → 终末地 · 天气**。源码构建命令：`python src/build_character_tools_addon.py --output-dir output/blender-addons`。
 
 插件启用后可直接切换文件，无需运行文件内嵌脚本，也不需要开启全局脚本自动执行。若手动运行了旧文件的脚本，可用「终末地 · 插件 → 刷新角色工作台」恢复插件面板。插件卸载或禁用后，模型、材质、动作及已创建的原生约束仍保留。
 
