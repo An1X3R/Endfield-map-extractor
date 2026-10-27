@@ -160,6 +160,28 @@ class SelectedMaterialHandoffTests(unittest.TestCase):
                     self.assertNotIn(("cab-source", 7), selected)
                     self.assertIn(("cab-source", 8), selected)
 
+    def test_velocity_aligned_mesh_particle_requires_its_material_dependency(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest, plan = _fixture(root)
+            original = json.loads(manifest.read_text(encoding="utf-8"))
+            renderer = {**original["Particles"]["Renderers"][0], "RenderMode": 4, "RenderAlignment": 4}
+            source = {**original, "Particles": {**original["Particles"], "Renderers": [renderer]}}
+            manifest.write_text(json.dumps(source), encoding="utf-8")
+
+            sources = capture_material_catalog_sources((manifest,))
+            materials, textures = load_catalog((manifest,))
+            payload = build_material_catalog_handoff(plan, materials, textures, sources)
+            selected, _textures = load_plan_material_catalog({**plan, "material_catalog": payload})
+            self.assertIn(("cab-source", 7), selected)
+
+            missing_source = {**source, "Materials": [row for row in source["Materials"] if row["PathId"] != 7]}
+            manifest.write_text(json.dumps(missing_source), encoding="utf-8")
+            sources = capture_material_catalog_sources((manifest,))
+            materials, textures = load_catalog((manifest,))
+            with self.assertRaisesRegex(ValueError, "Selected material catalog dependency is missing"):
+                build_material_catalog_handoff(plan, materials, textures, sources)
+
     def test_source_changes_before_handoff_or_worker_are_rejected_even_with_restored_mtime(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             manifest, plan = _fixture(Path(directory))

@@ -59,6 +59,7 @@ for (const invalid of [{ ...job, progress: NaN }, { ...job, progress: Infinity }
 const settings = { layers: { terrain: true, instances: true, water: false, effects: false }, groups: ['terrain'], chunkMode: 'per_sector', exportMode: 'data_package', outputName: 'coordinate_contract' }
 const request = paintingRequest(map, settings, { u: 2 / 15, v: 3 / 10, width: 1 / 15, height: 1 / 10 }, { game: 'user-selected-game', output: 'user-selected-output', cache: 'user-selected-cache', blender: '' })
 assert.equal(request.map_id, map.mapId)
+assert.equal(request.static_level_id, map.levelId)
 assert.deepEqual(request.selection, { type: 'world_bounds', xmin: 128, xmax: 256, zmin: 1152, zmax: 1280 })
 assert.equal(request.batch_mode, 'per_sector')
 assert.deepEqual(request.export_groups, ['terrain'])

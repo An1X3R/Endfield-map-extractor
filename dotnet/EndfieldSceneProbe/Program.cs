@@ -120,6 +120,7 @@ internal static partial class Program
             ClassIDType.AssetBundle, ClassIDType.ResourceManager,
             ClassIDType.GameObject, ClassIDType.Transform, ClassIDType.RectTransform,
             ClassIDType.MeshFilter, ClassIDType.MeshRenderer, ClassIDType.SkinnedMeshRenderer,
+            ClassIDType.MonoBehaviour, ClassIDType.MonoScript,
             ClassIDType.Mesh, ClassIDType.Material, ClassIDType.Texture2D,
         })
             TypeFlags.SetType(type, true, false);
@@ -205,6 +206,9 @@ internal static partial class Program
                 Skin = renderer is SkinnedMeshRenderer skinned ? ReadSceneSkin(skinned) : null,
                 Mesh = mesh == null ? null : ToRef(mesh),
                 Materials = materials.Count == 0 ? null : materials,
+                RuntimeMaterialProviders = renderer != null && renderer.m_Materials.Any(pointer => pointer.IsNull)
+                    ? ReadRuntimeMaterialProviders(go)
+                    : [],
             });
         }
 
@@ -607,6 +611,7 @@ internal sealed class NodeRecord
     public SceneSkinnedRendererRecord? Skin { get; init; }
     public AssetRef? Mesh { get; init; }
     public List<AssetRef>? Materials { get; init; }
+    public List<RuntimeMaterialProviderRecord> RuntimeMaterialProviders { get; init; } = [];
 }
 
 internal sealed class MaterialRecord

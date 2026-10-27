@@ -13,12 +13,15 @@ from pathlib import Path
 from endfield_scene_export_plan import (
     _manifest_index,
     _merge_mesh_exports,
+    _require_static_mesh_export,
+    _static_required_resource_paths,
     _water_global_resource_path,
     load_scene_export_plan,
     owns_static_footprint,
     prepare_scene_export_plan,
 )
 from endfield_scene_io import scene_io_session
+from extract_scene_renderer_materials import decode_static_pairs
 from webui_source_contract import selected_static_categories
 
 
@@ -167,6 +170,16 @@ class PortableScenePlanTests(unittest.TestCase):
             self.assertEqual(loaded["summary"]["ready_static_entities"], 1)
             self.assertEqual(loaded["summary"]["partial_static_entities"], 1)
             self.assertEqual(loaded["summary"]["complete_static_entities"], 0)
+            vlb_pending = {**pending,
+                "detail": "Material requires separate renderer support: material=M_shadowproxy_static_opaque, "
+                          "shader=Hidden/VLB_HGRP_SinglePass, role=volumetric_light_beam",
+                "surface_role": "volumetric_light_beam", "material_shader": "Hidden/VLB_HGRP_SinglePass"}
+            plan.write_text(json.dumps({**payload, "pending": [vlb_pending]}), encoding="utf-8")
+            self.assertEqual("volumetric_light_beam", load_scene_export_plan(plan)["pending"][0]["surface_role"])
+            plan.write_text(json.dumps({**payload, "pending": [{**vlb_pending, "surface_role": "ordinary"}]}), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "unresolved-role marker"):
+                load_scene_export_plan(plan)
+            plan.write_text(json.dumps(payload), encoding="utf-8")
             for changed, message in (
                 ({**row, "selected_submeshes": [0, 1]}, "selects a pending source submesh"),
                 ({**pending, "source_draw": {**proxy_draw, "source_draw_index": 0}}, "differs from ready source draw evidence"),
@@ -199,15 +212,16 @@ class PortableScenePlanTests(unittest.TestCase):
             first.write_bytes(b"mesh")
             second.write_bytes(b"mesh")
             asset = {"Source": "source", "PathId": 1, "Name": "mesh"}
+            mesh_asset = {**asset, "Type": "Mesh"}
             payload = {"Format": "EndfieldSceneProbe/1", "Containers": [], "MeshExports": [
-                {"Asset": asset, "File": "first.obj"},
-                {"Asset": asset, "File": "./first.obj"},
-                {"Asset": asset, "File": "missing.obj"},
+                {"Asset": mesh_asset, "File": "first.obj"},
+                {"Asset": mesh_asset, "File": "./first.obj"},
+                {"Asset": mesh_asset, "File": "missing.obj"},
             ]}
             manifest.write_text(json.dumps(payload), encoding="utf-8")
             self.assertEqual({("source", 1): (asset, first.resolve())}, _manifest_index(manifest)[1])
             manifest.write_text(json.dumps({**payload, "MeshExports": [
-                *payload["MeshExports"], {"Asset": asset, "File": "second.obj"},
+                *payload["MeshExports"], {"Asset": mesh_asset, "File": "second.obj"},
             ]}), encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "multiple export files"):
                 _manifest_index(manifest)
@@ -225,14 +239,76 @@ class PortableScenePlanTests(unittest.TestCase):
             }), encoding="utf-8")
             mesh.write_text("mesh", encoding="utf-8")
             with scene_io_session():
-                _, first_exports = _manifest_index(manifest)
+                _, first_exports, _ = _manifest_index(manifest)
                 self.assertIn(("source", 1), first_exports)
                 mesh.unlink()
-                _, missing_exports = _manifest_index(manifest)
+                _, missing_exports, _ = _manifest_index(manifest)
                 self.assertNotIn(("source", 1), missing_exports)
                 mesh.write_text("mesh", encoding="utf-8")
-                _, restored_exports = _manifest_index(manifest)
+                _, restored_exports, _ = _manifest_index(manifest)
                 self.assertIn(("source", 1), restored_exports)
+
+    def test_static_asset_dependency_is_collected_before_exact_mesh_manifest_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = root / "scene.json"
+            (root / "mesh.obj").write_text("mesh", encoding="utf-8")
+            mesh = {"Source": "cab-mesh", "PathId": 1, "Name": "model_lod0", "Type": "Mesh"}
+            material = {"Source": "cab-material", "PathId": 2, "Name": "surface", "Type": "Material"}
+            payload = {"Format": "EndfieldSceneProbe/1", "Containers": [
+                {"Container": "assets/model_lod0.asset", "Asset": mesh},
+                {"Container": "assets/surface.mat", "Asset": material},
+                {"Container": "assets/unverified.asset", "Asset": material},
+            ], "MeshExports": [{"Asset": mesh, "File": "mesh.obj"}]}
+            material_id = b"material"
+            mesh_id = b"meshpath"
+            references = struct.pack("<Q", 1) + material_id + mesh_id + bytes(24)
+            paths = {material_id: ("assets/surface.mat",), mesh_id: ("assets/model_lod0.asset",)}
+            decoded = decode_static_pairs(references, paths)
+            self.assertEqual((("assets/model_lod0.asset", "assets/surface.mat"),), decoded)
+            self.assertEqual(frozenset({"assets/model_lod0.asset", "assets/surface.mat"}),
+                             _static_required_resource_paths({decoded[0][0]: {decoded[0][1]}}))
+            with self.assertRaisesRegex(ValueError, "unique exact SceneProbe Container/OBJ"):
+                _require_static_mesh_export(decoded[0][0], {}, {})
+
+            manifest.write_text(json.dumps(payload), encoding="utf-8")
+            containers, mesh_exports, mesh_containers = _manifest_index(manifest)
+            self.assertIn("assets/unverified.asset", containers)
+            candidate = _require_static_mesh_export(decoded[0][0], mesh_containers, mesh_exports)
+            self.assertEqual(root / "mesh.obj", candidate[1])
+            with self.assertRaisesRegex(ValueError, "unique exact SceneProbe Container/OBJ"):
+                _require_static_mesh_export("assets/unverified.asset", mesh_containers, mesh_exports)
+
+            invalid = root / "invalid.json"
+            payload["MeshExports"] = [{"Asset": {**mesh, "Type": "Material"}, "File": "mesh.obj"}]
+            invalid.write_text(json.dumps(payload), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "Asset.Type must be Mesh"):
+                _manifest_index(invalid)
+
+    def test_static_fbx_container_selects_the_unique_mesh_named_by_subasset_suffix(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = root / "scene.json"
+            (root / "part_a.obj").write_text("mesh a", encoding="utf-8")
+            (root / "part_b.obj").write_text("mesh b", encoding="utf-8")
+            part_a = {"Source": "cab-fbx", "PathId": 1, "Name": "part_a", "Type": "Mesh"}
+            part_b = {"Source": "cab-fbx", "PathId": 2, "Name": "part_b", "Type": "Mesh"}
+            manifest.write_text(json.dumps({
+                "Format": "EndfieldSceneProbe/1",
+                "Containers": [
+                    {"Container": "assets/multi.fbx", "Asset": part_a},
+                    {"Container": "assets/multi.fbx", "Asset": part_b},
+                ],
+                "MeshExports": [
+                    {"Asset": part_a, "File": "part_a.obj"},
+                    {"Asset": part_b, "File": "part_b.obj"},
+                ],
+            }), encoding="utf-8")
+            _, mesh_exports, mesh_containers = _manifest_index(manifest)
+            selected_asset, selected_file = _require_static_mesh_export(
+                "assets/multi.fbx##part_a", mesh_containers, mesh_exports)
+            self.assertEqual("part_a", selected_asset["Name"])
+            self.assertEqual(root / "part_a.obj", selected_file)
 
     def test_serialized_draw_parameters_validate_binary_source_identity(self) -> None:
         from extract_scene_renderer_materials import serialized_draw_parameters

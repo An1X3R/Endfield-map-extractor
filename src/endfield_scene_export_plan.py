@@ -16,14 +16,15 @@ from endfield_scene_io import (SceneSourceCacheSlot, cached_scene_source_value,
                                configure_scene_manifest_cache, read_scene_manifest)
 from typing import Callable, Literal, Mapping, NotRequired, TypedDict, cast
 
-from extractor_core.scene_identity import validate_scene_id
+from extractor_core.scene_identity import static_level_namespace, validate_scene_id
 from extractor_core.vfs import VfsFile
 from endfield_map_layer_contract import ENTITY_CATEGORY_VERSION, classify_entity, is_hlod_name
-from endfield_scene_material_contract import (reference_key, resolve_export_path,
+from endfield_scene_material_contract import (MaterialRecord, reference_key, resolve_export_path,
                                              resolve_existing_export_files, supported_slots)
 from endfield_scene_material_handoff import (MaterialCatalogHandoff, build_material_catalog_handoff,
                                               capture_material_catalog_sources, require_material_catalog_sources)
 from endfield_scene_planning_catalog import load_planning_catalog
+from endfield_scene_runtime_material_roles import separate_surface_role
 from endfield_scene_effects_plan import EffectInstance, build_effect_plan
 from endfield_scene_direct_effects_plan import (DirectEffectRow, DirectEffectPending, build_direct_effect_plan,
                                                 validate_direct_effect_rows)
@@ -41,12 +42,12 @@ from endfield_water_transport import (WaterTransportLighting, WaterTransportLigh
                                      serialize_water_transport_lighting)
 from endfield_scene_slot_contract import (
     AmbiguousSubmeshSlots, RuntimeDraw, RuntimeLodDraw, asset_name, primary_visible_mesh, highest_detail_visible_meshes,
-    runtime_submesh_slots, runtime_submesh_passes, validate_ordered_surface_passes,
+    runtime_submesh_slots as runtime_submesh_slots, runtime_submesh_passes, validate_ordered_surface_passes,
 )
 from endfield_scene_vfxrefract_contract import SceneColorSnapshotPlan, read_scene_color_snapshot
 from endfield_effect_presentation import FlowPresentation, read_flow_presentation
-from endfield_scene_spatial_plan import (StaticSpatialRow, StaticSpatialSelection, WorldBounds,
-                                         owns_static_footprint, select_static_source_rows)
+from endfield_scene_spatial_plan import (StaticSpatialRow, StaticSpatialSelection as StaticSpatialSelection, WorldBounds,
+                                         owns_static_footprint as owns_static_footprint, select_static_source_rows)
 from endfield_scene_spatial_cache import (read_spatial_source_records, require_spatial_source_version,
                                           spatial_parser_identity, spatial_source_identity)
 from webui_source_contract import FogDepthPlan, read_fog_depth_options, selected_static_categories
@@ -72,6 +73,7 @@ class _CachedSpatialSelection:
     surface_candidate_ids: frozenset[int]
     selected_static_count: int
     footprint_extras: int
+    excluded_level_ids: frozenset[int]
 
 
 _MANIFEST_INDEX_CACHE = SceneSourceCacheSlot(
@@ -248,6 +250,8 @@ class StaticSubmeshPending(Pending):
     material_id: str
     mesh_id: str
     source_draw: StaticSourceDraw
+    surface_role: NotRequired[str]
+    material_shader: NotRequired[str]
 
 
 class StaticRoleExclusion(TypedDict):
@@ -271,6 +275,7 @@ class EffectPhysicsPlan(TypedDict):
 class SceneExportPlan(TypedDict):
     format: str
     map_id: str
+    static_level_id: NotRequired[str]
     bounds: Bounds
     category_filter: list[str]
     scene_manifests: list[str]
@@ -333,6 +338,7 @@ def _cached_spatial_selection(
     component_columns: Callable[[bytes], dict[int, dict[int, bytes]]],
     iter_entities: Callable[[bytes], Iterable[Mapping[str, object]]],
     check_cancelled: Callable[[], None] | None,
+    static_namespace: int | None,
 ) -> _CachedSpatialSelection:
     """Select from persisted spatial records and decode only selected/decal sources."""
     candidate_sources = tuple(sorted(set(by_source) | decal_source_names))
@@ -368,6 +374,7 @@ def _cached_spatial_selection(
         "layers": {name: layers.get(name) for name in
                    ("terrain", "instances", "roads", "vegetation", "water", "effects", "lights")},
         "allowed_categories": sorted(allowed_categories),
+        "static_namespace": static_namespace,
         "water_selected": water_selected,
         "effects_selected": effects_selected,
         "include_decals": include_decals,
@@ -387,6 +394,7 @@ def _cached_spatial_selection(
         surface_candidate_ids: set[int] = set()
         selected_static_count = 0
         footprint_extras = 0
+        excluded_level_ids: set[int] = set()
         for source in candidate_sources:
             if check_cancelled is not None:
                 check_cancelled()
@@ -399,13 +407,14 @@ def _cached_spatial_selection(
                 chunk = spatial_source.decoded_chunk
                 source_selection = select_static_source_rows(
                     source, rows, spatial_source.records, bounds, selection, allowed_categories,
-                    water_bounds, effects_selected,
+                    water_bounds, effects_selected, static_namespace,
                 )
                 visible_static_ids.update(source_selection.visible_static_ids)
                 bottom_candidate_ids.update(source_selection.bottom_candidate_ids)
                 surface_candidate_ids.update(source_selection.surface_candidate_ids)
                 selected_static_count += source_selection.selected_static_count
                 footprint_extras += source_selection.footprint_extras
+                excluded_level_ids.update(source_selection.excluded_level_ids)
                 selected_rows = source_selection.selected_rows
                 del spatial_source
             else:
@@ -423,7 +432,7 @@ def _cached_spatial_selection(
                     source, selected_rows, chunk, hashlib.sha256(chunk).hexdigest(), selected_columns))
         return _CachedSpatialSelection(
             tuple(selected_sources), frozenset(visible_static_ids), frozenset(bottom_candidate_ids),
-            frozenset(surface_candidate_ids), selected_static_count, footprint_extras,
+            frozenset(surface_candidate_ids), selected_static_count, footprint_extras, frozenset(excluded_level_ids),
         )
 
     return cached_scene_source_value(_SPATIAL_SELECTION_CACHE, unique_sources, qualifiers, build)
@@ -535,9 +544,10 @@ def _asset(value: object, label: str) -> AssetRef:
 def _manifest_index(path: Path) -> tuple[
     Mapping[str, frozenset[tuple[str, int]]],
     Mapping[tuple[str, int], tuple[AssetRef, Path]],
+    Mapping[str, frozenset[tuple[str, int]]],
 ]:
     resolved = resolve_export_path(path)
-    containers, candidates = cached_scene_source_value(
+    containers, candidates, mesh_containers = cached_scene_source_value(
         _MANIFEST_INDEX_CACHE, (resolved,), (),
         lambda: _build_manifest_index(resolved),
     )
@@ -555,32 +565,65 @@ def _manifest_index(path: Path) -> tuple[
             if len(paths) > 1:
                 raise ValueError(f"Mesh AssetRef has multiple export files: {key}")
             exports[key] = existing[-1]
-    return containers, exports
+    return containers, exports, mesh_containers
 
 
 def _build_manifest_index(path: Path) -> tuple[
     dict[str, set[tuple[str, int]]],
     dict[tuple[str, int], list[tuple[AssetRef, Path]]],
+    dict[str, set[tuple[str, int]]],
 ]:
     data = _object(read_scene_manifest(path), str(path))
     if data.get("Format") != "EndfieldSceneProbe/1":
         raise ValueError(f"Unsupported SceneProbe manifest: {path}")
     containers: dict[str, set[tuple[str, int]]] = defaultdict(set)
     exports: dict[tuple[str, int], list[tuple[AssetRef, Path]]] = defaultdict(list)
+    mesh_containers: dict[str, set[tuple[str, int]]] = defaultdict(set)
     for value in _list(data.get("Containers"), "SceneProbe.Containers"):
         row = _object(value, "SceneProbe container")
-        if row.get("Asset") is not None and _object(row["Asset"], "container Asset").get("Type") in ("Mesh", "Material"):
-            path_value = _text(row.get("Container"), "SceneProbe container path")
-            containers[path_value.replace("\\", "/").casefold()].add(reference_key(_object(row["Asset"], "container Asset")))
+        asset_value = row.get("Asset")
+        if asset_value is None:
+            continue
+        asset = _object(asset_value, "container Asset")
+        asset_type = asset.get("Type")
+        if asset_type not in ("Mesh", "Material"):
+            continue
+        path_value = _text(row.get("Container"), "SceneProbe container path").replace("\\", "/").casefold()
+        asset_key = reference_key(asset)
+        containers[path_value].add(asset_key)
+        if asset_type == "Mesh":
+            mesh_containers[path_value].add(asset_key)
     for value in _list(data.get("MeshExports"), "SceneProbe.MeshExports"):
         row = _object(value, "SceneProbe mesh export")
         if row.get("File") is None:
             continue
-        asset = _asset(row.get("Asset"), "mesh Asset")
+        asset_value = _object(row.get("Asset"), "mesh Asset")
+        if asset_value.get("Type") not in (None, "Mesh"):
+            raise ValueError(f"SceneProbe.MeshExports Asset.Type must be Mesh when present: manifest={path}, asset={asset_value}")
+        asset = _asset(asset_value, "mesh Asset")
         file = path.parent / _text(row["File"], "mesh export File").replace("\\", "/")
         key = reference_key(asset)
         exports[key].append((asset, file))
-    return containers, exports
+    return containers, exports, mesh_containers
+
+
+def _require_static_mesh_export(
+    mesh_path: str,
+    mesh_containers: Mapping[str, Iterable[tuple[str, int]]],
+    mesh_exports: Mapping[tuple[str, int], tuple[AssetRef, Path]],
+) -> tuple[AssetRef, Path]:
+    container_path = mesh_path.split("##", 1)[0].replace("\\", "/").casefold()
+    candidates = tuple(mesh_exports[reference] for reference in mesh_containers.get(container_path, ())
+                       if reference in mesh_exports
+                       and mesh_exports[reference][0]["Name"].casefold() == asset_name(mesh_path))
+    if len(candidates) != 1:
+        raise ValueError(f"Primary mesh lacks a unique exact SceneProbe Container/OBJ: {mesh_path}")
+    return candidates[0]
+
+
+def _static_required_resource_paths(selected_paths_by_mesh: Mapping[str, set[str]]) -> frozenset[str]:
+    return frozenset(resource for mesh_path, materials in selected_paths_by_mesh.items() if materials
+                     for resource in (mesh_path, *materials))
 
 
 def _merge_mesh_exports(
@@ -672,7 +715,8 @@ def prepare_scene_export_plan(
     """Build exact rows from current ECS and available first-run SceneProbe exports."""
     from dataclasses import asdict, replace
 
-    from extract_scene_renderer_materials import component_columns, decode_draws, decode_pairs, serialized_draw_parameters
+    from extract_scene_renderer_materials import component_columns, decode_draws, decode_static_pairs
+    from extract_scene_renderer_materials import serialized_draw_parameters
     from extractor_core.projected_decals import (
         build_path_id_index, decode_decal, read_chunk, rect_decal_records, streaming_records,
     )
@@ -688,6 +732,8 @@ def prepare_scene_export_plan(
     validate_scene_id(map_id)
     water_lighting = (read_water_transport_lighting(canonical["water_transport_lighting"])
                       if "water_transport_lighting" in canonical else None)
+    static_namespace = (static_level_namespace(map_id, canonical["static_level_id"])
+                        if "static_level_id" in canonical else None)
     if water_lighting is not None:
         if water_lighting.map_id != map_id:
             raise ValueError(f"Water transport map identity differs: plan={map_id}, lighting={water_lighting.map_id}")
@@ -761,10 +807,13 @@ def prepare_scene_export_plan(
     manifest_paths = list(dict.fromkeys(manifest_paths))
     containers: dict[str, set[tuple[str, int]]] = defaultdict(set)
     mesh_exports: dict[tuple[str, int], tuple[AssetRef, Path]] = {}
+    mesh_containers: dict[str, set[tuple[str, int]]] = defaultdict(set)
     for manifest_path in manifest_paths:
-        found_containers, found_exports = _manifest_index(manifest_path)
+        found_containers, found_exports, found_mesh_containers = _manifest_index(manifest_path)
         for name, refs in found_containers.items():
             containers[name].update(refs)
+        for name, refs in found_mesh_containers.items():
+            mesh_containers[name].update(refs)
         mesh_exports = _merge_mesh_exports(mesh_exports, found_exports)
     material_sources = capture_material_catalog_sources(tuple(manifest_paths))
     catalog = load_planning_catalog(tuple(manifest_paths), cache_root)
@@ -780,7 +829,6 @@ def prepare_scene_export_plan(
         _terrain_surface_roots(terrain_surface_values, runtime_path.parent)
         if water_selected and terrain_surface_values is not None else []
     )
-    water_depth_missing = water_selected and not water_depth_surfaces
     allowed_categories = selected_static_categories(layers, groups)
     effects_selected = layers.get("effects") is True and bool(groups & {"effects", "particle", "all"})
     include_decals = bool(groups & {"all", "terrain", "road", "unknown"}) and (
@@ -833,14 +881,6 @@ def prepare_scene_export_plan(
         from prepare_terrain_detail import terrain_detail_source_paths
 
         required_resources.update(terrain_detail_source_paths(map_id))
-    if water_depth_missing:
-        water_depth_pending.append({
-            "entity_id": -1,
-            "entity_base": "selection",
-            "component": "water_depth",
-            "reason": "terrain_height_source_missing",
-            "detail": "No verified terrain height source; water depth must be fully supported by opaque source assets",
-        })
     selected_static_count = 0
     footprint_extras = 0
     effect_instances: list[EffectInstance] = []
@@ -913,18 +953,6 @@ def prepare_scene_export_plan(
     if water_selected:
         from endfield_scene_water_plan import build_water_geometry_plan
 
-        global_water_path = _water_global_resource_path(path_index, map_id)
-        if global_water_path is None:
-            scene_path = f"Assets/Beyond/Scenes/LunaScenes/{map_id.capitalize()}/ReleaseData"
-            pending.append({
-                "entity_id": -1,
-                "entity_base": "selection",
-                "component": "water_materials",
-                "reason": "global_resource_path_missing",
-                "detail": f"StringPathHash has no {scene_path}/WaterData/Global_Water_Config.asset path",
-            })
-        else:
-            required_resources.add(global_water_path)
         geometry_plan = build_water_geometry_plan(
             vfs,
             entries,
@@ -935,6 +963,27 @@ def prepare_scene_export_plan(
             tuple(manifest_paths),
             check_cancelled,
         )
+        if geometry_plan.rows or geometry_plan.pending:
+            if not water_depth_surfaces:
+                water_depth_pending.append({
+                    "entity_id": -1,
+                    "entity_base": "selection",
+                    "component": "water_depth",
+                    "reason": "terrain_height_source_missing",
+                    "detail": "No verified terrain height source; water depth must be fully supported by opaque source assets",
+                })
+            global_water_path = _water_global_resource_path(path_index, map_id)
+            if global_water_path is None:
+                scene_path = f"Assets/Beyond/Scenes/LunaScenes/{map_id.capitalize()}/ReleaseData"
+                pending.append({
+                    "entity_id": -1,
+                    "entity_base": "selection",
+                    "component": "water_materials",
+                    "reason": "global_resource_path_missing",
+                    "detail": f"StringPathHash has no {scene_path}/WaterData/Global_Water_Config.asset path",
+                })
+            else:
+                required_resources.add(global_water_path)
         required_resources.update(geometry_plan.required_resource_paths)
         for source, digest in geometry_plan.source_sha256:
             previous = source_hashes.get(source)
@@ -1019,7 +1068,7 @@ def prepare_scene_export_plan(
         frozenset(by_decal_source), bounds, selection, groups, layers,
         allowed_categories, water_selected, effects_selected, include_decals,
         water_geometry_rows, read_chunk, component_columns,
-        cast(Callable[[bytes], Iterable[Mapping[str, object]]], iter_entities), check_cancelled,
+        cast(Callable[[bytes], Iterable[Mapping[str, object]]], iter_entities), check_cancelled, static_namespace,
     )
     visible_static = set(spatial_selection.visible_static_ids)
     bottom_candidates = set(spatial_selection.bottom_candidate_ids)
@@ -1050,7 +1099,7 @@ def prepare_scene_export_plan(
                         continue
                     if kind - 60 not in renderer:
                         raise ValueError(f"Renderer component {kind} has no matching draw component")
-                    decoded = decode_pairs(references, path_index)
+                    decoded = decode_static_pairs(references, path_index)
                     draws = decode_draws(renderer[kind - 60], references)
                     for index, ((mesh_path, material_path), draw) in enumerate(zip(decoded, draws, strict=True)):
                         pairs.append({"material_id": references[8 + 40 * index:16 + 40 * index].hex(),
@@ -1090,9 +1139,7 @@ def prepare_scene_export_plan(
                                     and (entity_id in visible_static or entity_id in bottom_candidates))):
                             selected_pair_paths.add(pair["material_path"])
                     selected_paths_by_mesh[mesh_path] = selected_pair_paths
-                    if selected_pair_paths:
-                        required_resources.add(mesh_path)
-                        required_resources.update(selected_pair_paths)
+                required_resources.update(_static_required_resource_paths(selected_paths_by_mesh))
                 for mesh_path, paths in selected_paths_by_mesh.items():
                     for path in paths:
                         refs = containers.get(path, set())
@@ -1109,12 +1156,7 @@ def prepare_scene_export_plan(
                 for mesh_path in mesh_paths:
                     if not selected_paths_by_mesh[mesh_path]:
                         continue
-                    stem = mesh_path.split("##", 1)[0]
-                    candidates = [mesh_exports[key] for key in containers.get(stem, set()) if key in mesh_exports
-                                  and mesh_exports[key][0]["Name"].casefold() == asset_name(mesh_path)]
-                    if len({(reference_key(asset), file) for asset, file in candidates}) != 1:
-                        raise ValueError(f"Primary mesh lacks a unique exact SceneProbe Container/OBJ: {mesh_path}")
-                    mesh_asset, mesh_file = candidates[0]
+                    mesh_asset, mesh_file = _require_static_mesh_export(mesh_path, mesh_containers, mesh_exports)
                     if is_hlod_name(mesh_asset["Name"]):
                         excluded_hlod += 1
                         excluded_hlod_mesh += int(entity_id in visible_static)
@@ -1170,25 +1212,35 @@ def prepare_scene_export_plan(
                         else:
                             if entity_id not in visible_static and entity_id not in bottom_candidates:
                                 continue
-                            unsupported_passes = [
-                                (pass_index, item)
-                                for pass_index, item in zip(passes.indices[submesh], source_records, strict=True)
-                                if item["Name"].casefold().startswith(("m_fx_", "m_water", "m_shadow", "m_fog", "m_volume"))
-                            ]
+                            unsupported_passes: list[tuple[int, MaterialRecord, str | None]] = []
+                            for pass_index, item in zip(passes.indices[submesh], source_records, strict=True):
+                                role = separate_surface_role(item)
+                                name_requires_separate_role = item["Name"].casefold().startswith(
+                                    ("m_fx_", "m_water", "m_shadow", "m_fog", "m_volume"))
+                                if role is not None or name_requires_separate_role:
+                                    unsupported_passes.append((pass_index, item, role))
                             if unsupported_passes:
-                                for pass_index, item in unsupported_passes:
+                                for pass_index, item, role in unsupported_passes:
                                     source_draw = active_sources[pass_index]
-                                    entity_role_pending.append({
+                                    role_detail = (f"Material requires separate renderer support: material={item['Name']}, "
+                                                   f"shader={item['Shader']['Name']}, role={role}"
+                                                   if role is not None else
+                                                   f"Material role is not validated for ordinary surface export: {item['Name']}")
+                                    role_pending: StaticSubmeshPending = {
                                         "entity_id": cast(int, entity_id), "entity_base": cast(str, base),
                                         "component": "static_mesh_submesh", "reason": "source_surface_role_unverified",
-                                        "detail": f"Material role is not validated for ordinary surface export: {item['Name']}",
+                                        "detail": role_detail,
                                         "source_path": source, "source_sha256": cached_source.source_sha256,
                                         "group_index": cast(int, group_index), "entity_index": cast(int, entity_index),
                                         "mesh_path": mesh_path, "submesh": submesh, "material_name": item["Name"],
                                         "material_path": source_draw["material_path"],
                                         "material_id": source_draw["material_id"], "mesh_id": source_draw["mesh_id"],
                                         "source_draw": source_draw,
-                                    })
+                                    }
+                                    if role is not None:
+                                        role_pending.update({"surface_role": role,
+                                                             "material_shader": item["Shader"]["Name"]})
+                                    entity_role_pending.append(role_pending)
                                 continue
                             regular_submeshes.append(submesh)
                             texture_slots = tuple(slot for item in source_records for slot in supported_slots(item))
@@ -1226,7 +1278,8 @@ def prepare_scene_export_plan(
                     if any(len({active[index]["material_id"] for index in indices}) > 1 for indices in passes.indices):
                         source_row["submesh_material_passes"] = material_passes
                         source_row["submesh_pass_indices"] = [list(indices) for indices in passes.indices]
-                    if (len(mesh_paths) == 1 and any(row["mesh_path"] == mesh_path for row in entity_role_pending)):
+                    if (passes.undrawn_submeshes or
+                            (len(mesh_paths) == 1 and any(row["mesh_path"] == mesh_path for row in entity_role_pending))):
                         source_row["source_draw_evidence"] = source_pairs
                     if regular_submeshes:
                         destination = entity_ready if entity_id in visible_static else entity_bottom
@@ -1307,7 +1360,7 @@ def prepare_scene_export_plan(
             tuple(selection[name] for name in ("xmin", "xmax", "zmin", "zmax")), cache_root)
         model_inventory = model_selection.inventory
         prefab_plan = build_prefab_geometry_plan(model_inventory, tuple(manifest_paths), allowed_categories,
-            containers, mesh_exports, materials, textures, uv_catalog, model_selection.evidence)
+            containers, mesh_exports, materials, textures, uv_catalog, model_selection.evidence, tuple(ready))
         prefab_rows.extend(prefab_plan.rows)
         prefab_pending.extend(prefab_plan.pending)
         prefab_pending.extend(cast(list[PrefabGeometryPending], list(model_selection.pending)))
@@ -1347,6 +1400,7 @@ def prepare_scene_export_plan(
     complete_static_entities = ready_static_entities - partial_static_entities
     result: SceneExportPlan = {
         "format": FORMAT, "map_id": map_id, "bounds": bounds, "category_filter": sorted(groups),
+        **({"static_level_id": cast(str, canonical["static_level_id"])} if static_namespace is not None else {}),
         "scene_manifests": [str(path) for path in manifest_paths],
         "terrain_surfaces": [str(path) for path in terrain_surfaces],
         "water_depth_surfaces": [str(path) for path in water_depth_surfaces],
@@ -1372,6 +1426,7 @@ def prepare_scene_export_plan(
         "summary": {"selected_static": selected_static_count - excluded_hlod_mesh - sum(
                         row["entity_id"] in visible_static for row in static_role_exclusions),
                     "excluded_static_shadow_only": len(static_role_exclusions),
+                    "excluded_static_other_level": len(spatial_selection.excluded_level_ids),
                     "footprint_overlap_extras": footprint_extras,
                     "excluded_hlod": excluded_hlod,
                     "ready_static": len(ready), "ready_static_entities": len(ready_static_entities),
@@ -1499,7 +1554,23 @@ def _validate_static_submesh_pending(
             raise ValueError(f"Static submesh pending differs from source SHA-256: entity_id={entity_id}, source={source_path}")
         if pending.get("reason") != "source_surface_role_unverified":
             raise ValueError(f"Static submesh pending has an unsupported reason: entity_id={entity_id}")
-        if not material_name.casefold().startswith(prefixes) or material_name not in detail:
+        surface_role = pending.get("surface_role")
+        material_shader = pending.get("material_shader")
+        if surface_role is None and material_shader is None:
+            role_valid = material_name.casefold().startswith(prefixes)
+        elif isinstance(surface_role, str) and isinstance(material_shader, str):
+            shader_role_valid = (
+                surface_role == "volumetric_light_beam" and material_shader.startswith("Hidden/VLB_")
+                or surface_role == "effect_or_volume_surface" and (
+                    material_shader in ("HGRP/FogSimple", "HGRP/Effect/VFXBaseV2", "HGRP/Effect/VFXDitherAlpha")
+                    or material_name.casefold().startswith(prefixes)
+                )
+            )
+            role_valid = (shader_role_valid and material_name in detail and material_shader in detail
+                          and f"role={surface_role}" in detail)
+        else:
+            role_valid = False
+        if not role_valid or material_name not in detail:
             raise ValueError(f"Static submesh pending material has no unresolved-role marker: entity_id={entity_id}, material={material_name}")
         draw = _object(pending.get("source_draw"), "static submesh pending.source_draw")
         draw_fields = ("mesh_path", "material_path", "material_id", "mesh_id", "submesh", "flags")
@@ -1547,6 +1618,8 @@ def load_scene_export_plan(path: Path) -> SceneExportPlan:
     if source.get("format") != FORMAT:
         raise ValueError("Unsupported portable scene plan format")
     validate_scene_id(_text(source.get("map_id"), "scene map_id"))
+    if "static_level_id" in source:
+        static_level_namespace(cast(str, source["map_id"]), source["static_level_id"])
     lighting: WaterTransportLighting | None = None
     if "water_transport_lighting" in source:
         lighting = read_water_transport_lighting(source["water_transport_lighting"])

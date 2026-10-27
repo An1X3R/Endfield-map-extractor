@@ -50,6 +50,16 @@ def scene_color_snapshot() -> dict[str, object]:
 
 
 class ContractTests(unittest.TestCase):
+    def test_static_level_scope_survives_canonicalization_and_matches_map(self) -> None:
+        schema = json.loads((SCHEMA_ROOT / "webui_export_job_v2.schema.json").read_text())
+        value = {**payload("map02"), "static_level_id": "map02_lv010"}
+        jsonschema.validate(value, schema)
+        self.assertEqual("map02_lv010", contract.canonicalize_job(value)["static_level_id"])
+        self.assertNotIn("static_level_id", contract.canonicalize_job(payload("map02")))
+        for invalid in (None, 10, "map01_lv010", "map02_lv032", "map02_lv000", "../../map02_lv010"):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(ValueError, "static_level_id"):
+                contract.canonicalize_job({**value, "static_level_id": invalid})
+
     def test_layer_flags_reject_non_boolean_values(self) -> None:
         schema = json.loads((SCHEMA_ROOT / "webui_export_job_v2.schema.json").read_text())
         for invalid in ("false", "true", 0, 1, None, [], {}):

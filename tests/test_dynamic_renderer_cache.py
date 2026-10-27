@@ -66,9 +66,8 @@ def _init() -> bytes:
     return struct.pack("<I", len(decoded)) + bytes((token,)) + extension + decoded
 
 
-def _write_vfs(root: Path, rows: tuple[tuple[str, bytes], ...]) -> tuple[Path, Path, Path]:
-    game = root / "game"
-    group = game / GROUP_HASH
+def _write_group(game: Path, group_hash: str, rows: tuple[tuple[str, bytes], ...]) -> None:
+    group = game / group_hash
     group.mkdir(parents=True, exist_ok=True)
     name = "00112233445566778899AABBCCDDEEFF"
     key = bytes.fromhex(vfs.DEFAULT_VFS_KEY_HEX)
@@ -81,11 +80,16 @@ def _write_vfs(root: Path, rows: tuple[tuple[str, bytes], ...]) -> tuple[Path, P
         records.extend(struct.pack("<h", len(encoded)) + encoded + bytes(8) + bytes.fromhex(name) + hashlib.md5(payload).digest())
         records.extend(struct.pack("<qqBBqI", offset, len(payload), 11, 1, seed, 0))
     header = struct.pack("<Iq", 1, 42)
-    body = struct.pack("<IIh", 4, 0, 7) + b"Dynamic" + bytes.fromhex(GROUP_HASH) + bytes(4)
+    body = struct.pack("<IIh", 4, 0, 7) + b"Dynamic" + bytes.fromhex(group_hash) + bytes(4)
     body += struct.pack("<iqBi", len(rows), len(chunk), 11, 1)
     body += bytes.fromhex(name) + hashlib.md5(chunk).digest() + struct.pack("<qBii", len(chunk), 11, 0, len(rows)) + records
-    (group / f"{GROUP_HASH}.blc").write_bytes(header + vfs.make_cipher(key, header).encrypt(body))
+    (group / f"{group_hash}.blc").write_bytes(header + vfs.make_cipher(key, header).encrypt(body))
     (group / f"{name}.chk").write_bytes(chunk)
+
+
+def _write_vfs(root: Path, rows: tuple[tuple[str, bytes], ...]) -> tuple[Path, Path, Path]:
+    game = root / "game"
+    _write_group(game, GROUP_HASH, rows)
     metadata = root / "metadata"
     metadata.mkdir(exist_ok=True)
     path_hash = metadata / "StringPathHash.bin"

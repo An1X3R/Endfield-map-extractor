@@ -20,6 +20,7 @@ from endfield_water_transport import (WaterTransportLighting, read_water_transpo
                                       serialize_water_transport_lighting)
 from endfield_scene_vfxrefract_contract import read_scene_color_snapshot
 from webui_source_contract import normalize_export_groups, read_fog_depth_options, validate_source_paths
+from extractor_core.scene_identity import static_level_namespace
 
 
 CONTRACT_FORMAT = "EndfieldWebUIExportJob/2"
@@ -172,6 +173,8 @@ def canonicalize_job(payload: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError(f"Unsupported map_id: {map_id!r}")
     spec.validate()
     bounds = _resolve_bounds(dict(payload.get("selection") or {}), spec)
+    if "static_level_id" in payload:
+        static_level_namespace(map_id, payload["static_level_id"])
     layers: object = payload.get("layers", {})
     if not isinstance(layers, Mapping):
         raise ValueError(f"layers must be an object of boolean flags, received {layers!r}")
@@ -241,6 +244,7 @@ def canonicalize_job(payload: Mapping[str, Any]) -> dict[str, Any]:
         "request_id": request_id,
         "job_id": job_id,
         "map_id": map_id,
+        **({"static_level_id": payload["static_level_id"]} if "static_level_id" in payload else {}),
         "bounds": asdict(bounds),
         "bounds_semantics": "half_open_xz",
         "selection_grid": spec.selection_grid,

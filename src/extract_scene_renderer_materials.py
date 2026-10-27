@@ -125,6 +125,13 @@ def decode_pairs(raw: bytes, paths: dict[bytes, tuple[str, ...]]) -> tuple[tuple
     return decode_renderer_pair_paths(raw, paths, (".fbx", ".mesh"))
 
 
+def decode_static_pairs(
+    raw: bytes, paths: dict[bytes, tuple[str, ...]],
+) -> tuple[tuple[str, str], ...]:
+    """Resolve static paths; SceneProbe Mesh identity is required before a row is built."""
+    return decode_renderer_pair_paths(raw, paths, (".fbx", ".mesh", ".asset"))
+
+
 def decode_renderer_pair_paths(
     raw: bytes, paths: dict[bytes, tuple[str, ...]], mesh_suffixes: tuple[str, ...],
 ) -> tuple[tuple[str, str], ...]:

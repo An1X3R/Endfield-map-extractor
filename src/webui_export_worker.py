@@ -13,6 +13,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import threading
 import time
 from typing import Any, Iterable, Mapping
@@ -24,12 +25,14 @@ from endfield_runtime_config import (
     load_runtime_config,
     path_hint,
 )
+from extractor_core.scene_identity import static_level_namespace
 from webui_export_contract_v2 import canonicalize_job, estimate_workload
 from webui_job_store import JobStore
 
 
 EXPECTED_MANIFEST_FORMAT = "EndfieldRegionMapLayerManifest/1"
 BLENDER_PROFILES = Path(__file__).resolve().parent.parent / "endfield_blender_worker_profiles_v1.json"
+STATIC_INSTANCE_ID_RE = re.compile(r"[a-z][a-z0-9]*(?:_[a-z0-9]+)*:instance:([0-9]+)")
 
 
 class JobCancelled(RuntimeError):
@@ -130,6 +133,19 @@ def iter_jsonl_gzip(path: Path) -> Iterable[dict[str, Any]]:
         for line in stream:
             if line.strip():
                 yield json.loads(line)
+
+
+def _parse_static_instance_entity_id(value: object) -> int:
+    if not isinstance(value, str):
+        raise ValueError(
+            f"static_level_id filtering requires instanceId in '<map_id>:instance:<integer>' form; received {value!r}"
+        )
+    match = STATIC_INSTANCE_ID_RE.fullmatch(value)
+    if match is None:
+        raise ValueError(
+            f"static_level_id filtering requires instanceId in '<map_id>:instance:<integer>' form; received {value!r}"
+        )
+    return int(match[1])
 
 
 def selected_sector_keys(bounds: Mapping[str, Any]) -> list[str]:
@@ -392,12 +408,17 @@ class ExportCoordinator:
         sectors: set[str],
         categories: set[str] | None,
         job_id: str,
+        static_namespace: int | None,
     ) -> Iterable[dict[str, Any]]:
         for shard in index.get("shards") or []:
             if shard.get("sectorKey") not in sectors:
                 continue
             for record in iter_jsonl_gzip(safe_child(self.stage119_root, str(shard["path"]))):
                 self._check_cancelled(job_id)
+                if static_namespace is not None:
+                    entity_id = _parse_static_instance_entity_id(record.get("instanceId"))
+                    if entity_id >> 27 != static_namespace:
+                        continue
                 if categories is None or record.get("category") in categories:
                     yield record
 
@@ -452,6 +473,10 @@ class ExportCoordinator:
             sector_list = selected_sector_keys(canonical["bounds"])
             sectors = set(sector_list)
             map_id = str(canonical["map_id"])
+            static_namespace = (
+                static_level_namespace(map_id, canonical["static_level_id"])
+                if "static_level_id" in canonical else None
+            )
             groups = set(canonical.get("export_groups") or ["all"])
             all_groups = "all" in groups
             layer_dir = output_dir / "layers"
@@ -465,7 +490,7 @@ class ExportCoordinator:
                 index = self._index(map_id, "instances", manifest)
                 artifacts["instances"] = self._write_records(
                     layer_dir / "instances.jsonl.gz",
-                    self._selected_instance_records(index, sectors, categories, job_id),
+                    self._selected_instance_records(index, sectors, categories, job_id, static_namespace),
                     job_id,
                 )
 

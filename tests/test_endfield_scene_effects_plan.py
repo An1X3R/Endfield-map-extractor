@@ -19,7 +19,7 @@ PREFAB = "assets/effects/p_fx.prefab"
 
 def _manifest(version: int) -> dict[str, object]:
     initial: dict[str, object] = {}
-    if version == PARTICLE_PARAMETER_SCHEMA_VERSION:
+    if version in (5, PARTICLE_PARAMETER_SCHEMA_VERSION):
         initial = {"StartRotationX": {}, "StartRotationY": {}, "StartRotation": {},
                    "GravityModifier": {}, "RandomizeRotationDirection": 0.0, "Rotation3D": False}
     return {
@@ -55,6 +55,20 @@ def _manifest(version: int) -> dict[str, object]:
 
 
 class EffectPlanIntegrationTests(unittest.TestCase):
+    def test_supported_versions_and_new_module_requirements(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for version in (4, 5, 6):
+                manifest = root / f"schema_{version}.json"
+                manifest.write_text(json.dumps(_manifest(version)), encoding="utf-8")
+                self.assertEqual(PREFAB in observed_effect_prefabs((manifest,)), version in (5, 6))
+            for field in ("RotationOverLifetime", "ClampVelocity"):
+                manifest = root / f"missing_{field}.json"
+                payload = _manifest(6)
+                del payload["Particles"]["Systems"][0]["Parameters"][field]
+                manifest.write_text(json.dumps(payload), encoding="utf-8")
+                self.assertNotIn(PREFAB, observed_effect_prefabs((manifest,)))
+
     def test_readiness_rechecks_payloads_with_shared_manifest_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -289,7 +303,7 @@ class EffectPlanIntegrationTests(unittest.TestCase):
             root = Path(temporary)
             old = root / "a_old.json"
             current = root / "z_current.json"
-            old.write_text(json.dumps(_manifest(PARTICLE_PARAMETER_SCHEMA_VERSION - 1)), encoding="utf-8")
+            old.write_text(json.dumps(_manifest(4)), encoding="utf-8")
             current.write_text(json.dumps(_manifest(PARTICLE_PARAMETER_SCHEMA_VERSION)), encoding="utf-8")
             source = "Data/DynamicStreaming/PC/Scene/map01/fb_main_1_0000_0000.bytes"
             inventory = MapEffectInventory("map01", (EffectSource(source, "A" * 32, 0, 1, 1),),

@@ -19,12 +19,13 @@ from .dynamic_renderers import (
     DynamicRendererSource, DynamicSceneRendererInventory, _RENDERER_INVENTORY_CACHE,
     _decode_dynamic_scene_renderers_for_scene,
 )
-from .effects import GROUP_HASH, MAIN_FILE, _dynamic_inventory_qualifiers, _dynamic_inventory_sources, _require_dynamic_inventory_sources
+from .effects import (GROUP_HASH, MAIN_FILE, _dynamic_inventory_qualifiers, _scene_inventory_sources,
+                      _require_scene_inventory_sources, _require_static_only_scene)
 from .resources import BootstrapExtractionError, validate_vfs_root
 from .scene_identity import validate_scene_id
 
 
-_MAGIC = b"EFDYN002"
+_MAGIC = b"EFDYN003"
 _HEADER = struct.Struct("<8sI4Q")
 _LENGTH = struct.Struct("<I")
 _STRING_COUNT = struct.Struct("<Q")
@@ -50,7 +51,7 @@ def dynamic_renderer_parser_identity() -> str:
     core = Path(__file__).resolve().parent
     paths = (Path(__file__), *(core / name for name in (
         "dynamic_renderers.py", "effects.py", "resources.py", "vfs.py", "flatbuffer.py",
-        "lz4.py", "scene_identity.py", "projected_decals.py")),
+        "lz4.py", "scene_identity.py", "projected_decals.py", "instances.py")),
         core.parent / "extract_scene_renderer_materials.py", core.parent / "endfield_scene_io.py")
     digest = hashlib.sha256()
     for path in paths:
@@ -60,7 +61,7 @@ def dynamic_renderer_parser_identity() -> str:
 
 
 def _identity(cache: Path, scene: str, sources: tuple[Path, ...]) -> _Identity:
-    metadata = json.dumps({"format": "DynamicSceneRendererInventory/2", "scene_id": scene,
+    metadata = json.dumps({"format": "DynamicSceneRendererInventory/3", "scene_id": scene,
                            "parser": dynamic_renderer_parser_identity(),
                            "sources": [{"lexical_path": str(path), "resolved_path": str(resolve_scene_read_path(path)),
                                         "stamp": asdict(_file_stamp(resolve_scene_read_path(path)))} for path in sources]},
@@ -68,12 +69,12 @@ def _identity(cache: Path, scene: str, sources: tuple[Path, ...]) -> _Identity:
     if len(metadata) > _MAX_JSON_BYTES:
         raise ValueError(f"Dynamic renderer cache identity exceeds size limit: scene={scene}, bytes={len(metadata)}")
     key = hashlib.sha256(metadata).hexdigest()
-    return _Identity(metadata, cache / "dynamic_renderers_v2" / key[:2] / f"{scene}_{key}.bin")
+    return _Identity(metadata, cache / "dynamic_renderers_v3" / key[:2] / f"{scene}_{key}.bin")
 
 
 def _require_version(identity: _Identity, cache: Path, scene: str, root: Path, hash_path: Path,
                      sources: tuple[Path, ...]) -> None:
-    _require_dynamic_inventory_sources(root, hash_path, sources)
+    _require_scene_inventory_sources(root, hash_path, (scene,), sources)
     if _identity(cache, scene, sources).metadata != identity.metadata:
         raise SceneInputChangedError(f"Dynamic renderer sources changed during cache read: scene={scene}, path={identity.path}")
 
@@ -362,8 +363,8 @@ def _load(identity: _Identity, scene: str, check_cancelled: Callable[[], None]) 
         digest = hashlib.sha256(header + metadata)
         sources = tuple(_source(_read_json(stream, digest.update, path), scene) for _ in range(nsources))
         source_map = {source.virtual_path: source for source in sources}
-        if not sources or len(source_map) != len(sources):
-            raise DynamicRendererCacheCorruptError(f"Dynamic renderer cache source list is empty or repeats: path={path}")
+        if len(source_map) != len(sources) or (not sources and any((nrefs, ngroups, nrecords))):
+            raise DynamicRendererCacheCorruptError(f"Dynamic renderer cache source list is missing or repeats: path={path}")
         refs = tuple(_reference(_read_json(stream, digest.update, path), source_map) for _ in range(nrefs))
         references: dict[tuple[int, int], list[str]] = {}
         for ref in refs:
@@ -440,7 +441,7 @@ def read_dynamic_scene_renderers_cached(
     cache = cache_dir.expanduser().resolve()
     if cache.is_relative_to(root) or cache.is_relative_to(hash_path):
         raise ValueError(f"Dynamic renderer cache must not write into the read-only game tree or metadata file: {cache}")
-    sources = _dynamic_inventory_sources(root, hash_path)
+    sources = _scene_inventory_sources(root, hash_path, (scene,))
     if len(sources) < 3 or not sources[1].is_file():
         raise BootstrapExtractionError(
             f"Required VFS group {GROUP_HASH} is incomplete under {root / GROUP_HASH}. Verify the selected game build."
@@ -457,6 +458,8 @@ def read_dynamic_scene_renderers_cached(
                 inventory = _load(identity, scene, check_cancelled)
             except DynamicRendererCacheCorruptError as error:
                 raise DynamicRendererCacheCorruptError(f"{error}, cachePath={identity.path}") from error
+            if not inventory.sources:
+                _require_static_only_scene(root, scene, check_cancelled)
             require_version()
         else:
             inventory = _decode_dynamic_scene_renderers_for_scene(root, hash_path, scene, check_cancelled)

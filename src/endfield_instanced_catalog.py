@@ -106,7 +106,7 @@ _JSON_GROUP = "775A31D1"
 _STATIC_GROUP = "C3442D43"
 _DYNAMIC_GROUP = "23D53F5D"
 _COMPONENTS = ("building", "prop", "lighting", "particle", "vegetation", "terrain", "road", "water", "effects", "unknown")
-_BINDING_LIMIT = "Dungeon sceneId takes precedence over levelId; this table relationship is not a live gameplay activation check."
+_BINDING_LIMIT = "Dungeon sceneId takes precedence over levelId, then LevelConfig selects the art owner; this table relationship is not a live gameplay activation check."
 _SCOPE_LIMIT = "Names identify whole physical resource scenes; no interior subregion or rendered completeness has been certified."
 
 
@@ -255,6 +255,11 @@ def _assemble_catalog(owners: Mapping[str, str], roots: Mapping[str, int],
     categories: dict[str, set[str]] = {scene: set() for scene in independent}
     groups: dict[str, InstancedSceneGroup] = {}
     for level, owner in owners.items():
+        owner_evidence = _evidence("LevelConfig", level, "_art_owner", owner, None)
+        if owner in independent:
+            source_rows[owner].append(owner_evidence)
+        if level in independent and level != owner:
+            source_rows[level].append(owner_evidence)
         if owner not in independent or level not in descriptions:
             continue
         row = require_object(descriptions[level], f"LevelDescTable[{level}]")
@@ -267,7 +272,7 @@ def _assemble_catalog(owners: Mapping[str, str], roots: Mapping[str, int],
         raw_scene = _text(row.get("sceneId"), f"DungeonTable[{key}].sceneId")
         raw_level = _text(row.get("levelId"), f"DungeonTable[{key}].levelId")
         selected = raw_scene or raw_level
-        owner = selected if selected in independent else owners.get(selected)
+        owner = owners.get(selected, selected)
         if owner not in independent:
             continue
         category = _text(row.get("dungeonCategory"), f"DungeonTable[{key}].dungeonCategory")
@@ -293,9 +298,14 @@ def _assemble_catalog(owners: Mapping[str, str], roots: Mapping[str, int],
         group_id = category_ids[0] if len(category_ids) == 1 else "multiple_categories" if category_ids else "unclassified"
         if group_id not in groups:
             groups[group_id] = {"group_id": group_id, "name": "多类别物理场景" if category_ids else "未分类物理场景", "source_evidence": []}
-        available = bool(levels[scene]) and roots.get(scene, 0) > 0
-        reason = "" if available else "Physical scene has no logical registration or no supported InitChunkData sources."
+        available = roots.get(scene, 0) > 0
+        reason = "" if available else "Physical scene has no supported InitChunkData sources."
         limits = [_SCOPE_LIMIT]
+        art_owner = owners.get(scene)
+        if art_owner is not None and art_owner != scene:
+            limits.append(f"LevelConfig selects {art_owner} as the art owner; this physical layer export does not include that owner's sources.")
+        if not levels[scene]:
+            limits.append("Physical source chunks are present without a logical level registration; exported by source scene ID.")
         if len(names_sorted) > 1:
             limits.append("Conflicting source names are retained as evidence; the physical ID is displayed.")
         scenes.append({"scene_id": scene, "name": name, "group_id": group_id, "form": "blueprint",

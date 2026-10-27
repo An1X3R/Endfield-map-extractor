@@ -13,8 +13,8 @@ from typing import Callable, Literal
 
 from . import flatbuffer as fb
 from . import vfs
-from .effects import (GROUP_HASH, MAIN_FILE, EffectDecodeError, _dynamic_inventory_qualifiers, _dynamic_inventory_sources,
-                      _require_dynamic_inventory_sources, _resolve_hashes, _vector)
+from .effects import (GROUP_HASH, MAIN_FILE, EffectDecodeError, _dynamic_inventory_qualifiers, _scene_inventory_sources,
+                      _require_scene_inventory_sources, _require_static_only_scene, _resolve_hashes, _vector)
 from .lz4 import decompress_lz4_inv
 from .resources import load_group, validate_vfs_root
 from .scene_identity import validate_scene_id
@@ -292,7 +292,11 @@ def _read_raw_dynamic_scene_renderers(
             segment, chunk = int(match[2]), int(match[3])
             inits.setdefault(chunk, []).append((segment, item))
     if not mains:
-        raise DynamicRendererDecodeError(f"Dynamic ECS main sources missing: scene={scene}, group={GROUP_HASH}")
+        try:
+            _require_static_only_scene(root, scene, check_cancelled)
+        except EffectDecodeError as error:
+            raise DynamicRendererDecodeError(f"Dynamic ECS main sources missing: scene={scene}, error={error}") from error
+        return _RawDynamicSceneRendererInventory(scene, (), (), (), ())
     if len({i.file_name.casefold() for i in mains}) != len(mains):
         raise DynamicRendererDecodeError(f"Duplicate Dynamic ECS main source paths: scene={scene}")
     sources: list[DynamicRendererSource] = []
@@ -390,13 +394,13 @@ def read_dynamic_scene_renderers_for_bounds(
     scene = validate_scene_id(scene_id)
     root = validate_vfs_root(vfs_root)
     hash_path = string_path_hash.expanduser().resolve()
-    sources = _dynamic_inventory_sources(root, hash_path)
+    sources = _scene_inventory_sources(root, hash_path, (scene,))
 
     def decode() -> DynamicSceneRendererInventory:
         raw = _read_raw_dynamic_scene_renderers(root, hash_path, scene, check_cancelled)
         selected = replace(raw, records=tuple(row for row in raw.records if _renderer_intersects_bounds(row, bounds)))
         result = _resolve_dynamic_scene_renderers(selected, hash_path, check_cancelled)
-        _require_dynamic_inventory_sources(root, hash_path, sources)
+        _require_scene_inventory_sources(root, hash_path, (scene,), sources)
         return result
 
     qualifiers = _dynamic_inventory_qualifiers((scene, "bounded", *(str(value) for value in bounds)), sources)
@@ -415,11 +419,11 @@ def read_dynamic_scene_renderers_for_scene(
     hash_path = string_path_hash.expanduser().resolve()
     if not hash_path.is_file():
         raise FileNotFoundError(f"Dynamic ECS StringPathHash source is missing: {hash_path}")
-    sources = _dynamic_inventory_sources(root, hash_path)
+    sources = _scene_inventory_sources(root, hash_path, (scene,))
 
     def decode() -> DynamicSceneRendererInventory:
         result = _decode_dynamic_scene_renderers_for_scene(root, hash_path, scene, check_cancelled)
-        _require_dynamic_inventory_sources(root, hash_path, sources)
+        _require_scene_inventory_sources(root, hash_path, (scene,), sources)
         return result
 
     qualifiers = _dynamic_inventory_qualifiers((scene,), sources)

@@ -123,13 +123,44 @@ class InstancedSceneCatalogTests(unittest.TestCase):
         self.assertEqual(scenes["indie_one"]["logical_level_ids"], ["logical_alias", "logical_one"])
         self.assertEqual(scenes["indie_one"]["category_ids"], ["category_one"])
         self.assertEqual(scenes["indie_two"]["category_ids"], ["category_two"])
-        self.assertFalse(scenes["indie_unregistered"]["export_capability"]["ready"])
+        self.assertTrue(scenes["indie_unregistered"]["export_capability"]["ready"])
+        self.assertEqual(scenes["indie_unregistered"]["logical_level_ids"], [])
+        self.assertEqual(scenes["indie_unregistered"]["name"], "indie_unregistered")
+        self.assertTrue(any("without a logical level registration" in reason
+                            for reason in scenes["indie_unregistered"]["limitations"]))
         self.assertTrue(all(value is None for value in scenes["indie_one"]["component_counts"].values()))
         self.assertEqual(len({group["name"] for group in catalog["groups"]}), len(catalog["groups"]))
         self.assertEqual(_validate_catalog(catalog), catalog)
         invalid = {**catalog, "scenes": [catalog["scenes"][0], catalog["scenes"][0]]}
         with self.assertRaisesRegex(InstancedSceneError, "Duplicate cached physical scene"):
             _validate_catalog(invalid)
+
+    def test_dungeon_uses_explicit_art_owner_before_matching_physical_root(self) -> None:
+        owners = {"indie_layer": "indie_owner", "indie_owner": "indie_owner", "indie_other": "indie_other"}
+        dungeons = {"shared": {"sceneId": "indie_layer", "levelId": "indie_other",
+                                "dungeonCategory": "story", "dungeonName": {"id": 1, "text": ""}},
+                    "unregistered": {"sceneId": "indie_unregistered", "levelId": "",
+                                     "dungeonCategory": "story", "dungeonName": {"id": 2, "text": ""}}}
+        types = {"story": {"enemyInfoTitle": {"id": 3, "text": ""}}}
+        roots = {"indie_layer": 2, "indie_owner": 4, "indie_other": 1, "indie_unregistered": 1}
+        catalog = _assemble_catalog(owners, roots, {}, dungeons, types,
+                                    {"1": "Shared art", "2": "Raw scene", "3": "Story"}, {}, "b" * 64)
+        scenes = {row["scene_id"]: row for row in catalog["scenes"]}
+        self.assertEqual(scenes["indie_owner"]["name"], "Shared art")
+        self.assertEqual(scenes["indie_owner"]["category_ids"], ["story"])
+        self.assertEqual(scenes["indie_owner"]["logical_level_ids"], ["indie_layer", "indie_owner"])
+        self.assertEqual(scenes["indie_layer"]["category_ids"], [])
+        self.assertEqual(scenes["indie_other"]["category_ids"], [])
+        self.assertTrue(scenes["indie_layer"]["export_capability"]["ready"])
+        self.assertTrue(any("does not include that owner's sources" in reason
+                            for reason in scenes["indie_layer"]["limitations"]))
+        self.assertIn({"table": "LevelConfig", "key": "indie_layer", "field": "_art_owner",
+                       "value": "indie_owner", "i18n_id": None}, scenes["indie_layer"]["source_evidence"])
+        self.assertTrue(any(row["table"] == "DungeonTable" and row["value"] == "indie_layer"
+                            for row in scenes["indie_owner"]["source_evidence"]))
+        self.assertEqual(scenes["indie_unregistered"]["name"], "Raw scene")
+        self.assertEqual(scenes["indie_unregistered"]["category_ids"], ["story"])
+        self.assertEqual(_validate_catalog(catalog), catalog)
 
     def test_prepared_marker_reuse_cancellation_and_missing_changed_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

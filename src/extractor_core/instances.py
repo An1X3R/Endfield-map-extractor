@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import math
 import re
 import sqlite3
@@ -22,9 +21,9 @@ Cancelled = Callable[[], bool]
 GROUP_HASH = "C3442D43"
 _SOURCE_COLUMNS = frozenset({"source_chunk", "source_data_md5", "source_offset"})
 PATH_PATTERNS = {
-    "map01": re.compile(r"^Data/Streaming/PC/map01/Streaming/InitChunkData_(.+)_0_0\.bytes$", re.I),
+    "map01": re.compile(r"^Data/Streaming/PC/map01/Streaming/InitChunkData_(.+)_0_-?\d+\.bytes$", re.I),
     "map02": re.compile(
-        r"^Data/Streaming/PC/map02/Streaming/InitChunkData_(?:Global|-?\d+_-?\d+)_0_0\.bytes$",
+        r"^Data/Streaming/PC/map02/Streaming/InitChunkData_(?:Global|-?\d+_-?\d+)_0_-?\d+\.bytes$",
         re.I,
     ),
 }
@@ -44,9 +43,15 @@ def _instance_pattern(map_id: str) -> re.Pattern[str]:
     if pattern is not None:
         return pattern
     return re.compile(
-        rf"^Data/Streaming/PC/{re.escape(map_id)}/Streaming/InitChunkData_(?:Global|-?\d+_-?\d+)_0_0\.bytes$",
+        rf"^Data/Streaming/PC/{re.escape(map_id)}/Streaming/InitChunkData_(?:Global|-?\d+_-?\d+)_0_-?\d+\.bytes$",
         re.I,
     )
+
+
+def _instance_source_order(item: vfs.VfsFile) -> tuple[int, str]:
+    """Prefer base-group records while retaining unique entities in other groups."""
+    name = item.file_name.casefold()
+    return (0 if name.endswith("_0_0.bytes") else 1, name)
 
 
 def _emit(progress: Progress | None, phase: str, value: float, message: str, **details: Any) -> None:
@@ -177,7 +182,7 @@ def build_instance_database(
     pattern = _instance_pattern(map_id)
     files = sorted(
         (item for item in group.iter_files() if pattern.match(item.file_name)),
-        key=lambda item: item.file_name.casefold(),
+        key=_instance_source_order,
     )
     if not files:
         raise BootstrapExtractionError(f"No {map_id} InitChunkData records were found in VFS group {GROUP_HASH}")

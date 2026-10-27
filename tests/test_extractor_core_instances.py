@@ -12,6 +12,8 @@ from unittest.mock import patch
 
 from extractor_core.instances import (
     InstanceSourceGenerationError,
+    _instance_pattern,
+    _instance_source_order,
     build_instance_database,
     iter_entities,
     validate_instance_source_generation,
@@ -45,6 +47,26 @@ def chunk_with_components(components: tuple[tuple[int, bytes], ...]) -> bytes:
 
 
 class InstanceWorldBoundsTests(unittest.TestCase):
+    def test_static_group_paths_are_discovered_without_character_or_region_ids(self) -> None:
+        for scene in ("map01", "map02", "indie_dg010"):
+            pattern = _instance_pattern(scene)
+            prefix = f"Data/Streaming/PC/{scene}/Streaming/InitChunkData_"
+            for suffix in ("Global_0_0", "Global_0_1664795649", "-8_1_0_4294967295", "3_-2_0_-17"):
+                with self.subTest(scene=scene, suffix=suffix):
+                    self.assertIsNotNone(pattern.fullmatch(prefix + suffix + ".bytes"))
+            for suffix in ("Global_1_0", "-8_1_2_0", "Global_0_unknown"):
+                with self.subTest(scene=scene, suffix=suffix):
+                    self.assertIsNone(pattern.fullmatch(prefix + suffix + ".bytes"))
+
+    def test_base_group_wins_duplicate_identity_before_other_source_groups(self) -> None:
+        paths = (
+            "Data/Streaming/PC/map02/Streaming/InitChunkData_-8_1_0_1664795649.bytes",
+            "Data/Streaming/PC/map02/Streaming/InitChunkData_Global_0_0.bytes",
+        )
+        files = tuple(VfsFile(path, "a" * 32, "b" * 32, "c" * 32,
+                              0, 1, 1, False, None) for path in paths)
+        self.assertEqual(sorted(files, key=_instance_source_order)[0].file_name, paths[1])
+
     def test_decodes_real_flatbuffer_columns(self) -> None:
         matrix = struct.pack("<16f", 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, -6.2, 203, 216.96, 1)
         values = (-46.0, 259.0, 283.0, 26.0, 57.0, 31.0)

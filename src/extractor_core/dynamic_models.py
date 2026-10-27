@@ -13,7 +13,7 @@ from . import flatbuffer as fb
 from .dynamic_renderers import _read_source
 from .effects import (
     GROUP_HASH, MAIN_FILE, EffectDecodeError, _dynamic_inventory_qualifiers,
-    _dynamic_inventory_sources, _require_dynamic_inventory_sources, _resolve_hashes, _vector,
+    _scene_inventory_sources, _require_scene_inventory_sources, _require_static_only_scene, _resolve_hashes, _vector,
 )
 from .resources import load_group, validate_vfs_root
 from .scene_identity import validate_scene_id
@@ -120,7 +120,11 @@ def _decode_scene_models(
     candidates = sorted((item for item in group.iter_files() if item.file_name.casefold().startswith(prefix)),
                         key=lambda item: item.file_name.casefold())
     if not candidates:
-        raise DynamicModelDecodeError(f"Model main sources missing: scene={scene}, group={GROUP_HASH}")
+        try:
+            _require_static_only_scene(root, scene, check_cancelled)
+        except EffectDecodeError as error:
+            raise DynamicModelDecodeError(f"Model main sources missing: scene={scene}, error={error}") from error
+        return DynamicModelInventory(scene, (), ())
     if len({item.file_name.casefold() for item in candidates}) != len(candidates):
         raise DynamicModelDecodeError(f"Duplicate model main paths: scene={scene}, group={GROUP_HASH}")
     sources: list[DynamicModelSource] = []
@@ -182,11 +186,11 @@ def _read_selected_models(
     path_hash = string_path_hash.expanduser().resolve()
     if not path_hash.is_file():
         raise FileNotFoundError(f"Model StringPathHash source is missing: path={path_hash}")
-    sources = _dynamic_inventory_sources(root, path_hash)
+    sources = _scene_inventory_sources(root, path_hash, (scene,))
 
     def decode() -> DynamicModelInventory:
         result = _decode_scene_models(root, path_hash, scene, include, check_cancelled)
-        _require_dynamic_inventory_sources(root, path_hash, sources)
+        _require_scene_inventory_sources(root, path_hash, (scene,), sources)
         return result
 
     qualifiers = _dynamic_inventory_qualifiers((scene, *selection_key), sources)

@@ -138,7 +138,7 @@ def _particle_material_keys(renderer: Mapping[str, object]) -> set[tuple[str, in
     alignment = renderer.get("RenderAlignment")
     if type(alignment) is not int:
         raise ValueError("Selected particle renderer requires integer RenderAlignment")
-    if alignment not in (0, 2) or (alignment == 2 and mode == 1):
+    if (alignment not in (0, 2) and not (alignment == 4 and mode == 4)) or (alignment == 2 and mode == 1):
         return set()
     camera_velocity = renderer.get("CameraVelocityScale")
     if type(camera_velocity) not in (int, float) or not math.isfinite(camera_velocity):

@@ -18,7 +18,7 @@ from endfield_scene_material_contract import (
     require_object,
     validate_texture_sampler,
 )
-from extractor_core.particle_snapshot import PARTICLE_PARAMETER_MODULE_FIELDS, PARTICLE_PARAMETER_SCHEMA_VERSION
+from extractor_core.particle_snapshot import UnsupportedParticleSnapshot, validate_particle_parameter_schema
 
 if TYPE_CHECKING:
     from extractor_core.effects import MapEffectInventory
@@ -421,14 +421,16 @@ def _vertex_offset_sampler_issues(
 def _schema_issue(pairs: tuple[tuple[dict[str, object], dict[str, object]], ...]) -> str | None:
     for system, _ in pairs:
         asset = _asset(system.get("Asset"), "FX system Asset")
-        parameters = require_object(system.get("Parameters"), "FX system Parameters")
+        try:
+            parameters = validate_particle_parameter_schema(system.get("Parameters"))
+        except UnsupportedParticleSnapshot as exc:
+            return f"Particle parameter schema unsupported: system={asset}, detail={exc}"
         version = parameters.get("SchemaVersion")
         initial = require_object(parameters.get("Initial"), "FX system Initial")
         missing = sorted(_INITIAL_V3_FIELDS - initial.keys())
-        missing_modules = [field for field in PARTICLE_PARAMETER_MODULE_FIELDS if not isinstance(parameters.get(field), dict)]
-        if type(version) is not int or version != PARTICLE_PARAMETER_SCHEMA_VERSION or missing or missing_modules:
-            return (f"Particle parameter schema requires v{PARTICLE_PARAMETER_SCHEMA_VERSION}: "
-                    f"system={asset}, version={version}, missing_initial={missing}, missing_modules={missing_modules}")
+        if missing:
+            return (f"Particle parameter schema missing Initial fields: "
+                    f"system={asset}, version={version}, missing_initial={missing}")
         for field in ("StartRotationX", "StartRotationY", "StartRotation", "GravityModifier"):
             require_object(initial[field], f"FX Initial {field}")
         direction = initial["RandomizeRotationDirection"]

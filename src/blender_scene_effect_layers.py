@@ -171,7 +171,7 @@ def _single_weight_sample(record: MaterialRecord) -> int | None:
     floats = record["Floats"]
     if (any(floats.get(name) != 1 for name in ("_UseWeightTex", "_UseDissolve", "_DissolveUseWeight")) or
             floats.get("_UseDisturb") not in (0, 1) or
-            floats.get("_Bi_Disturb") != 0 or floats.get("_DisturbUseWeight") not in (0, 1)):
+            floats.get("_Bi_Disturb") not in (0, 1) or floats.get("_DisturbUseWeight") not in (0, 1)):
         return None
     active = tuple(index for index in range(5) if floats.get(f"_UseSampleTex{index}") == 1)
     weights = tuple(index for index in active if floats.get(f"_SampleTex{index}Use") == 2)
@@ -230,9 +230,10 @@ def _material_feature_issues(record: MaterialRecord) -> tuple[str, ...]:
     issues.extend(name for name in excluded if floats.get(name, 0) != 0)
     weighted_dissolve = (floats.get("_UseDissolve", 0) != 0 and
                          floats.get("_DissolveUseWeight", 0) != 0 and floats.get("_UseWeightTex", 0) != 0)
-    bidirectional_disturb = floats.get("_UseDisturb", 0) != 0 and floats.get("_Bi_Disturb", 0) != 0
-    if (weighted_dissolve or bidirectional_disturb) and weight_sample is None:
+    if weighted_dissolve and weight_sample is None:
         issues.append("weighted_or_bidirectional_dissolve_disturb")
+    if floats.get("_UseDisturb", 0) != 0 and floats.get("_Bi_Disturb", 0) not in (0, 1):
+        issues.append("bidirectional_disturb_control")
     for flag, channel in (("_UsePolarUV", 2), ("_UseScreenUV", 3)):
         if floats.get(flag, 0) != 0 and any(
             isinstance(weights := colors.get(f"{name}UVWeights"), list) and len(weights) == 4 and weights[channel] != 0
@@ -569,18 +570,30 @@ def _add_rgba(tree: bpy.types.NodeTree, label: str, left: _Rgba,
                  _math(tree, f"{label} Alpha", "ADD", left.alpha, right.alpha))
 
 
-def _disturb(tree: bpy.types.NodeTree, label: str, sample: _Rgba,
-             u: float, v: float, weight: bpy.types.NodeSocket | float) -> bpy.types.NodeSocket:
+def _disturb_red(tree: bpy.types.NodeTree, label: str, sample: _Rgba,
+                 bias: float) -> bpy.types.NodeSocket:
+    """Apply the compiled signed-red remap before either disturbance decoder."""
     red = _component(tree, f"{label} Red", sample.rgb, "X")
+    if bias != 0:
+        red = _math(tree, f"{label} Signed Red", "SUBTRACT",
+                    _math(tree, f"{label} Red Scale", "MULTIPLY", red, 1.0 + bias), bias)
+    return red
+
+
+def _disturb(tree: bpy.types.NodeTree, label: str, sample: _Rgba,
+             u: float, v: float, weight: bpy.types.NodeSocket | float,
+             bias: float) -> bpy.types.NodeSocket:
+    red = _disturb_red(tree, label, sample, bias)
     weighted = _math(tree, f"{label} Particle Weight", "MULTIPLY", red, weight)
     return _scale(tree, f"{label} UV Offset", _vec(tree, f"{label} Intensities", "ADD",
                                                      (u, v, 0.0), (0.0, 0.0, 0.0)), weighted)
 
 
 def _normal_disturb(tree: bpy.types.NodeTree, label: str, sample: _Rgba,
-                    intensity: float, weight: bpy.types.NodeSocket | float) -> bpy.types.NodeSocket:
+                    intensity: float, weight: bpy.types.NodeSocket | float,
+                    bias: float) -> bpy.types.NodeSocket:
     """Decode the source packed normal's A*R and G; both axes use U intensity."""
-    red = _component(tree, f"{label} Normal Red", sample.rgb, "X")
+    red = _disturb_red(tree, f"{label} Normal", sample, bias)
     green = _component(tree, f"{label} Normal Green", sample.rgb, "Y")
     packed_x = _math(tree, f"{label} Normal Alpha Red", "MULTIPLY", sample.alpha, red)
     x = _math(tree, f"{label} Normal Signed X", "SUBTRACT",
@@ -691,17 +704,17 @@ def _make_vfx_feature_source(tree: bpy.types.NodeTree, record: MaterialRecord,
         sampling_limitations.extend(sample_result.limitations)
         role_samples[role].append(sampled)
         if role == 0 and floats.get("_UseDisturb", 0):
-            offset = (_normal_disturb(tree, "Disturb 1", sampled, floats["_DisturbUIntensity1"], disturb_weight)
+            offset = (_normal_disturb(tree, "Disturb 1", sampled, floats["_DisturbUIntensity1"], disturb_weight, floats.get("_Bi_Disturb", 0))
                       if floats.get("_DisturbTex1Normal", 0) else
                       _disturb(tree, "Disturb 1", sampled, floats.get("_DisturbUIntensity1", 0),
-                               floats.get("_DisturbVIntensity1", 0), disturb_weight))
+                               floats.get("_DisturbVIntensity1", 0), disturb_weight, floats.get("_Bi_Disturb", 0)))
             disturbance = _vec(tree, "Disturb 1 Accumulation", "ADD", disturbance,
                                offset)
         elif role == 1 and floats.get("_UseDisturb", 0) and floats.get("_UseDisturb2", 0):
-            offset = (_normal_disturb(tree, "Disturb 2", sampled, floats["_DisturbUIntensity2"], disturb_weight)
+            offset = (_normal_disturb(tree, "Disturb 2", sampled, floats["_DisturbUIntensity2"], disturb_weight, floats.get("_Bi_Disturb", 0))
                       if floats.get("_DisturbTex2Normal", 0) else
                       _disturb(tree, "Disturb 2", sampled, floats.get("_DisturbUIntensity2", 0),
-                               floats.get("_DisturbVIntensity2", 0), disturb_weight))
+                               floats.get("_DisturbVIntensity2", 0), disturb_weight, floats.get("_Bi_Disturb", 0)))
             disturbance = _vec(tree, "Disturb 2 Accumulation", "ADD", disturbance,
                                offset)
         elif role == 2:

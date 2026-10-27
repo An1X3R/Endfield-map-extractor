@@ -12,7 +12,7 @@ const terminal = (job: ExportJob): boolean => ['completed', 'failed', 'cancelled
 
 export function paintingRequest(map: LevelMap, settings: PaintingSettings, selection: PaintingSelection, source: PaintingSource) {
   return {
-    format: 'EndfieldWebUIExportJob/2', export_mode: settings.exportMode, map_id: map.mapId,
+    format: 'EndfieldWebUIExportJob/2', export_mode: settings.exportMode, map_id: map.mapId, static_level_id: map.levelId,
     selection: { type: 'world_bounds', ...selectionBounds(map, selection) }, batch_mode: settings.chunkMode,
     layers: { ...settings.layers, roads: settings.layers.instances, vegetation: settings.layers.instances, lights: settings.layers.effects },
     export_groups: settings.groups, effects: { selection_mode: 'full_system_by_anchor' }, water_mode: 'stable_eevee',

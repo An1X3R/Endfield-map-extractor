@@ -10,8 +10,10 @@ from endfield_map_layer_contract import classify_entity
 from endfield_scene_effects_plan import _PrefabCandidate, _anchor_matrix, _asset, _manifest, _root_members
 from endfield_scene_material_contract import MaterialRecord, reference_key, require_object, resolve_export_path, supported_slots
 from endfield_scene_mesh_uv_contract import MeshUvCatalog, RequiredUvStreams, SourceUvStream, required_uv_channels, source_uv_streams
+from endfield_scene_native_draw_evidence import NativeUndrawnEvidence, native_undrawn_evidence, native_undrawn_index
 from endfield_scene_slot_contract import validate_ordered_surface_passes
 from endfield_scene_skin_contract import SourceSceneSkin, source_scene_skin
+from endfield_scene_runtime_material_roles import separate_surface_role, source_runtime_fog_provider
 
 if TYPE_CHECKING:
     from extractor_core.dynamic_models import DynamicModelInventory
@@ -50,6 +52,7 @@ class PrefabGeometryRow(TypedDict):
     source_uv_streams: list[SourceUvStream]
     snapshot_status: str
     source_skin: NotRequired[SourceSceneSkin]
+    undrawn_submesh_evidence: NotRequired[NativeUndrawnEvidence]
 
 
 class PrefabGeometryPending(TypedDict):
@@ -169,6 +172,8 @@ def observed_prefab_geometry_paths(
             for ref in cast(list[object], node.get("Materials") or []):
                 material_key = reference_key(require_object(ref, "prefab material"))
                 if material_key[1] == 0:
+                    if "RuntimeMaterialProviders" not in node:
+                        complete = False
                     continue
                 material = materials.get(material_key)
                 if material is None or any(slot["Texture"] is not None and reference_key(slot["Texture"]) not in textures
@@ -241,11 +246,13 @@ def build_prefab_geometry_plan(
     mesh_exports: Mapping[tuple[str, int], tuple[AssetRef, Path]],
     materials: Mapping[tuple[str, int], MaterialRecord], textures: Mapping[tuple[str, int], tuple[Path, str]],
     uv_catalog: MeshUvCatalog, selection_evidence: Mapping[str, dict[str, object]],
+    native_instances: tuple[Mapping[str, object], ...],
 ) -> PrefabGeometryPlan:
     """Place serialized ordinary renderers while preserving unresolved runtime behavior."""
     from prepare_scene_geometry_repairs import obj_submesh_count
 
     candidates = prefab_candidates(manifests, frozenset(record.prefab_path.replace("\\", "/").casefold() for record in inventory.records))
+    native_draws = native_undrawn_index(native_instances)
     hashes = {source.virtual_path: source.decoded_sha256 for source in inventory.sources}
     rows: list[PrefabGeometryRow] = []
     pending: list[PrefabGeometryPending] = []
@@ -320,14 +327,20 @@ def build_prefab_geometry_plan(
                 for value in cast(list[object], node.get("Materials") or []):
                     ref = require_object(value, "prefab material")
                     if reference_key(ref)[1] == 0:
+                        provider = source_runtime_fog_provider(node)
+                        if provider is not None:
+                            raise UnsupportedPrefabRendererRole(
+                                f"Source renderer material is supplied by active {provider['Namespace']}.{provider['Class']}; "
+                                f"volume evaluation requires separate support: component={provider['ComponentAsset']}, "
+                                f"fogIntensity={provider['FogIntensity']}, owner={owner}")
                         raise UnresolvedPrefabMaterialBinding(
                             f"Source renderer material slot is null; runtime binding remains unverified: prefab={record.prefab_path}, owner={owner}, slot={len(material_refs)}")
                     material = materials.get(reference_key(ref))
                     if material is None:
                         raise ValueError(f"Exact prefab material record missing: prefab={record.prefab_path}, material={ref}")
-                    if (material["Shader"].get("Name") in ("HGRP/FogSimple", "HGRP/Effect/VFXBaseV2", "HGRP/Effect/VFXDitherAlpha")
-                            or material["Name"].casefold().startswith(("m_fx_", "m_fxmap_", "m_water", "m_shadow", "m_fog", "m_volume"))):
-                        raise UnsupportedPrefabRendererRole(f"Prefab non-ordinary material requires its separate renderer role: material={material['Name']}, shader={material['Shader'].get('Name')}, owner={owner}")
+                    role = separate_surface_role(material)
+                    if role is not None:
+                        raise UnsupportedPrefabRendererRole(f"Prefab non-ordinary material requires its separate renderer role: material={material['Name']}, shader={material['Shader'].get('Name')}, role={role}, owner={owner}")
                     for slot in supported_slots(material):
                         if slot["Texture"] is not None and reference_key(slot["Texture"]) not in textures:
                             raise ValueError(f"Prefab material texture missing: material={material['Name']}, slot={slot['Property']}")
@@ -345,7 +358,8 @@ def build_prefab_geometry_plan(
                     required_uv.setdefault(mesh_path, set()).update(channels)
                 streams = source_uv_streams(uv_catalog, mesh_asset, channels)
                 unbound = [index for index, refs in enumerate(passes) if not refs]
-                if unbound:
+                undrawn_evidence = native_undrawn_evidence(native_draws, mesh_asset, material_refs, count) if unbound else None
+                if unbound and undrawn_evidence is None:
                     pending.append({"source_key": key, "component": "prefab_geometry",
                         "reason": "source_submesh_material_binding_unresolved",
                         "detail": f"Source submeshes have no corresponding serialized material slot: submeshes={unbound}, materials={len(material_refs)}; bound submeshes remain ready",
@@ -363,7 +377,8 @@ def build_prefab_geometry_plan(
                     "material_refs": [refs[0] if refs else None for refs in passes], "submesh_slot_indices": [group[0] if group else -1 for group in indices],
                     "submesh_material_passes": passes, "submesh_pass_indices": indices,
                     "selected_submeshes": [index for index in range(count) if index not in unbound], "undrawn_submeshes": unbound, "source_uv_streams": streams,
-                    "snapshot_status": SNAPSHOT_STATUS, **({"source_skin": skin} if skin is not None else {})})
+                    "snapshot_status": SNAPSHOT_STATUS, **({"source_skin": skin} if skin is not None else {}),
+                    **({"undrawn_submesh_evidence": undrawn_evidence} if undrawn_evidence is not None else {})})
             except UnresolvedPrefabMaterialBinding as error:
                 pending.append({"source_key": key, "component": "prefab_geometry", "reason": "source_null_material_runtime_binding_unresolved",
                     "detail": str(error), "placement_key": record.key, "scene_manifest": str(candidate.manifest), "source_renderer": dict(node)})
@@ -389,6 +404,13 @@ def validate_prefab_geometry_plan(plan: Mapping[str, object]) -> None:
         if not isinstance(plan.get(field), list):
             raise ValueError(f"Scene {field} must be an array")
     hashes = require_object(plan["source_sha256"], "scene source hashes")
+    native_instances = plan.get("instances", [])
+    if not isinstance(native_instances, list):
+        raise ValueError("Scene instances must be an array for native draw evidence")
+    needs_native_evidence = any("undrawn_submesh_evidence" in require_object(value, "prefab instance")
+                               for value in cast(list[object], plan["prefab_geometry_instances"]))
+    native_draws = (native_undrawn_index(tuple(require_object(value, "native static instance") for value in native_instances))
+                    if needs_native_evidence else {})
     placements = {str(row["key"]): row for value in cast(list[object], plan["prefab_placements"])
                   for row in [require_object(value, "prefab placement")]}
     if len(placements) != len(cast(list[object], plan["prefab_placements"])):
@@ -470,7 +492,13 @@ def validate_prefab_geometry_plan(plan: Mapping[str, object]) -> None:
                 or row.get("selected_submeshes") != [index for index, group in enumerate(passes) if group]
                 or row.get("undrawn_submeshes") != [index for index, group in enumerate(passes) if not group]):
             raise ValueError(f"Prefab material passes differ from source renderer: source_key={key}")
-        if any(not group for group in passes) and not any(
+        proof = row.get("undrawn_submesh_evidence")
+        if proof is not None:
+            expected = native_undrawn_evidence(native_draws, require_object(row["mesh_asset"], "prefab mesh"), refs, count)
+            if (expected is None or proof != expected
+                    or hashes.get(expected["source_path"]) != expected["source_sha256"]):
+                raise ValueError(f"Prefab native undrawn submesh evidence differs from static source draws: source_key={key}")
+        if any(not group for group in passes) and proof is None and not any(
                 require_object(item, "prefab submesh pending").get("source_key") == key
                 and require_object(item, "prefab submesh pending").get("reason") == "source_submesh_material_binding_unresolved"
                 for item in cast(list[object], plan["prefab_geometry_pending"])):

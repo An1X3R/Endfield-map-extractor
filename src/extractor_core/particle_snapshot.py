@@ -15,10 +15,13 @@ from extractor_core.particle_curves import ParticleMinMaxCurve, evaluate_minmax_
 from extractor_core.particle_mesh_geometry import ParticleMeshGeometry
 
 
-PARTICLE_PARAMETER_SCHEMA_VERSION = 5
-PARTICLE_PARAMETER_MODULE_FIELDS = (
+PARTICLE_PARAMETER_SCHEMA_VERSION = 6
+_LEGACY_PARTICLE_PARAMETER_MODULE_FIELDS = (
     "Initial", "Emission", "Shape", "SizeOverLifetime", "ColorOverLifetime",
     "Trail", "CustomData", "Uv", "VelocityOverLifetime",
+)
+PARTICLE_PARAMETER_MODULE_FIELDS = (
+    *_LEGACY_PARTICLE_PARAMETER_MODULE_FIELDS, "RotationOverLifetime", "ClampVelocity",
 )
 
 
@@ -73,6 +76,24 @@ def _field(row: Mapping[str, object], key: str, context: str) -> object:
     if key not in row:
         raise ParticleSnapshotError(f"Required field missing: field={context}.{key}")
     return row[key]
+
+
+def validate_particle_parameter_schema(value: object) -> Mapping[str, object]:
+    """Require complete module objects for the exact supported reader revision."""
+    if not isinstance(value, dict):
+        raise UnsupportedParticleSnapshot("unsupported_parameter_schema: Parameters missing or not an object")
+    parameters = _record(value, "Parameters")
+    version = parameters.get("SchemaVersion")
+    if type(version) is not int or version not in (5, PARTICLE_PARAMETER_SCHEMA_VERSION):
+        raise UnsupportedParticleSnapshot(
+            f"unsupported_parameter_schema: supported=(5,{PARTICLE_PARAMETER_SCHEMA_VERSION}), actual={version!r}")
+    fields = (_LEGACY_PARTICLE_PARAMETER_MODULE_FIELDS if version == 5
+              else PARTICLE_PARAMETER_MODULE_FIELDS)
+    missing = [field for field in fields if not isinstance(parameters.get(field), dict)]
+    if missing:
+        raise UnsupportedParticleSnapshot(
+            f"unsupported_parameter_schema: version={version}, missing_module_objects={missing}")
+    return parameters
 
 
 def _number(value: object, context: str) -> float:
@@ -635,21 +656,7 @@ def _generate_particle_snapshot(system_value: object, snapshot_age: float, ident
     age *= speed_multiplier
     if not math.isfinite(age):
         raise ParticleSnapshotError(f"Scaled simulation time is not finite: age={snapshot_age}, speed={speed_multiplier}")
-    if "Parameters" not in system:
-        raise UnsupportedParticleSnapshot("unsupported_parameter_schema: Parameters missing")
-    if not isinstance(system["Parameters"], dict):
-        raise UnsupportedParticleSnapshot("unsupported_parameter_schema: Parameters is not an object")
-    parameters = _record(system["Parameters"], "Parameters")
-    if "SchemaVersion" not in parameters:
-        raise UnsupportedParticleSnapshot("unsupported_parameter_schema: SchemaVersion missing")
-    version = _integer(parameters["SchemaVersion"], "Parameters.SchemaVersion")
-    if version != PARTICLE_PARAMETER_SCHEMA_VERSION:
-        raise UnsupportedParticleSnapshot(
-            f"unsupported_parameter_schema: required={PARTICLE_PARAMETER_SCHEMA_VERSION}, actual={version}")
-    for module_name in PARTICLE_PARAMETER_MODULE_FIELDS:
-        if module_name not in parameters:
-            raise UnsupportedParticleSnapshot(
-                f"unsupported_parameter_schema: required field missing: Parameters.{module_name}")
+    parameters = validate_particle_parameter_schema(system.get("Parameters"))
     initial = _record(_field(parameters, "Initial", "Parameters"), "Initial")
     emission = _record(_field(parameters, "Emission", "Parameters"), "Emission")
     shape = _record(_field(parameters, "Shape", "Parameters"), "Shape")

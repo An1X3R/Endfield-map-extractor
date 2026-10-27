@@ -17,7 +17,8 @@ import bpy
 from blender_scene_materials import layout_shader_node_tree
 from blender_scene_effect_layers import (VfxColor, make_vfx_feature_source, make_vfx_mesh_source,
                                          vfx_feature_issues, vfx_mesh_feature_issues, vfx_custom1_channels)
-from blender_scene_effect_vertex_offset import OffsetSamplerContract, validate_vertex_offset_source
+from blender_scene_effect_vertex_offset import (OffsetSamplerContract, validate_vertex_offset_mask_source,
+                                                validate_vertex_offset_source)
 from endfield_scene_material_contract import (AssetReference, MaterialRecord, reference_key, resolve_export_path,
                                               has_shader_white_texture_default, validate_material,
                                               mesh_material_requires_uv1)
@@ -113,7 +114,7 @@ def _make_effect_material(record: MaterialRecord,
         raise NotImplementedError(f"FX alpha blend factors are not verified: material={record['Name']}")
     if floats["_BlendMode"] not in (0, 1) or floats["_UseMainTexAsAlpha"] not in (0, 1):
         raise NotImplementedError(f"FX blend/channel mode is not verified: material={record['Name']}")
-    if floats.get("_CullMode") not in (0, 2) or any(floats.get(name) != value for name, value in (("_ZWrite", 1 - surface_type), ("_ZTest", 4), ("_DisableZTest", 0))):
+    if floats.get("_CullMode") not in (0, 1, 2) or any(floats.get(name) != value for name, value in (("_ZWrite", 1 - surface_type), ("_ZTest", 4), ("_DisableZTest", 0))):
         raise NotImplementedError(f"FX culling/depth state is not verified: material={record['Name']}")
     slots = [slot for slot in record["Textures"] if slot["Property"] == "_MainTex"]
     if len(slots) != 1:
@@ -197,14 +198,15 @@ def _make_effect_material(record: MaterialRecord,
         tree.links.new(output_alpha, composite.inputs["Output Alpha"])
         surface = composite.outputs[0]
     output = tree.nodes.new("ShaderNodeOutputMaterial")
-    if floats["_CullMode"] == 2:
+    if floats["_CullMode"] != 0:
         geometry = tree.nodes.new("ShaderNodeNewGeometry")
         transparent = tree.nodes.new("ShaderNodeBsdfTransparent")
         cull = tree.nodes.new("ShaderNodeMixShader")
-        cull.name = cull.label = "Source Backface Culling"
+        cull.name = cull.label = "Source Frontface Culling" if floats["_CullMode"] == 1 else "Source Backface Culling"
         tree.links.new(geometry.outputs["Backfacing"], cull.inputs[0])
-        tree.links.new(surface, cull.inputs[1])
-        tree.links.new(transparent.outputs[0], cull.inputs[2])
+        surface_slot = 2 if floats["_CullMode"] == 1 else 1
+        tree.links.new(surface, cull.inputs[surface_slot])
+        tree.links.new(transparent.outputs[0], cull.inputs[3 - surface_slot])
         surface = cull.outputs[0]
     tree.links.new(surface, output.inputs["Surface"])
     layout_shader_node_tree(tree)
@@ -390,6 +392,64 @@ def _register_vertex_offset_material(material: bpy.types.Material, record: Mater
     layout_shader_node_tree(material.node_tree)
 
 
+def _register_vertex_offset_mask_material(material: bpy.types.Material,
+                                          reference: Mapping[str, object],
+                                          sampler: OffsetSamplerContract,
+                                          image: bpy.types.Image) -> None:
+    if not material.use_nodes or material.node_tree is None:
+        raise ValueError(f"FX vertex-offset mask material has no node tree: material={material.name}")
+    key = reference_key(cast(AssetReference, reference))
+    identity = {"PathId": reference["PathId"], "Source": reference["Source"], "Type": "Texture2D"}
+    identity_json = json.dumps(identity, sort_keys=True, separators=(",", ":"))
+    normalized_identity_json = json.dumps(
+        {"PathId": key[1], "Source": key[0], "Type": "Texture2D"},
+        sort_keys=True, separators=(",", ":"))
+    if image.get("endfield_fx_vertex_offset_texture_identity_json") != normalized_identity_json:
+        raise ValueError(f"FX vertex-offset mask image reference changed: material={material.name}, image={image.name}")
+    material["endfield_fx_vertex_offset_mask_texture_identity_json"] = identity_json
+    material["endfield_fx_vertex_offset_mask_sampler_json"] = json.dumps({
+        "filter_mode": sampler.filter_mode,
+        "wrap_u": sampler.wrap_u,
+        "wrap_v": sampler.wrap_v,
+        "source_color_space": sampler.source_color_space,
+        "sampler_evidence": sampler.sampler_evidence,
+        "evidence_reference": sampler.evidence_reference,
+    }, sort_keys=True)
+    material["endfield_fx_vertex_offset_mask_contract"] = "SourceFormulaPreview/1"
+    limitations_value = material.get("endfield_fx_limitations")
+    if type(limitations_value) is not str:
+        raise ValueError(f"FX vertex-offset mask limitations are missing: material={material.name}")
+    limitations = json.loads(limitations_value)
+    if not isinstance(limitations, list) or any(type(item) is not str for item in limitations):
+        raise ValueError(f"FX vertex-offset mask limitations are malformed: material={material.name}")
+    mask_limitation = (
+        "Masked vertex offset and mesh-normal direction are CPU-deformed from the verified VFXBaseV2 source formula; game fog remains unreconstructed.")
+    if mask_limitation not in limitations:
+        limitations.append(mask_limitation)
+    material["endfield_fx_limitations"] = json.dumps(limitations)
+    nodes = [node for node in material.node_tree.nodes
+             if node.get("endfield_fx_vertex_offset_node_contract") == "SourceOffsetMaskTexture/1"]
+    if len(nodes) > 1:
+        raise ValueError(f"FX vertex-offset mask image node is duplicated: material={material.name}, count={len(nodes)}")
+    if nodes:
+        node = nodes[0]
+        if node.type != "TEX_IMAGE" or node.image != image:
+            raise ValueError(f"FX vertex-offset mask image node conflicts: material={material.name}, node={node.name}")
+    else:
+        node = material.node_tree.nodes.new("ShaderNodeTexImage")
+        node.name = "EF_FX_VERTEX_OFFSET_MASK_SOURCE_TEXTURE"
+        node.image = image
+        node["endfield_fx_vertex_offset_node_contract"] = "SourceOffsetMaskTexture/1"
+        node["endfield_fx_vertex_offset_mask_texture_identity_json"] = identity_json
+        node["endfield_layout_section"] = "Vertex Offset Geometry Preview"
+    node.label = "Source _OffsetMaskTex - Geometry Preview Input"
+    node.interpolation = "Linear"
+    node.extension = "REPEAT" if sampler.wrap_u == "repeat" else "EXTEND"
+    if node.get("endfield_fx_vertex_offset_mask_texture_identity_json") != identity_json:
+        raise ValueError(f"FX vertex-offset mask node identity conflicts: material={material.name}, node={node.name}")
+    layout_shader_node_tree(material.node_tree)
+
+
 def _vertex_offset_inputs(record: MaterialRecord,
                           textures: dict[tuple[str, int], tuple[Path, str]]
                           ) -> tuple[Mapping[str, object], OffsetSamplerContract, bpy.types.Image]:
@@ -400,6 +460,25 @@ def _vertex_offset_inputs(record: MaterialRecord,
     identity = json.dumps({"PathId": key[1], "Source": key[0], "Type": "Texture2D"},
                           sort_keys=True, separators=(",", ":"))
     return reference, sampler, _load_vertex_offset_image(path, identity)
+
+
+def _vertex_offset_mask_inputs(record: MaterialRecord,
+                               textures: dict[tuple[str, int], tuple[Path, str]]
+                               ) -> tuple[Mapping[str, object], OffsetSamplerContract, bpy.types.Image]:
+    reference, sampler = validate_vertex_offset_mask_source(record)
+    path = _vertex_offset_texture_path(reference, textures)
+    key = reference_key(cast(AssetReference, reference))
+    identity = json.dumps({"PathId": key[1], "Source": key[0], "Type": "Texture2D"},
+                          sort_keys=True, separators=(",", ":"))
+    return reference, sampler, _load_vertex_offset_image(path, identity)
+
+
+def _register_vertex_offset_mask_if_enabled(material: bpy.types.Material, record: MaterialRecord,
+                                            textures: dict[tuple[str, int], tuple[Path, str]]) -> None:
+    if record["Floats"].get("_UseVertexOffsetMask", 0) != 1:
+        return
+    reference, sampler, image = _vertex_offset_mask_inputs(record, textures)
+    _register_vertex_offset_mask_material(material, reference, sampler, image)
 
 
 def _color_stage_record(record: MaterialRecord) -> MaterialRecord:
@@ -435,6 +514,7 @@ def make_effect_material(record: MaterialRecord,
         if offset_reference is None or offset_sampler is None or offset_image is None:
             raise ValueError(f"FX vertex-offset registration data is incomplete: material={record['Name']}")
         _register_vertex_offset_material(material, record, offset_reference, offset_sampler, offset_image)
+        _register_vertex_offset_mask_if_enabled(material, record, textures)
     return material
 
 
@@ -463,10 +543,16 @@ def make_mesh_effect_material(record: MaterialRecord,
         if not blend_issues:
             return make_vfxadvance_blend_dissolve_disturb_material(
                 record, textures, snapshot_time, vertex_color_components)
+        from blender_scene_vfxadvance_ink import make_vfxadvance_ink_material
+        from endfield_scene_vfxadvance_ink_contract import vfxadvance_ink_texture_issues
+
+        ink_issues = vfxadvance_ink_texture_issues(record, vertex_color_components)
+        if not ink_issues:
+            return make_vfxadvance_ink_material(record, textures, snapshot_time, vertex_color_components)
         raise NotImplementedError(
             "VFXAdvance mesh features are outside implemented source contracts: "
             f"material={record['Name']}, mask_issues={mask_issues}, "
-            f"blend_dissolve_disturb_issues={blend_issues}")
+            f"blend_dissolve_disturb_issues={blend_issues}, ink_issues={ink_issues}")
     if record["Shader"].get("Name") == "HGRP/Effect/VFXDitherAlpha":
         from blender_scene_dither_materials import make_dither_mesh_material
 
@@ -485,4 +571,5 @@ def make_mesh_effect_material(record: MaterialRecord,
         lambda tree: make_vfx_mesh_source(tree, color_record, textures, snapshot_time, vertex_color_components))
     if inputs is not None:
         _register_vertex_offset_material(material, record, *inputs)
+        _register_vertex_offset_mask_if_enabled(material, record, textures)
     return material

@@ -45,9 +45,10 @@ from blender_scene_effects import (
 from endfield_scene_material_contract import resolve_export_path
 from blender_scene_effect_vertex_offset import apply_material_vertex_offset
 from extractor_core.particle_snapshot import (
-    PARTICLE_PARAMETER_SCHEMA_VERSION,
     ParticleSnapshot,
+    UnsupportedParticleSnapshot,
     generate_fixed_emitter_particle_snapshot,
+    validate_particle_parameter_schema,
 )
 from extractor_core.particle_mesh_geometry import ParticleMeshGeometry, load_particle_shape_geometry
 
@@ -97,16 +98,16 @@ def _source_objects() -> tuple[dict[tuple[int, str, int], bpy.types.Object],
     return sources, trails
 
 
-def _validate_schema5(system: Mapping[str, object], manifest_path: Path,
+def _validate_parameter_schema(system: Mapping[str, object], manifest_path: Path,
                       system_source: str, system_path_id: int) -> None:
-    parameters = _record(_field(system, "Parameters", "System"), "System.Parameters")
-    schema = parameters.get("SchemaVersion")
-    if type(schema) is not int or schema != PARTICLE_PARAMETER_SCHEMA_VERSION:
+    try:
+        validate_particle_parameter_schema(system.get("Parameters"))
+    except UnsupportedParticleSnapshot as exc:
         raise ValueError(
             "SceneProbe particle data must be refreshed before animation: "
             f"manifest={manifest_path}, systemSource={system_source}, systemPathId={system_path_id}, "
-            f"requiredSchema={PARTICLE_PARAMETER_SCHEMA_VERSION}, actualSchema={schema!r}"
-        )
+            f"detail={exc}"
+        ) from exc
 
 
 def _matrix_error(actual: Matrix, expected: Matrix) -> float:
@@ -234,7 +235,7 @@ def _build_samplers(plan: Mapping[str, object], camera: bpy.types.Object,
                 raise ValueError(f"Renderer.Enabled must be boolean: identity={key}, value={enabled!r}")
             if not enabled:
                 raise ValueError(f"Static particle object maps to a disabled renderer: identity={key}, object={obj.name}")
-            _validate_schema5(system, manifest_path, system_key[0], system_key[1])
+            _validate_parameter_schema(system, manifest_path, system_key[0], system_key[1])
             unity_world = _particle_world_matrix(
                 anchor @ _owner_matrix_root_relative(nodes, root, owner), nodes[owner],
                 _integer(_field(system, "ScalingMode", "System"), "System.ScalingMode"))

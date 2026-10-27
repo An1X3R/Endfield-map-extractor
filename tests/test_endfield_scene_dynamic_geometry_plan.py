@@ -51,6 +51,14 @@ class DynamicGeometryPartTests(unittest.TestCase):
             self.assertEqual([row["source_draw_indices"] for row in result.rows], [[0], [1]])
             self.assertEqual(len({row["mesh_part_key"] for row in result.rows}), 2)
             self.assertTrue(all(len(row["source_renderer_pairs"]) == 2 for row in result.rows))
+            volume = {**materials[("cab", 4)], "Shader": {
+                **materials[("cab", 4)]["Shader"], "Name": "Hidden/VLB_HGRP_SinglePass"}}
+            volume_materials = {**materials, ("cab", 4): volume}
+            deferred = build_dynamic_geometry_plan(inventory, bounds, bounds, args[2], containers,
+                exports, volume_materials, {}, (), MeshUvCatalog({}, {}))
+            self.assertEqual((deferred.rows, len(deferred.pending)), ((), 1))
+            self.assertIn("volumetric_light_beam", deferred.pending[0]["detail"])
+            self.assertIn("Hidden/VLB_HGRP_SinglePass", deferred.pending[0]["detail"])
             static_rows = tuple({**row, "entity_id": index + 1, "entity_index": 0}
                                 for index, row in enumerate(result.rows))
             partial = build_dynamic_geometry_plan(inventory, *args, static_rows[:1], MeshUvCatalog({}, {}))

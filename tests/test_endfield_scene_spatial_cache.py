@@ -111,7 +111,7 @@ class PersistentSpatialCacheTests(unittest.TestCase):
                 return _cached_spatial_selection(db, root / "cache", root, entries, rows,
                                                  frozenset({"decal"}), bounds, bounds, {"all"}, {},
                                                  frozenset({"building"}), False, False, True, [],
-                                                 counted_read, columns, counted_entities, None)
+                                                 counted_read, columns, counted_entities, None, None)
 
             near_bounds: Bounds = {"xmin": 0, "xmax": 10, "zmin": 0, "zmax": 10}
             far_bounds: Bounds = {"xmin": 100, "xmax": 110, "zmin": 100, "zmax": 110}
@@ -134,6 +134,14 @@ class PersistentSpatialCacheTests(unittest.TestCase):
                 first = select(far_bounds)
                 select(far_bounds)
                 self.assertEqual(["decal", "distant"], reads)
+                scoped = _cached_spatial_selection(
+                    db, root / "cache", root, entries, rows, frozenset({"decal"}),
+                    far_bounds, far_bounds, {"all"}, {}, frozenset({"building"}),
+                    False, False, True, [], counted_read, columns, counted_entities, None, 1,
+                )
+                self.assertFalse(scoped.visible_static_ids)
+                self.assertTrue(scoped.excluded_level_ids)
+                self.assertNotEqual(first, scoped)
                 source = root / "C3442D43" / f"{distant.file_chunk_md5_name}.chk"
                 source.write_bytes(source.read_bytes()[:-1])
                 with self.assertRaisesRegex(ValueError, "range exceeds backing"):
@@ -199,7 +207,7 @@ class PersistentSpatialCacheTests(unittest.TestCase):
                 rows = ((42, "Distant", indexed_matrix, "distant", 0, 0, "building"),)
                 with self.assertRaisesRegex(ValueError, message):
                     select_static_source_rows("distant", rows, warm.records, bounds, bounds,
-                                              frozenset({"building"}), (), False)
+                                              frozenset({"building"}), (), False, None)
 
     def test_nonfinite_matrix_is_rejected_before_publication(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -254,16 +262,16 @@ class PersistentSpatialCacheTests(unittest.TestCase):
                     self.assertIsNone(warm.decoded_chunk)
                     if expected_error is None:
                         direct = select_static_source_rows("source", indexed_rows, decoded, bounds, bounds,
-                                                           frozenset({"building"}), (), False)
+                                                           frozenset({"building"}), (), False, None)
                         cached = select_static_source_rows("source", indexed_rows, warm.records, bounds, bounds,
-                                                           frozenset({"building"}), (), False)
+                                                           frozenset({"building"}), (), False, None)
                         self.assertEqual(direct, cached)
                         self.assertEqual(indexed_rows, cached.selected_rows)
                     else:
                         for records in (decoded, cold.records, warm.records):
                             with self.assertRaisesRegex(ValueError, expected_error):
                                 select_static_source_rows("source", indexed_rows, records, bounds, bounds,
-                                                          frozenset({"building"}), (), False)
+                                                          frozenset({"building"}), (), False, None)
 
 
 if __name__ == "__main__":

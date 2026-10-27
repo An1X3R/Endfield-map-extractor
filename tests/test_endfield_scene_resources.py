@@ -42,6 +42,7 @@ class SceneResourceIntegrationTests(unittest.TestCase):
             nodes = [{**asset, "TransformPathId": 100 + index,
                       "Parent": {"Source": "CAB-shared", "PathId": 0, "Type": "Transform"},
                       "RendererType": kind, "RendererRole": {"CastShadows": 1, "PlatformCastShadows": 1},
+                      "RuntimeMaterialProviders": [],
                       "Mesh": mesh, "Materials": [{"Source": "CAB-shared", "PathId": 0, "Type": "Material"}]}
                      for index, (asset, kind) in enumerate(zip(roots, ("SkinnedMeshRenderer", "MeshRenderer")))]
             old, new = root / "old.json", root / "new.json"

@@ -68,7 +68,7 @@ class PrefabGeometryPlanTests(unittest.TestCase):
             textures = {("cab-texture", 3): (root, "texture.png")}
             plan = build_prefab_geometry_plan(inventory, (manifest,), frozenset({"prop", "unknown"}),
                 {"assets/source.fbx": {reference_key(mesh_asset)}}, {reference_key(mesh_asset): (mesh_asset, mesh)},
-                materials, textures, MeshUvCatalog({}, {}), {})
+                materials, textures, MeshUvCatalog({}, {}), {}, ())
             self.assertEqual(plan.pending, ())
             self.assertEqual(len(plan.rows), 2)
             self.assertEqual(len(plan.exclusions), 6)
@@ -84,13 +84,13 @@ class PrefabGeometryPlanTests(unittest.TestCase):
                 "summary": {"selected_prefab_placements": 2, "ready_prefab_geometry": 2, "pending_prefab_geometry": 0, "excluded_prefab_geometry": 6}}))
             validate_prefab_geometry_plan(payload)
             external = build_prefab_geometry_plan(inventory, (manifest,), frozenset({"prop", "unknown"}),
-                {}, {reference_key(mesh_asset): (mesh_asset, mesh)}, materials, textures, MeshUvCatalog({}, {}), {})
+                {}, {reference_key(mesh_asset): (mesh_asset, mesh)}, materials, textures, MeshUvCatalog({}, {}), {}, ())
             self.assertFalse(external.rows)
             self.assertTrue(all("external mesh requires an exact source container" in row["detail"] for row in external.pending))
             mesh_asset["Source"] = "CAB-prefab"
             manifest.write_text(json.dumps(data), encoding="utf-8")
             embedded = build_prefab_geometry_plan(inventory, (manifest,), frozenset({"prop", "unknown"}),
-                {}, {reference_key(mesh_asset): (mesh_asset, mesh)}, materials, textures, MeshUvCatalog({}, {}), {})
+                {}, {reference_key(mesh_asset): (mesh_asset, mesh)}, materials, textures, MeshUvCatalog({}, {}), {}, ())
             self.assertFalse(embedded.pending)
             self.assertEqual(len(embedded.rows), 2)
             self.assertTrue(all(row["mesh_resource_binding"] == "prefab_embedded_asset" for row in embedded.rows))
@@ -117,7 +117,7 @@ class PrefabGeometryPlanTests(unittest.TestCase):
                 validate_prefab_geometry_plan(payload)
             effects = build_prefab_geometry_plan(inventory, (manifest,), frozenset({"prop", "unknown"}),
                 {"assets/arts/effects/source.fbx": {reference_key(mesh_asset)}}, {reference_key(mesh_asset): (mesh_asset, mesh)},
-                materials, textures, MeshUvCatalog({}, {}), {})
+                materials, textures, MeshUvCatalog({}, {}), {}, ())
             self.assertFalse(effects.rows)
             self.assertEqual([row["reason"] for row in effects.pending], ["effect_renderer_role_requires_separate_support"] * 2)
             original_mesh = mesh.read_text(encoding="utf-8")
@@ -127,7 +127,7 @@ class PrefabGeometryPlanTests(unittest.TestCase):
             manifest.write_text(json.dumps(data), encoding="utf-8")
             partial = build_prefab_geometry_plan(inventory, (manifest,), frozenset({"prop", "unknown"}),
                 {"assets/source.fbx": {reference_key(mesh_asset)}}, {reference_key(mesh_asset): (mesh_asset, mesh)},
-                materials, textures, MeshUvCatalog({}, {}), {})
+                materials, textures, MeshUvCatalog({}, {}), {}, ())
             self.assertEqual(len(partial.rows), 2)
             self.assertEqual([row["selected_submeshes"] for row in partial.rows], [[0, 1], [0, 1]])
             self.assertEqual([row["material_refs"][-1] for row in partial.rows], [None, None])
@@ -138,6 +138,62 @@ class PrefabGeometryPlanTests(unittest.TestCase):
             partial_payload["prefab_geometry_pending"] = []
             with self.assertRaisesRegex(ValueError, "lacks explicit pending"):
                 validate_prefab_geometry_plan(partial_payload)
+            native_pairs = [{"material_id": "1" * 16, "material_path": "assets/source.mat", "mesh_id": "2" * 16,
+                "mesh_path": partial.rows[0]["mesh_path"], "submesh": index, "flags": 0} for index in (0, 1)]
+            native_draws = [{**pair, "reference_component": 69, "source_draw_index": index,
+                "lod_max_squared": 1., "lod_min_squared": 0.} for index, pair in enumerate(native_pairs)]
+            native = {"entity_id": 77, "source_path": "Data/Streaming/PC/map02/Streaming/InitChunkData_0_0_0_0.bytes",
+                "source_sha256": "b" * 64, "group_index": 0, "entity_index": 0, "mesh_asset": mesh_asset,
+                "mesh_path": partial.rows[0]["mesh_path"], "material_refs": partial.rows[0]["material_refs"],
+                "renderer_pairs": native_pairs, "source_draw_evidence": native_draws,
+                "selected_submeshes": [0, 1], "undrawn_submeshes": [2]}
+            confirmed = build_prefab_geometry_plan(inventory, (manifest,), frozenset({"prop", "unknown"}),
+                {"assets/source.fbx": {reference_key(mesh_asset)}}, {reference_key(mesh_asset): (mesh_asset, mesh)},
+                materials, textures, MeshUvCatalog({}, {}), {}, (native,))
+            self.assertFalse(confirmed.pending)
+            self.assertEqual([row["selected_submeshes"] for row in confirmed.rows], [[0, 1], [0, 1]])
+            self.assertTrue(all(row["material_refs"][-1] is None for row in confirmed.rows))
+            self.assertTrue(all(row["undrawn_submesh_evidence"]["entity_id"] == 77 for row in confirmed.rows))
+            confirmed_payload = {**partial_payload, "instances": [native],
+                "source_sha256": {**payload["source_sha256"], native["source_path"]: native["source_sha256"]},
+                "prefab_geometry_instances": json.loads(json.dumps(confirmed.rows)),
+                "summary": {**partial_payload["summary"], "pending_prefab_geometry": 0}}
+            validate_prefab_geometry_plan(confirmed_payload)
+            legacy_payload = {**confirmed_payload, "prefab_geometry_instances": json.loads(json.dumps(partial.rows)),
+                "prefab_geometry_pending": json.loads(json.dumps(partial.pending)),
+                "summary": {**partial_payload["summary"], "pending_prefab_geometry": 2}}
+            validate_prefab_geometry_plan(legacy_payload)
+            mismatched = {**native, "material_refs": [{**material_ref, "PathId": 999}, material_ref, None]}
+            unmatched = build_prefab_geometry_plan(inventory, (manifest,), frozenset({"prop", "unknown"}),
+                {"assets/source.fbx": {reference_key(mesh_asset)}}, {reference_key(mesh_asset): (mesh_asset, mesh)},
+                materials, textures, MeshUvCatalog({}, {}), {}, (mismatched,))
+            self.assertEqual(len(unmatched.pending), 2)
+            self.assertTrue(all("undrawn_submesh_evidence" not in row for row in unmatched.rows))
+            wrong_mesh = {**native, "mesh_asset": {**mesh_asset, "PathId": 999}}
+            unmatched = build_prefab_geometry_plan(inventory, (manifest,), frozenset({"prop", "unknown"}),
+                {"assets/source.fbx": {reference_key(mesh_asset)}}, {reference_key(mesh_asset): (mesh_asset, mesh)},
+                materials, textures, MeshUvCatalog({}, {}), {}, (wrong_mesh,))
+            self.assertEqual(len(unmatched.pending), 2)
+            conflict = {**native, "entity_id": 78, "renderer_pairs": [{**pair, "flags": 1} for pair in native_pairs],
+                "source_draw_evidence": [{**draw, "flags": 1} for draw in native_draws]}
+            conflicted = build_prefab_geometry_plan(inventory, (manifest,), frozenset({"prop", "unknown"}),
+                {"assets/source.fbx": {reference_key(mesh_asset)}}, {reference_key(mesh_asset): (mesh_asset, mesh)},
+                materials, textures, MeshUvCatalog({}, {}), {}, (native, conflict))
+            self.assertEqual(len(conflicted.pending), 2)
+            with self.assertRaisesRegex(ValueError, "native undrawn submesh evidence differs"):
+                validate_prefab_geometry_plan({**confirmed_payload, "instances": [native, conflict]})
+            for field, replacement in (("entity_id", 999), ("mesh_hash_hex", "3" * 16), ("reference_components", [68])):
+                tampered = json.loads(json.dumps(confirmed_payload))
+                tampered["prefab_geometry_instances"][0]["undrawn_submesh_evidence"][field] = replacement
+                with self.subTest(proof_field=field), self.assertRaisesRegex(ValueError, "native undrawn submesh evidence differs"):
+                    validate_prefab_geometry_plan(tampered)
+            tampered = json.loads(json.dumps(confirmed_payload))
+            tampered["instances"][0]["source_draw_evidence"][0]["flags"] = 1
+            with self.assertRaisesRegex(ValueError, "native undrawn submesh evidence"):
+                validate_prefab_geometry_plan(tampered)
+            tampered["instances"][0]["renderer_pairs"][0]["flags"] = 1
+            with self.assertRaisesRegex(ValueError, "native undrawn submesh evidence differs"):
+                validate_prefab_geometry_plan(tampered)
             mesh.write_text(original_mesh, encoding="utf-8")
             children[0]["Materials"] = [material_ref]
             manifest.write_text(json.dumps(data), encoding="utf-8")
@@ -145,9 +201,35 @@ class PrefabGeometryPlanTests(unittest.TestCase):
             effect_material = {**material, "Name": "M_fx_source", "Shader": {**material["Shader"], "Name": "HGRP/Effect/VFXBaseV2"}}
             effects = build_prefab_geometry_plan(inventory, (manifest,), frozenset({"prop", "unknown"}),
                 {"assets/source.fbx": {reference_key(mesh_asset)}}, {reference_key(mesh_asset): (mesh_asset, mesh)},
-                {reference_key(material): effect_material}, textures, MeshUvCatalog({}, {}), {})
+                {reference_key(material): effect_material}, textures, MeshUvCatalog({}, {}), {}, ())
             self.assertFalse(effects.rows)
             self.assertEqual([row["reason"] for row in effects.pending], ["effect_renderer_role_requires_separate_support"] * 2)
+            children[0]["Materials"] = [{"Source": "CAB-prefab", "PathId": 0, "Type": "Material"}]
+            manifest.write_text(json.dumps(data), encoding="utf-8")
+            self.assertFalse(observed_prefab_geometry_paths((manifest,), frozenset({prefab}), materials, textures))
+            provider = {
+                "ComponentAsset": {"Source": "CAB-prefab", "PathId": 71, "Type": "MonoBehaviour"},
+                "ScriptAsset": {"Source": "CAB-script", "PathId": 72, "Type": "MonoScript"},
+                "Namespace": "HG.Rendering.Runtime", "Class": "VFXFakeVolumeFog",
+                "Enabled": True, "UseFog": True, "FogIntensity": 1.0,
+            }
+            children[0]["RuntimeMaterialProviders"] = [provider]
+            manifest.write_text(json.dumps(data), encoding="utf-8")
+            self.assertEqual(observed_prefab_geometry_paths((manifest,), frozenset({prefab}), materials, textures), frozenset({prefab}))
+            fog = build_prefab_geometry_plan(inventory, (manifest,), frozenset({"prop", "unknown"}),
+                {"assets/source.fbx": {reference_key(mesh_asset)}}, {reference_key(mesh_asset): (mesh_asset, mesh)},
+                materials, textures, MeshUvCatalog({}, {}), {}, ())
+            self.assertFalse(fog.rows)
+            self.assertTrue(all(row["reason"] == "effect_renderer_role_requires_separate_support" and
+                                "VFXFakeVolumeFog" in row["detail"] for row in fog.pending))
+            children[0]["RuntimeMaterialProviders"] = [{**provider, "Class": "UnknownProvider"}]
+            manifest.write_text(json.dumps(data), encoding="utf-8")
+            unresolved = build_prefab_geometry_plan(inventory, (manifest,), frozenset({"prop", "unknown"}),
+                {"assets/source.fbx": {reference_key(mesh_asset)}}, {reference_key(mesh_asset): (mesh_asset, mesh)},
+                materials, textures, MeshUvCatalog({}, {}), {}, ())
+            self.assertTrue(all(row["reason"] == "source_null_material_runtime_binding_unresolved" for row in unresolved.pending))
+            children[0]["Materials"] = [material_ref]
+            del children[0]["RuntimeMaterialProviders"]
             data["MeshBounds"] = [{"Asset": mesh_asset, "Minimum": [-1, 0, -1], "Maximum": [1, 1, 1]}]
             root_node["LocalPosition"] = [9999, 9999, 9999]
             children[0]["LocalPosition"] = [10, 0, 0]
@@ -234,7 +316,7 @@ class PrefabGeometryPlanTests(unittest.TestCase):
             manifest.write_text(json.dumps(data), encoding="utf-8")
             missing = build_prefab_geometry_plan(inventory, (manifest,), frozenset({"prop", "unknown"}),
                 {"assets/source.fbx": {reference_key(mesh_asset)}}, {reference_key(mesh_asset): (mesh_asset, mesh)},
-                materials, textures, MeshUvCatalog({}, {}), {})
+                materials, textures, MeshUvCatalog({}, {}), {}, ())
             self.assertFalse(missing.rows)
             self.assertEqual(len(missing.pending), 2)
             self.assertEqual(observed_prefab_geometry_paths((manifest,), frozenset({prefab}), materials, textures), frozenset())

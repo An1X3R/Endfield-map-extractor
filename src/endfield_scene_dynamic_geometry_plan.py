@@ -9,6 +9,7 @@ from endfield_map_layer_contract import classify_entity, is_hlod_name
 from endfield_scene_material_contract import MaterialRecord, reference_key, supported_slots
 from endfield_scene_slot_contract import RuntimeDraw, RuntimeLodDraw, asset_name, highest_detail_visible_meshes, runtime_submesh_slots
 from endfield_scene_mesh_uv_contract import MeshUvCatalog, RequiredUvStreams, SourceUvStream, required_uv_channels, source_uv_streams
+from endfield_scene_runtime_material_roles import separate_surface_role
 
 if TYPE_CHECKING:
     from extractor_core.dynamic_renderers import DynamicSceneRendererInventory
@@ -215,9 +216,9 @@ def build_dynamic_geometry_plan(
                     if key not in materials:
                         raise ValueError(f"Dynamic ordinary material record missing: {pair.material_path}:{key}")
                     material = materials[key]
-                    if (material["Shader"].get("Name") in ("HGRP/FogSimple", "HGRP/Effect/VFXBaseV2", "HGRP/Effect/VFXDitherAlpha")
-                            or material["Name"].casefold().startswith(("m_fx_", "m_fxmap_", "m_water", "m_shadow", "m_fog", "m_volume"))):
-                        raise ValueError(f"Dynamic non-ordinary material requires its separate renderer role: {material['Name']}")
+                    role = separate_surface_role(material)
+                    if role is not None:
+                        raise ValueError(f"Dynamic non-ordinary material requires its separate renderer role: material={material['Name']}, shader={material['Shader'].get('Name')}, role={role}")
                     for texture_slot in supported_slots(material):
                         texture = texture_slot["Texture"]
                         if texture is not None and reference_key(texture) not in textures:

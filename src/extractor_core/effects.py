@@ -14,6 +14,8 @@ from endfield_scene_io import SceneInputChangedError, SceneSourceCacheSlot, cach
 
 from . import flatbuffer as fb
 from . import vfs
+from .instances import GROUP_HASH as STATIC_GROUP_HASH, _instance_pattern, iter_entities
+from .lz4 import decompress_lz4_inv
 from .resources import iter_path_records, load_group, validate_vfs_root
 from .scene_identity import validate_scene_id
 
@@ -71,6 +73,77 @@ def _dynamic_inventory_sources(vfs_root: Path, string_path_hash: Path) -> tuple[
     group_dir = vfs_root / GROUP_HASH
     chunks = tuple(sorted(group_dir.glob("*.chk")))
     return (string_path_hash, group_dir / f"{GROUP_HASH}.blc", *chunks)
+
+
+def _static_scene_source(vfs_root: Path, scene_id: str) -> tuple[vfs.VfsGroup, vfs.VfsFile]:
+    """Bind absent dynamic payloads to an exact, independently indexed static chunk."""
+    group = load_group(vfs_root, STATIC_GROUP_HASH)
+    pattern = _instance_pattern(scene_id)
+    files = sorted((item for item in group.iter_files() if pattern.fullmatch(item.file_name)),
+                   key=lambda item: item.file_name.casefold())
+    if not files or len({item.file_name.casefold() for item in files}) != len(files):
+        raise EffectDecodeError(f"Static-only scene requires unique InitChunkData sources: scene={scene_id}")
+    return group, files[0]
+
+
+def _scene_inventory_sources(vfs_root: Path, string_path_hash: Path,
+                             scene_ids: tuple[str, ...]) -> tuple[Path, ...]:
+    """Include exact static evidence only for scenes without dynamic main files."""
+    sources = _dynamic_inventory_sources(vfs_root, string_path_hash)
+    group = load_group(vfs_root, GROUP_HASH)
+    main_scenes = {match[1].casefold() for item in group.iter_files()
+                   if (match := MAIN_FILE.fullmatch(item.file_name)) is not None}
+    extra: list[Path] = []
+    for scene in scene_ids:
+        if scene not in main_scenes:
+            _, item = _static_scene_source(vfs_root, scene)
+            extra.extend((vfs_root / STATIC_GROUP_HASH / f"{STATIC_GROUP_HASH}.blc",
+                          vfs_root / STATIC_GROUP_HASH / f"{item.file_chunk_md5_name}.chk"))
+    return (*sources, *dict.fromkeys(extra))
+
+
+def _require_scene_inventory_sources(vfs_root: Path, string_path_hash: Path, scene_ids: tuple[str, ...],
+                                     expected: tuple[Path, ...]) -> None:
+    if _scene_inventory_sources(vfs_root, string_path_hash, scene_ids) != expected:
+        raise SceneInputChangedError(f"Scene inventory source membership changed during read: scenes={scene_ids}")
+
+
+def _require_static_only_scene(vfs_root: Path, scene_id: str, check_cancelled: Callable[[], None]) -> None:
+    """Require absent dynamic payloads and a checksum-verified, decoded static root."""
+    check_cancelled()
+    group = load_group(vfs_root, GROUP_HASH)
+    prefix = f"data/dynamicstreaming/pc/scene/{scene_id}/"
+    metadata = {prefix + "fbstreamarea.bytes", prefix + "fb_version.bytes"}
+    files = tuple(item for item in group.iter_files() if item.file_name.casefold().startswith(prefix))
+    if any(item.file_name.casefold() not in metadata for item in files):
+        raise EffectDecodeError(
+            f"Dynamic scene has payloads without main sources: scene={scene_id}, "
+            f"paths={tuple(item.file_name for item in files)}")
+    if len({item.file_name.casefold() for item in files}) != len(files):
+        raise EffectDecodeError(f"Duplicate static-only scene metadata paths: scene={scene_id}")
+    for item in files:
+        check_cancelled()
+        _verified_inventory_payload(vfs_root, group, item)
+    static_group, static_item = _static_scene_source(vfs_root, scene_id)
+    packed = _verified_inventory_payload(vfs_root, static_group, static_item)
+    if len(packed) < 4:
+        raise EffectDecodeError(f"Static InitChunkData compression header missing: path={static_item.file_name}")
+    try:
+        clear = decompress_lz4_inv(packed[4:], struct.unpack_from("<I", packed)[0])
+        for index, _ in enumerate(iter_entities(clear)):
+            if index % 1024 == 0:
+                check_cancelled()
+    except (ValueError, struct.error) as error:
+        raise EffectDecodeError(f"Static InitChunkData evidence decode failed: path={static_item.file_name}, error={error}") from error
+
+
+def _verified_inventory_payload(vfs_root: Path, group: vfs.VfsGroup, item: vfs.VfsFile) -> bytes:
+    output = BytesIO()
+    with (vfs_root / group.group_hash / f"{item.file_chunk_md5_name}.chk").open("rb") as source:
+        digest = vfs.copy_virtual_file(source, output, item, group.version, bytes.fromhex(vfs.DEFAULT_VFS_KEY_HEX))
+    if digest != item.file_data_md5.upper() or not item.length:
+        raise EffectDecodeError(f"Scene evidence VFS checksum/length differs: path={item.file_name}, expectedMd5={item.file_data_md5}, actualMd5={digest}")
+    return output.getvalue()
 
 
 def _dynamic_inventory_qualifiers(scene_ids: tuple[str, ...], sources: tuple[Path, ...]) -> tuple[str, ...]:
@@ -264,16 +337,8 @@ def _decode_dynamic_scene_effects(
         candidates.append((matched_scene_id, item))
     candidates.sort(key=lambda pair: pair[1].file_name.casefold())
     found_scene_ids = {scene_id for scene_id, _ in candidates}
-    if found_scene_ids != set(scene_ids):
-        if scene_ids == ("map01", "map02"):
-            raise EffectDecodeError(
-                f"FX main sources for both maps are required: group={GROUP_HASH}, "
-                f"mapIds={sorted(found_scene_ids)}"
-            )
-        raise EffectDecodeError(
-            f"FX main sources for requested scenes are required: group={GROUP_HASH}, "
-            f"sceneIds={list(scene_ids)}, foundSceneIds={sorted(found_scene_ids)}"
-        )
+    for scene_id in set(scene_ids) - found_scene_ids:
+        _require_static_only_scene(game_vfs, scene_id, check_cancelled)
     raw: dict[str, list[_RawEffect]] = {scene_id: [] for scene_id in scene_ids}
     sources: dict[str, list[EffectSource]] = {scene_id: [] for scene_id in scene_ids}
     seen_paths: set[str] = set()
@@ -325,11 +390,11 @@ def _read_dynamic_scene_effects(
     hash_path = string_path_hash.expanduser().resolve()
     if not hash_path.is_file():
         raise FileNotFoundError(f"FX StringPathHash source is missing: {hash_path}")
-    sources = _dynamic_inventory_sources(root, hash_path)
+    sources = _scene_inventory_sources(root, hash_path, scene_ids)
 
     def decode() -> dict[str, MapEffectInventory]:
         result = _decode_dynamic_scene_effects(root, hash_path, scene_ids, check_cancelled)
-        _require_dynamic_inventory_sources(root, hash_path, sources)
+        _require_scene_inventory_sources(root, hash_path, scene_ids, sources)
         return result
 
     qualifiers = _dynamic_inventory_qualifiers(scene_ids, sources)

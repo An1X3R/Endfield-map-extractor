@@ -1,4 +1,4 @@
-"""Unlit VFXDitherAlpha preview from compiled HGBuffer/DepthOnly variants 142/418."""
+"""Unlit VFXDitherAlpha preview from compiled HGBuffer and DepthOnly variants."""
 from __future__ import annotations
 
 import hashlib
@@ -8,7 +8,7 @@ from pathlib import Path
 
 import bpy
 
-from blender_scene_effect_layers import _component, _math, _sample, _scale, _uv, _value, _vec
+from blender_scene_effect_layers import _component, _disturb, _math, _normal_disturb, _sample, _scale, _uv, _value, _vec
 from blender_scene_materials import layout_shader_node_tree
 from endfield_scene_material_contract import MaterialRecord
 
@@ -17,12 +17,15 @@ SHADER = "HGRP/Effect/VFXDitherAlpha"
 
 
 def validate_dither_mesh(record: MaterialRecord, vertex_color_components: int) -> None:
-    """Require the actual unlit UV0 variant; inactive feature controls do not alter it."""
+    """Require compiled unlit UV0 branches; inactive controls do not enable features."""
     if record["Shader"].get("Name") != SHADER:
         raise ValueError(f"Dither shader family differs: material={record['Name']}")
     state = record.get("RenderState")
-    if state is None or state.get("ValidKeywords") != []:
+    if state is None:
         raise NotImplementedError(f"Dither compiled feature variant is not verified: material={record['Name']}")
+    keywords = state.get("ValidKeywords")
+    if not isinstance(keywords, list) or any(keyword not in ("_USE_DISTURB", "_USE_MASK") for keyword in keywords):
+        raise NotImplementedError(f"Dither compiled feature variant is not verified: material={record['Name']}, keywords={keywords}")
     disabled = state.get("DisabledShaderPasses")
     if not isinstance(disabled, list) or "DepthOnly" in disabled or "HGBuffer" in disabled:
         raise NotImplementedError(f"Dither requires source HGBuffer and DepthOnly passes: material={record['Name']}")
@@ -49,6 +52,30 @@ def validate_dither_mesh(record: MaterialRecord, vertex_color_components: int) -
             raise ValueError(f"Dither source vector is missing or invalid: material={record['Name']}, property={name}")
     if colors["_MainTexUVWeights"] != [1, 0, 0, 0] or colors["_MainTexUVSpeed"][2:] != [0, 0]:
         raise NotImplementedError(f"Dither requires actual UV0 without particle custom inputs: material={record['Name']}")
+    features: list[tuple[str, str, str]] = []
+    if "_USE_DISTURB" in keywords:
+        features.append(("_DisturbUVWeights1", "_DisturbUVSpeed1", "_DisturbUVRotateMat1"))
+        for name in ("_Bi_Disturb", "_DisturbTex1Normal", "_DisturbUIntensity1", "_DisturbVIntensity1", "_MainTexUseDisturb"):
+            value = floats.get(name)
+            if type(value) not in (int, float) or not math.isfinite(value):
+                raise ValueError(f"Dither disturbance control is missing or non-finite: material={record['Name']}, property={name}")
+        if floats["_Bi_Disturb"] not in (0, 1) or floats["_DisturbTex1Normal"] not in (0, 1):
+            raise NotImplementedError(f"Dither disturbance decoder is not verified: material={record['Name']}")
+    if "_USE_MASK" in keywords:
+        features.append(("_MaskTexUVWeights", "_MaskTexUVSpeed", "_MaskTexUVRotateMat"))
+        for name in ("_UseMaskTexAsAlpha", "_MaskTexUseDisturb"):
+            value = floats.get(name)
+            if type(value) not in (int, float) or not math.isfinite(value):
+                raise ValueError(f"Dither mask control is missing or non-finite: material={record['Name']}, property={name}")
+        if floats["_UseMaskTexAsAlpha"] not in (0, 1):
+            raise NotImplementedError(f"Dither mask channel is not verified: material={record['Name']}")
+    for weights, speed, rotation in features:
+        for name in (weights, speed, rotation):
+            value = colors.get(name)
+            if not isinstance(value, list) or len(value) != 4 or any(type(item) not in (int, float) or not math.isfinite(item) for item in value):
+                raise ValueError(f"Dither feature vector is missing or invalid: material={record['Name']}, property={name}")
+        if colors[weights][1:] != [0, 0, 0] or colors[speed][2:] != [0, 0]:
+            raise NotImplementedError(f"Dither feature requires UV0 without particle custom inputs: material={record['Name']}, property={weights}")
     if type(vertex_color_components) is not int or vertex_color_components not in (0, 3, 4):
         raise ValueError(f"Dither mesh COLOR component count is invalid: material={record['Name']}, components={vertex_color_components}")
 
@@ -90,12 +117,39 @@ def make_dither_mesh_material(record: MaterialRecord, textures: dict[tuple[str, 
     uv = tree.nodes.new("ShaderNodeUVMap")
     uv.uv_map = "UVMap"
     zero = _vec(tree, "Dither No UV Disturbance", "ADD", (0., 0., 0.), (0., 0., 0.))
-    sample_uv = _uv(tree, record, "_MainTex", uv.outputs[0], snapshot_time, zero, 0.)
+    disturbance = zero
+    feature_limitations: list[str] = []
+    keywords = record["RenderState"]["ValidKeywords"]
+    if "_USE_DISTURB" in keywords:
+        disturb_record: MaterialRecord = {**record, "Colors": {**colors,
+            "_DisturbTex1UVWeights": colors["_DisturbUVWeights1"],
+            "_DisturbTex1UVSpeed": colors["_DisturbUVSpeed1"],
+            "_DisturbTex1UVRotateMat": colors["_DisturbUVRotateMat1"]}}
+        disturb_source_uv = _scale(tree, "Dither Disturb Source UV0 Weight", uv.outputs[0], colors["_DisturbUVWeights1"][0])
+        disturb_uv = _uv(tree, disturb_record, "_DisturbTex1", disturb_source_uv, snapshot_time, zero, 0.)
+        disturb_sample = _sample(tree, record, "_DisturbTex1", textures, disturb_uv)
+        feature_limitations.extend(disturb_sample.limitations)
+        # Current HGBuffer 200 and DepthOnly 630 compile one disturbance map.
+        disturbance = (_normal_disturb(tree, "Dither Disturb 1", disturb_sample.rgba,
+                        floats["_DisturbUIntensity1"], 1., floats["_Bi_Disturb"])
+                       if floats["_DisturbTex1Normal"] else
+                       _disturb(tree, "Dither Disturb 1", disturb_sample.rgba,
+                        floats["_DisturbUIntensity1"], floats["_DisturbVIntensity1"], 1., floats["_Bi_Disturb"]))
+    main_disturbance = _scale(tree, "Dither Main Disturbance", disturbance, floats["_MainTexUseDisturb"]) if "_USE_DISTURB" in keywords else zero
+    sample_uv = _uv(tree, record, "_MainTex", uv.outputs[0], snapshot_time, main_disturbance, 0.)
     sample = _sample(tree, record, "_MainTex", textures, sample_uv)
     tint = colors["_TintColor"]
     rgb = _scale(tree, "Dither Source Tint Intensity", _vec(tree, "Dither Source Tint RGB", "MULTIPLY", sample.rgba.rgb, tuple(tint[:3])), floats["_TintColorIntensity"])
     alpha = _math(tree, "Dither Source Tint Alpha", "MULTIPLY", sample.rgba.alpha, tint[3] * floats["_TintColorAlpha"])
-    limitations = [*sample.limitations,
+    if "_USE_MASK" in keywords:
+        mask_disturbance = _scale(tree, "Dither Mask Disturbance", disturbance, floats["_MaskTexUseDisturb"])
+        mask_source_uv = _scale(tree, "Dither Mask Source UV0 Weight", uv.outputs[0], colors["_MaskTexUVWeights"][0])
+        mask_uv = _uv(tree, record, "_MaskTex", mask_source_uv, snapshot_time, mask_disturbance, 0.)
+        mask_sample = _sample(tree, record, "_MaskTex", textures, mask_uv)
+        feature_limitations.extend(mask_sample.limitations)
+        # Mask affects the native depth discard; HGBuffer RGB omits this sample.
+        alpha = _math(tree, "Dither Source Mask Alpha", "MULTIPLY", alpha, mask_sample.rgba.alpha)
+    limitations = [*sample.limitations, *feature_limitations,
         "Compiled VFXDitherAlpha HGBuffer RGB and DepthOnly discard are combined into one Blender surface; Unity equal-depth/stencil and deferred GBuffer pipeline are approximated",
         "Source Geometry/AlphaTest queue ordering is retained as evidence; Blender does not reproduce Unity draw ordering",
         "Game exposure is an explicit reference of one; game grading is not captured",
@@ -161,5 +215,6 @@ def make_dither_mesh_material(record: MaterialRecord, textures: dict[tuple[str, 
     material["endfield_fx_custom1_channels"] = "[]"
     material["endfield_fx_dither_shader"] = SHADER
     material["endfield_fx_dither_contract"] = "unlit_hgbuffer_depth_ign/1"
+    material["endfield_fx_dither_keywords"] = json.dumps(keywords)
     layout_shader_node_tree(tree)
     return material

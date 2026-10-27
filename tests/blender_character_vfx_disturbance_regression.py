@@ -23,6 +23,7 @@ from character_npr_vfx import CHARACTER_VFX_SHADER  # noqa: E402
 from endfield_scene_material_contract import load_catalog  # noqa: E402
 from rebuild_character_materials import MaterialSource, SourcePacket, read_packet  # noqa: E402
 Texel = tuple[float, float, float, float]
+TexelSource = Texel | dict[str, Texel]
 Vector = tuple[float, ...]
 
 def _image_cache() -> dict[tuple[tuple[str, int], str, str], bpy.types.Image]:
@@ -32,7 +33,7 @@ def _image_cache() -> dict[tuple[tuple[str, int], str, str], bpy.types.Image]:
             if node.type == 'TEX_IMAGE' and node.image and 'source_identity' in node
             for cab, path_id in (json.loads(node['source_identity']),)}
 
-def _value(socket: bpy.types.NodeSocket, texel: Texel, seconds: float) -> float | Vector:
+def _value(socket: bpy.types.NodeSocket, texel: TexelSource, seconds: float) -> float | Vector:
     if not socket.is_output:
         links = tuple(socket.links)
         if len(links) > 1:
@@ -41,9 +42,15 @@ def _value(socket: bpy.types.NodeSocket, texel: Texel, seconds: float) -> float 
         return float(value) if isinstance(value, (int, float)) else tuple(float(v) for v in value)
     node = socket.node
     if node.type == 'TEX_IMAGE':
-        if node.name != 'Source _SampleTex0':
-            raise AssertionError(f'Unexpected disturbance texture: {node.name}')
-        return texel[:3] if socket.name == 'Color' else texel[3]
+        if isinstance(texel, dict):
+            if node.name not in texel:
+                raise AssertionError(f'Missing texel for disturbance texture: {node.name}')
+            sample = texel[node.name]
+        else:
+            if node.name != 'Source _SampleTex0':
+                raise AssertionError(f'Unexpected disturbance texture: {node.name}')
+            sample = texel
+        return sample[:3] if socket.name == 'Color' else sample[3]
     if node.type == 'VALUE':
         return seconds if node.name == 'EF FX Source Time Seconds' else float(socket.default_value)
     if node.type == 'SEPXYZ':
