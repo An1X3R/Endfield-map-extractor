@@ -12,7 +12,7 @@ import tempfile
 import unittest
 import xml.etree.ElementTree as ET
 
-from endfield_character_tools import CharacterToolsError, ROOT, TOOL_PROJECTS, _relative, _verify_file, _verify_snapshot, character_tool_source_identity
+from endfield_character_tools import CharacterToolsError, ROOT, TOOL_PROJECTS, _patch_specs, _relative, _verify_file, _verify_snapshot, character_tool_source_identity
 from setup_character_tools import setup_character_tools
 from assemble_corresponding_source import is_source_package_path
 
@@ -34,11 +34,35 @@ class CharacterToolTests(unittest.TestCase):
         lock = json.loads((ROOT / "third_party" / "character-dotnet.lock.json").read_text(encoding="utf-8"))
         for key in ("animeStudio", "ruri"):
             value = lock[key]
-            _verify_file(ROOT / value["patch"], value["patchSha256"], key)
+            for patch_path, patch_sha256 in _patch_specs(value, key):
+                _verify_file(ROOT / patch_path, patch_sha256, key)
         license_text = (ROOT / "dotnet" / "CharacterTools" / "ThirdParty" / "Ruri" / "LICENSE").read_text(encoding="utf-8")
         self.assertIn("GNU AFFERO GENERAL PUBLIC LICENSE", license_text)
         self.assertEqual(lock["ruri"]["license"], "AGPL-3.0")
         self.assertEqual(len(character_tool_source_identity()), 64)
+
+    def test_animestudio_snapshot_requires_every_pinned_patch(self) -> None:
+        lock = json.loads((ROOT / "third_party" / "character-dotnet.lock.json").read_text(encoding="utf-8"))
+        dependency = lock["animeStudio"]
+        patches = [{"path": path, "sha256": digest} for path, digest in _patch_specs(dependency, "animeStudio")]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            source = root / "reader.cs"
+            source.write_bytes(b"source archive integrity fixture")
+            manifest = {
+                "format": "EndfieldPinnedSourceSnapshot/1",
+                "repository": dependency["repository"],
+                "commit": dependency["commit"],
+                "license": dependency["license"],
+                "files": {"reader.cs": hashlib.sha256(source.read_bytes()).hexdigest()},
+                "appliedPatches": patches,
+            }
+            (root / "SOURCE-PROVENANCE.json").write_text(json.dumps(manifest), encoding="utf-8")
+            _verify_snapshot(root, dependency, "animeStudio")
+            manifest["appliedPatches"] = patches[:-1]
+            (root / "SOURCE-PROVENANCE.json").write_text(json.dumps(manifest), encoding="utf-8")
+            with self.assertRaisesRegex(CharacterToolsError, "SOURCE_SNAPSHOT_PATCH_MISMATCH"):
+                _verify_snapshot(root, dependency, "animeStudio")
 
     def test_source_change_and_path_escape_fail_explicitly(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

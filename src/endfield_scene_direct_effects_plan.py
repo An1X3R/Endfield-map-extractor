@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import math
 from dataclasses import dataclass
 from pathlib import Path
@@ -185,6 +184,26 @@ def ready_effect_mesh_paths(manifests: tuple[Path, ...]) -> frozenset[str]:
                 ready.add(path + "##" + asset["Name"].casefold())
                 if path.endswith((".asset", ".mesh")):
                     ready.add(path)
+    return frozenset(ready)
+
+
+def ready_requested_effect_mesh_paths(manifests: tuple[Path, ...], requested: frozenset[str]) -> frozenset[str]:
+    """Check stream sidecars only for the exact requested FX meshes."""
+    containers, exports = _indices(manifests)
+    requested_by_key: dict[tuple[str, int], set[str]] = {}
+    for value in requested:
+        normalized = value.replace("\\", "/").casefold()
+        path, separator, name = normalized.partition("##")
+        if "/effects/" not in path or (not separator and not path.endswith((".asset", ".mesh"))):
+            continue
+        for key, asset in containers.get(path, {}).items():
+            if (asset["Type"] == "Mesh" and
+                    (not separator or asset["Name"].casefold() == name)):
+                requested_by_key.setdefault(key, set()).add(normalized)
+    ready: set[str] = set()
+    for key, paths in requested_by_key.items():
+        if any(effect_mesh_streams_ready(value.export, value.manifest) for value in exports.get(key, ())):
+            ready.update(paths)
     return frozenset(ready)
 
 

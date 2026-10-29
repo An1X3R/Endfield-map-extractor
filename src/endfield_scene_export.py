@@ -334,7 +334,8 @@ def _build_scene_exports(runtime_path: Path, canonical: Mapping[str, object], ou
         timings.append({"stage": "resource_prepare", "batch": 0, "seconds": time.perf_counter() - stage_started})
         passes.append(resource_audit)
         attempted.update(discovered)
-        if not discovered or resource_audit.get("missing") == []:
+        if (not discovered or resource_audit.get("missing") == []
+                or resource_audit.get("cachedAttempt") is True):
             break
     resource_audit = {**passes[-1], "dependencyPasses": passes}
     (output / "resource_preflight" / "resource_audit.json").write_text(json.dumps(resource_audit, indent=2), encoding="utf-8")

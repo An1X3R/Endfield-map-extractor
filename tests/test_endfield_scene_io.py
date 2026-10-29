@@ -120,28 +120,36 @@ class SceneIoTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "already exited"):
                 document["Nodes"]
 
-    def test_single_plan_scope_rebuilds_plan_indexes_without_sharing_mutations(self) -> None:
+    def test_single_plan_scope_reuses_bounded_path_index_and_bypasses_other_large_indexes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "source.json"
             path.write_text("first", encoding="utf-8")
-            slot = SceneSourceCacheSlot("path-id-index", dict, 1, 320 * 1024 * 1024)
+            path_slot = SceneSourceCacheSlot("path-id-index", dict, 1, 320 * 1024 * 1024)
+            renderer_slot = SceneSourceCacheSlot("dynamic-scene-renderers", dict, 1, 320 * 1024 * 1024)
 
             def build() -> dict[str, list[str]]:
                 return {"items": [path.read_text(encoding="utf-8")]}
 
             with single_scene_plan_io_session() as session:
-                first = cached_scene_source_value(slot, (path,), (), build)
-                first["items"].append("changed locally")
-                second = cached_scene_source_value(slot, (path,), (), build)
-                self.assertEqual({"items": ["first"]}, second)
-                self.assertIsNot(first, second)
-                self.assertEqual(2, session.statistics()["source_cache_misses"])
-                self.assertEqual(0, session.statistics()["retained_source_cache_entries"])
-                self.assertEqual(0, session.statistics()["estimated_source_cache_bytes"])
+                first = cached_scene_source_value(path_slot, (path,), (), build)
+                with self.assertRaises(ReadOnlySceneDataError):
+                    first["items"].append("changed locally")
+                self.assertIs(first, cached_scene_source_value(path_slot, (path,), (), build))
+                unshared = cached_scene_source_value(renderer_slot, (path,), (), build)
+                unshared["items"].append("changed locally")
+                rebuilt = cached_scene_source_value(renderer_slot, (path,), (), build)
+                self.assertEqual({"items": ["first"]}, rebuilt)
+                self.assertIsNot(unshared, rebuilt)
+                self.assertEqual(3, session.statistics()["source_cache_misses"])
+                self.assertEqual(1, session.statistics()["source_cache_hits"])
+                self.assertEqual(1, session.statistics()["retained_source_cache_entries"])
+                self.assertGreater(session.statistics()["estimated_source_cache_bytes"], 0)
+
+            self.assertEqual(0, len(session.source_cache))
 
             with scene_io_session() as session:
-                cached = cached_scene_source_value(slot, (path,), (), build)
-                self.assertIs(cached, cached_scene_source_value(slot, (path,), (), build))
+                cached = cached_scene_source_value(path_slot, (path,), (), build)
+                self.assertIs(cached, cached_scene_source_value(path_slot, (path,), (), build))
                 with self.assertRaises(ReadOnlySceneDataError):
                     cached["items"].append("changed locally")
                 self.assertEqual(1, session.statistics()["source_cache_hits"])

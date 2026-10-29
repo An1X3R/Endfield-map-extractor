@@ -20,6 +20,7 @@ SOURCE_KIT_FORMAT = "EndfieldCorrespondingSourceKit/1"
 SOURCE_ROOTS = frozenset({"docs", "dotnet", "patches", "schemas", "src", "tests", "third_party", "webui"})
 ROOT_SOURCE_NAMES = frozenset(
     {
+        ".gitattributes",
         ".gitignore",
         "LICENSE",
         "README.md",

@@ -15,6 +15,8 @@ VENV_ROOT = APP_ROOT / ".venv"
 REQUIREMENTS = APP_ROOT / "requirements.txt"
 STATUS_FILE = APP_ROOT / ".runtime_status.json"
 SETUP_SCRIPT = APP_ROOT / "setup_development_environment.ps1"
+MINIMUM_PYTHON = (3, 11)
+MAXIMUM_PYTHON_EXCLUSIVE = (3, 15)
 
 
 def venv_python() -> Path:
@@ -36,7 +38,17 @@ def setup_command() -> str:
     return f'powershell -ExecutionPolicy Bypass -File "{SETUP_SCRIPT}"'
 
 
+def require_supported_python() -> None:
+    version = sys.version_info[:2]
+    if sys.implementation.name != "cpython" or not MINIMUM_PYTHON <= version < MAXIMUM_PYTHON_EXCLUSIVE:
+        raise RuntimeError(
+            "CPython 3.11 through 3.14 is required for the pinned runtime dependencies: "
+            f"detected={sys.implementation.name} {version[0]}.{version[1]}"
+        )
+
+
 def require_virtualenv() -> Path:
+    require_supported_python()
     interpreter = venv_python()
     if not interpreter.is_file():
         raise RuntimeError(
@@ -64,6 +76,21 @@ def ensure_virtualenv() -> tuple[Path, bool]:
 
 
 def verify_requirements(interpreter: Path, requirements: Path) -> tuple[bool, str]:
+    version_process = subprocess.run(
+        [
+            str(interpreter),
+            "-c",
+            "import sys; print(f'{sys.implementation.name} {sys.version_info.major}.{sys.version_info.minor}'); "
+            "raise SystemExit(0 if sys.implementation.name == 'cpython' "
+            "and (3, 11) <= sys.version_info[:2] < (3, 15) else 1)",
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if version_process.returncode != 0:
+        detected = (version_process.stdout or version_process.stderr or "unknown interpreter").strip()
+        return False, f"prepared interpreter must be CPython 3.11 through 3.14; detected={detected}"
     if not requirement_lines(requirements):
         return True, "no third-party requirements"
     command = [
@@ -139,6 +166,11 @@ def arguments() -> argparse.Namespace:
 
 def main() -> int:
     args = arguments()
+    try:
+        require_supported_python()
+    except RuntimeError as error:
+        print(f"ENDFIELD_EXTRACTOR_PYTHON_UNSUPPORTED: {error}", file=sys.stderr)
+        return 2
     if args.prepare:
         interpreter, created = ensure_virtualenv()
         dependency_ok, dependency_message = install_requirements(interpreter, REQUIREMENTS)

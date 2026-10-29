@@ -92,6 +92,31 @@ def _verify_file(path: Path, expected: object, field: str) -> None:
         raise CharacterToolsError(f"CHARACTER_TOOLS_SOURCE_HASH_MISMATCH: {path}; install the pinned source and patch before building.")
 
 
+def _patch_specs(dependency: dict[str, object], name: str) -> tuple[tuple[str, str], ...]:
+    """Return the exact ordered patch set pinned for a dependency."""
+    specs = [
+        (
+            _text(dependency.get("patch"), f"{name}.patch"),
+            _text(dependency.get("patchSha256"), f"{name}.patchSha256"),
+        )
+    ]
+    additional = dependency.get("additionalPatches", [])
+    if not isinstance(additional, list):
+        raise CharacterToolsError(f"CHARACTER_TOOLS_INVALID_ADDITIONAL_PATCHES: {name}")
+    for index, value in enumerate(additional):
+        patch = _object(value, f"{name}.additionalPatches[{index}]")
+        specs.append(
+            (
+                _text(patch.get("path"), f"{name}.additionalPatches[{index}].path"),
+                _text(patch.get("sha256"), f"{name}.additionalPatches[{index}].sha256"),
+            )
+        )
+    paths = [path for path, _ in specs]
+    if len(set(paths)) != len(paths):
+        raise CharacterToolsError(f"CHARACTER_TOOLS_DUPLICATE_PATCH_PATH: {name}")
+    return tuple(specs)
+
+
 def _snapshot_files(root: Path) -> dict[str, Path]:
     """Enumerate the complete supplied source inventory, excluding generated build directories."""
     generated = {".git", "bin", "obj", "bin-flat", "obj-flat", ".vs"}
@@ -121,8 +146,11 @@ def _verify_snapshot(root: Path, dependency: dict[str, object], name: str) -> No
     rows = [_object(value, f"{name}.snapshot.appliedPatches") for value in patches]
     for row in rows:
         _verify_file(_relative(ROOT, row.get("path"), f"{name}.snapshot.patch.path"), row.get("sha256"), f"{name}.snapshot.patch.sha256")
-    if not any(row.get("path") == dependency.get("patch") and row.get("sha256") == dependency.get("patchSha256") for row in rows):
-        raise CharacterToolsError(f"CHARACTER_TOOLS_SOURCE_SNAPSHOT_PATCH_MISMATCH: {name}")
+    applied = {(row.get("path"), row.get("sha256", "").upper()) for row in rows
+               if isinstance(row.get("path"), str) and isinstance(row.get("sha256"), str)}
+    for patch_path, patch_sha256 in _patch_specs(dependency, name):
+        if (patch_path, patch_sha256.upper()) not in applied:
+            raise CharacterToolsError(f"CHARACTER_TOOLS_SOURCE_SNAPSHOT_PATCH_MISMATCH: {name}/{patch_path}")
 
 
 def _verify_checkout(root: Path, dependency: dict[str, object], name: str) -> None:
@@ -151,8 +179,9 @@ def verify_character_sources(animestudio_root: Path, ruri_root: Path) -> dict[st
     lock = _lock()
     for name, root in (("animeStudio", animestudio_root), ("ruri", ruri_root)):
         dependency = _object(lock.get(name), name)
-        patch = _relative(ROOT, dependency.get("patch"), f"{name}.patch")
-        _verify_file(patch, dependency.get("patchSha256"), f"{name}.patchSha256")
+        for patch_path, patch_sha256 in _patch_specs(dependency, name):
+            patch = _relative(ROOT, patch_path, f"{name}.patch")
+            _verify_file(patch, patch_sha256, f"{name}.patchSha256")
         entries = dependency.get("compiledFiles")
         if not isinstance(entries, list) or not entries:
             raise CharacterToolsError(f"CHARACTER_TOOLS_MISSING_COMPILED_FILES: {name}")
@@ -186,7 +215,7 @@ def character_tool_source_identity() -> str:
                      and path.suffix in {".cs", ".csproj", ".props", ".targets", ".json", ".txt", ".md"})
     for name in ("animeStudio", "ruri"):
         entry = _object(_lock()[name], name)
-        files.add(_relative(ROOT, entry["patch"], f"{name}.patch"))
+        files.update(_relative(ROOT, path, f"{name}.patch") for path, _ in _patch_specs(entry, name))
     entries = [(path.relative_to(ROOT).as_posix(), _sha(path)) for path in sorted(files)]
     return hashlib.sha256(json.dumps(entries, separators=(",", ":")).encode()).hexdigest()
 
@@ -272,10 +301,10 @@ def build_character_tools(request: CharacterToolBuild) -> Path:
     tools: dict[str, str] = {}
     projects = [(key, ROOT / "dotnet" / "CharacterTools" / name / f"{name}.csproj", name) for key, name in TOOL_PROJECTS.items()]
     for key, project, name in projects:
-        _run([str(request.dotnet), "restore", str(project), "--locked-mode", "--configfile", str(request.nuget_config),
+        _run([str(request.dotnet), "restore", str(project), "--disable-build-servers", "--locked-mode", "--configfile", str(request.nuget_config),
               "--packages", str(request.nuget_packages), *properties], logs / f"{name}.restore.log", environment)
         output = request.output_root / "tools" / name
-        _run([str(request.dotnet), "build", str(project), "--no-restore", "-c", "Release", "-f", "net9.0-windows", "--output", str(output),
+        _run([str(request.dotnet), "build", str(project), "--disable-build-servers", "--no-restore", "-c", "Release", "-f", "net9.0-windows", "--output", str(output),
               *properties], logs / f"{name}.build.log", environment)
         artifact_name = "AnimeStudio.CLI" if key == "json_reader" else name
         artifact = output / f"{artifact_name}{'.dll' if key in DLL_TOOLS else '.exe'}"

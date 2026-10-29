@@ -12,8 +12,10 @@ import bpy
 from mathutils import Matrix
 
 import basic_expression_shape_baker as basic_baker
-from basic_expression_shape_baker import BasicExpressionDefinition, BakedExpression, _attach_driver, _decode_source, _extract_pose_targets, _mapping_for_control, _read_json, _selected_rig_meshes
-from character_expression_shape_keys import evaluated_skin_vertices
+from basic_expression_shape_baker import BasicExpressionDefinition, BakedExpression, _attach_driver, _decode_source, _extract_pose_target_batch, _mapping_for_control, _read_json, _selected_rig_meshes
+from character_expression_shape_keys import (
+    ExpressionDriverControl, FacialBoneTarget, evaluated_skin_batch, validate_expression_drivers,
+)
 
 
 @dataclass(frozen=True)
@@ -279,7 +281,7 @@ def _controller(name: str, labels: tuple[str, ...]) -> bpy.types.Object:
 
 
 def _bake_existing_key_data(armature: bpy.types.Object, meshes: tuple[bpy.types.Object, ...],
-                            targets: tuple[object, ...], control_name: str, tolerance: float) -> tuple[BakedExpression, ...]:
+                            targets: tuple[FacialBoneTarget, ...], control_name: str, tolerance: float) -> tuple[BakedExpression, ...]:
     identity = Matrix.Identity(4)
     for obj in meshes:
         if obj.data.users != 1:
@@ -292,17 +294,17 @@ def _bake_existing_key_data(armature: bpy.types.Object, meshes: tuple[bpy.types.
             raise ValueError(f"Independent expression needs relative shape keys and a unique source control name: {obj.name}/{control_name}")
         if keys and any(abs(float(key.value)) > tolerance for key in keys.key_blocks):
             raise ValueError(f"Existing shape keys must be neutral before independent expression baking: {obj.name}")
-    neutral = {obj.name: evaluated_skin_vertices(obj) for obj in meshes}
+    neutral = evaluated_skin_batch(meshes)
     try:
         for target in targets:
             armature.pose.bones[target.bone_name].matrix_basis = target.matrix_basis.copy()
-        bpy.context.view_layer.update()
-        posed = {obj.name: evaluated_skin_vertices(obj) for obj in meshes}
+        posed = evaluated_skin_batch(meshes)
     finally:
         for target in targets:
             armature.pose.bones[target.bone_name].matrix_basis = identity
-        bpy.context.view_layer.update()
+        # The endpoint read below evaluates the neutral rig and new key together.
     baked: list[BakedExpression] = []
+    created: list[tuple[bpy.types.Object, bpy.types.ShapeKey]] = []
     for obj in meshes:
         deltas = tuple(new - old for new, old in zip(posed[obj.name], neutral[obj.name], strict=True))
         maximum_delta = max((delta.length for delta in deltas), default=0.0)
@@ -315,17 +317,20 @@ def _bake_existing_key_data(armature: bpy.types.Object, meshes: tuple[bpy.types.
         key.relative_key = basis
         for point, original, delta in zip(key.data, basis.data, deltas, strict=True):
             point.co = original.co + delta
-        key.value = 0.0
-        key.value = 1.0
-        bpy.context.view_layer.update()
-        actual = evaluated_skin_vertices(obj)
-        error = max((value - expected).length for value, expected in zip(actual, posed[obj.name], strict=True))
-        key.value = 0.0
-        bpy.context.view_layer.update()
-        if error > tolerance:
-            obj.shape_key_remove(key)
-            raise ValueError(f"Independent shape endpoint differs from exact source pose: {obj.name}/{control_name}, error={error}, tolerance={tolerance}")
+        created.append((obj, key))
         baked.append(BakedExpression(obj.name, key.name, sum(delta.length > tolerance for delta in deltas), maximum_delta))
+    try:
+        for _obj, key in created:
+            key.value = 1.0
+        actual = evaluated_skin_batch(tuple(obj for obj, _key in created))
+        for obj, key in created:
+            error = max((value - expected).length for value, expected in zip(actual[obj.name], posed[obj.name], strict=True))
+            if error > tolerance:
+                raise ValueError(f"Independent shape endpoint differs from exact source pose: {obj.name}/{control_name}, error={error}, tolerance={tolerance}")
+    finally:
+        for _obj, key in created:
+            key.value = 0.0
+        bpy.context.view_layer.update()
     return tuple(baked)
 
 
@@ -337,11 +342,11 @@ def bake_expression_table_endpoints(manifest_path: Path, audit_path: Path, rig_n
     manifest_resolved = manifest_path.resolve(strict=True)
     manifest = _manifest(manifest_resolved)
     table_path = (manifest_resolved.parent / manifest.source_document_path).resolve(strict=True)
-    table, table_payload, table_resolved = _read_json(table_path, "independent expression source table")
+    table, table_payload, table_resolved = basic_baker._read_json(table_path, "independent expression source table")
     audit, audit_payload, audit_resolved = _read_json(audit_path, "source audit")
     if audit.get("format") != "EndfieldCharacterSourceAudit/1":
         raise ValueError(f"Unsupported source audit format: {audit_resolved}")
-    source = _verify_table_identity(manifest, table, table_payload, audit_payload)
+    _verify_table_identity(manifest, table, table_payload, audit_payload)
     _verify_control_partition(table, manifest)
     armature = bpy.data.objects.get(rig_name)
     if armature is None or armature.type != "ARMATURE" or armature.data.pose_position != "POSE":
@@ -393,12 +398,15 @@ def bake_expression_table_endpoints(manifest_path: Path, audit_path: Path, rig_n
                 mapping_info = _mapping_for_control(decoded, definition)
                 if mapping_info is None:
                     raise ValueError(f"Manifest endpoint control is absent from decoded table: {definition.source_name}")
-                _, _, _, mapping_bones = mapping_info
-                targets, mapping_rows = _extract_pose_targets(armature, decoded, definition, mapping_bones)
+                mapping_info_by_name[definition.source_name] = mapping_info
+            poses = _extract_pose_target_batch(armature, decoded,
+                tuple((definition, mapping_info_by_name[definition.source_name][3])
+                      for definition in decoded.definitions))
+            for definition in decoded.definitions:
+                targets, mapping_rows = poses[definition.source_name]
                 baked_by_name[definition.source_name] = _bake_existing_key_data(
                     armature, meshes, targets, definition.source_name, tolerance)
                 mapping_rows_by_name[definition.source_name] = mapping_rows
-                mapping_info_by_name[definition.source_name] = mapping_info
         finally:
             for modifier in downstream:
                 modifier.show_viewport = True
@@ -512,53 +520,31 @@ def validate_expression_table_endpoints(receipt: dict[str, object], tolerance: f
     controller = bpy.data.objects.get(controller_name)
     if controller is None or controller.get("expression_controls_format") != "EndfieldIndependentExpressionControls/1":
         raise ValueError(f"Saved ear expression controller is missing or malformed: {controller_name}")
-    checks: list[dict[str, object]] = []
     active = tuple(_record(value, f"receipt.controls[{index}]") for index, value in enumerate(
         _array(receipt.get("controls"), "receipt.controls")) if value.get("status") == "baked_and_synchronized")
     original_values = {row["source_control"]: float(controller[row["source_control"]]) for row in active}
     if any(abs(value) > tolerance for value in original_values.values()):
         raise AssertionError(f"Saved ear controls do not open neutral: {original_values}")
-    try:
-        for row in active:
-            label = _text(row.get("source_control"), "control.source_control")
-            driven = tuple(_record(item, f"{label}.driven_objects[{index}]") for index, item in enumerate(
-                _array(row.get("driven_objects"), f"{label}.driven_objects")))
-            for value in (0.0, 0.5, 1.0):
-                controller[label] = value
-                controller.update_tag()
-                for target in driven:
-                    obj = bpy.data.objects.get(_text(target.get("object_name"), f"{label}.object_name"))
-                    if obj is None or obj.data.shape_keys is None:
-                        raise ValueError(f"Saved ear shape-key data is missing: {target}")
-                    obj.data.shape_keys.update_tag()
-                bpy.context.view_layer.update()
-                errors: list[float] = []
-                for target in driven:
-                    obj_name = _text(target.get("object_name"), f"{label}.object_name")
-                    key_name = _text(target.get("shape_key_name"), f"{label}.shape_key_name")
-                    obj = bpy.data.objects[obj_name]
-                    key = obj.data.shape_keys.key_blocks.get(key_name)
-                    if key is None or abs(float(key.value) - value) > tolerance:
-                        raise AssertionError(f"Ear shape-key driver did not follow its controller: {obj_name}/{key_name}")
-                    keys = key.id_data
-                    path = key.path_from_id("value")
-                    curves = tuple(curve for curve in keys.animation_data.drivers if curve.data_path == path) if keys.animation_data else ()
-                    if len(curves) != 1:
-                        raise AssertionError(f"Expected one ear shape-key driver: {obj_name}/{key_name}, count={len(curves)}")
-                    driver = curves[0].driver
-                    if driver.type != "SCRIPTED" or driver.expression != "v" or len(driver.variables) != 1:
-                        raise AssertionError(f"Unexpected ear shape-key driver: {obj_name}/{key_name}")
-                    variable = driver.variables[0]
-                    target_id = variable.targets[0]
-                    if variable.name != "v" or variable.type != "SINGLE_PROP" or target_id.id != controller or target_id.data_path != f'["{label}"]':
-                        raise AssertionError(f"Ear shape-key driver is not bound to its exact control: {obj_name}/{key_name}")
-                    errors.append(abs(float(key.value) - value))
-                checks.append({"control": label, "requested": value, "driven_key_count": len(errors),
-                               "maximum_driver_error": max(errors, default=0.0)})
-    finally:
-        for label, value in original_values.items():
-            controller[label] = value
-        bpy.context.view_layer.update()
+    controls: list[ExpressionDriverControl] = []
+    for row in active:
+        label = _text(row.get("source_control"), "control.source_control")
+        driven = tuple(_record(item, f"{label}.driven_objects[{index}]") for index, item in enumerate(
+            _array(row.get("driven_objects"), f"{label}.driven_objects")))
+        keys: list[bpy.types.ShapeKey] = []
+        for target in driven:
+            obj_name = _text(target.get("object_name"), f"{label}.object_name")
+            key_name = _text(target.get("shape_key_name"), f"{label}.shape_key_name")
+            obj = bpy.data.objects.get(obj_name)
+            if obj is None or obj.type != 'MESH' or obj.data.shape_keys is None:
+                raise ValueError(f"Saved ear shape-key data is missing: {obj_name}/{key_name}")
+            key = obj.data.shape_keys.key_blocks.get(key_name)
+            if key is None:
+                raise AssertionError(f"Saved ear shape key is missing: {obj_name}/{key_name}")
+            keys.append(key)
+        controls.append(ExpressionDriverControl(label, tuple(keys)))
+    checks = [{"control": check.label, "requested": check.requested,
+               "driven_key_count": check.driven_key_count, "maximum_driver_error": check.maximum_driver_error}
+              for check in validate_expression_drivers(controller, tuple(controls), tolerance)]
     return {"status": "all_independent_expression_drivers_verified_at_0_0_5_1_and_restored",
             "controller": controller_name, "checked_control_count": len(active), "checks": checks,
             "controls_restored": original_values}

@@ -9,6 +9,12 @@
     "license": "MIT",
     "patch": "patches/animestudio-character-texture-provider.patch",
     "patchSha256": "8152fda2c15b5c28fa9df7410c2249bb4380c208c0d97b420e2a59bb54d2bb89",
+    "additionalPatches": [
+      {
+        "path": "patches/animestudio-character-typetree-performance.patch",
+        "sha256": "723AC28311CC7BF5274B179A92C796002BF310C361C976CF3E54F558FD1F2765"
+      }
+    ],
     "compiledFiles": [
       {
         "path": "AnimeStudio.Utility/ModelConverter.cs",
@@ -21,6 +27,10 @@
       {
         "path": "AnimeStudio/BundleFile.cs",
         "sha256": "64f3824d4bdcf15d488548280a80dfc7b5c68c838108e155e18c8d2d9f52329f"
+      },
+      {
+        "path": "AnimeStudio/TypeTreeHelper.cs",
+        "sha256": "798671B581479E60A6B7CAA1F69ACA965A335DDCDB96AE9D1CF09278508EFAE7"
       },
       {
         "path": "AnimeStudio/Crypto/UnityCN.cs",

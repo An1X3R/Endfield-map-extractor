@@ -11,7 +11,9 @@ from src.assemble_corresponding_source import (
 class CorrespondingSourcePathTests(unittest.TestCase):
     def test_includes_build_source_and_license_material(self) -> None:
         for value in (
+            ".gitattributes",
             "src/endfield_dependency_bootstrap.py",
+            "src/extractor_core/lz4_numba.py",
             "dotnet/CharacterTools/CharacterModel/CharacterModel.csproj",
             "patches/ruri-character-humanoid.patch",
             "third_party/licenses/Ruri-AGPL-3.0.txt",
@@ -31,6 +33,7 @@ class CorrespondingSourcePathTests(unittest.TestCase):
     def test_excludes_generated_game_and_sdk_payloads(self) -> None:
         for value in (
             "webui/dist/assets/app.js",
+            "src/extractor_core/__pycache__/lz4_numba.pyc",
             "webui/.playwright-cli/traces/page.jpeg",
             "dotnet/CharacterTools/bin/Release/tool.dll",
             "third_party/sources/scene/AnimeStudio/CNKeys.json",

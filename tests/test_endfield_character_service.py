@@ -10,11 +10,14 @@ import sys
 import tempfile
 import unittest
 from uuid import uuid4
+from unittest.mock import patch
 
 from endfield_character_cache import CharacterSourceChangedError, source_stamp
 from endfield_character_runtime import configure_character_runtime
+from endfield_character_selection import CharacterSelection
 from endfield_character_service import (
-    CharacterService, CharacterServiceError, _PATH_DEFAULTS, _VALUE_DEFAULTS, require_character_export_blender,
+    CharacterService, CharacterServiceError, _PATH_DEFAULTS, _VALUE_DEFAULTS, _digest,
+    require_character_export_blender,
 )
 from endfield_character_sources import CharacterSourceContext, game_source_stamps, prepare_character_sources
 from endfield_character_tools import character_tool_source_identity
@@ -112,6 +115,39 @@ class CharacterServiceTests(unittest.TestCase):
         receipt = helper_root / "current.json"
         receipt.write_text(json.dumps({"sourceIdentity": identity, "outputs": outputs}), encoding="utf-8")
         return receipt
+
+    def test_export_reuses_canonical_source_snapshot_before_output_validation(self) -> None:
+        identity = "c" * 64
+        variant_id = "variant-1"
+        selection_id = "playable-test_character"
+        selection = CharacterSelection(identity, "test_character", "template", "part", "characters",
+                                       "assets/test.prefab", "main/provider.ab")
+        request = {
+            "format": "CharacterExportRequest/1",
+            "request_id": str(uuid4()),
+            "catalog_id": _digest((identity, "catalog/1")),
+            "source_identity": identity,
+            "selection_id": selection_id,
+            "variant_id": variant_id,
+            "export_profile_id": "hgrp-preview",
+            "output_label": "TestCharacter",
+            "options": {},
+        }
+        variants = {variant_id: (selection_id, selection)}
+        with (patch.object(self.service, "_catalog_source",
+                           return_value=(self.context, object(), object(), identity)) as source_snapshot,
+              patch.object(self.service, "_variants", return_value=variants),
+              patch.object(self.service, "_npc_variants", return_value={}),
+              patch.object(self.service, "_authoring_tools", return_value={}),
+              patch.object(self.service, "_runtime_defaults", return_value=(self.context.blender, {})),
+              patch("endfield_character_service.require_character_export_blender")):
+            canonical = self.service.canonical_export(request)
+            source_snapshot.reset_mock()
+
+            with self.assertRaisesRegex(CharacterServiceError, "产物目录不属于"):
+                self.service.export(canonical, self.root / "outside", no_cancel, no_progress)
+
+        self.assertEqual(1, source_snapshot.call_count)
 
     def test_appearance_runtime_defaults_normalize_configured_tool_paths(self) -> None:
         reader = self.root / "json-reader.exe"

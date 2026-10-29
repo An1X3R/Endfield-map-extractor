@@ -6,24 +6,28 @@ $coordinator = Join-Path $root 'src\endfield_first_run.py'
 $venvPython = Join-Path $root '.venv\Scripts\python.exe'
 
 $hostPython = $null
+$pythonVersionCheck = "import sys; raise SystemExit(0 if sys.implementation.name == 'cpython' and (3, 11) <= sys.version_info[:2] < (3, 15) else 1)"
 $py = Get-Command py -ErrorAction SilentlyContinue
 if ($py) {
-    & $py.Source -3 -c "import sys; print(sys.executable)" *> $null
-    if ($LASTEXITCODE -eq 0) {
-        $hostPython = @($py.Source, '-3')
+    foreach ($pythonArgument in @('-3.14', '-3.13', '-3.12', '-3.11')) {
+        & $py.Source $pythonArgument -c $pythonVersionCheck *> $null
+        if ($LASTEXITCODE -eq 0) {
+            $hostPython = @($py.Source, $pythonArgument)
+            break
+        }
     }
 }
 if (-not $hostPython) {
     $python = Get-Command python -ErrorAction SilentlyContinue
     if ($python) {
-        & $python.Source -c "import sys; print(sys.executable)" *> $null
+        & $python.Source -c $pythonVersionCheck *> $null
         if ($LASTEXITCODE -eq 0) {
             $hostPython = @($python.Source)
         }
     }
 }
 if (-not $hostPython) {
-    throw 'No usable Python 3 interpreter was found. Install Python 3.11+ and retry.'
+    throw 'No compatible CPython 3.11 through 3.14 interpreter was found. Install one and retry.'
 }
 
 if ($hostPython.Count -eq 2) {

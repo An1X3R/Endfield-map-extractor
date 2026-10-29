@@ -19,23 +19,27 @@ $env:npm_config_cache = Join-Path $localCache 'npm'
 
 $hostPython = $null
 $py = Get-Command py -ErrorAction SilentlyContinue
+$pythonVersionCheck = "import sys; raise SystemExit(0 if sys.implementation.name == 'cpython' and (3, 11) <= sys.version_info[:2] < (3, 15) else 1)"
 if ($py) {
-    & $py.Source -3 -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)" *> $null
-    if ($LASTEXITCODE -eq 0) {
-        $hostPython = @($py.Source, '-3')
+    foreach ($pythonArgument in @('-3.14', '-3.13', '-3.12', '-3.11')) {
+        & $py.Source $pythonArgument -c $pythonVersionCheck *> $null
+        if ($LASTEXITCODE -eq 0) {
+            $hostPython = @($py.Source, $pythonArgument)
+            break
+        }
     }
 }
 if (-not $hostPython) {
     $python = Get-Command python -ErrorAction SilentlyContinue
     if ($python) {
-        & $python.Source -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)" *> $null
+        & $python.Source -c $pythonVersionCheck *> $null
         if ($LASTEXITCODE -eq 0) {
             $hostPython = @($python.Source)
         }
     }
 }
 if (-not $hostPython) {
-    throw 'Python 3.11 or newer is required. Install it, then rerun setup_development_environment.ps1.'
+    throw 'CPython 3.11 through 3.14 is required. Install a supported version, then rerun setup_development_environment.ps1.'
 }
 
 if ($hostPython.Count -eq 2) {

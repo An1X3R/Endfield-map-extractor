@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import os
 import re
 import struct
 from dataclasses import dataclass
@@ -10,12 +11,14 @@ from io import BytesIO
 from pathlib import Path
 from typing import Callable
 
-from endfield_scene_io import SceneInputChangedError, SceneSourceCacheSlot, cached_scene_source_value
+from endfield_scene_io import (SceneInputChangedError, SceneSourceCacheSlot, cached_scene_source_value,
+                               resolve_scene_read_path)
 
 from . import flatbuffer as fb
 from . import vfs
 from .instances import GROUP_HASH as STATIC_GROUP_HASH, _instance_pattern, iter_entities
 from .lz4 import decompress_lz4_inv
+from .projected_decals import build_path_id_index_views_cancellable
 from .resources import iter_path_records, load_group, validate_vfs_root
 from .scene_identity import validate_scene_id
 
@@ -65,6 +68,9 @@ class MapEffectInventory:
 
 _EFFECT_INVENTORY_CACHE = SceneSourceCacheSlot(
     "dynamic-scene-effects", dict, 4, 64 * 1024 * 1024
+)
+_PATH_RECORD_VALIDATION_CACHE = SceneSourceCacheSlot(
+    "path-id-record-validation", bytes, 4, 64
 )
 
 
@@ -262,30 +268,37 @@ def _resolve_hashes(
     string_path_hash: Path, wanted: frozenset[bytes], check_cancelled: Callable[[], None],
     path_prefixes: tuple[str, ...],
 ) -> dict[bytes, str]:
-    data = string_path_hash.read_bytes()
-    if len(data) < 8:
-        raise EffectDecodeError(f"StringPathHash is too short: path={string_path_hash}, bytes={len(data)}")
-    strings_offset, count = struct.unpack_from("<II", data, 0)
-    if strings_offset != 8 + count * 24 or strings_offset > len(data):
+    with string_path_hash.open("rb") as source:
+        header = source.read(8)
+        byte_length = os.fstat(source.fileno()).st_size
+    if len(header) < 8:
+        raise EffectDecodeError(f"StringPathHash is too short: path={string_path_hash}, bytes={len(header)}")
+    strings_offset, count = struct.unpack_from("<II", header, 0)
+    if strings_offset != 8 + count * 24 or strings_offset > byte_length:
         raise EffectDecodeError(
             f"StringPathHash layout differs: path={string_path_hash}, "
-            f"offset={strings_offset}, count={count}, bytes={len(data)}"
+            f"offset={strings_offset}, count={count}, bytes={byte_length}"
         )
-    by_offset: dict[int, set[bytes]] = {}
-    for word_index, position in enumerate(range(8, strings_offset - 8, 8)):
-        if word_index % 8192 == 0:
-            check_cancelled()
-        identifier = data[position:position + 8]
-        if identifier not in wanted:
-            continue
-        relative_offset = struct.unpack_from("<Q", data, position + 8)[0]
-        by_offset.setdefault(strings_offset + relative_offset, set()).add(identifier)
-    del data
+    check_cancelled()
+    path_views = (build_path_id_index_views_cancellable(string_path_hash, check_cancelled)
+                  if wanted else None)
+    resolved_path = resolve_scene_read_path(string_path_hash)
+
+    if path_views is None or not path_views.path_records_valid:
+        def validate_path_records() -> bytes:
+            for record_index, _value, _opaque_record, _string_at in iter_path_records(resolved_path):
+                if record_index % 8192 == 0:
+                    check_cancelled()
+            return b""
+
+        cached_scene_source_value(_PATH_RECORD_VALIDATION_CACHE, (resolved_path,), (), validate_path_records)
+    check_cancelled()
     found: dict[bytes, set[str]] = {identifier: set() for identifier in wanted}
-    for record_index, value, _opaque_record, string_at in iter_path_records(string_path_hash):
-        if record_index % 8192 == 0:
+    for wanted_index, identifier in enumerate(wanted):
+        if wanted_index % 8192 == 0:
             check_cancelled()
-        for identifier in by_offset.get(string_at, ()):
+        strict_paths = path_views.strict_paths(identifier) if path_views is not None else ()
+        for value in strict_paths:
             if value.casefold().startswith(path_prefixes):
                 found[identifier].add(value)
     unresolved = sorted(identifier.hex() for identifier, values in found.items() if not values)

@@ -1004,6 +1004,10 @@ class CharacterService:
         return {**request, "source": {name: str(path) for name, path in paths.items()}}
 
     def canonical_export(self, payload: dict[str, object]) -> dict[str, object]:
+        return self._canonical_export_with_source(payload)[0]
+
+    def _canonical_export_with_source(self, payload: dict[str, object]) -> tuple[
+            dict[str, object], CharacterSourceContext, CharacterCatalog, IndependentNpcCatalog, str]:
         kind, request = normalize_character_request(payload)
         if kind != "export":
             raise CharacterServiceError("需要角色导出请求。")
@@ -1058,7 +1062,8 @@ class CharacterService:
                     actions = self._npc_actions(context, match[1], identity, str(request["variant_id"]), _no_cancel)
                     if not any(action.action_id == action_id for action in actions.actions):
                         raise CharacterServiceError("所选 NPC 动作没有当前配置的精确 CPU/Avatar 绑定，请刷新动作目录。")
-                return {**request, "selection": asdict(match[1]), "context": _context_row(context)}
+                return ({**request, "selection": asdict(match[1]), "context": _context_row(context)},
+                        context, catalog, npc, identity)
             elif options.get("raw_expressions") or options.get("basic_mmd"):
                 raise CharacterServiceError("独立 NPC 尚未接入确切的表情模板引用，请关闭原始表情和基础 MMD 选项。")
             elif self._npc_prepare_script() is None:
@@ -1070,8 +1075,8 @@ class CharacterService:
                         raise CharacterServiceError("敌人控制器片段请使用 action_id；reference_id 仅用于 NPC CPU 来源引用。")
                     document = self._enemy_actions(context, match[1], identity, str(request["variant_id"]), _no_cancel)
                     selected = enemy_animation_selection_document(document, match[1], str(animation["action_id"]))
-                    return {**request, "selection": asdict(match[1]), "context": _context_row(context),
-                            "enemy_animation_selection": selected}
+                    return ({**request, "selection": asdict(match[1]), "context": _context_row(context),
+                             "enemy_animation_selection": selected}, context, catalog, npc, identity)
                 if "reference_id" in animation:
                     if entries[0].source_kind != "prefab":
                         raise CharacterServiceError("reference_id 需要精确预制体 NPC 来源。")
@@ -1082,8 +1087,8 @@ class CharacterService:
                         document = npc_cpu_reference_document(references, match[1], str(animation["reference_id"]))
                     except (ValueError, OSError, RuntimeError) as error:
                         raise CharacterServiceError("NPC 精确 CPU 引用选择失败：" + public_npc_failure(error)) from error
-                    return {**request, "selection": asdict(match[1]), "context": _context_row(context),
-                            "npc_cpu_reference": document}
+                    return ({**request, "selection": asdict(match[1]), "context": _context_row(context),
+                             "npc_cpu_reference": document}, context, catalog, npc, identity)
         if options.get("animation") and "reference_id" in json_object(options["animation"], "animation options"):
             raise CharacterServiceError("reference_id 仅用于独立预制体 NPC；当前角色请使用 action_id。")
         tools = self._authoring_tools() if options else {}
@@ -1126,7 +1131,7 @@ class CharacterService:
             result["native_expression_replay"] = expression_snapshot
         if finalik_snapshot is not None:
             result["finalik_replay"] = finalik_snapshot
-        return result
+        return result, context, catalog, npc, identity
 
     def prepare(self, canonical: dict[str, object], output_dir: Path,
                 check_cancelled: CheckCancelled, progress: Progress) -> dict[str, object]:
@@ -1210,7 +1215,7 @@ class CharacterService:
     def export(self, canonical: dict[str, object], output_dir: Path,
                check_cancelled: CheckCancelled, progress: Progress) -> dict[str, object]:
         check_cancelled()
-        current = self.canonical_export(canonical)
+        current, catalog_context, catalog, npc, identity = self._canonical_export_with_source(canonical)
         if current != canonical:
             raise CharacterServiceError("角色准备数据已变化，请重新提交。")
         context = _context_from_row(json_object(canonical["context"], "context"))
@@ -1220,7 +1225,6 @@ class CharacterService:
         if not output_dir.resolve().is_relative_to(context.output_root):
             raise CharacterServiceError("角色产物目录不属于所选输出文件夹，请重新选择输出目录。")
         selection = json_object(canonical["selection"], "selection")
-        catalog_context, catalog, npc, identity = self._catalog_source()
         if catalog_context != context or identity != canonical["source_identity"]:
             raise CharacterServiceError("角色准备数据在导出启动期间变化，请重新提交。")
         if str(canonical["selection_id"]).startswith("independent-npc-"):

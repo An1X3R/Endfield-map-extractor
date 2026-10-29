@@ -841,12 +841,16 @@ def prepare_scene_export_plan(
         ).fetchall()
     selected_static: list[StaticSpatialRow] = []
     selected_decals: list[tuple[int, str, bytes, str]] = []
+    categories_by_base: dict[str, str] = {}
     excluded_hlod = 0
     excluded_hlod_mesh = 0
     for entity_id, base, matrix_type, matrix_blob, source_path, group_index, entity_index, origin_x, origin_z in rows:
         if not isinstance(base, str) or not base:
             continue
-        category, _ = classify_entity(base)
+        category = categories_by_base.get(base)
+        if category is None:
+            category, _ = classify_entity(base)
+            categories_by_base[base] = category
         if matrix_type == 18 and (category in allowed_categories or water_selected or effects_selected):
             if is_hlod_name(base):
                 if bounds["xmin"] <= origin_x < bounds["xmax"] and bounds["zmin"] <= origin_z < bounds["zmax"]:

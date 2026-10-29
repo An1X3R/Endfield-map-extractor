@@ -308,8 +308,13 @@ def expose_source_instance(material: bpy.types.Material, instance: bpy.types.Nod
 
 def layout_material_authoring(material: bpy.types.Material) -> None:
     """Arrange editable samplers in a bounded grid beside compact calculation stages."""
+    _layout_material_authoring(material, active_shader_nodes(material))
+
+
+def _layout_material_authoring(material: bpy.types.Material,
+                              active: frozenset[tuple[int, int]]) -> None:
+    """Arrange nodes using a dependency result computed before layout begins."""
     tree = material.node_tree
-    active = active_shader_nodes(material)
     all_images = tuple(sorted((item for item in tree.nodes if item.get('endfield_authoring_texture')),
                           key=lambda item: (str(item.get('source_slot', '')), item.label, item.name)))
     images = tuple(item for item in all_images if (tree.as_pointer(), item.as_pointer()) in active)
@@ -379,7 +384,7 @@ def package_material_authoring(materials: Sequence[bpy.types.Material],
             row['inactive_textures'] = [name for name in row['textures'] if name not in row['active_textures']]
             instance['endfield_authoring_packaging'] = json.dumps(row, sort_keys=True)
             rows.append(row)
-        layout_material_authoring(material)
+        _layout_material_authoring(material, active)
     scene = bpy.context.scene
     uniforms = migrate_shader_uniforms(materials, tuple(scene.objects), scene)
     return {'format': 'EndfieldMaterialAuthoring/1', 'materials': rows, 'uniforms': uniforms,
@@ -392,6 +397,19 @@ def socket_dependencies(outputs: Sequence[bpy.types.NodeSocket]) -> ShaderDepend
     active: set[tuple[int, int]] = set()
     active_inputs: set[int] = set()
     active_outputs: set[int] = set()
+    incoming_by_tree: dict[int, dict[int, tuple[bpy.types.NodeSocket, ...]]] = {}
+    active_group_output_by_tree: dict[int, bpy.types.Node] = {}
+
+    def incoming_sources(tree: bpy.types.NodeTree, socket: bpy.types.NodeSocket) -> tuple[bpy.types.NodeSocket, ...]:
+        tree_pointer = tree.as_pointer()
+        incoming = incoming_by_tree.get(tree_pointer)
+        if incoming is None:
+            mutable: dict[int, list[bpy.types.NodeSocket]] = {}
+            for link in tree.links:
+                mutable.setdefault(link.to_socket.as_pointer(), []).append(link.from_socket)
+            incoming = {pointer: tuple(sources) for pointer, sources in mutable.items()}
+            incoming_by_tree[tree_pointer] = incoming
+        return incoming.get(socket.as_pointer(), ())
 
     def visit(socket: bpy.types.NodeSocket, callers: tuple[bpy.types.Node, ...]) -> None:
         key = (socket.node.as_pointer(), socket.identifier, socket.is_output, tuple(item.as_pointer() for item in callers))
@@ -400,15 +418,20 @@ def socket_dependencies(outputs: Sequence[bpy.types.NodeSocket]) -> ShaderDepend
         visited.add(key)
         if not socket.is_output:
             active_inputs.add(socket.as_pointer())
-            for link in socket.links:
-                visit(link.from_socket, callers)
+            for source in incoming_sources(socket.node.id_data, socket):
+                visit(source, callers)
             return
         item = socket.node
         active_outputs.add(socket.as_pointer())
         tree = item.id_data
         active.add((tree.as_pointer(), item.as_pointer()))
         if item.type == 'GROUP':
-            output = next(node for node in item.node_tree.nodes if node.type == 'GROUP_OUTPUT' and node.is_active_output)
+            group_tree = item.node_tree
+            group_tree_pointer = group_tree.as_pointer()
+            output = active_group_output_by_tree.get(group_tree_pointer)
+            if output is None:
+                output = next(node for node in group_tree.nodes if node.type == 'GROUP_OUTPUT' and node.is_active_output)
+                active_group_output_by_tree[group_tree_pointer] = output
             visit(next(value for value in output.inputs if value.identifier == socket.identifier), callers + (item,))
         elif item.type == 'GROUP_INPUT':
             if not callers:
@@ -472,6 +495,11 @@ def verify_material_authoring(report: MaterialPackagingReport) -> dict[str, int 
     active_textures = 0
     preserved_textures = 0
     active_parameters = 0
+    node_groups = tuple(bpy.data.node_groups)
+    invalid_group_owner_by_input: dict[int, int] | None = None
+    calculation_image_group: str | None = None
+    calculation_images_checked = False
+    invalid_material_inputs_by_tree: dict[int, frozenset[int]] = {}
     for row in report['materials']:
         material = bpy.data.materials.get(row['material'])
         if material is None or not material.use_nodes:
@@ -482,11 +510,26 @@ def verify_material_authoring(report: MaterialPackagingReport) -> dict[str, int 
             raise AssertionError(f'Original material parameter carrier is missing: {material.name}')
         dependencies = shader_dependencies(material)
         active = dependencies.nodes
-        for owner in (tree, *bpy.data.node_groups):
-            invalid = tuple(link for link in owner.links if not link.is_valid
-                            and link.to_socket.as_pointer() in dependencies.input_sockets)
-            if invalid:
-                raise AssertionError(f'Active authoring shader contains invalid links: {material.name}/{owner.name}')
+        tree_pointer = tree.as_pointer()
+        invalid_material_inputs = invalid_material_inputs_by_tree.get(tree_pointer)
+        if invalid_material_inputs is None:
+            invalid_material_inputs = frozenset(link.to_socket.as_pointer() for link in tree.links if not link.is_valid)
+            invalid_material_inputs_by_tree[tree_pointer] = invalid_material_inputs
+        if dependencies.input_sockets.intersection(invalid_material_inputs):
+            raise AssertionError(f'Active authoring shader contains invalid links: {material.name}/{tree.name}')
+        if invalid_group_owner_by_input is None:
+            invalid_group_owner_by_input = {}
+            for group_index, group in enumerate(node_groups):
+                for link in group.links:
+                    target = link.to_socket.as_pointer()
+                    if not link.is_valid and target not in invalid_group_owner_by_input:
+                        invalid_group_owner_by_input[target] = group_index
+        invalid_group_indices = tuple(invalid_group_owner_by_input[pointer]
+                                      for pointer in dependencies.input_sockets
+                                      if pointer in invalid_group_owner_by_input)
+        if invalid_group_indices:
+            owner = node_groups[min(invalid_group_indices)]
+            raise AssertionError(f'Active authoring shader contains invalid links: {material.name}/{owner.name}')
         active_parameters += sum(socket.as_pointer() in dependencies.input_sockets for socket in controls.inputs)
         bindings = json.loads(controls['endfield_authoring_output_bindings'])
         original_outputs = tuple(next(socket for socket in controls.outputs if socket.identifier == binding['source_identifier'])
@@ -504,9 +547,13 @@ def verify_material_authoring(report: MaterialPackagingReport) -> dict[str, int 
                 active_textures += 1
             else:
                 preserved_textures += 1
-        for group in bpy.data.node_groups:
-            if group.get('endfield_authoring_computation') and contains_images(group, frozenset()):
-                raise AssertionError(f'Packaged calculation still hides textures: {group.name}')
+        if not calculation_images_checked:
+            calculation_image_group = next((group.name for group in node_groups
+                                             if group.get('endfield_authoring_computation')
+                                             and contains_images(group, frozenset())), None)
+            calculation_images_checked = True
+        if calculation_image_group is not None:
+            raise AssertionError(f'Packaged calculation still hides textures: {calculation_image_group}')
         carrier_tree = controls.node_tree
         hidden_active_images = tuple(item.name for item in carrier_tree.nodes if item.type == 'TEX_IMAGE'
                                     and (carrier_tree.as_pointer(), item.as_pointer()) in active)

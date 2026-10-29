@@ -18,10 +18,12 @@ from endfield_scene_material_contract import (MaterialRecord, load_catalog, refe
                                              resolve_existing_export_files)
 from extractor_core.resources import extract_candidate_bundles, read_bundle_closure_names
 from endfield_scene_helpers import SceneHelpers, require_prepared_scene_helpers
+from endfield_scene_mesh_uv_contract import RequiredUvStreams
 from endfield_shader_contract import surface_family
 
 
 FORMAT = "EndfieldSceneResourceCache/1"
+PARTIAL_ATTEMPT_FORMAT = "EndfieldScenePartialAttempt/1"
 PROVIDER_COVERAGE = "all_asset_containers"
 PACKAGE_PROVIDER_COVERAGE = "all_asset_and_package_containers"
 
@@ -155,6 +157,7 @@ def _ready_resource_paths(
     from endfield_scene_effects_plan import _shader_default_issues
 
     mesh_keys: set[tuple[str, int]] = set()
+    mesh_candidates: list[tuple[tuple[str, int], Path]] = []
     terrain_metadata_paths: set[str] = set()
     water_keys: set[tuple[str, int]] = set()
     array_keys: set[tuple[str, int]] = set()
@@ -190,7 +193,6 @@ def _ready_resource_paths(
             for value in records:
                 row = require_object(value, "water record")
                 water_records.append((kind, row))
-        mesh_candidates: list[tuple[dict[str, object], Path]] = []
         for value in cast(list[object], data["MeshExports"]):
             row = require_object(value, "mesh export")
             file = row.get("File")
@@ -199,12 +201,19 @@ def _ready_resource_paths(
             if not isinstance(file, str):
                 raise ValueError(f"Expected a nonempty resource path relative to {path.parent}")
             candidate = Path(file).expanduser()
-            mesh_candidates.append((row, candidate if candidate.is_absolute() else path.parent / candidate))
-        existing_meshes = resolve_existing_export_files(tuple(candidate for _, candidate in mesh_candidates))
-        for row, candidate in mesh_candidates:
-            if str(candidate) in existing_meshes:
-                mesh_keys.add(reference_key(require_object(row["Asset"], "mesh asset")))
+            mesh_candidates.append((reference_key(require_object(row["Asset"], "mesh asset")),
+                                    candidate if candidate.is_absolute() else path.parent / candidate))
         containers.extend(require_object(value, "container") for value in cast(list[object], data["Containers"]))
+    selected_mesh_keys = {
+        reference_key(asset)
+        for row in containers
+        if selects_container(str(row["Container"]).replace("\\", "/").casefold())
+        and isinstance((asset := row.get("Asset")), dict) and asset.get("Type") == "Mesh"
+    }
+    selected_candidates = tuple(candidate for key, candidate in mesh_candidates if key in selected_mesh_keys)
+    existing_meshes = resolve_existing_export_files(selected_candidates)
+    mesh_keys.update(key for key, candidate in mesh_candidates
+                     if key in selected_mesh_keys and str(candidate) in existing_meshes)
     for kind, row in water_records:
         header = require_object(row.get("Header"), "water header")
         key = reference_key(require_object(header.get("Asset"), "water asset"))
@@ -333,6 +342,99 @@ def validate_scan(path: Path) -> None:
         raise ValueError(f"Provider scan must finish without failures: {path}; last={last}")
 
 
+def _cached_provider(runtime_path: Path, root: Path, existing: Mapping[str, object],
+                     extraction: Mapping[str, object], coverage: str) -> tuple[dict[str, object], Path] | None:
+    accepted = {coverage, PACKAGE_PROVIDER_COVERAGE}
+    provider = existing.get("providerIndex")
+    if provider is not None and existing.get("providerCoverage", PROVIDER_COVERAGE) in accepted:
+        record = require_object(provider, "provider descriptor")
+        provider_path = resolve_path(record["path"], root)
+        if not provider_path.is_relative_to(root) or describe_file(provider_path) != record:
+            raise ValueError(f"Provider cache failed integrity validation: {provider_path}")
+        return record, provider_path
+    discovery = require_object(extraction["sceneDiscovery"], "scene discovery")
+    if discovery.get("providerCoverage") in accepted:
+        record = require_object(discovery["scannerResults"], "scanner results")
+        provider_path = resolve_path(record["path"], runtime_path.parent)
+        if describe_file(provider_path) != record:
+            raise ValueError(f"Prepared provider index changed: {provider_path}")
+        return record, provider_path
+    return None
+
+
+def _partial_attempt_key(
+    root: Path, extraction: Mapping[str, object], requested: frozenset[str],
+    required_streams: frozenset[str], uv_requirements: tuple[RequiredUvStreams, ...],
+    required_prefabs: frozenset[str], provider: Mapping[str, object], coverage: str,
+    helpers: SceneHelpers, game_generation: list[dict[str, object]],
+    cab_inventory: Mapping[str, object],
+) -> str:
+    from endfield_dependency_bootstrap import helper_source_identity
+
+    identity = {
+        "format": PARTIAL_ATTEMPT_FORMAT,
+        "datasetFingerprint": extraction["mapLayerFingerprint"],
+        "resourceCacheRoot": str(root.resolve()),
+        "requirements": {
+            "resources": sorted(requested),
+            "effectMeshStreams": sorted(required_streams),
+            "uvStreams": [
+                {"mesh_path": row["mesh_path"], "channels": sorted(row["channels"])}
+                for row in sorted(uv_requirements, key=lambda value: value["mesh_path"])
+            ],
+            "prefabGeometry": sorted(required_prefabs),
+        },
+        "providerCoverage": coverage,
+        "provider": dict(provider),
+        "cabInventory": dict(cab_inventory),
+        "sourceGeneration": game_generation,
+        "helperSourceIdentity": helper_source_identity(Path(__file__).resolve().parent.parent),
+        "bundleScanner": {"apphost": describe_file(helpers.scanner),
+                          "assembly": describe_file(helpers.scanner.with_suffix(".dll"))},
+        "sceneProbe": {"apphost": describe_file(helpers.probe),
+                       "assembly": describe_file(helpers.probe.with_suffix(".dll"))},
+    }
+    encoded = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _cached_partial_attempt(index_path: Path, root: Path, key: str,
+                            current_missing: frozenset[str],
+                            provider: Mapping[str, object]) -> dict[str, object] | None:
+    if not index_path.is_file():
+        return None
+    existing = read_json(index_path)
+    attempts_value = existing.get("partialAttempts", {})
+    if not isinstance(attempts_value, dict):
+        raise ValueError(f"Scene resource partial-attempt cache must be an object: {index_path}")
+    cached_value = attempts_value.get(key)
+    if cached_value is None:
+        return None
+    cached = require_object(cached_value, "cached partial attempt")
+    result = require_object(cached.get("result"), "cached partial result")
+    if (cached.get("format") != PARTIAL_ATTEMPT_FORMAT or cached.get("completed") is not True
+            or cached.get("key") != key or cached.get("provider") != dict(provider)
+            or result.get("status") != "partial"
+            or result.get("partial") is not True):
+        raise ValueError(f"Invalid completed partial-attempt cache entry: {index_path}")
+    missing_after = result.get("missingAfter")
+    outputs = cached.get("outputManifests")
+    indexed_manifests = existing.get("manifests")
+    if (not isinstance(missing_after, list) or any(not isinstance(path, str) for path in missing_after)
+            or not isinstance(outputs, list) or not outputs or not isinstance(indexed_manifests, list)):
+        raise ValueError(f"Incomplete completed partial-attempt cache entry: {index_path}")
+    if frozenset(cast(list[str], missing_after)) != current_missing:
+        return None
+    for value in cast(list[object], outputs):
+        descriptor = require_object(value, "partial-attempt output manifest")
+        manifest = resolve_path(descriptor.get("path"), root)
+        if not manifest.is_relative_to(root) or not manifest.is_file():
+            raise FileNotFoundError(f"Cached partial-attempt manifest is missing or outside its cache: {manifest}")
+        if describe_file(manifest) != descriptor or descriptor not in indexed_manifests:
+            raise ValueError(f"Cached partial-attempt manifest failed integrity validation: {manifest}")
+    return {**result, "cachedAttempt": True}
+
+
 def ensure_scene_resources(runtime_path: Path, plan_path: Path,
                            check_cancelled: Callable[[], None], progress: Callable[[float, str], None]) -> dict[str, object]:
     """Upgrade existing caches on demand without rebuilding terrain or overwriting scenes."""
@@ -354,15 +456,15 @@ def ensure_scene_resources(runtime_path: Path, plan_path: Path,
     if cache_root.is_relative_to(resolve_path(paths["game_root"], runtime_path.parent)):
         raise ValueError(f"Scene planning cache cannot be inside the game: {cache_root}")
     missing = requested - ready_requested_resource_paths(manifests, requested, cache_root)
-    from endfield_scene_direct_effects_plan import ready_effect_mesh_paths
+    from endfield_scene_direct_effects_plan import ready_requested_effect_mesh_paths
 
     streams = plan.get("required_effect_mesh_paths", [])
     if not isinstance(streams, list) or any(not isinstance(path, str) or path not in requested for path in streams):
         raise ValueError("FX source mesh stream requests must be a subset of required_resource_paths")
     required_streams = frozenset(cast(list[str], streams))
     if required_streams:
-        missing |= required_streams - ready_effect_mesh_paths(manifests)
-    from endfield_scene_mesh_uv_contract import RequiredUvStreams, ready_uv_stream_paths
+        missing |= required_streams - ready_requested_effect_mesh_paths(manifests, required_streams)
+    from endfield_scene_mesh_uv_contract import ready_uv_stream_paths
 
     uv_values = plan.get("required_uv_streams", [])
     if not isinstance(uv_values, list):
@@ -393,34 +495,51 @@ def ensure_scene_resources(runtime_path: Path, plan_path: Path,
     if not missing:
         return {"status": "ready", "requested": len(requested), "missing": []}
     root = resource_cache_root(runtime_path, runtime)
+    index_path = root / "index.json"
+    discovery = require_object(extraction["sceneDiscovery"], "scene discovery")
+    coverage = PACKAGE_PROVIDER_COVERAGE if any(path.startswith("packages/") for path in missing) else PROVIDER_COVERAGE
+    existing = read_json(index_path) if index_path.is_file() else {
+        "format": FORMAT, "datasetFingerprint": extraction["mapLayerFingerprint"], "manifests": []}
+    if existing.get("format") != FORMAT or existing.get("datasetFingerprint") != extraction["mapLayerFingerprint"]:
+        raise ValueError(f"Invalid scene resource cache identity: {index_path}")
+    provider = _cached_provider(runtime_path, root, existing, extraction, coverage)
+    helpers: SceneHelpers | None = None
+    if provider is not None and existing.get("partialAttempts"):
+        provider_record, _provider_path = provider
+        paths = require_object(runtime["paths"], "runtime paths")
+        helper_cache = resolve_path(paths["cache_root"], runtime_path.parent)
+        helpers = require_prepared_scene_helpers(runtime_path, helper_cache)
+        game = resolve_path(paths["game_root"], runtime_path.parent)
+        _game_identity, game_stamps = _prefab_bounds_game_generation(game)
+        cab = resolve_path(require_object(discovery["cabInventory"], "CAB inventory")["path"], runtime_path.parent)
+        cab_record = describe_file(cab)
+        attempt_key = _partial_attempt_key(
+            root, extraction, requested, required_streams, tuple(uv_requirements), required_prefabs,
+            provider_record, coverage, helpers, game_stamps, cab_record,
+        )
+        cached_attempt = _cached_partial_attempt(index_path, root, attempt_key, missing, provider_record)
+        if cached_attempt is not None:
+            if describe_file(cab) != cab_record:
+                raise OSError(f"CAB inventory changed during scene resource cache lookup: path={cab}")
+            return cached_attempt
     root.mkdir(parents=True, exist_ok=True)
     lock = root / "preparing.lock"
     with lock.open("x", encoding="utf-8") as stream:
         stream.write(str(os.getpid()))
     try:
-        index_path = root / "index.json"
         existing = read_json(index_path) if index_path.is_file() else {
             "format": FORMAT, "datasetFingerprint": extraction["mapLayerFingerprint"], "manifests": []}
+        if existing.get("format") != FORMAT or existing.get("datasetFingerprint") != extraction["mapLayerFingerprint"]:
+            raise ValueError(f"Invalid scene resource cache identity: {index_path}")
         paths = require_object(runtime["paths"], "runtime paths")
         helper_cache = resolve_path(paths["cache_root"], runtime_path.parent)
-        helpers: SceneHelpers | None = None
         work = root / uuid4().hex
         work.mkdir()
         environment = {**os.environ, "TEMP": str(work), "TMP": str(work), "PYTHONDONTWRITEBYTECODE": "1"}
-        discovery = require_object(extraction["sceneDiscovery"], "scene discovery")
-        provider = existing.get("providerIndex")
-        coverage = PACKAGE_PROVIDER_COVERAGE if any(path.startswith("packages/") for path in missing) else PROVIDER_COVERAGE
-        accepted_coverage = {coverage, PACKAGE_PROVIDER_COVERAGE}
-        if provider is not None and existing.get("providerCoverage", PROVIDER_COVERAGE) in accepted_coverage:
-            record = require_object(provider, "provider descriptor")
-            provider_path = resolve_path(record["path"], root)
-            if not provider_path.is_relative_to(root) or describe_file(provider_path) != record:
-                raise ValueError(f"Provider cache failed integrity validation: {provider_path}")
-        elif discovery.get("providerCoverage") in accepted_coverage:
-            record = require_object(discovery["scannerResults"], "scanner results")
-            provider_path = resolve_path(record["path"], runtime_path.parent)
-            if describe_file(provider_path) != record:
-                raise ValueError(f"Prepared provider index changed: {provider_path}")
+        cached_provider = _cached_provider(runtime_path, root, existing, extraction, coverage)
+        provider_record: dict[str, object]
+        if cached_provider is not None:
+            provider_record, provider_path = cached_provider
         else:
             check_cancelled()
             helpers = require_prepared_scene_helpers(runtime_path, helper_cache)
@@ -434,7 +553,8 @@ def ensure_scene_resources(runtime_path: Path, plan_path: Path,
                                *filters, "--progress-every", "1000"],
                               work / "providers.log", environment, check_cancelled)
             validate_scan(provider_path)
-            existing = {**existing, "providerIndex": describe_file(provider_path), "providerCoverage": coverage}
+            provider_record = describe_file(provider_path)
+            existing = {**existing, "providerIndex": provider_record, "providerCoverage": coverage}
             write_index(index_path, existing)
         check_cancelled()
         indexed = _provider_index(provider_path).providers
@@ -444,11 +564,24 @@ def ensure_scene_resources(runtime_path: Path, plan_path: Path,
         unresolved = {path: list(names) for path, names in providers.items() if len(names) != 1}
         result: dict[str, object] = {"requested": len(requested), "missingBefore": len(missing),
                                     "providerRoots": len(roots), "unresolvedProviders": unresolved}
+        attempt_key: str | None = None
+        game: Path | None = None
+        game_stamps: list[dict[str, object]] | None = None
+        output_manifest: dict[str, object] | None = None
+        cab: Path | None = None
+        cab_record: dict[str, object] | None = None
         if roots:
             if helpers is None:
                 check_cancelled()
                 helpers = require_prepared_scene_helpers(runtime_path, helper_cache)
+            game = resolve_path(paths["game_root"], runtime_path.parent)
+            _game_identity, game_stamps = _prefab_bounds_game_generation(game)
             cab = resolve_path(require_object(discovery["cabInventory"], "CAB inventory")["path"], runtime_path.parent)
+            cab_record = describe_file(cab)
+            attempt_key = _partial_attempt_key(
+                root, extraction, requested, required_streams, tuple(uv_requirements), required_prefabs,
+                provider_record, coverage, helpers, game_stamps, cab_record,
+            )
             closures, metadata = read_bundle_closure_names({"resources": roots}, cab)
             bundles = work / "bundles"
             paths = require_object(runtime["paths"], "runtime paths")
@@ -470,7 +603,8 @@ def ensure_scene_resources(runtime_path: Path, plan_path: Path,
             if read_json(manifest).get("Format") != "EndfieldSceneProbe/1":
                 raise ValueError(f"Invalid supplementary SceneProbe output: {manifest}")
             after = ready_requested_resource_paths((*manifests, manifest), requested, cache_root)
-            stream_missing = (required_streams - ready_effect_mesh_paths((*manifests, manifest))) if required_streams else frozenset()
+            stream_missing = (required_streams - ready_requested_effect_mesh_paths(
+                (*manifests, manifest), required_streams)) if required_streams else frozenset()
             uv_missing = (required_uv_paths - ready_uv_stream_paths((*manifests, manifest), tuple(uv_requirements))) if uv_requirements else frozenset()
             prefab_missing: frozenset[str] = frozenset()
             if required_prefabs:
@@ -478,16 +612,41 @@ def ensure_scene_resources(runtime_path: Path, plan_path: Path,
                 prefab_missing = required_prefabs - observed_prefab_geometry_paths(
                     (*manifests, manifest), required_prefabs, catalog.materials, catalog.textures)
             result["missingAfter"] = sorted((requested - after - required_prefabs) | stream_missing | uv_missing | prefab_missing)
-            prior = existing["manifests"]
-            if not isinstance(prior, list):
-                raise ValueError("Supplement index requires a manifest list")
-            updated = {**existing, "manifests": [*prior, describe_file(manifest)]}
-            write_index(index_path, updated)
+            output_manifest = describe_file(manifest)
         else:
             result["missingAfter"] = sorted(missing)
         result["status"] = "partial" if result["missingAfter"] else "ready"
+        result["partial"] = result["status"] == "partial"
+        result["cachedAttempt"] = False
         write_index(work / "audit.json", result)
         progress(1.0, f"Exact resource preparation {result['status']}; unresolved inputs remain explicit")
+        if output_manifest is not None:
+            if game is None or game_stamps is None or cab is None or cab_record is None:
+                raise RuntimeError("Supplementary SceneProbe output lacks a source-generation identity")
+            if _prefab_bounds_game_generation(game)[1] != game_stamps:
+                raise OSError(f"Game files changed during scene resource preparation: game={game}")
+            if describe_file(provider_path) != provider_record:
+                raise OSError(f"Provider index changed during scene resource preparation: path={provider_path}")
+            if describe_file(cab) != cab_record:
+                raise OSError(f"CAB inventory changed during scene resource preparation: path={cab}")
+            prior = existing.get("manifests")
+            if not isinstance(prior, list):
+                raise ValueError("Supplement index requires a manifest list")
+            updated: dict[str, object] = {**existing, "manifests": [*prior, output_manifest]}
+            if result["status"] == "partial" and attempt_key is not None:
+                attempts_value = existing.get("partialAttempts", {})
+                if not isinstance(attempts_value, dict):
+                    raise ValueError("Scene resource partial-attempt cache must be an object")
+                attempt = {
+                    "format": PARTIAL_ATTEMPT_FORMAT,
+                    "completed": True,
+                    "key": attempt_key,
+                    "provider": provider_record,
+                    "result": result,
+                    "outputManifests": [output_manifest],
+                }
+                updated["partialAttempts"] = {**attempts_value, attempt_key: attempt}
+            write_index(index_path, updated)
         return result
     finally:
         lock.unlink()

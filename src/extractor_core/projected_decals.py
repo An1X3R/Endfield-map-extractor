@@ -10,15 +10,18 @@ from __future__ import annotations
 import hashlib
 import math
 import struct
+import sys
 from collections import defaultdict
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 
 from . import flatbuffer as fb
 from .lz4 import decompress_lz4_inv
 from .vfs import VfsFile
-from endfield_scene_io import SceneSourceCacheSlot, cached_scene_source_value, resolve_scene_read_path
+from endfield_scene_io import (SceneSourceCacheSlot, cached_scene_source_value_with_estimated_size,
+                               resolve_scene_read_path)
 from endfield_projected_decal_contract import ProjectedDecal
 
 
@@ -30,8 +33,24 @@ class StreamingRecord:
     end: int
 
 
+@dataclass(frozen=True)
+class PathIdIndexViews:
+    candidate_paths_by_id: Mapping[bytes, tuple[tuple[str, bool], ...]]
+    path_records_valid: bool
+
+    def permissive(self) -> dict[bytes, tuple[str, ...]]:
+        return {
+            identifier: tuple(path for path, _is_record_start in paths)
+            for identifier, paths in self.candidate_paths_by_id.items()
+        }
+
+    def strict_paths(self, identifier: bytes) -> tuple[str, ...]:
+        return tuple(path for path, is_record_start in self.candidate_paths_by_id.get(identifier, ())
+                     if is_record_start)
+
+
 _PATH_ID_INDEX_CACHE = SceneSourceCacheSlot(
-    "path-id-index", dict, 4, 320 * 1024 * 1024
+    "path-id-index", PathIdIndexViews, 4, 320 * 1024 * 1024
 )
 
 
@@ -50,26 +69,65 @@ def read_chunk(vfs_root: Path, entry: VfsFile) -> bytes:
 
 def build_path_id_index(path: Path) -> dict[bytes, tuple[str, ...]]:
     """Reuse the recovered path-ID/relative-string-offset scan, without name guesses."""
+    return build_path_id_index_cancellable(path, _no_cancellation)
+
+
+def build_path_id_index_cancellable(path: Path,
+                                    check_cancelled: Callable[[], None]) -> dict[bytes, tuple[str, ...]]:
+    """Reuse a stamped path-ID index, checking cancellation while it is built."""
+    return build_path_id_index_views_cancellable(path, check_cancelled).permissive()
+
+
+def build_path_id_index_views_cancellable(path: Path,
+                                          check_cancelled: Callable[[], None]) -> PathIdIndexViews:
+    """Build permissive decal candidates and strict record-start paths from one cache entry."""
     resolved = resolve_scene_read_path(path)
-    return cached_scene_source_value(
+    cached_views = cached_scene_source_value_with_estimated_size(
         _PATH_ID_INDEX_CACHE, (resolved,), (),
-        lambda: _build_path_id_index(resolved),
+        lambda: _build_path_id_index_views(resolved, check_cancelled),
     )
+    return cached_views
 
 
-def _build_path_id_index(path: Path) -> dict[bytes, tuple[str, ...]]:
+def _no_cancellation() -> None:
+    return None
+
+
+def _build_path_id_index_views(
+    path: Path,
+    check_cancelled: Callable[[], None],
+) -> tuple[PathIdIndexViews, int]:
+    from .resources import BootstrapExtractionError, iter_path_records
+
     data = path.read_bytes()
     offset, count = struct.unpack_from("<II", data)
     if offset != 8 + 24 * count or offset > len(data):
         raise ValueError(f"PATH_HASH_HEADER_INVALID path={path} offset={offset} count={count}")
-    found: dict[bytes, set[str]] = defaultdict(set)
+
+    string_start_bits = bytearray((len(data) + 7) // 8)
+    path_records_valid = True
+    try:
+        for record_index, _value, _opaque_record, string_at in iter_path_records(path):
+            if record_index % 8192 == 0:
+                check_cancelled()
+            string_start_bits[string_at >> 3] |= 1 << (string_at & 7)
+    except (BootstrapExtractionError, UnicodeDecodeError, struct.error):
+        # Decal lookup has historically tolerated malformed unrelated string records.
+        path_records_valid = False
+
+    found: dict[bytes, dict[str, bool]] = defaultdict(dict)
+    retained_entry_bytes = 0
+    retained_boolean_ids: set[int] = set()
     words = struct.iter_unpack("<Q", memoryview(data)[8:offset])
     previous = next(words, None)
     if previous is None:
-        return {}
+        views = PathIdIndexViews(MappingProxyType({}), path_records_valid)
+        return views, _estimate_path_id_index_bytes(views, 0, set())
     identifier = previous[0]
     # Keep overlapping eight-byte candidates, including those between 24-byte rows.
-    for (relative,) in words:
+    for word_index, (relative,) in enumerate(words):
+        if word_index % 8192 == 0:
+            check_cancelled()
         current = identifier
         identifier = relative
         start = offset + relative
@@ -84,8 +142,48 @@ def _build_path_id_index(path: Path) -> dict[bytes, tuple[str, ...]]:
         except UnicodeDecodeError:
             continue
         if value.casefold().startswith(("assets/", "data/", "packages/")):
-            found[current.to_bytes(8, "little")].add(value)
-    return {key: tuple(sorted(values)) for key, values in found.items()}
+            identifier_bytes = current.to_bytes(8, "little")
+            paths = found.get(identifier_bytes)
+            if paths is None:
+                paths = {}
+                found[identifier_bytes] = paths
+                retained_entry_bytes += sys.getsizeof(identifier_bytes)
+            is_record_start = bool(string_start_bits[start >> 3] & (1 << (start & 7)))
+            existing_record_start = paths.get(value)
+            if existing_record_start is None:
+                paths[value] = is_record_start
+                retained_entry_bytes += sys.getsizeof(value)
+            else:
+                paths[value] = existing_record_start or is_record_start
+    candidate_paths_by_id: dict[bytes, tuple[tuple[str, bool], ...]] = {}
+    for key, paths in found.items():
+        path_rows = tuple(sorted(paths.items()))
+        candidate_paths_by_id[key] = path_rows
+        retained_entry_bytes += sys.getsizeof(path_rows)
+        for path_row in path_rows:
+            retained_entry_bytes += sys.getsizeof(path_row)
+            flag_identity = id(path_row[1])
+            if flag_identity not in retained_boolean_ids:
+                retained_entry_bytes += sys.getsizeof(path_row[1])
+                retained_boolean_ids.add(flag_identity)
+        paths.clear()
+    found.clear()
+    views = PathIdIndexViews(MappingProxyType(candidate_paths_by_id), path_records_valid)
+    return views, _estimate_path_id_index_bytes(views, retained_entry_bytes, retained_boolean_ids)
+
+
+def _estimate_path_id_index_bytes(
+    views: PathIdIndexViews,
+    retained_entry_bytes: int,
+    retained_boolean_ids: set[int],
+) -> int:
+    fields_by_name = vars(views)
+    retained_bytes = retained_entry_bytes + sys.getsizeof(views) + sys.getsizeof(fields_by_name)
+    retained_bytes += sum(sys.getsizeof(field_name) for field_name in fields_by_name)
+    retained_bytes += sys.getsizeof(views.candidate_paths_by_id) + 64 + 16 * len(views.candidate_paths_by_id)
+    if id(views.path_records_valid) not in retained_boolean_ids:
+        retained_bytes += sys.getsizeof(views.path_records_valid)
+    return retained_bytes
 
 
 def streaming_records(data: bytes) -> dict[int, StreamingRecord]:

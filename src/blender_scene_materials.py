@@ -67,7 +67,12 @@ def layout_shader_node_tree(node_tree: bpy.types.NodeTree) -> None:
         elif node.type == "GROUP_INPUT":
             node.label = "Group Inputs"
 
+    size_cache: dict[int, tuple[float, float]] = {}
+
     def node_size(node: bpy.types.Node) -> tuple[float, float]:
+        pointer = node.as_pointer()
+        if pointer in size_cache:
+            return size_cache[pointer]
         visible_inputs = sum(
             3 if socket.type == "VECTOR" and not socket.is_linked and not socket.hide_value else 1
             for socket in node.inputs if not socket.hide
@@ -79,9 +84,11 @@ def layout_shader_node_tree(node_tree: bpy.types.NodeTree) -> None:
                         "BUMP": 260.0, "MAPPING": 380.0}.get(node.type, 0.0)
         preview_height = 160.0 if node.show_preview else 0.0
         height = 80.0 if node.hide else max(160.0, socket_height, panel_height) + preview_height
-        return max(float(node.width), float(node.dimensions.x), 140.0), max(
+        result = max(float(node.width), float(node.dimensions.x), 140.0), max(
             height, float(node.height), float(node.dimensions.y)
         )
+        size_cache[pointer] = result
+        return result
 
     outgoing: dict[str, list[tuple[str, str]]] = defaultdict(list)
     for link in node_tree.links:
@@ -317,8 +324,11 @@ def layout_shader_node_tree(node_tree: bpy.types.NodeTree) -> None:
             for node in sorted(column, key=lambda current: (
                     -terminal_lane(current.name, frozenset()),
                     current.type, current.name.casefold())):
-                node.parent = frame
-                node.location = (column_x[depth] - frame_left + 26.0, node_y)
+                if node.parent != frame:
+                    node.parent = frame
+                location = (column_x[depth] - frame_left + 26.0, node_y)
+                if tuple(node.location) != location:
+                    node.location = location
                 node_y -= node_size(node)[1] + 32.0
         cursor_y = frame_y - frame.height - 64.0
     for key, frame in existing_frames.items():

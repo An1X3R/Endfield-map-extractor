@@ -12,7 +12,10 @@ import zlib
 import bpy
 from mathutils import Matrix, Quaternion, Vector
 
-from character_expression_shape_keys import BakedExpression, FacialBoneTarget, bake_facial_target
+from character_expression_shape_keys import (
+    BakedExpression, ExpressionDriverControl, FacialBoneTarget, bake_facial_target,
+    isolated_pose_evaluation, validate_expression_drivers,
+)
 
 
 @dataclass(frozen=True)
@@ -397,6 +400,29 @@ def _extract_pose_targets(
     definition: BasicExpressionDefinition,
     mapping_bones: list[dict[str, object]],
 ) -> tuple[tuple[FacialBoneTarget, ...], tuple[dict[str, object], ...]]:
+    with isolated_pose_evaluation(armature):
+        return _extract_active_pose_targets(armature, source, definition, mapping_bones)
+
+
+def _extract_pose_target_batch(
+    armature: bpy.types.Object,
+    source: DecodedSource,
+    mappings: tuple[tuple[BasicExpressionDefinition, list[dict[str, object]]], ...],
+) -> dict[str, tuple[tuple[FacialBoneTarget, ...], tuple[dict[str, object], ...]]]:
+    """Resolve all static endpoints before changing any source shape keys."""
+    if not mappings:
+        return {}
+    with isolated_pose_evaluation(armature):
+        return {definition.source_name: _extract_active_pose_targets(armature, source, definition, bones)
+                for definition, bones in mappings}
+
+
+def _extract_active_pose_targets(
+    armature: bpy.types.Object,
+    source: DecodedSource,
+    definition: BasicExpressionDefinition,
+    mapping_bones: list[dict[str, object]],
+) -> tuple[tuple[FacialBoneTarget, ...], tuple[dict[str, object], ...]]:
     target_local_by_path: dict[str, Matrix] = {}
     mapping_rows: list[dict[str, object]] = []
     seen_bone_ids: set[int] = set()
@@ -707,12 +733,16 @@ def apply_basic_expressions(
             for modifier, _ in downstream_modifiers:
                 modifier.show_viewport = False
             bpy.context.view_layer.update()
+            mappings: list[tuple[BasicExpressionDefinition, tuple[int, int, dict[str, object], list[dict[str, object]]]]] = []
             for definition in source.definitions:
                 mapping_info = _mapping_for_control(source, definition)
                 if mapping_info is None:
                     continue
-                _, _, _, mapping_bones = mapping_info
-                targets, endpoint_rows = _extract_pose_targets(armature, source, definition, mapping_bones)
+                mappings.append((definition, mapping_info))
+            poses = _extract_pose_target_batch(armature, source,
+                tuple((definition, mapping_info[3]) for definition, mapping_info in mappings))
+            for definition, mapping_info in mappings:
+                targets, endpoint_rows = poses[definition.source_name]
                 baked_rows = bake_facial_target(armature, meshes, targets, definition.source_name, tolerance)
                 unlinked.append((definition, mapping_info, endpoint_rows, tuple(baked_rows)))
         finally:
@@ -816,51 +846,24 @@ def validate_basic_expressions(receipt: dict[str, object], tolerance: float) -> 
     rows = tuple(_record(value, f"receipt.controls[{index}]") for index, value in enumerate(_array(receipt.get("controls"), "receipt.controls")))
     active = tuple(row for row in rows if row.get("status") == "baked_and_synchronized")
     original_values = {str(row["label"]): float(controller[str(row["label"])]) for row in active}
-    checks: list[dict[str, object]] = []
-    try:
-        for row in active:
-            label = _text(row.get("label"), "control.label")
-            driven = tuple(_record(item, f"{label}.driven_objects[{index}]") for index, item in enumerate(_array(row.get("driven_objects"), f"{label}.driven_objects")))
-            for value in (0.0, 0.5, 1.0):
-                controller[label] = value
-                controller.update_tag()
-                for target in driven:
-                    obj_name = _text(target.get("object_name"), f"{label}.driven.object_name")
-                    target_obj = bpy.data.objects.get(obj_name)
-                    if target_obj is None or target_obj.data.shape_keys is None:
-                        raise ValueError(f"Driven shape-key datablock is missing while updating: {obj_name}")
-                    target_obj.data.shape_keys.update_tag()
-                bpy.context.view_layer.update()
-                key_values: list[float] = []
-                for target in driven:
-                    object_name = _text(target.get("object_name"), f"{label}.driven.object_name")
-                    key_name = _text(target.get("shape_key_name"), f"{label}.driven.shape_key_name")
-                    obj = bpy.data.objects.get(object_name)
-                    if obj is None or obj.type != "MESH" or obj.data.shape_keys is None:
-                        raise ValueError(f"Driven mesh or shape keys are missing: {object_name}/{key_name}")
-                    key = obj.data.shape_keys.key_blocks.get(key_name)
-                    if key is None:
-                        raise ValueError(f"Driven shape key is missing: {object_name}/{key_name}")
-                    if abs(float(key.value) - value) > tolerance:
-                        raise AssertionError(f"Shape-key driver did not follow controller: control={label}, object={object_name}, expected={value}, actual={key.value}")
-                    keys = key.id_data
-                    if keys.animation_data is None:
-                        raise AssertionError(f"Shape-key driver datablock is missing: {object_name}/{key_name}")
-                    path = key.path_from_id("value")
-                    curves = tuple(curve for curve in keys.animation_data.drivers if curve.data_path == path)
-                    if len(curves) != 1:
-                        raise AssertionError(f"Expected one shape-key driver: {object_name}/{key_name}, count={len(curves)}")
-                    driver = curves[0].driver
-                    if driver.type != "SCRIPTED" or driver.expression != "v" or len(driver.variables) != 1:
-                        raise AssertionError(f"Unexpected shape-key driver definition: {object_name}/{key_name}")
-                    variable = driver.variables[0]
-                    if variable.name != "v" or variable.type != "SINGLE_PROP" or variable.targets[0].id != controller or variable.targets[0].data_path != f'["{label}"]':
-                        raise AssertionError(f"Shape-key driver does not resolve to the expected control property: {object_name}/{key_name}")
-                    key_values.append(float(key.value))
-                checks.append({"label": label, "requested": value, "driven_key_count": len(key_values), "maximum_driver_error": max((abs(item - value) for item in key_values), default=0.0)})
-    finally:
-        for label, value in original_values.items():
-            controller[label] = value
-        bpy.context.view_layer.update()
+    controls: list[ExpressionDriverControl] = []
+    for row in active:
+        label = _text(row.get("label"), "control.label")
+        driven = tuple(_record(item, f"{label}.driven_objects[{index}]") for index, item in enumerate(_array(row.get("driven_objects"), f"{label}.driven_objects")))
+        keys: list[bpy.types.ShapeKey] = []
+        for target in driven:
+            object_name = _text(target.get("object_name"), f"{label}.driven.object_name")
+            key_name = _text(target.get("shape_key_name"), f"{label}.driven.shape_key_name")
+            obj = bpy.data.objects.get(object_name)
+            if obj is None or obj.type != "MESH" or obj.data.shape_keys is None:
+                raise ValueError(f"Driven mesh or shape keys are missing: {object_name}/{key_name}")
+            key = obj.data.shape_keys.key_blocks.get(key_name)
+            if key is None:
+                raise ValueError(f"Driven shape key is missing: {object_name}/{key_name}")
+            keys.append(key)
+        controls.append(ExpressionDriverControl(label, tuple(keys)))
+    checks = [{"label": check.label, "requested": check.requested,
+               "driven_key_count": check.driven_key_count, "maximum_driver_error": check.maximum_driver_error}
+              for check in validate_expression_drivers(controller, tuple(controls), tolerance)]
     return {"status": "all_shared_expression_drivers_verified_at_0_0_5_1_and_restored", "controller": controller_name,
             "checked_control_count": len(active), "checks": checks, "controls_restored": original_values}

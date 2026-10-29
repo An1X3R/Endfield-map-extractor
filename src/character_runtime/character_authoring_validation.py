@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import hashlib
 import struct
+import sys
+from array import array
 from collections.abc import Mapping
 from typing import TypedDict
 
@@ -157,8 +159,11 @@ def shape_signatures(names: tuple[str, ...]) -> dict[str, dict[str, str]]:
         for block in keys.key_blocks:
             digest = hashlib.sha256()
             digest.update(repr((block.relative_key.name, block.vertex_group, block.interpolation)).encode())
-            for point in block.data:
-                digest.update(struct.pack('<3f', *point.co))
+            coordinates = array('f', [0.0]) * (len(block.data) * 3)
+            block.data.foreach_get('co', coordinates)
+            if sys.byteorder != 'little':
+                coordinates.byteswap()
+            digest.update(coordinates.tobytes())
             result[name][block.name] = digest.hexdigest()
     return result
 

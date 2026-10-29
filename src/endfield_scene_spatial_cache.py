@@ -53,7 +53,7 @@ def spatial_parser_identity() -> str:
     """Version records by the actual source decoder and cache implementation."""
     root = Path(__file__).resolve().parent
     paths = (Path(__file__), *(root / "extractor_core" / name for name in
-                              ("instances.py", "flatbuffer.py", "lz4.py", "projected_decals.py")))
+                              ("instances.py", "flatbuffer.py", "lz4.py", "lz4_numba.py", "projected_decals.py")))
     digest = hashlib.sha256()
     for path in paths:
         digest.update(path.name.encode("utf-8"))
@@ -135,20 +135,51 @@ def _load(identity: SpatialSourceIdentity) -> tuple[SpatialRecord, ...]:
             raise SpatialCacheCorruptError(f"Spatial cache record is truncated: path={path}, index={len(payload) // _RECORD.size}")
         if stream.read(32) != hashlib.sha256(payload).digest() or stream.read(1):
             raise SpatialCacheCorruptError(f"Spatial cache payload SHA256 differs: path={path}")
-        records: list[SpatialRecord] = []
-        ids: set[int] = set()
-        label = str(path)
-        for index, (entity_id, matrix, present, *values) in enumerate(_RECORD.iter_unpack(payload)):
-            if present not in (0, 1) or (present == 0 and any(values[:6])):
-                raise SpatialCacheCorruptError(f"Spatial cache null-bounds marker is invalid: path={path}, index={index}")
-            record = _record({"entity_id": entity_id, "matrix_blob": matrix,
-                              "world_bounds": tuple(values[:6]) if present else None,
-                              "x": values[6], "z": values[7]}, label)
-            if entity_id in ids:
-                raise SpatialCacheCorruptError(f"Spatial cache entity ID repeats: path={path}, entity_id={entity_id}")
-            ids.add(entity_id)
-            records.append(record)
-    return tuple(records)
+    return _records_from_payload(payload, path)
+
+
+def _records_from_payload(payload: bytes, path: Path) -> tuple[SpatialRecord, ...]:
+    """Validate packed numeric columns in native code before materializing records."""
+    if not payload:
+        return ()
+    import numpy as np
+
+    dtype = np.dtype([("id", "<u4"), ("matrix", "V64"), ("present", "u1"),
+                      ("bounds", "<f8", (6,)), ("origin", "<f8", (2,))])
+    if dtype.itemsize != _RECORD.size or len(payload) % _RECORD.size:
+        raise SpatialCacheCorruptError(f"Spatial cache record layout is invalid: path={path}")
+    rows = np.frombuffer(payload, dtype=dtype)
+    matrices = np.ndarray((len(rows), 16), dtype="<f4", buffer=payload,
+                          offset=4, strides=(_RECORD.size, 4))
+    present = rows["present"]
+    bounds = rows["bounds"]
+    origin = rows["origin"]
+    invalid_marker = np.flatnonzero((present > 1) | ((present == 0) & np.any(bounds != 0, axis=1)))
+    if invalid_marker.size:
+        raise SpatialCacheCorruptError(
+            f"Spatial cache null-bounds marker is invalid: path={path}, index={int(invalid_marker[0])}")
+    invalid_matrix = np.flatnonzero(~np.all(np.isfinite(matrices), axis=1))
+    if invalid_matrix.size:
+        raise SpatialCacheCorruptError(
+            f"Spatial matrix requires 16 finite float32 values: {path}, entity_id={int(rows['id'][invalid_matrix[0]])}")
+    invalid_origin = np.flatnonzero(~np.all(np.isfinite(origin), axis=1)
+                                    | (origin[:, 0] != matrices[:, 12]) | (origin[:, 1] != matrices[:, 14]))
+    if invalid_origin.size:
+        raise SpatialCacheCorruptError(
+            f"Spatial origin differs from matrix: {path}, entity_id={int(rows['id'][invalid_origin[0]])}")
+    invalid_bounds = np.flatnonzero((present == 1) & (
+        ~np.all(np.isfinite(bounds), axis=1) | np.any(bounds[:, ::2] > bounds[:, 1::2], axis=1)))
+    if invalid_bounds.size:
+        raise SpatialCacheCorruptError(
+            f"Spatial bounds require six finite ordered values or null: {path}, entity_id={int(rows['id'][invalid_bounds[0]])}")
+    identifiers, counts = np.unique(rows["id"], return_counts=True)
+    duplicates = identifiers[counts > 1]
+    if duplicates.size:
+        raise SpatialCacheCorruptError(f"Spatial cache entity ID repeats: path={path}, entity_id={int(duplicates[0])}")
+    return tuple({"entity_id": entity_id, "matrix_blob": matrix,
+                  "world_bounds": cast(WorldBounds, tuple(values[:6])) if marker else None,
+                  "x": values[6], "z": values[7]}
+                 for entity_id, matrix, marker, *values in _RECORD.iter_unpack(payload))
 
 
 def _write(identity: SpatialSourceIdentity, records: tuple[SpatialRecord, ...]) -> None:

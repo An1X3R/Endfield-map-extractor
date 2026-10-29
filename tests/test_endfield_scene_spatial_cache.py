@@ -15,7 +15,7 @@ from endfield_scene_export_plan import Bounds, _CachedSpatialSelection, _cached_
 from endfield_scene_io import SceneInputChangedError, scene_io_session
 from endfield_scene_spatial_cache import (
     SpatialCacheCorruptError, SpatialSourceIdentity, SpatialSourceRecords, read_spatial_source_records,
-    spatial_parser_identity, spatial_source_identity,
+    spatial_parser_identity, spatial_source_identity, _records_from_payload,
 )
 from extractor_core.instances import iter_entities
 from extractor_core.projected_decals import read_chunk
@@ -67,6 +67,36 @@ def _read(identity: SpatialSourceIdentity, root: Path, entry: VfsFile) -> Spatia
 
 
 class PersistentSpatialCacheTests(unittest.TestCase):
+    def test_native_record_validation_preserves_numeric_failures(self) -> None:
+        record = struct.Struct("<I64sB6d2d")
+        path = Path("numeric-records.bin")
+        matrix = _matrix(2.0, 3.0)
+        valid = record.pack(42, matrix, 1, 1, 4, -2, 8, 2, 6, 2, 3)
+        self.assertEqual(_records_from_payload(valid, path), ({
+            "entity_id": 42, "matrix_blob": matrix, "world_bounds": (1.0, 4.0, -2.0, 8.0, 2.0, 6.0),
+            "x": 2.0, "z": 3.0,
+        },))
+        null_bounds = record.pack(43, matrix, 0, 0, 0, 0, 0, 0, 0, 2, 3)
+        self.assertIsNone(_records_from_payload(null_bounds, path)[0]["world_bounds"])
+        other_matrix = _matrix(-9.5, 11.25)
+        other = record.pack(0xFFFFFFFF, other_matrix, 1, -12, -8, 4, 5, 10, 13, -9.5, 11.25)
+        self.assertEqual(_records_from_payload(valid + other, path)[1], {
+            "entity_id": 0xFFFFFFFF, "matrix_blob": other_matrix,
+            "world_bounds": (-12.0, -8.0, 4.0, 5.0, 10.0, 13.0), "x": -9.5, "z": 11.25,
+        })
+        for payload, message in (
+            (record.pack(42, matrix, 2, 1, 4, -2, 8, 2, 6, 2, 3), "marker is invalid"),
+            (record.pack(42, matrix, 0, 1, 0, 0, 0, 0, 0, 2, 3), "marker is invalid"),
+            (record.pack(42, _matrix(float("nan"), 3.0), 1, 1, 4, -2, 8, 2, 6, 2, 3), "finite float32"),
+            (record.pack(42, matrix, 1, 1, 4, -2, 8, 2, 6, 9, 3), "origin differs"),
+            (record.pack(42, matrix, 1, 1, 4, -2, 8, 2, 6, 2, float("inf")), "origin differs"),
+            (record.pack(42, matrix, 1, 4, 1, -2, 8, 2, 6, 2, 3), "six finite ordered"),
+            (record.pack(42, matrix, 1, 1, 4, float("nan"), 8, 2, 6, 2, 3), "six finite ordered"),
+            (valid + valid, "entity ID repeats"),
+        ):
+            with self.subTest(message=message), self.assertRaisesRegex(SpatialCacheCorruptError, message):
+                _records_from_payload(payload, path)
+
     def test_roundtrip_preserves_exact_selection_and_returns_cold_chunk(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -146,7 +146,7 @@ _MANIFEST_COUNT_BUDGET = 256
 _RESOLUTION_COUNT_BUDGET = 131072
 _SOURCE_CACHE_BYTE_BUDGET = 768 * 1024 * 1024
 _SINGLE_PLAN_SOURCE_CACHE_BYPASS = frozenset({
-    "scene-manifest-index", "path-id-index", "dynamic-scene-renderers",
+    "scene-manifest-index", "dynamic-scene-renderers",
 })
 
 
@@ -215,6 +215,27 @@ class SceneIoSession:
     def cached_source_value(self, slot: SceneSourceCacheSlot[T], source_paths: tuple[Path, ...],
                             qualifiers: tuple[str, ...], factory: Callable[[], T]) -> T:
         """Read stable sources and retain only admitted immutable derived values."""
+        return self._cached_source_value(
+            slot, source_paths, qualifiers, lambda: (factory(), None)
+        )
+
+    def cached_source_value_with_estimated_size(
+        self,
+        slot: SceneSourceCacheSlot[T],
+        source_paths: tuple[Path, ...],
+        qualifiers: tuple[str, ...],
+        factory: Callable[[], tuple[T, int]],
+    ) -> T:
+        """Retain a derived value using its builder-provided exact size estimate."""
+        return self._cached_source_value(slot, source_paths, qualifiers, factory)
+
+    def _cached_source_value(
+        self,
+        slot: SceneSourceCacheSlot[T],
+        source_paths: tuple[Path, ...],
+        qualifiers: tuple[str, ...],
+        factory: Callable[[], tuple[T, int | None]],
+    ) -> T:
         self._require_owner()
         if not source_paths:
             raise ValueError(f"Invalid scene source cache request: slot={slot.name}, sources={len(source_paths)}")
@@ -235,7 +256,7 @@ class SceneIoSession:
             self.source_cache_slot_keys[slot.name].move_to_end(key)
             return previous.value
         self.source_cache_misses += 1
-        value = factory()
+        value, estimated_size = factory()
         if not isinstance(value, slot.value_type):
             raise TypeError(f"Scene source factory returned unexpected type: slot={slot.name}, expected={slot.value_type.__name__}, actual={type(value).__name__}")
         admitted = slot.name not in self.bypassed_source_cache_slots
@@ -246,9 +267,16 @@ class SceneIoSession:
             raise SceneInputChangedError(f"Scene source changed during derived read: slot={slot.name}, sources={sources}")
         if not admitted:
             return value
-        retained_bytes = _estimate_cached_value_bounded(
-            frozen, set(), min(slot.max_bytes, self.source_cache_byte_budget)
-        )
+        if estimated_size is None:
+            retained_bytes = _estimate_cached_value_bounded(
+                frozen, set(), min(slot.max_bytes, self.source_cache_byte_budget)
+            )
+        else:
+            if type(estimated_size) is not int or estimated_size < 0:
+                raise ValueError(
+                    f"Invalid builder-provided scene cache estimate: slot={slot.name}, bytes={estimated_size!r}"
+                )
+            retained_bytes = estimated_size
         if retained_bytes > slot.max_bytes or retained_bytes > self.source_cache_byte_budget:
             return frozen
         same_slot = self.source_cache_slot_keys.get(slot.name)
@@ -433,6 +461,20 @@ def cached_scene_source_value(slot: SceneSourceCacheSlot[T], source_paths: tuple
     if session is None:
         return factory()
     return session.cached_source_value(slot, source_paths, qualifiers, factory)
+
+
+def cached_scene_source_value_with_estimated_size(
+    slot: SceneSourceCacheSlot[T],
+    source_paths: tuple[Path, ...],
+    qualifiers: tuple[str, ...],
+    factory: Callable[[], tuple[T, int]],
+) -> T:
+    """Use a builder-provided retained-size estimate for one immutable source cache value."""
+    session = _active_session()
+    if session is None:
+        value, _estimated_size = factory()
+        return value
+    return session.cached_source_value_with_estimated_size(slot, source_paths, qualifiers, factory)
 
 
 def resolve_scene_read_path(path: Path) -> Path:

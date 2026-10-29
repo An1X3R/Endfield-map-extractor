@@ -22,7 +22,7 @@
 | 依赖 | 要求 |
 |---|---|
 | 系统 | Windows x64 |
-| Python | 3.11+，项目依赖安装于 `.venv` |
+| Python | CPython 3.11–3.14，项目依赖安装于 `.venv` |
 | Blender | 4.4+，已验证 4.4.3 |
 | Node.js / npm | 已验证 Node.js 24.16.0 |
 | .NET | 9 x64 运行时；预编译包不需要 SDK |

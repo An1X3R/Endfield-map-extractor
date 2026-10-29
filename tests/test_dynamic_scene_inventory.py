@@ -6,14 +6,18 @@ import struct
 import tempfile
 import unittest
 
-from endfield_scene_io import SceneInputChangedError
+from endfield_scene_io import (
+    SceneInputChangedError,
+    _estimate_cached_value_bounded,
+    single_scene_plan_io_session,
+)
 from extractor_core.dynamic_renderers import read_dynamic_scene_renderers_for_scene
 from extractor_core.effects import (
     GROUP_HASH, EffectDecodeError, _dynamic_inventory_qualifiers, _dynamic_inventory_sources,
     _require_dynamic_inventory_sources, _resolve_hashes, read_dynamic_scene_effects_for_scene,
 )
 from extractor_core.resources import BootstrapExtractionError
-from extractor_core.projected_decals import build_path_id_index
+from extractor_core.projected_decals import build_path_id_index, build_path_id_index_views_cancellable
 
 
 def _check_cancelled() -> None:
@@ -100,6 +104,83 @@ class DynamicInventoryTests(unittest.TestCase):
                 handle.write(b"trailing")
             with self.assertRaisesRegex(BootstrapExtractionError, "trailing bytes"):
                 _resolve_hashes(path, frozenset((identifier,)), _check_cancelled, ("assets/", "data/"))
+
+    def test_effect_resolver_rejects_valid_string_at_interior_offset(self) -> None:
+        identifier = bytes.fromhex("1234567890abcdef")
+        interior_path = "assets/interior.prefab"
+        encoded_path = interior_path.encode("utf-16le")
+        embedded_record = struct.pack("<I", len(encoded_path)) + encoded_path + b"\0\0"
+        record_payload = "x".encode("utf-16le") + embedded_record + "tail".encode("utf-16le")
+        string_table = struct.pack("<I", len(record_payload)) + record_payload + b"\0\0"
+        path_offset = 8 + 24
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "StringPathHash.bin"
+            path.write_bytes(
+                struct.pack("<II", path_offset, 1)
+                + identifier
+                + struct.pack("<QQ", 6, 0)
+                + string_table
+            )
+            self.assertIn(interior_path, build_path_id_index(path)[identifier])
+            with self.assertRaisesRegex(EffectDecodeError, "unresolvedCount=1"):
+                _resolve_hashes(path, frozenset((identifier,)), _check_cancelled, ("assets/", "data/"))
+
+    def test_resolver_reuses_stamped_index_with_original_path_spelling(self) -> None:
+        first_id = bytes.fromhex("1020304050607080")
+        second_id = bytes.fromhex("2030405060708090")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "StringPathHash.bin"
+            _write_path_hash(path, ((first_id, "Assets/Upper/First.prefab"),
+                                    (second_id, "packages/Second.prefab")))
+            with single_scene_plan_io_session() as session:
+                index = build_path_id_index(path)
+                self.assertEqual(("Assets/Upper/First.prefab",), index[first_id])
+                all_paths = _resolve_hashes(path, frozenset((first_id, second_id)), _check_cancelled,
+                                            ("assets/", "data/", "packages/"))
+                self.assertEqual({first_id: "Assets/Upper/First.prefab",
+                                  second_id: "packages/Second.prefab"}, all_paths)
+                asset_paths = _resolve_hashes(path, frozenset((first_id,)), _check_cancelled,
+                                              ("assets/", "data/"))
+                self.assertEqual({first_id: "Assets/Upper/First.prefab"}, asset_paths)
+                _write_path_hash(path, ((first_id, "Data/Changed.prefab"),
+                                        (second_id, "packages/Second.prefab")))
+                updated_index = build_path_id_index(path)
+                self.assertEqual(("Data/Changed.prefab",), updated_index[first_id])
+                updated = _resolve_hashes(path, frozenset((first_id,)), _check_cancelled,
+                                          ("assets/", "data/"))
+                self.assertEqual({first_id: "Data/Changed.prefab"}, updated)
+                self.assertGreaterEqual(session.statistics()["source_cache_hits"], 3)
+            self.assertEqual(0, len(session.source_cache))
+
+    def test_path_index_size_estimate_matches_general_cache_walk(self) -> None:
+        interior_id = bytes.fromhex("1020304050607080")
+        strict_id = bytes.fromhex("2030405060708090")
+        embedded_path = "assets/InteriorCandidate.prefab"
+        encoded_path = embedded_path.encode("utf-16le")
+        embedded_record = struct.pack("<I", len(encoded_path)) + encoded_path + b"\0\0"
+        record_payload = "x".encode("utf-16le") + embedded_record + "tail".encode("utf-16le")
+        first_string = struct.pack("<I", len(record_payload)) + record_payload + b"\0\0"
+        second_path = "data/StrictRecord.prefab"
+        encoded_second = second_path.encode("utf-16le")
+        second_string = struct.pack("<I", len(encoded_second)) + encoded_second + b"\0\0"
+        strings_offset = 8 + 2 * 24
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "StringPathHash.bin"
+            path.write_bytes(
+                struct.pack("<II", strings_offset, 2)
+                + interior_id + struct.pack("<QQ", 6, 0)
+                + strict_id + struct.pack("<QQ", len(first_string), 0)
+                + first_string + second_string
+            )
+            with single_scene_plan_io_session() as session:
+                views = build_path_id_index_views_cancellable(path, _check_cancelled)
+                self.assertIn(embedded_path, views.permissive()[interior_id])
+                self.assertEqual((), views.strict_paths(interior_id))
+                self.assertEqual((second_path,), views.strict_paths(strict_id))
+                expected_size = _estimate_cached_value_bounded(views, set(), None)
+                self.assertEqual(expected_size, session.statistics()["estimated_source_cache_bytes"])
+            self.assertEqual(0, len(session.source_cache))
 
     def test_cancelled_inventory_request_stops_before_reading_inputs(self) -> None:
         def cancelled() -> None:

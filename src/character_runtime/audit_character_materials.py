@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from array import array
 import hashlib
 import json
 from pathlib import Path
@@ -9,12 +10,14 @@ import struct
 import sys
 from typing import Callable, Mapping, Sequence
 
-sys.dont_write_bytecode = True
 import bpy
+
+sys.dont_write_bytecode = True
 
 
 def _geometry_digest(object_names: Sequence[str], transform_bytes: Callable[[bpy.types.Object], bytes], shape_blocks: Callable[[bpy.types.Object], Sequence[bpy.types.ShapeKey]], visibility: Callable[[bpy.types.Object], tuple[bool, bool, bool]], modifiers: Callable[[bpy.types.Object], Sequence[bpy.types.Modifier]]) -> dict[str, str]:
     result: dict[str, str] = {}
+    armature_bytes: dict[int, bytes] = {}
     for name in object_names:
         obj = bpy.data.objects[name]
         digest = hashlib.sha256()
@@ -24,29 +27,37 @@ def _geometry_digest(object_names: Sequence[str], transform_bytes: Callable[[bpy
             for weight in vertex.groups:
                 digest.update(struct.pack("<If", weight.group, weight.weight))
         for polygon in obj.data.polygons:
-            digest.update(struct.pack("<I", len(polygon.vertices)))
-            for index in polygon.vertices:
-                digest.update(struct.pack("<I", index))
+            indices = tuple(polygon.vertices)
+            digest.update(struct.pack('<' + 'I' * (len(indices) + 1), len(indices), *indices))
         for group in obj.vertex_groups:
             digest.update(group.name.encode("utf-8") + b"\0")
         for layer in obj.data.uv_layers:
             digest.update(layer.name.encode("utf-8") + b"\0")
-            for loop in layer.data:
-                digest.update(struct.pack("<2f", *loop.uv))
+            coordinates = array('f', [0.0]) * (len(layer.data) * 2)
+            layer.data.foreach_get('uv', coordinates)
+            if sys.byteorder != 'little':
+                coordinates.byteswap()
+            digest.update(coordinates.tobytes())
         for block in shape_blocks(obj):
             digest.update(block.name.encode("utf-8") + b"\0")
-            for vertex in block.data:
-                digest.update(struct.pack("<3f", *vertex.co))
+            coordinates = array('f', [0.0]) * (len(block.data) * 3)
+            block.data.foreach_get('co', coordinates)
+            if sys.byteorder != 'little':
+                coordinates.byteswap()
+            digest.update(coordinates.tobytes())
         for modifier in modifiers(obj):
             digest.update((modifier.name + "|" + modifier.type).encode("utf-8") + b"\0")
             if modifier.type == "ARMATURE":
                 if modifier.object is None:
                     raise ValueError(f"Armature modifier target missing: {name}")
-                digest.update(modifier.object.name.encode("utf-8") + b"\0")
-                for bone in modifier.object.data.bones:
-                    digest.update(bone.name.encode("utf-8") + b"\0")
-                    for row in bone.matrix_local:
-                        digest.update(struct.pack("<4f", *row))
+                pointer = modifier.object.as_pointer()
+                if pointer not in armature_bytes:
+                    chunks = [modifier.object.name.encode("utf-8") + b"\0"]
+                    for bone in modifier.object.data.bones:
+                        chunks.append(bone.name.encode("utf-8") + b"\0")
+                        chunks.extend(struct.pack("<4f", *row) for row in bone.matrix_local)
+                    armature_bytes[pointer] = b''.join(chunks)
+                digest.update(armature_bytes[pointer])
         digest.update(bytes(visibility(obj)))
         result[name] = digest.hexdigest()
     return result

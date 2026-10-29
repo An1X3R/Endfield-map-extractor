@@ -2,9 +2,24 @@
 
 from __future__ import annotations
 
+import random
 import unittest
 
+from lz4.block import compress, decompress
+
 from extractor_core.lz4 import decompress_lz4_inv
+
+
+_STANDARD_TOKENS = bytes(
+    (((value & 3) | ((value >> 2) & 12)) << 4)
+    | ((value >> 2) & 3)
+    | ((value >> 4) & 12)
+    for value in range(256)
+)
+_STANDARD_TO_INVERTED: tuple[int, ...] = tuple(
+    next(inverted for inverted, standard in enumerate(_STANDARD_TOKENS) if standard == token)
+    for token in range(256)
+)
 
 
 def token_for(literal_nibble: int, match_nibble: int) -> bytes:
@@ -17,7 +32,66 @@ def token_for(literal_nibble: int, match_nibble: int) -> bytes:
     return bytes((token,))
 
 
+def invert_standard_lz4_block(source: bytes) -> bytes:
+    inverted = bytearray(source)
+    source_pos = 0
+    while source_pos < len(source):
+        token = source[source_pos]
+        inverted[source_pos] = _STANDARD_TO_INVERTED[token]
+        source_pos += 1
+        literal_length = token >> 4
+        if literal_length == 15:
+            while True:
+                if source_pos >= len(source):
+                    raise ValueError("Truncated standard LZ4 literal length in test fixture")
+                extension = source[source_pos]
+                source_pos += 1
+                literal_length += extension
+                if extension != 255:
+                    break
+        if source_pos + literal_length > len(source):
+            raise ValueError("Truncated standard LZ4 literal payload in test fixture")
+        source_pos += literal_length
+        if source_pos == len(source):
+            break
+        if source_pos + 2 > len(source):
+            raise ValueError("Truncated standard LZ4 offset in test fixture")
+        inverted[source_pos] = source[source_pos + 1]
+        inverted[source_pos + 1] = source[source_pos]
+        source_pos += 2
+        if token & 15 == 15:
+            while True:
+                if source_pos >= len(source):
+                    raise ValueError("Truncated standard LZ4 match length in test fixture")
+                extension = source[source_pos]
+                source_pos += 1
+                if extension != 255:
+                    break
+    return bytes(inverted)
+
+
 class InvertedLz4Tests(unittest.TestCase):
+    def test_compiled_decoder_matches_lz4_blocks_without_mutating_read_only_input(self) -> None:
+        generator = random.Random(0xE4D1)
+        payloads = (
+            b"x",
+            b"ABCD" * 4096,
+            generator.randbytes(8192),
+        )
+        for payload in payloads:
+            with self.subTest(payload_size=len(payload)):
+                standard_block = compress(payload, store_size=False)
+                release_output = decompress(standard_block, uncompressed_size=len(payload))
+                self.assertEqual(release_output, payload)
+                inverted_block = invert_standard_lz4_block(standard_block)
+                source_snapshot = bytes(inverted_block)
+                self.assertEqual(decompress_lz4_inv(inverted_block, len(payload)), release_output)
+                self.assertEqual(inverted_block, source_snapshot)
+
+        from extractor_core.lz4_numba import _normalize
+
+        self.assertTrue(_normalize.signatures)
+
     def test_empty_block(self) -> None:
         self.assertEqual(decompress_lz4_inv(b"", 0), b"")
 

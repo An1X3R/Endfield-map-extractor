@@ -9,7 +9,7 @@ from pathlib import Path
 import subprocess
 import sys
 
-from endfield_character_tools import CharacterToolBuild, CharacterToolsError, ROOT, _lock, _object, _relative, _text, build_character_tools
+from endfield_character_tools import CharacterToolBuild, CharacterToolsError, ROOT, _lock, _object, _patch_specs, _relative, _text, _verify_file, build_character_tools
 from release_source_overrides import apply_animestudio_source_overrides
 
 
@@ -60,9 +60,11 @@ def prepare_character_sources(work_root: Path) -> tuple[Path, Path, Path, Path]:
         commit = _text(dependency["commit"], f"{key}.commit")
         _git(["-C", str(root), "fetch", "--depth", "1", "origin", commit], log, environment)
         _git(["-C", str(root), "checkout", "--detach", commit], log, environment)
-        patch = _relative(ROOT, dependency["patch"], f"{key}.patch")
-        _git(["-C", str(root), "apply", "--check", str(patch)], log, environment)
-        _git(["-C", str(root), "apply", str(patch)], log, environment)
+        for patch_path, patch_sha256 in _patch_specs(dependency, key):
+            patch = _relative(ROOT, patch_path, f"{key}.patch")
+            _verify_file(patch, patch_sha256, f"{key}.patchSha256")
+            _git(["-C", str(root), "apply", "--check", str(patch)], log, environment)
+            _git(["-C", str(root), "apply", str(patch)], log, environment)
         if key == "animeStudio":
             apply_animestudio_source_overrides(root, ROOT / "third_party" / "source-overrides" / "animestudio")
         roots[key] = root

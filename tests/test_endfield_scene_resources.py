@@ -9,6 +9,7 @@ import tempfile
 import unittest
 from contextlib import closing
 from pathlib import Path
+from unittest.mock import patch
 
 from endfield_scene_resources import (
     FORMAT,
@@ -16,6 +17,8 @@ from endfield_scene_resources import (
     describe_file,
     ensure_scene_resources,
     exact_providers,
+    read_json,
+    resolve_existing_export_files,
     ready_resource_paths,
     ready_requested_resource_paths,
     resource_cache_root,
@@ -24,6 +27,7 @@ from endfield_scene_resources import (
     _prefab_bounds_game_generation,
 )
 from endfield_scene_io import scene_io_session
+from endfield_scene_helpers import SceneHelpers
 from endfield_scene_prefab_geometry_plan import observed_prefab_geometry_paths, prefab_candidates
 from extractor_core.resources import BundleProviderIssue, read_bundle_provider_names_for_paths
 
@@ -149,6 +153,41 @@ class SceneResourceIntegrationTests(unittest.TestCase):
                 self.assertEqual(full & requested, selected & requested)
                 self.assertEqual(material_path in selected, texture_ready)
                 self.assertEqual(mesh_path + "##mesh" in selected, mesh_ready)
+
+    def test_selected_mesh_readiness_resolves_only_cross_manifest_requested_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            mesh = {"Source": "CAB-selected", "PathId": 1, "Type": "Mesh", "Name": "selected"}
+            selected_path = "assets/effects/selected.mesh##selected"
+            containers = root / "containers.json"
+            exports = root / "exports.json"
+            containers.write_text(json.dumps({
+                "Format": "EndfieldSceneProbe/1", "Materials": [], "TextureExports": [],
+                "Containers": [{"Container": "assets/effects/selected.mesh", "Asset": mesh}],
+                "MeshExports": [],
+            }), encoding="utf-8")
+            mesh_exports = [{"Asset": mesh, "File": "selected.obj"}]
+            mesh_exports.extend({
+                "Asset": {"Source": f"CAB-unrelated-{index}", "PathId": index,
+                          "Type": "Mesh", "Name": f"unrelated-{index}"},
+                "File": f"missing-{index}.obj",
+            } for index in range(64))
+            exports.write_text(json.dumps({
+                "Format": "EndfieldSceneProbe/1", "Materials": [], "TextureExports": [],
+                "Containers": [], "MeshExports": mesh_exports,
+            }), encoding="utf-8")
+            selected_file = root / "selected.obj"
+            requested = frozenset({selected_path})
+            for present in (False, True):
+                if present:
+                    selected_file.write_bytes(b"selected mesh")
+                else:
+                    selected_file.unlink(missing_ok=True)
+                with patch("endfield_scene_resources.resolve_existing_export_files",
+                           wraps=resolve_existing_export_files) as resolve_files:
+                    ready = ready_requested_resource_paths((containers, exports), requested, root / "cache")
+                self.assertEqual(ready, requested if present else frozenset())
+                self.assertEqual(resolve_files.call_args.args[0], (selected_file,))
 
     def test_mapped_sweep_cache_requires_source_texture_color_space(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -375,6 +414,194 @@ class SceneResourceIntegrationTests(unittest.TestCase):
                 result["unresolvedProviders"],
             )
             self.assertNotIn("extraction", result)
+
+    def test_completed_partial_attempt_is_reused_without_output_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runtime_path, plan_path, runtime, plan, provider_path, probe_path, source_chunk = self._partial_attempt_fixture(root)
+            helpers = SceneHelpers(root / "bundle-scanner.exe", probe_path)
+            output_manifest = {
+                "Format": "EndfieldSceneProbe/1", "Materials": [], "TextureExports": [], "LodGroups": [],
+                "Nodes": [], "MeshExports": [], "Containers": [],
+            }
+
+            def run_process(arguments: list[str], *_args: object) -> None:
+                output = Path(arguments[2])
+                output.mkdir(parents=True)
+                (output / "scene_manifest.json").write_text(json.dumps(output_manifest), encoding="utf-8")
+
+            with patch("endfield_scene_resources.require_prepared_scene_helpers", return_value=helpers), \
+                    patch("endfield_scene_resources.read_bundle_closure_names",
+                          return_value=({"resources": ["main/missing.ab"]}, {})), \
+                    patch("endfield_scene_resources.extract_candidate_bundles", return_value={"bundles": 1}) as extract, \
+                    patch("endfield_scene_export.run_scene_process", side_effect=run_process) as probe:
+                first = ensure_scene_resources(runtime_path, plan_path, lambda: None, lambda _value, _message: None)
+                self.assertEqual("partial", first["status"])
+                self.assertTrue(first["partial"])
+                self.assertFalse(first["cachedAttempt"])
+                self.assertEqual(["assets/test/missing.fbx##mesh"], first["missingAfter"])
+
+                cache_root = resource_cache_root(runtime_path, runtime)
+                supplement = supplemental_manifests(runtime_path, runtime)
+                plan["scene_manifests"] = [str(root / "base_manifest.json"), *(str(path) for path in supplement)]
+                plan_path.write_text(json.dumps(plan), encoding="utf-8")
+                index_before = read_json(cache_root / "index.json")
+                work_directories_before = tuple(path for path in cache_root.iterdir() if path.is_dir())
+
+                repeated = ensure_scene_resources(runtime_path, plan_path, lambda: None, lambda _value, _message: None)
+
+                self.assertEqual("partial", repeated["status"])
+                self.assertTrue(repeated["partial"])
+                self.assertTrue(repeated["cachedAttempt"])
+                self.assertEqual(first["missingBefore"], repeated["missingBefore"])
+                self.assertEqual(first["missingAfter"], repeated["missingAfter"])
+                self.assertEqual(1, extract.call_count)
+                self.assertEqual(1, probe.call_count)
+                self.assertEqual(work_directories_before,
+                                 tuple(path for path in cache_root.iterdir() if path.is_dir()))
+                self.assertEqual(index_before, read_json(cache_root / "index.json"))
+
+                scan_rows = (
+                    {"kind": "match", "logical_name": "main/changed.ab", "containers": ["assets/test/missing.fbx"]},
+                    {"kind": "complete", "failed": 0},
+                )
+                provider_path.write_text("".join(json.dumps(row) + "\n" for row in scan_rows), encoding="utf-8")
+                extraction = runtime["extraction"]
+                assert isinstance(extraction, dict)
+                discovery = extraction["sceneDiscovery"]
+                assert isinstance(discovery, dict)
+                discovery["scannerResults"] = describe_file(provider_path)
+                runtime_path.write_text(json.dumps(runtime), encoding="utf-8")
+                plan["scene_manifests"] = [str(root / "base_manifest.json"),
+                                            *(str(path) for path in supplemental_manifests(runtime_path, runtime))]
+                plan_path.write_text(json.dumps(plan), encoding="utf-8")
+                changed_provider = ensure_scene_resources(
+                    runtime_path, plan_path, lambda: None, lambda _value, _message: None)
+                self.assertEqual("partial", changed_provider["status"])
+                self.assertFalse(changed_provider["cachedAttempt"])
+                self.assertEqual(first["missingAfter"], changed_provider["missingAfter"])
+                self.assertEqual(2, extract.call_count)
+
+                probe_path.with_suffix(".dll").write_bytes(b"changed SceneProbe assembly")
+                plan["scene_manifests"] = [str(root / "base_manifest.json"),
+                                            *(str(path) for path in supplemental_manifests(runtime_path, runtime))]
+                plan_path.write_text(json.dumps(plan), encoding="utf-8")
+                changed_helper = ensure_scene_resources(
+                    runtime_path, plan_path, lambda: None, lambda _value, _message: None)
+                self.assertEqual("partial", changed_helper["status"])
+                self.assertFalse(changed_helper["cachedAttempt"])
+                self.assertEqual(first["missingAfter"], changed_helper["missingAfter"])
+                self.assertEqual(3, extract.call_count)
+
+                plan["required_uv_streams"] = [{"mesh_path": "assets/test/missing.fbx##mesh", "channels": [2]}]
+                plan_path.write_text(json.dumps(plan), encoding="utf-8")
+                changed_requirements = ensure_scene_resources(
+                    runtime_path, plan_path, lambda: None, lambda _value, _message: None)
+                self.assertEqual("partial", changed_requirements["status"])
+                self.assertFalse(changed_requirements["cachedAttempt"])
+                self.assertEqual(first["missingAfter"], changed_requirements["missingAfter"])
+                self.assertEqual(4, extract.call_count)
+
+                source_chunk.write_bytes(b"new game source generation")
+                changed_game = ensure_scene_resources(
+                    runtime_path, plan_path, lambda: None, lambda _value, _message: None)
+                self.assertEqual("partial", changed_game["status"])
+                self.assertFalse(changed_game["cachedAttempt"])
+                self.assertEqual(first["missingAfter"], changed_game["missingAfter"])
+                self.assertEqual(5, extract.call_count)
+
+                cab_inventory = root / "cab_inventory.jsonl"
+                cab_inventory.write_text('{"kind":"cab","logical_name":"main/shared.ab"}\n', encoding="utf-8")
+                plan["scene_manifests"] = [str(root / "base_manifest.json"),
+                                            *(str(path) for path in supplemental_manifests(runtime_path, runtime))]
+                plan_path.write_text(json.dumps(plan), encoding="utf-8")
+                changed_cab = ensure_scene_resources(
+                    runtime_path, plan_path, lambda: None, lambda _value, _message: None)
+                self.assertEqual("partial", changed_cab["status"])
+                self.assertFalse(changed_cab["cachedAttempt"])
+                self.assertEqual(first["missingAfter"], changed_cab["missingAfter"])
+                self.assertEqual(6, extract.call_count)
+
+                plan["scene_manifests"] = [str(root / "base_manifest.json"),
+                                            *(str(path) for path in supplemental_manifests(runtime_path, runtime))]
+                plan_path.write_text(json.dumps(plan), encoding="utf-8")
+                unchanged_cab = ensure_scene_resources(
+                    runtime_path, plan_path, lambda: None, lambda _value, _message: None)
+                self.assertTrue(unchanged_cab["cachedAttempt"])
+                self.assertEqual(6, extract.call_count)
+
+                index_before = read_json(cache_root / "index.json")
+                cab_inventory.write_text('{"kind":"cab","logical_name":"main/new.ab"}\n', encoding="utf-8")
+
+                def change_cab_during_probe(arguments: list[str], *_args: object) -> None:
+                    run_process(arguments)
+                    cab_inventory.write_text('{"kind":"cab","logical_name":"main/changed.ab"}\n', encoding="utf-8")
+
+                with patch("endfield_scene_export.run_scene_process", side_effect=change_cab_during_probe), scene_io_session():
+                    with self.assertRaisesRegex(OSError, "CAB inventory changed during scene resource preparation"):
+                        ensure_scene_resources(
+                            runtime_path, plan_path, lambda: None, lambda _value, _message: None)
+                self.assertEqual(index_before, read_json(cache_root / "index.json"))
+
+    def _partial_attempt_fixture(
+        self, root: Path,
+    ) -> tuple[Path, Path, dict[str, object], dict[str, object], Path, Path, Path]:
+        config = root / "config"
+        inputs = config / "inputs"
+        inputs.mkdir(parents=True)
+        bundle_index = inputs / "bundle_scan_index.tsv"
+        bundle_index.write_text("bundle index fixture\n", encoding="utf-8")
+        database = inputs / "resources.sqlite"
+        self._create_resource_database(database, "initial")
+        game = root / "game"
+        vfs = game / "Endfield_Data" / "StreamingAssets" / "VFS" / "group"
+        vfs.mkdir(parents=True)
+        (game / "Endfield.exe").write_bytes(b"game executable")
+        source_chunk = vfs / "source.blc"
+        source_chunk.write_bytes(b"game bundle source")
+        (vfs / "source.chk").write_bytes(b"game chunk source")
+        provider_path = root / "providers.jsonl"
+        provider_path.write_text("".join(json.dumps(row) + "\n" for row in (
+            {"kind": "match", "logical_name": "main/missing.ab", "containers": ["assets/test/missing.fbx"]},
+            {"kind": "complete", "failed": 0},
+        )), encoding="utf-8")
+        probe_path = root / "scene-probe.exe"
+        probe_path.write_bytes(b"SceneProbe executable")
+        (root / "scene-probe.dll").write_bytes(b"SceneProbe assembly")
+        (root / "bundle-scanner.exe").write_bytes(b"BundleScanner executable")
+        (root / "bundle-scanner.dll").write_bytes(b"BundleScanner assembly")
+        base_manifest = root / "base_manifest.json"
+        base_manifest.write_text(json.dumps({
+            "Format": "EndfieldSceneProbe/1", "Materials": [], "TextureExports": [], "LodGroups": [],
+            "Nodes": [], "MeshExports": [], "Containers": [],
+        }), encoding="utf-8")
+        (root / "cab_inventory.jsonl").write_text("{}\n", encoding="utf-8")
+        runtime: dict[str, object] = {
+            "format": "EndfieldRuntimeConfig/1",
+            "paths": {"cache_root": "../cache", "game_root": "../game"},
+            "extraction": {
+                "mapLayerFingerprint": FINGERPRINT,
+                "bundleScanIndex": "inputs/bundle_scan_index.tsv",
+                "resourceDatabase": "inputs/resources.sqlite",
+                "sceneDiscovery": {
+                    "providerCoverage": PROVIDER_COVERAGE,
+                    "scannerResults": describe_file(provider_path),
+                    "cabInventory": {"path": "../cab_inventory.jsonl"},
+                },
+            },
+        }
+        runtime_path = config / "runtime.json"
+        runtime_path.write_text(json.dumps(runtime), encoding="utf-8")
+        mesh_path = "assets/test/missing.fbx##mesh"
+        plan: dict[str, object] = {
+            "required_resource_paths": [mesh_path],
+            "required_effect_mesh_paths": [mesh_path],
+            "required_uv_streams": [{"mesh_path": mesh_path, "channels": [1]}],
+            "scene_manifests": [str(base_manifest)],
+        }
+        plan_path = root / "plan.json"
+        plan_path.write_text(json.dumps(plan), encoding="utf-8")
+        return runtime_path, plan_path, runtime, plan, provider_path, probe_path, source_chunk
 
     def test_scene_resource_cache_root_changes_when_either_prepared_input_changes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

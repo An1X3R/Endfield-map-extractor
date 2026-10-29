@@ -5,10 +5,12 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from endfield_scene_direct_effects_plan import build_direct_effect_plan
+from endfield_scene_direct_effects_plan import (build_direct_effect_plan, effect_mesh_streams_ready,
+                                                ready_effect_mesh_paths, ready_requested_effect_mesh_paths)
 from endfield_scene_vfxrefract_contract import read_scene_color_snapshot
 from extractor_core.dynamic_renderers import (DynamicRendererPair, DynamicRendererRecord,
                                               DynamicRendererSource, DynamicSceneRendererInventory)
@@ -47,6 +49,60 @@ def source_snapshot() -> dict[str, object]:
 
 
 class DirectEffectSnapshotPlanTests(unittest.TestCase):
+    def test_requested_fx_mesh_checks_only_selected_sidecars_across_manifests(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            mesh = {"Source": "CAB-selected", "PathId": 1, "Type": "Mesh", "Name": "selected"}
+            outside_mesh = {"Source": "CAB-outside", "PathId": 2, "Type": "Mesh", "Name": "outside"}
+            requested_path = "assets/effects/selected.mesh##selected"
+            selected_alias = "assets/effects/selected.mesh"
+            outside_path = "assets/models/outside.mesh##outside"
+            outside_alias = "assets/models/outside.mesh"
+            containers = root / "containers.json"
+            exports = root / "exports.json"
+            containers.write_text(json.dumps({
+                "Format": "EndfieldSceneProbe/1",
+                "Containers": [
+                    {"Container": selected_alias, "Asset": mesh},
+                    {"Container": outside_alias, "Asset": outside_mesh},
+                ],
+                "MeshExports": [],
+            }), encoding="utf-8")
+            (root / "selected.bin").write_bytes(b"mesh")
+            mesh_exports = [{
+                "Asset": mesh, "File": "selected.bin", "VertexCount": 3,
+                "VertexColorComponents": 0, "Uv0Components": 2, "Uv1Components": 0,
+                "Uv0File": "selected-uv0.bin",
+            }, {"Asset": outside_mesh, "File": "outside.bin", "VertexCount": 3,
+                "VertexColorComponents": 0, "Uv0Components": 0, "Uv1Components": 0}]
+            (root / "outside.bin").write_bytes(b"mesh")
+            mesh_exports.extend({
+                "Asset": {"Source": f"CAB-unrelated-{index}", "PathId": index,
+                          "Type": "Mesh", "Name": f"unrelated-{index}"},
+                "File": f"missing-{index}.bin", "VertexCount": 3,
+                "VertexColorComponents": 0, "Uv0Components": 2, "Uv1Components": 0,
+                "Uv0File": f"missing-{index}-uv0.bin",
+            } for index in range(64))
+            exports.write_text(json.dumps({
+                "Format": "EndfieldSceneProbe/1", "Containers": [], "MeshExports": mesh_exports,
+            }), encoding="utf-8")
+            requested = frozenset({requested_path, selected_alias, outside_path, outside_alias})
+            expected_ready = frozenset({requested_path, selected_alias})
+            for uv_ready in (False, True):
+                uv_path = root / "selected-uv0.bin"
+                if uv_ready:
+                    uv_path.write_bytes(bytes(3 * 2 * 4))
+                else:
+                    uv_path.unlink(missing_ok=True)
+                with patch("endfield_scene_direct_effects_plan.effect_mesh_streams_ready",
+                           wraps=effect_mesh_streams_ready) as check_streams:
+                    ready = ready_requested_effect_mesh_paths((containers, exports), requested)
+                self.assertEqual(ready, expected_ready if uv_ready else frozenset())
+                self.assertEqual(check_streams.call_count, 1)
+                self.assertEqual(check_streams.call_args.args[0]["Asset"]["Source"], "CAB-selected")
+            complete = ready_effect_mesh_paths((containers, exports))
+            self.assertEqual(requested & complete, expected_ready)
+
     def test_vfxrefract_requires_snapshot_and_actual_uv0_stream(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

@@ -1,0 +1,15 @@
+diff --git a/AnimeStudio/TypeTreeHelper.cs b/AnimeStudio/TypeTreeHelper.cs
+--- a/AnimeStudio/TypeTreeHelper.cs
++++ b/AnimeStudio/TypeTreeHelper.cs
+@@ -306,7 +306,10 @@
+             var varTypeStr = m_Node.m_Type;
+             
+             object value;
+             var align = (m_Node.m_MetaFlag & 0x4000) != 0;
+-            Logger.Verbose($"Reading {m_Node.m_Name} of type {varTypeStr} at {reader.Position - 4200} with align {align} and {reader.Remaining} left");
++            if (Logger.Flags.HasFlag(LoggerEvent.Verbose) && !Logger.Silent)
++            {
++                Logger.Verbose($"Reading {m_Node.m_Name} of type {varTypeStr} at {reader.Position - 4200} with align {align} and {reader.Remaining} left");
++            }
+ 
+             if (reader.Remaining <= 0)

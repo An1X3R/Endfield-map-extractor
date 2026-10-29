@@ -9,8 +9,11 @@ import sys
 import tempfile
 import time
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from endfield_scene_export import (
+    _build_scene_exports,
     _can_reuse_preflight_plan,
     _refresh_after_resource_writes,
     _scene_export_io_session,
@@ -164,7 +167,7 @@ class PreflightReuseTests(unittest.TestCase):
         self.assertTrue(_can_reuse_preflight_plan(canonical, batches))
         with _scene_export_io_session(canonical, batches) as session:
             self.assertEqual(_SOURCE_CACHE_BYTE_BUDGET, session.source_cache_byte_budget)
-            self.assertEqual(frozenset({"scene-manifest-index", "path-id-index", "dynamic-scene-renderers"}),
+            self.assertEqual(frozenset({"scene-manifest-index", "dynamic-scene-renderers"}),
                              session.bypassed_source_cache_slots)
 
         other_selection = {**canonical, "selection_bounds": {**bounds, "xmax": 256.0}}
@@ -216,6 +219,55 @@ class PreflightReuseTests(unittest.TestCase):
             with self.assertRaises(FileNotFoundError):
                 copy_preflight_plan(source, directory / "missing_source.json")
             self.assertFalse((directory / "missing_source.json").exists())
+
+    def test_cached_partial_attempt_reuses_its_preflight_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            game = root / "game"
+            game.mkdir()
+            blender = root / "blender.exe"
+            blender.write_bytes(b"blender")
+            cache = root / "cache"
+            output = root / "output"
+            output.mkdir()
+            runtime = {"paths": {"cache_root": str(cache)}}
+            canonical = {
+                "map_id": "map01",
+                "batch_mode": "merged_selection",
+                "bounds": {"xmin": 0, "xmax": 128, "zmin": 0, "zmax": 128},
+                "source": {"game_root": str(game), "blender_exe": str(blender)},
+            }
+
+            def write_plan(_runtime_path: Path, _canonical: object, target: Path, _check: object) -> Path:
+                target.parent.mkdir(parents=True)
+                target.write_text(json.dumps({"required_resource_paths": ["assets/missing.prefab"]}),
+                                  encoding="utf-8")
+                return target
+
+            cached_audit = {
+                "status": "partial", "partial": True, "cachedAttempt": True,
+                "missingAfter": ["assets/missing.prefab"],
+            }
+            with patch("endfield_scene_export.scene_runtime", return_value=runtime), \
+                    patch("endfield_scene_export.system_memory_snapshot",
+                          return_value=SimpleNamespace(available_physical_bytes=8 * 1024 ** 3,
+                                                       total_physical_bytes=16 * 1024 ** 3)), \
+                    patch("endfield_scene_export.scene_memory_tool_signature", return_value="fixture"), \
+                    patch("endfield_scene_export.read_scene_memory_calibrations", return_value=()), \
+                    patch("endfield_scene_pipeline.run_scene_pipeline", return_value=[]), \
+                    patch("endfield_scene_export_plan.prepare_scene_export_plan", side_effect=write_plan) as planner, \
+                    patch("endfield_scene_resources.ensure_scene_resources", return_value=cached_audit) as prepare:
+                with scene_io_session() as io_session:
+                    artifacts = _build_scene_exports(
+                        root / "runtime.json", canonical, output, lambda: None, lambda _value, _message: None,
+                        io_session, scene_batches(canonical))
+
+            self.assertEqual([], artifacts)
+            self.assertEqual(1, planner.call_count)
+            self.assertEqual(1, prepare.call_count)
+            audit = json.loads((output / "resource_preflight" / "resource_audit.json").read_text(encoding="utf-8"))
+            self.assertTrue(audit["cachedAttempt"])
+            self.assertEqual([cached_audit], audit["dependencyPasses"])
 
 
 class ResourceSourceInvalidationTests(unittest.TestCase):
