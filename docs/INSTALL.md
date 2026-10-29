@@ -2,7 +2,7 @@
 
 ## 普通用户：预编译发行包
 
-从 [GitHub Releases](https://github.com/An1X3R/Endfield-map-extractor/releases/latest) 下载 `Endfield-Extractor-v3.7-windows-x64.zip`，完整解压到可写目录。请保留 `.tools` 文件夹；GitHub 自动生成的 Source code ZIP 不包含它。
+从 [GitHub Releases](https://github.com/An1X3R/Endfield-map-extractor/releases/latest) 下载 `Endfield-Extractor-v3.8-windows-x64.zip`，完整解压到可写目录。请保留 `.tools` 文件夹；GitHub 自动生成的 Source code ZIP 不包含它。
 
 需要 Windows x64、CPython 3.11–3.14、Node.js/npm、.NET 9 x64 运行时和 Blender 4.4+（已验证 4.4.3）。读取工具已预编译，不需要 Git 或 .NET SDK。工具运行依赖以随包回执校验。
 
@@ -27,6 +27,8 @@ powershell -ExecutionPolicy Bypass -File .\launch_extractor.ps1
 ## 升级与旧缓存
 
 建议解压新版到独立目录，完成新版环境准备，再选择原游戏、缓存和输出目录。不要直接删除旧缓存，也不要把旧版 `.tools` 覆盖到新版；工具升级会核对来源与工具身份，复用有效数据。
+
+v3.8 新增 NumPy / Numba 运行依赖，并更新角色读取工具。普通用户使用完整发行包，重新运行 `setup_release_environment.ps1` 即可，无需编译读取器或克隆第三方仓库。第一次解压预处理会生成本机编译缓存，旧空间索引和部分资源探测缓存可能刷新一次；后续复用有效结果，不需要删除原数据缓存。源码安装者还需按本文末尾的构建流程重建角色工具，旧工具不能覆盖新版。
 
 v3.1 会核对地图实例索引与当前包体是否匹配。旧索引缺少来源记录、或游戏更新导致来源变化时，需要继续首次准备以刷新相关阶段；已有文件并不代表缓存仍适用于当前包体。角色数据仍独立准备。
 

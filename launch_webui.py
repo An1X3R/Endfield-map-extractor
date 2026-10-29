@@ -967,7 +967,7 @@ def resolve_port(requested: int) -> int:
 
 
 def frontend_command(
-    npm: str,
+    node: str,
     webui_root: Path,
     *,
     development: bool,
@@ -980,14 +980,17 @@ def frontend_command(
             f"WebUI dependencies are missing at {webui_root / 'node_modules'}. "
             f'Run: powershell -ExecutionPolicy Bypass -File "{ROOT / "setup_development_environment.ps1"}"'
         )
+    vite = webui_root / "node_modules" / "vite" / "bin" / "vite.js"
+    if not vite.is_file():
+        raise FileNotFoundError(f"Installed Vite entry point is missing: {vite}. Rerun setup_development_environment.ps1.")
     if development:
-        return [npm, "run", "dev", "--", "--port", str(port)]
+        return [node, str(vite), "--host", "127.0.0.1", "--port", str(port)]
     if not (webui_root / "dist" / "index.html").is_file():
         raise RuntimeError(
             f"Built WebUI is missing: {webui_root / 'dist' / 'index.html'}. "
             f'Run: powershell -ExecutionPolicy Bypass -File "{ROOT / "setup_development_environment.ps1"}"'
         )
-    return [npm, "run", "preview", "--", "--port", str(port)]
+    return [node, str(vite), "preview", "--host", "127.0.0.1", "--port", str(port)]
 
 
 def wait_for_server(url: str, process: subprocess.Popen[object], timeout: float = 30.0) -> bool:
@@ -1150,17 +1153,17 @@ def main() -> int:
         print(f"WebUI package is missing: {WEBUI_ROOT}", file=sys.stderr)
         return 2
 
-    npm = shutil.which("npm.cmd") or shutil.which("npm")
-    if not npm:
+    node = shutil.which("node.exe") or shutil.which("node")
+    if not node:
         print(
-            f'Node.js/npm was not found. Install Node.js, then run: powershell -ExecutionPolicy Bypass -File "{ROOT / "setup_development_environment.ps1"}"',
+            f'Node.js was not found. Install Node.js, then run: powershell -ExecutionPolicy Bypass -File "{ROOT / "setup_development_environment.ps1"}"',
             file=sys.stderr,
         )
         return 2
 
     preferred_port = args.port if args.port is not None else (5173 if args.development else 4174)
     try:
-        command = frontend_command(npm, WEBUI_ROOT, development=args.development, port=preferred_port)
+        command = frontend_command(node, WEBUI_ROOT, development=args.development, port=preferred_port)
     except (FileNotFoundError, RuntimeError) as error:
         print(str(error), file=sys.stderr)
         return 2
@@ -1226,7 +1229,7 @@ def main() -> int:
     environment["ENDFIELD_PATH_PICKER_TOKEN"] = picker_server.token
 
     url = f"http://127.0.0.1:{port}/"
-    command = frontend_command(npm, WEBUI_ROOT, development=args.development, port=port)
+    command = frontend_command(node, WEBUI_ROOT, development=args.development, port=port)
     server_kind = "Vite development server" if args.development else "Vite preview server with local API middleware"
     if not args.development:
         print("Serving the built WebUI through Vite preview; local API middleware remains enabled.")

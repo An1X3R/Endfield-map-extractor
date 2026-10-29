@@ -4,6 +4,25 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+function Test-SupportedPythonRuntime {
+    param(
+        [string]$Executable,
+        [string[]]$RuntimeArguments,
+        [string]$VersionCheck
+    )
+
+    $previousPreference = $ErrorActionPreference
+    try {
+        # A missing launcher version is an expected probe result in Windows PowerShell.
+        $ErrorActionPreference = 'Continue'
+        & $Executable @RuntimeArguments -c $VersionCheck *> $null
+        return $LASTEXITCODE -eq 0
+    } finally {
+        $ErrorActionPreference = $previousPreference
+    }
+}
+
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $bootstrap = Join-Path $root 'bootstrap_environment.py'
 $venvPython = Join-Path $root '.venv\Scripts\python.exe'
@@ -22,8 +41,7 @@ $py = Get-Command py -ErrorAction SilentlyContinue
 $pythonVersionCheck = "import sys; raise SystemExit(0 if sys.implementation.name == 'cpython' and (3, 11) <= sys.version_info[:2] < (3, 15) else 1)"
 if ($py) {
     foreach ($pythonArgument in @('-3.14', '-3.13', '-3.12', '-3.11')) {
-        & $py.Source $pythonArgument -c $pythonVersionCheck *> $null
-        if ($LASTEXITCODE -eq 0) {
+        if (Test-SupportedPythonRuntime -Executable $py.Source -RuntimeArguments @($pythonArgument) -VersionCheck $pythonVersionCheck) {
             $hostPython = @($py.Source, $pythonArgument)
             break
         }
@@ -32,8 +50,7 @@ if ($py) {
 if (-not $hostPython) {
     $python = Get-Command python -ErrorAction SilentlyContinue
     if ($python) {
-        & $python.Source -c $pythonVersionCheck *> $null
-        if ($LASTEXITCODE -eq 0) {
+        if (Test-SupportedPythonRuntime -Executable $python.Source -RuntimeArguments @() -VersionCheck $pythonVersionCheck) {
             $hostPython = @($python.Source)
         }
     }
@@ -61,9 +78,18 @@ if (-not $npmCommand) {
 if (-not $npmCommand) {
     throw 'Node.js/npm is required to build the local WebUI. Install Node.js, then rerun this setup script.'
 }
+$nodeCommand = Get-Command node.exe -ErrorAction Stop
 
 Push-Location $webui
+$previousPath = $env:Path
 try {
+    # npm extends PATH for child shells; long host paths exceed cmd.exe limits.
+    $env:Path = @(
+        (Split-Path -Parent $nodeCommand.Source),
+        (Split-Path -Parent $npmCommand.Source),
+        [Environment]::SystemDirectory,
+        [Environment]::GetFolderPath('Windows')
+    ) -join ';'
     & $npmCommand.Source ci --no-audit --no-fund
     if ($LASTEXITCODE -ne 0) {
         throw "WebUI dependency setup failed with exit code $LASTEXITCODE."
@@ -95,6 +121,7 @@ try {
         throw "WebUI production build failed with exit code $LASTEXITCODE."
     }
 } finally {
+    $env:Path = $previousPath
     Pop-Location
 }
 

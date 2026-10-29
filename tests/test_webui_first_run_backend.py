@@ -734,21 +734,26 @@ class WebUIFirstRunBackendTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             webui = Path(temporary)
             (webui / "package.json").write_text("{}", encoding="utf-8")
-            (webui / "node_modules").mkdir()
+            vite = webui / "node_modules" / "vite" / "bin" / "vite.js"
+            vite.parent.mkdir(parents=True)
+            vite.touch()
             (webui / "dist").mkdir()
             (webui / "dist" / "index.html").write_text("<html></html>", encoding="utf-8")
 
             self.assertEqual(
-                ["npm.cmd", "run", "preview", "--", "--port", "4174"],
-                frontend_command("npm.cmd", webui, development=False, port=4174),
+                ["node.exe", str(vite), "preview", "--host", "127.0.0.1", "--port", "4174"],
+                frontend_command("node.exe", webui, development=False, port=4174),
             )
             self.assertEqual(
-                ["npm.cmd", "run", "dev", "--", "--port", "5173"],
-                frontend_command("npm.cmd", webui, development=True, port=5173),
+                ["node.exe", str(vite), "--host", "127.0.0.1", "--port", "5173"],
+                frontend_command("node.exe", webui, development=True, port=5173),
             )
             (webui / "dist" / "index.html").unlink()
             with self.assertRaisesRegex(RuntimeError, "setup_development_environment.ps1"):
-                frontend_command("npm.cmd", webui, development=False, port=4174)
+                frontend_command("node.exe", webui, development=False, port=4174)
+            vite.unlink()
+            with self.assertRaisesRegex(FileNotFoundError, "Installed Vite entry point is missing"):
+                frontend_command("node.exe", webui, development=True, port=5173)
 
     def test_shutdown_reports_timeout_and_worker_can_finish_after_release(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

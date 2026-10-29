@@ -4,7 +4,7 @@ This source kit contains the first-party project files and the exact upstream so
 
 The Ooz native library was rebuilt successfully from the included pinned Oodle and SIMDe sources with the documented CMake helper. The character reader uses the portable JSON/model source path; it does not build FBX export, Autodesk SDK, or FMOD bindings. The source kit excludes extracted game source, game shader/resource payloads, and `CNKeys.json`. The existing default VFS key constant is an explicit approved inclusion exception for compatibility; the release-level source manifest records the exception without repeating its value. This build record is not a legal clearance or a guarantee about a particular release archive.
 
-The precompiled user release does not need these build tools or source downloads. To rebuild, work from the extracted source-kit root with Python 3.11+, .NET SDK 9.0.308, and Visual Studio 2022 C++ build tools with CMake. Restore NuGet and npm packages from their checked-in lock files; `third_party/NuGet.Config` selects nuget.org without extra feeds. No Git checkout is needed because the pinned AnimeStudio and Ruri source is already included.
+The precompiled user release does not need these build tools or source downloads. To rebuild, work from the extracted source-kit root with CPython 3.11–3.14, .NET SDK 9.0.308, and Visual Studio 2022 C++ build tools with CMake. Restore NuGet and npm packages from their checked-in lock files; `third_party/NuGet.Config` selects nuget.org without extra feeds. No Git checkout is needed because the pinned AnimeStudio and Ruri source is already included.
 
 Build the scene helpers from the included scene source snapshot:
 

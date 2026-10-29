@@ -246,11 +246,11 @@ def verify_source_snapshot(
     for relative_path, expected_digest in file_rows.items():
         path = snapshot_root / _relative_path(relative_path)
         _validate_source_path(_relative_path(relative_path))
-        if _sha256(path) != expected_digest:
+        if _sha256(path) != expected_digest.lower():
             raise SourceCollectionError(f"Source file hash differs from the manifest: {relative_path}.")
 
     for row in patch_rows:
         relative_path = _relative_path(str(row["path"]))
         path = repository_root / relative_path
-        if not path.is_file() or _sha256(path) != row["sha256"]:
+        if not path.is_file() or _sha256(path) != row["sha256"].lower():
             raise SourceCollectionError(f"Applied patch input hash differs from the manifest: {relative_path}.")
