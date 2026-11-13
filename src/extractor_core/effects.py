@@ -19,7 +19,8 @@ from . import vfs
 from .instances import GROUP_HASH as STATIC_GROUP_HASH, _instance_pattern, iter_entities
 from .lz4 import decompress_lz4_inv
 from .projected_decals import build_path_id_index_views_cancellable
-from .resources import iter_path_records, load_group, validate_vfs_root
+from .resources import BootstrapExtractionError, iter_path_records, load_group, validate_vfs_root
+from .vfs_overlay import resolve_vfs_file, vfs_group_sources
 from .scene_identity import validate_scene_id
 
 
@@ -76,9 +77,13 @@ _PATH_RECORD_VALIDATION_CACHE = SceneSourceCacheSlot(
 
 def _dynamic_inventory_sources(vfs_root: Path, string_path_hash: Path) -> tuple[Path, ...]:
     """Stamp the whole group because BLC validation includes every physical chunk."""
-    group_dir = vfs_root / GROUP_HASH
-    chunks = tuple(sorted(group_dir.glob("*.chk")))
-    return (string_path_hash, group_dir / f"{GROUP_HASH}.blc", *chunks)
+    try:
+        sources = vfs_group_sources(vfs_root, GROUP_HASH)
+    except FileNotFoundError as error:
+        raise BootstrapExtractionError(
+            f"Required VFS group {GROUP_HASH} is incomplete under {vfs_root / GROUP_HASH}. Verify the selected game build."
+        ) from error
+    return (string_path_hash, *sources)
 
 
 def _static_scene_source(vfs_root: Path, scene_id: str) -> tuple[vfs.VfsGroup, vfs.VfsFile]:
@@ -103,8 +108,8 @@ def _scene_inventory_sources(vfs_root: Path, string_path_hash: Path,
     for scene in scene_ids:
         if scene not in main_scenes:
             _, item = _static_scene_source(vfs_root, scene)
-            extra.extend((vfs_root / STATIC_GROUP_HASH / f"{STATIC_GROUP_HASH}.blc",
-                          vfs_root / STATIC_GROUP_HASH / f"{item.file_chunk_md5_name}.chk"))
+            extra.extend((resolve_vfs_file(vfs_root, STATIC_GROUP_HASH, f"{STATIC_GROUP_HASH}.blc"),
+                          resolve_vfs_file(vfs_root, STATIC_GROUP_HASH, f"{item.file_chunk_md5_name}.chk")))
     return (*sources, *dict.fromkeys(extra))
 
 
@@ -145,7 +150,8 @@ def _require_static_only_scene(vfs_root: Path, scene_id: str, check_cancelled: C
 
 def _verified_inventory_payload(vfs_root: Path, group: vfs.VfsGroup, item: vfs.VfsFile) -> bytes:
     output = BytesIO()
-    with (vfs_root / group.group_hash / f"{item.file_chunk_md5_name}.chk").open("rb") as source:
+    chunk = resolve_vfs_file(vfs_root, group.group_hash, f"{item.file_chunk_md5_name}.chk")
+    with chunk.open("rb") as source:
         digest = vfs.copy_virtual_file(source, output, item, group.version, bytes.fromhex(vfs.DEFAULT_VFS_KEY_HEX))
     if digest != item.file_data_md5.upper() or not item.length:
         raise EffectDecodeError(f"Scene evidence VFS checksum/length differs: path={item.file_name}, expectedMd5={item.file_data_md5}, actualMd5={digest}")
@@ -360,7 +366,7 @@ def _decode_dynamic_scene_effects(
         if item.file_name.casefold() in seen_paths:
             raise EffectDecodeError(f"Duplicate FX VFS source path: {item.file_name}")
         seen_paths.add(item.file_name.casefold())
-        chunk_path = game_vfs / GROUP_HASH / f"{item.file_chunk_md5_name}.chk"
+        chunk_path = resolve_vfs_file(game_vfs, GROUP_HASH, f"{item.file_chunk_md5_name}.chk")
         output = BytesIO()
         with chunk_path.open("rb") as source:
             digest = vfs.copy_virtual_file(

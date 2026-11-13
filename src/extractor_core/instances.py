@@ -14,6 +14,7 @@ from . import flatbuffer as fb, vfs
 from .scene_identity import validate_scene_id
 from .lz4 import decompress_lz4_inv
 from .resources import BootstrapExtractionError, load_group, validate_vfs_root
+from .vfs_overlay import resolve_vfs_file
 
 
 Progress = Callable[[str, float, str, dict[str, Any] | None], None]
@@ -186,7 +187,6 @@ def build_instance_database(
     )
     if not files:
         raise BootstrapExtractionError(f"No {map_id} InitChunkData records were found in VFS group {GROUP_HASH}")
-    group_dir = game_vfs / GROUP_HASH
     connection = sqlite3.connect(target)
     try:
         connection.executescript(
@@ -219,7 +219,7 @@ def build_instance_database(
         try:
             for file_index, item in enumerate(files, start=1):
                 _check_cancelled(cancelled)
-                chunk_path = group_dir / f"{item.file_chunk_md5_name}.chk"
+                chunk_path = resolve_vfs_file(game_vfs, GROUP_HASH, f"{item.file_chunk_md5_name}.chk")
                 if current_chunk != chunk_path:
                     if current_handle is not None:
                         current_handle.close()

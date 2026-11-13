@@ -57,6 +57,7 @@ class DynamicInventoryTests(unittest.TestCase):
             root = Path(directory)
             group = root / GROUP_HASH
             group.mkdir()
+            (group / f"{GROUP_HASH}.blc").write_bytes(b"catalog")
             path_hash = root / "StringPathHash.bin"
             first, second = group / "A.chk", group / "B.chk"
             first.write_bytes(b"first")

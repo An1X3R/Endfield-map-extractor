@@ -139,6 +139,28 @@ def _mutate_binary(path: Path, offset: int, raw: bytes) -> None:
 
 
 class PersistentDynamicRendererCacheTests(unittest.TestCase):
+    def test_hot_catalog_and_payload_invalidate_base_inventory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            game = root / "Endfield_Data/StreamingAssets/VFS"
+            _write_group(game, GROUP_HASH, ((_MAIN, _main()), (_INIT, _init())))
+            path_hash = root / "StringPathHash.bin"
+            _write_path_hash(path_hash, ((_MATERIAL, "assets/example.mat"), (_MESH, "packages/example.asset")))
+            cache = root / "cache"
+            base = _read(game, path_hash, cache)
+            base_sources = _dynamic_inventory_sources(game, path_hash)
+            update = root / "Endfield_Data/Persistent/VFS"
+            changed_main = bytearray(_main())
+            struct.pack_into("<f", changed_main, 172, 1.0)
+            _write_group(update, GROUP_HASH, ((_MAIN, bytes(changed_main)), (_INIT, _init())))
+            hot_sources = _dynamic_inventory_sources(game, path_hash)
+            self.assertNotEqual(base_sources, hot_sources)
+            self.assertEqual(update / GROUP_HASH / f"{GROUP_HASH}.blc", hot_sources[1])
+            active = _read(game, path_hash, cache)
+            self.assertNotEqual(base.sources, active.sources)
+            self.assertEqual(active, _read(game, path_hash, cache))
+            self.assertEqual(2, len(tuple(cache.rglob("*.bin"))))
+
     def test_bounded_selection_retains_crossing_source_footprints(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             game, path_hash, _cache = _write_vfs(Path(directory), ((_MAIN, _main()), (_INIT, _init())))

@@ -17,6 +17,7 @@ from PIL import Image
 from .lz4 import decompress_lz4_inv
 from .resources import BootstrapExtractionError, load_group, validate_vfs_root
 from .vfs import VfsFile
+from .vfs_overlay import resolve_vfs_file
 
 
 Progress = Callable[[str, float, str, dict[str, Any] | None], None]
@@ -107,7 +108,7 @@ def _resize_rgba_channels(image: Image.Image, size: tuple[int, int]) -> Image.Im
 
 
 def _read_clear_page(item: Any, group_dir: Path, handles: dict[Path, Any]) -> tuple[int, int, int, int, bytes]:
-    chunk_path = group_dir / f"{item.file_chunk_md5_name}.chk"
+    chunk_path = resolve_vfs_file(group_dir.parent, group_dir.name, f"{item.file_chunk_md5_name}.chk")
     stream = handles.get(chunk_path)
     if stream is None:
         stream = chunk_path.open("rb")

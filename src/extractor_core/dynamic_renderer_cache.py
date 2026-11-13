@@ -50,7 +50,7 @@ def dynamic_renderer_parser_identity() -> str:
     """Bind the format to the exact cache, decoder and source-reading implementations."""
     core = Path(__file__).resolve().parent
     paths = (Path(__file__), *(core / name for name in (
-        "dynamic_renderers.py", "effects.py", "resources.py", "vfs.py", "flatbuffer.py",
+        "dynamic_renderers.py", "effects.py", "resources.py", "vfs.py", "vfs_overlay.py", "flatbuffer.py",
         "lz4.py", "scene_identity.py", "projected_decals.py", "instances.py")),
         core.parent / "extract_scene_renderer_materials.py", core.parent / "endfield_scene_io.py")
     digest = hashlib.sha256()

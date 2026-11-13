@@ -15,6 +15,7 @@ import tempfile
 from . import flatbuffer as fb
 from .projected_decals import build_path_id_index, read_chunk, streaming_records
 from .scene_identity import validate_scene_id
+from .vfs_overlay import resolve_vfs_file
 
 
 _GROUP = "C3442D43"
@@ -308,7 +309,7 @@ def read_native_lights(vfs_root: Path, path_hash: Path, map_id: str,
 def _cache_fingerprint(vfs_root: Path, path_hash: Path, map_id: str) -> str:
     from .resources import load_group
 
-    catalog = vfs_root / _GROUP / f"{_GROUP}.blc"
+    catalog = resolve_vfs_file(vfs_root, _GROUP, f"{_GROUP}.blc")
     group = load_group(vfs_root, _GROUP)
     digest = hashlib.sha256()
     for source in (catalog, path_hash, Path(__file__)):
@@ -318,7 +319,7 @@ def _cache_fingerprint(vfs_root: Path, path_hash: Path, map_id: str) -> str:
               if entry.file_name.startswith(prefix) and
               ("/InitChunkData_" in entry.file_name or "/StreamingChunkData_" in entry.file_name)}
     for name in sorted(chunks):
-        chunk = vfs_root / _GROUP / f"{name}.chk"
+        chunk = resolve_vfs_file(vfs_root, _GROUP, f"{name}.chk")
         info = chunk.stat()
         digest.update(f"{name}:{info.st_size}:{info.st_mtime_ns}\n".encode("ascii"))
     return digest.hexdigest()

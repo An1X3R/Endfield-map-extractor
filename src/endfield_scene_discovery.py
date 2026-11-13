@@ -18,6 +18,7 @@ from endfield_scene_export import run_scene_process
 from endfield_scene_resources import PACKAGE_PROVIDER_COVERAGE, describe_file, read_json, validate_scan, write_index
 from endfield_scene_scanner import run_scanner_shards, scan_index_rows, scanner_capacity
 from extractor_core.effects import GROUP_HASH as EFFECT_GROUP_HASH, read_dynamic_scene_effects
+from extractor_core.vfs_overlay import resolve_vfs_file
 from extractor_core.resources import (
     extract_candidate_bundles,
     read_bundle_closure_names,
@@ -191,9 +192,10 @@ def effect_candidates(root: Path, vfs: Path, string_path_hash: Path, providers: 
     if root.resolve().is_relative_to(vfs.resolve()):
         raise ValueError("Effect discovery checkpoints cannot be inside the game VFS")
     source_identity = identity({
-        "catalog": describe_file(vfs / EFFECT_GROUP_HASH / f"{EFFECT_GROUP_HASH}.blc"),
+        "catalog": describe_file(resolve_vfs_file(vfs, EFFECT_GROUP_HASH, f"{EFFECT_GROUP_HASH}.blc")),
         "paths": describe_file(string_path_hash),
         "decoder": describe_file(Path(inspect.getfile(read_dynamic_scene_effects))),
+        "resolver": describe_file(Path(inspect.getfile(resolve_vfs_file))),
         "contract": 1,
     })
     checkpoint, work = stage_work(root, "dynamic_effects")

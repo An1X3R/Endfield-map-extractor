@@ -18,6 +18,7 @@ from .effects import (GROUP_HASH, MAIN_FILE, EffectDecodeError, _dynamic_invento
 from .lz4 import decompress_lz4_inv
 from .resources import load_group, validate_vfs_root
 from .scene_identity import validate_scene_id
+from .vfs_overlay import resolve_vfs_file
 from extract_scene_renderer_materials import RendererDraw, decode_draws, decode_renderer_pair_paths, serialized_draw_parameters
 from endfield_scene_io import SceneSourceCacheSlot, cached_scene_source_value
 
@@ -139,7 +140,7 @@ class _RawDynamicSceneRendererInventory:
 
 def _read_source(root: Path, group: vfs.VfsGroup, item: vfs.VfsFile) -> tuple[bytes, str]:
     output = BytesIO()
-    chunk = root / GROUP_HASH / f"{item.file_chunk_md5_name}.chk"
+    chunk = resolve_vfs_file(root, GROUP_HASH, f"{item.file_chunk_md5_name}.chk")
     with chunk.open("rb") as source:
         digest = vfs.copy_virtual_file(source, output, item, group.version, bytes.fromhex(vfs.DEFAULT_VFS_KEY_HEX))
     if digest != item.file_data_md5.upper():

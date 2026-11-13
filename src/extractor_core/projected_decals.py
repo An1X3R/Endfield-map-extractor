@@ -20,6 +20,7 @@ from types import MappingProxyType
 from . import flatbuffer as fb
 from .lz4 import decompress_lz4_inv
 from .vfs import VfsFile
+from .vfs_overlay import resolve_vfs_file
 from endfield_scene_io import (SceneSourceCacheSlot, cached_scene_source_value_with_estimated_size,
                                resolve_scene_read_path)
 from endfield_projected_decal_contract import ProjectedDecal
@@ -56,7 +57,7 @@ _PATH_ID_INDEX_CACHE = SceneSourceCacheSlot(
 
 def read_chunk(vfs_root: Path, entry: VfsFile) -> bytes:
     """Read and authenticate an existing streaming VFS entry without writes."""
-    path = vfs_root / "C3442D43" / (entry.file_chunk_md5_name + ".chk")
+    path = resolve_vfs_file(vfs_root, "C3442D43", entry.file_chunk_md5_name + ".chk")
     with path.open("rb") as stream:
         stream.seek(entry.offset)
         packed = stream.read(entry.length)
