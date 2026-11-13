@@ -299,16 +299,39 @@ def _tree_animation_paths(tree: bpy.types.NodeTree, trail: frozenset[int]) -> tu
         if animation.action is not None:
             paths.append(f"{tree.name}:action={animation.action.name}")
         paths.extend(f"{tree.name}:{driver.data_path}" for driver in animation.drivers
-                     if not _is_raster_dimension_driver(tree, driver))
+                     if not (_is_raster_dimension_driver(tree, driver) or _is_screen_projection_driver(tree, driver)))
     for item in tree.nodes:
         if item.type == "GROUP" and item.node_tree is not None:
             paths.extend(_tree_animation_paths(item.node_tree, trail | {pointer}))
     return tuple(paths)
 
 
+def _is_screen_projection_driver(tree: bpy.types.NodeTree, curve: bpy.types.FCurve) -> bool:
+    """Allow the shared factory's camera inputs without admitting time animation."""
+    contracts = (
+        ('Screen UV Camera Height / Width', 'resolution_y * pixel_aspect_y / (resolution_x * pixel_aspect_x)',
+         (('resolution_x', 'render.resolution_x'), ('resolution_y', 'render.resolution_y'),
+          ('pixel_aspect_x', 'render.pixel_aspect_x'), ('pixel_aspect_y', 'render.pixel_aspect_y'))),
+        ('Screen UV Active Camera Near Clip', 'near_clip', (('near_clip', 'camera.data.clip_start'),)),
+    )
+    for name, expression, variables in contracts:
+        node = tree.nodes.get(name)
+        if node is None or curve.data_path != node.outputs[0].path_from_id('default_value'):
+            continue
+        driver = curve.driver
+        if curve.mute or driver.type != 'SCRIPTED' or driver.expression != expression or len(driver.variables) != len(variables):
+            return False
+        return all(variable.name == variable_name and variable.type == 'SINGLE_PROP'
+                   and variable.targets[0].id_type == 'SCENE' and variable.targets[0].id == bpy.context.scene
+                   and variable.targets[0].data_path == data_path
+                   for variable, (variable_name, data_path) in zip(driver.variables, variables, strict=True))
+    return False
+
+
 def _validate_snapshot_time(tree: bpy.types.NodeTree, snapshot_time: float, stage: str) -> None:
-    if _tree_animation_paths(tree, frozenset()):
-        raise ValueError(f"VFX source node tree contains animation or drivers at {stage}: tree={tree.name}")
+    animation_paths = _tree_animation_paths(tree, frozenset())
+    if animation_paths:
+        raise ValueError(f"VFX source node tree contains animation or drivers at {stage}: tree={tree.name}, paths={animation_paths}")
     nodes = tuple(item for item in tree.nodes if item.name == "EF FX Source Time Seconds")
     if len(nodes) != 1 or len(nodes[0].outputs) != 1:
         raise ValueError(f"VFX source time node is missing or ambiguous at {stage}: tree={tree.name}, count={len(nodes)}")

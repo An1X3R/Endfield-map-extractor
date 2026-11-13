@@ -1092,6 +1092,7 @@ def animation_data_blockers(owner: bpy.types.ID, label: str) -> list[str]:
 
 def require_static_pose_scene(scene: bpy.types.Scene) -> None:
     """Reject scene animation or constraints before resetting imported bind pose offsets."""
+    from character_geometry import has_source_bind_constraint
     blockers = animation_data_blockers(scene, "Scene")
     for obj in scene.objects:
         if len(obj.constraints) > 0:
@@ -1105,7 +1106,7 @@ def require_static_pose_scene(scene: bpy.types.Scene) -> None:
                 blockers.extend(animation_data_blockers(shape_keys, f"shape keys {shape_keys.name!r}"))
         if obj.type == "ARMATURE":
             for pose_bone in obj.pose.bones:
-                if len(pose_bone.constraints) > 0:
+                if len(pose_bone.constraints) > 0 and not has_source_bind_constraint(obj, pose_bone):
                     blockers.append(f"pose bone {obj.name!r}/{pose_bone.name!r} has {len(pose_bone.constraints)} constraints")
     if blockers:
         raise RuntimeError(

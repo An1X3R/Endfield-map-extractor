@@ -19,8 +19,9 @@ SCOPE = ('Host layered RGB texture approximation, not native parallax marching. 
          'the editable half-strength mix over the original surface are host choices. '
          'BaseMap alpha times BaseColor alpha bounds this approximation to the source effect mask. '
          'Texture RGB is sampled as color, not interpreted as height or alpha coverage. '
-         'Source HDR tint is retained; the host color/BSDF response may clamp it. Native '
-         'color composition, sampler, ray traversal and lighting equivalence remain unverified.')
+         'Source HDR tint is retained; the host color/BSDF response may clamp it. '
+         'Normal-map mode uses the decoded source bump map with a reprojected host tangent frame. '
+         'Native color composition, sampler, ray traversal and lighting equivalence remain unverified.')
 
 
 def _vector(tree: bpy.types.NodeTree, operation: str, name: str) -> bpy.types.Node:
@@ -41,8 +42,15 @@ def apply_parallax_preview(tree: bpy.types.ShaderNodeTree, source: MaterialSourc
         return base
     if enabled != 1.0 or not keyword:
         raise ValueError(f'Source parallax property/keyword disagree: material={source.identity}; enabled={enabled}; keyword={keyword}')
-    if source.floats.get('_ParallaxUseNormal') != 0.0:
-        raise NotImplementedError(f'Source parallax normal-map mode is not implemented: material={source.identity}; value={source.floats.get("_ParallaxUseNormal")}')
+    normal_mode = source.floats.get('_ParallaxUseNormal')
+    if normal_mode not in (0.0, 1.0):
+        raise ValueError(f'Source parallax normal mode must be zero or one: material={source.identity}; value={normal_mode}')
+    normal_sample = samples.get('_BumpMap')
+    normal_strength = source.floats.get('_BumpScale')
+    if normal_mode == 1.0:
+        if (normal_sample is None or normal_sample.image is None or normal_sample.image.packed_file is None
+                or normal_strength is None or not math.isfinite(normal_strength)):
+            raise ValueError(f'Normal-mapped parallax requires a packed source BumpMap and finite BumpScale: material={source.identity}')
     required = {'_UseParallax': 2, '_ParallaxTex': 4, '_ParallaxUseNormal': 2,
                 '_ParallaxMarchNum': 3, '_ParallaxScale': 3, '_ParallaxColor': 0}
     for name, expected in required.items():
@@ -77,13 +85,32 @@ def apply_parallax_preview(tree: bpy.types.ShaderNodeTree, source: MaterialSourc
     tangent = node(tree, 'ShaderNodeTangent', 'Parallax host UV0 tangent', 'Approx Source Parallax')
     tangent.direction_type = 'UV_MAP'
     tangent.uv_map = 'UV0'
+    surface_normal = geometry.outputs['Normal']
+    surface_tangent = tangent.outputs['Tangent']
+    if normal_mode == 1.0:
+        from rebuild_character_materials import decode_normal
+        input_socket(tree, 'Source Parallax Normal Strength', 'NodeSocketFloat', normal_strength,
+                     'Source BumpScale for the host normal-mapped parallax frame.')
+        surface_normal = decode_normal(tree, normal_sample, entry.outputs['Source Parallax Normal Strength'], True, 'Parallax source BumpMap')
+        projection = _vector(tree, 'DOT_PRODUCT', 'Parallax tangent projection onto mapped normal')
+        tree.links.new(surface_tangent, projection.inputs[0])
+        tree.links.new(surface_normal, projection.inputs[1])
+        normal_component = _vector(tree, 'SCALE', 'Parallax projected normal component')
+        tree.links.new(surface_normal, normal_component.inputs[0])
+        tree.links.new(projection.outputs['Value'], normal_component.inputs[3])
+        projected = _vector(tree, 'SUBTRACT', 'Parallax tangent orthogonal to mapped normal')
+        tree.links.new(surface_tangent, projected.inputs[0])
+        tree.links.new(normal_component.outputs['Vector'], projected.inputs[1])
+        normalized = _vector(tree, 'NORMALIZE', 'Parallax normalized mapped tangent')
+        tree.links.new(projected.outputs['Vector'], normalized.inputs[0])
+        surface_tangent = normalized.outputs['Vector']
     bitangent = _vector(tree, 'CROSS_PRODUCT', 'Parallax host normal cross tangent')
-    tree.links.new(geometry.outputs['Normal'], bitangent.inputs[0])
-    tree.links.new(tangent.outputs['Tangent'], bitangent.inputs[1])
+    tree.links.new(surface_normal, bitangent.inputs[0])
+    tree.links.new(surface_tangent, bitangent.inputs[1])
     view_components: list[bpy.types.NodeSocket] = []
-    for name, direction in (('Tangent', tangent.outputs['Tangent']),
+    for name, direction in (('Tangent', surface_tangent),
                             ('Bitangent', bitangent.outputs['Vector']),
-                            ('Normal', geometry.outputs['Normal'])):
+                            ('Normal', surface_normal)):
         dot = _vector(tree, 'DOT_PRODUCT', 'Parallax view dot ' + name)
         tree.links.new(direction, dot.inputs[0])
         tree.links.new(geometry.outputs['Incoming'], dot.inputs[1])
@@ -130,6 +157,7 @@ def apply_parallax_preview(tree: bpy.types.ShaderNodeTree, source: MaterialSourc
     tree['source_parallax_preview'] = json.dumps({
         'format': CONTRACT, 'source_identity': source.identity, 'texture_identity': binding.identity,
         'source_scale': scale, 'source_color': tint, 'source_march_count': int(count),
+        'source_use_normal': normal_mode, 'source_bump_scale': normal_strength if normal_mode == 1.0 else None,
         'source_texture_scale': binding.scale, 'source_texture_offset': binding.offset,
         'host_layer_depths': [(index + 0.5) / count for index in range(int(count))],
         'host_rgb_weights': [1.0 / count] * int(count), 'host_strength': 0.5,

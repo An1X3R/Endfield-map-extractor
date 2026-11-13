@@ -19,6 +19,7 @@ from typing import Literal
 
 from extractor_core import vfs
 from extractor_core.resources import load_group
+from extractor_core.vfs_overlay import resolve_vfs_file, vfs_group_sources
 from extractor_core.scene_tables import TableValue, read_scene_table
 from endfield_character_cache import (
     CharacterCacheError,
@@ -228,7 +229,7 @@ def _read_virtual_payload(
     item = files.get(virtual_path.casefold())
     if item is None:
         raise FileNotFoundError(f"Required virtual file is absent: group={group_hash}, path={virtual_path}")
-    chunk_path = vfs_root / group_hash / f"{item.file_chunk_md5_name}.chk"
+    chunk_path = resolve_vfs_file(vfs_root, group_hash, f"{item.file_chunk_md5_name}.chk")
     if not chunk_path.is_file():
         raise FileNotFoundError(f"VFS chunk is missing: path={chunk_path}, virtual_file={virtual_path}")
     output = BytesIO()
@@ -492,8 +493,7 @@ def _catalog_source_paths(game: Path, vfs_root: Path, provider_path: Path) -> tu
     sources: list[Path] = [game / "Endfield.exe"]
     for group_hash in (_TABLE_GROUP, _JSON_GROUP):
         group_dir = vfs_root / group_hash
-        catalog_path = group_dir / f"{group_hash}.blc"
-        chunks = tuple(sorted(group_dir.glob("*.chk"), key=lambda path: path.name.casefold()))
+        catalog_path, *chunks = vfs_group_sources(vfs_root, group_hash)
         if not catalog_path.is_file() or not chunks:
             raise FileNotFoundError(
                 f"Character catalog VFS group is incomplete: group={group_hash}, directory={group_dir}"
@@ -609,7 +609,7 @@ def read_character_catalog_cached(
     provider_stamp = source_stamp(provider_path)
     cached_provider = cache.lookup_fingerprint(provider_path, _PROVIDER_FINGERPRINT_SCHEMA, check_cancelled)
     group_headers = tuple(
-        vfs_root / group_hash / f"{group_hash}.blc"
+        resolve_vfs_file(vfs_root, group_hash, f"{group_hash}.blc")
         for group_hash in (_TABLE_GROUP, _JSON_GROUP)
     )
     header_fingerprints = tuple(

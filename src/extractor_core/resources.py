@@ -15,6 +15,7 @@ from typing import Any, Callable, Literal, TypedDict
 import brotli
 
 from . import vfs
+from .vfs_overlay import resolve_vfs_file, vfs_group_sources
 
 
 Progress = Callable[[str, float, str, dict[str, Any] | None], None]
@@ -71,8 +72,7 @@ def validate_vfs_root(vfs_root: Path) -> Path:
 
 def load_group(vfs_root: Path, group_hash: str) -> vfs.VfsGroup:
     group_dir = validate_vfs_root(vfs_root) / group_hash
-    catalog = group_dir / f"{group_hash}.blc"
-    chunks = list(group_dir.glob("*.chk"))
+    catalog, *chunks = vfs_group_sources(vfs_root, group_hash)
     if not catalog.is_file() or not chunks:
         raise BootstrapExtractionError(
             f"Required VFS group {group_hash} is incomplete under {group_dir}. Verify the selected game build."
@@ -95,8 +95,7 @@ def read_virtual_file(vfs_root: Path, group_hash: str, virtual_path: str) -> byt
         raise BootstrapExtractionError(
             f"Required game file is absent from VFS group {group_hash}: {virtual_path}"
         )
-    group_dir = vfs_root / group_hash
-    chunk_path = group_dir / f"{item.file_chunk_md5_name}.chk"
+    chunk_path = resolve_vfs_file(vfs_root, group_hash, f"{item.file_chunk_md5_name}.chk")
     if not chunk_path.is_file():
         raise BootstrapExtractionError(f"VFS chunk is missing for {virtual_path}: {chunk_path}")
     from io import BytesIO
@@ -292,17 +291,19 @@ def write_bundle_scan_index(database: Path, vfs_root: Path, output: Path) -> dic
             "FROM bundles ORDER BY group_hash,chunk_name,chunk_offset,logical_name"
         )
         count = 0
-        checked_chunks: set[Path] = set()
+        checked_chunks: dict[tuple[str, str], Path] = {}
         with target.open("x", encoding="utf-8", newline="\n") as handle:
             handle.write("logical_name\tchunk_path\toffset\tlength\n")
             for logical_name, group_hash, chunk_name, offset, length in rows:
-                chunk_path = game_vfs / str(group_hash) / f"{chunk_name}.chk"
-                if chunk_path not in checked_chunks:
+                chunk_key = (str(group_hash), str(chunk_name))
+                chunk_path = checked_chunks.get(chunk_key)
+                if chunk_path is None:
+                    chunk_path = resolve_vfs_file(game_vfs, str(group_hash), f"{chunk_name}.chk")
                     if not chunk_path.is_file():
                         raise BootstrapExtractionError(
                             f"Bundle scan input references a missing VFS chunk: {chunk_path}"
                         )
-                    checked_chunks.add(chunk_path)
+                    checked_chunks[chunk_key] = chunk_path
                 handle.write(f"{logical_name}\t{chunk_path}\t{int(offset)}\t{int(length)}\n")
                 count += 1
     finally:
@@ -611,7 +612,7 @@ def extract_candidate_bundles(
         target = target_dir / (file_name or f"{item.file_data_md5}.ab")
         if target.exists():
             raise FileExistsError(f"Refusing to overwrite candidate bundle: {target}")
-        chunk_path = game_vfs / group_key / f"{item.file_chunk_md5_name}.chk"
+        chunk_path = resolve_vfs_file(game_vfs, group_key, f"{item.file_chunk_md5_name}.chk")
         with chunk_path.open("rb") as input_stream, target.open("xb") as output_stream:
             digest = vfs.copy_virtual_file(input_stream, output_stream, item, group.version, key)
         if digest != item.file_data_md5.upper():

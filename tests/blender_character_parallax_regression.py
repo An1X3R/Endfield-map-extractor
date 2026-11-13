@@ -84,7 +84,7 @@ def main() -> None:
         if before != (len(group.nodes), len(group.links), len(group.interface.items_tree)):
             raise AssertionError('Inactive parallax created nodes or interfaces')
         checks.append('disabled_branch_has_no_graph_mutation')
-        for field, value in (('_ParallaxUseNormal', 1.0), ('_ParallaxMarchNum', 0.0), ('_ParallaxScale', float('nan'))):
+        for field, value in (('_ParallaxUseNormal', 2.0), ('_ParallaxMarchNum', 0.0), ('_ParallaxScale', float('nan'))):
             malformed = replace(source, floats={**source.floats, field: value})
             try:
                 apply_parallax_preview(group, malformed, {}, socket, entry)

@@ -81,10 +81,33 @@ def _matrix(value: object) -> Matrix:
     return result
 
 
-def geometry_bind_worlds(worlds: dict[str, Matrix], meshes: tuple[dict[str, object], ...]) -> tuple[dict[str, Matrix], dict[str, Matrix]]:
-    """Resolve the canonical source skin bind space used by geometry import."""
+def _unweighted_bind_parents(worlds: dict[str, Matrix], binds: dict[str, Matrix]) -> dict[str, Matrix]:
+    """Recover unweighted joint rests from direct, co-located weighted children."""
+    candidates: dict[str, list[tuple[str, Matrix]]] = {}
+    for path, bind in binds.items():
+        parent = path.rpartition('/')[0]
+        if parent in binds or parent not in worlds:
+            continue
+        local = worlds[parent].inverted() @ worlds[path]
+        if local.translation.length <= 1e-5:
+            candidates.setdefault(parent, []).append((path, bind @ local.inverted()))
+    result: dict[str, Matrix] = {}
+    for parent, anchors in candidates.items():
+        reference = anchors[0][1]
+        for path, candidate in anchors[1:]:
+            residual = max(abs(a - b) for ra, rb in zip(reference, candidate) for a, b in zip(ra, rb))
+            if residual > .0005:
+                raise ValueError(f'Co-located skin joints disagree on parent rest: parent={parent}, '
+                                 f'anchors={anchors[0][0]},{path}, residual={residual}')
+        result[parent] = reference
+    return result
+
+
+def geometry_bind_layout(worlds: dict[str, Matrix], meshes: tuple[dict[str, object], ...]) -> tuple[dict[str, Matrix], dict[str, Matrix], dict[str, dict[str, Matrix]]]:
+    """Retain per-mesh inverse binds when one joint has different source rest spaces."""
     binds: dict[str, Matrix] = {}
     mesh_worlds: dict[str, Matrix] = {}
+    overrides: dict[str, dict[str, Matrix]] = {}
     for mesh in meshes:
         mesh_path = text(mesh['path'], 'mesh.path')
         world = worlds[mesh_path]
@@ -103,13 +126,36 @@ def geometry_bind_worlds(worlds: dict[str, Matrix], meshes: tuple[dict[str, obje
             if path in binds:
                 residual = max(abs(a - b) for r1, r2 in zip(bind, binds[path]) for a, b in zip(r1, r2))
                 if residual > .0005:
-                    raise ValueError(f'No common mesh bind-space correction: bone={path}, mesh={mesh["name"]}, residual={residual}')
+                    overrides.setdefault(mesh_path, {})[path] = bind
             else:
                 binds[path] = bind
         mesh_worlds[mesh_path] = world
     if not binds:
         raise ValueError('Character geometry contains no skin bones')
+    # Prefab transforms can retain a T-pose while skin binds use an A-pose.
+    # Twist-only skinning must not leave its unweighted parent in the prefab pose.
+    return {**binds, **_unweighted_bind_parents(worlds, binds)}, mesh_worlds, overrides
+
+
+def geometry_bind_worlds(worlds: dict[str, Matrix], meshes: tuple[dict[str, object], ...]) -> tuple[dict[str, Matrix], dict[str, Matrix]]:
+    """Return canonical animation bind worlds without discarding mesh-specific rest data."""
+    binds, mesh_worlds, _ = geometry_bind_layout(worlds, meshes)
     return binds, mesh_worlds
+
+
+def has_source_bind_constraint(rig: bpy.types.Object, bone: bpy.types.PoseBone) -> bool:
+    """Recognize only the importer's exact per-mesh bind-space constraint."""
+    target = bone.bone.get('source_bind_target')
+    mesh_path = bone.bone.get('source_mesh_bind_path')
+    if not isinstance(target, str) or target not in rig.pose.bones or not isinstance(mesh_path, str) or not mesh_path:
+        return False
+    if len(bone.constraints) != 1:
+        return False
+    constraint = bone.constraints[0]
+    return (constraint.type == 'COPY_TRANSFORMS' and constraint.name == 'Source per-mesh inverse bind'
+            and constraint.target == rig and constraint.subtarget == target
+            and constraint.owner_space == 'POSE' and constraint.target_space == 'POSE'
+            and constraint.mix_mode == 'REPLACE' and constraint.influence == 1.0 and not constraint.mute)
 
 
 def source_bone_name(node: GeometryNode) -> str:
@@ -125,12 +171,12 @@ def source_bone_name(node: GeometryNode) -> str:
     return prefix + suffix
 
 
-def _rig(nodes: tuple[GeometryNode, ...], worlds: dict[str, Matrix], meshes: tuple[dict[str, object], ...]) -> tuple[bpy.types.Object, dict[str, str], dict[str, Matrix]]:
+def _rig(nodes: tuple[GeometryNode, ...], worlds: dict[str, Matrix], meshes: tuple[dict[str, object], ...]) -> tuple[bpy.types.Object, dict[str, dict[str, str]], dict[str, Matrix]]:
     roots = tuple(node for node in nodes if node.parent is None)
     if len(roots) != 1:
         raise ValueError(f'Geometry must have one explicit root: {len(roots)}')
     lookup = {node.path: node for node in nodes}
-    binds, mesh_worlds = geometry_bind_worlds(worlds, meshes)
+    binds, mesh_worlds, overrides = geometry_bind_layout(worlds, meshes)
     paths = set(binds)
     for path in tuple(paths):
         while path is not None:
@@ -148,6 +194,7 @@ def _rig(nodes: tuple[GeometryNode, ...], worlds: dict[str, Matrix], meshes: tup
     bpy.context.view_layer.objects.active = rig
     rig.select_set(True)
     names: dict[str, str] = {}
+    aliases: dict[str, dict[str, str]] = {}
     bpy.ops.object.mode_set(mode='EDIT')
     try:
         for node in nodes:
@@ -163,6 +210,15 @@ def _rig(nodes: tuple[GeometryNode, ...], worlds: dict[str, Matrix], meshes: tup
         for node in nodes:
             if node.path in paths and node.parent in paths:
                 data.edit_bones[names[node.path]].parent = data.edit_bones[names[node.parent]]
+        for mesh_path, mesh_binds in overrides.items():
+            aliases[mesh_path] = {}
+            for path, bind in mesh_binds.items():
+                identity = hashlib.sha256((mesh_path + '\0' + path).encode('utf-8')).hexdigest()[:16]
+                bone = data.edit_bones.new('BIND_' + identity)
+                bone.head = (0, 0, 0)
+                bone.tail = (0, .05, 0)
+                bone.matrix = bind
+                aliases[mesh_path][path] = bone.name
     finally:
         bpy.ops.object.mode_set(mode='OBJECT')
     for path, name in names.items():
@@ -172,7 +228,22 @@ def _rig(nodes: tuple[GeometryNode, ...], worlds: dict[str, Matrix], meshes: tup
             data.bones[name]['source_unskinned_transform'] = True
             data.bones[name].hide = True
     rig['source_unskinned_transform_count'] = len(paths - skin_hierarchy)
-    return rig, names, mesh_worlds
+    for mesh_path, mesh_aliases in aliases.items():
+        for path, name in mesh_aliases.items():
+            data.bones[name]['source_mesh_bind_path'] = mesh_path
+            data.bones[name]['source_bind_target'] = names[path]
+            data.bones[name].hide = True
+            constraint = rig.pose.bones[name].constraints.new('COPY_TRANSFORMS')
+            constraint.name = 'Source per-mesh inverse bind'
+            constraint.target = rig
+            constraint.subtarget = names[path]
+            constraint.target_space = 'POSE'
+            constraint.owner_space = 'POSE'
+            constraint.mix_mode = 'REPLACE'
+    rig['source_mesh_bind_override_count'] = sum(len(value) for value in aliases.values())
+    mesh_names = {text(mesh['path'], 'mesh.path'): {**names, **aliases.get(text(mesh['path'], 'mesh.path'), {})}
+                  for mesh in meshes}
+    return rig, mesh_names, mesh_worlds
 
 
 def _mesh(row: dict[str, object], payload: bytes, world: Matrix, rig: bpy.types.Object,
@@ -345,7 +416,7 @@ def import_character_geometry(path: Path) -> list[bpy.types.Object]:
     if len({text(mesh['path'], 'mesh.path') for mesh in meshes}) != len(meshes):
         raise ValueError('Duplicate geometry mesh paths')
     rig, names, mesh_worlds = _rig(nodes, worlds, meshes)
-    objects = {text(mesh['path'], 'mesh.path'): _mesh(mesh, payload, mesh_worlds[text(mesh['path'], 'mesh.path')], rig, names) for mesh in meshes}
+    objects = {text(mesh['path'], 'mesh.path'): _mesh(mesh, payload, mesh_worlds[text(mesh['path'], 'mesh.path')], rig, names[text(mesh['path'], 'mesh.path')]) for mesh in meshes}
     _morphs(document['morphs'], payload, objects)
     bpy.context.view_layer.update()
     return [rig, *objects.values()]

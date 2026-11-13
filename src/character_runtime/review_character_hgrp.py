@@ -55,7 +55,9 @@ def bind_face_anchor(anchor: bpy.types.Object, rig: bpy.types.Object, bone_name:
     bone=rig.pose.bones[bone_name]
     original=anchor.matrix_world.copy();original.translation=rig.matrix_world@bone.head
     anchor.parent=rig;anchor.parent_type='BONE';anchor.parent_bone=bone_name
-    bpy.context.view_layer.update();anchor.matrix_world=original;bpy.context.view_layer.update()
+    # Keep affine compensation in the parent inverse instead of decomposing it into object TRS.
+    anchor.matrix_parent_inverse=Matrix.Identity(4);anchor.matrix_basis=Matrix.Identity(4)
+    bpy.context.view_layer.update();anchor.matrix_parent_inverse=anchor.matrix_world.inverted()@original;bpy.context.view_layer.update()
     if max(abs(anchor.matrix_world[r][c]-original[r][c]) for r in range(4) for c in range(4))>1e-5:raise AssertionError('Face anchor keep-world parenting changed its requested basis')
     source_basis=bone.matrix_basis.copy();before=anchor.matrix_world.copy()
     bone.matrix_basis=source_basis@Matrix.Rotation(.25,4,'Y');bpy.context.scene.frame_set(bpy.context.scene.frame_current);bpy.context.view_layer.update()

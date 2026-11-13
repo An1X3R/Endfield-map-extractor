@@ -12,6 +12,7 @@ from typing import Literal, cast
 
 from extractor_core import vfs
 from extractor_core.resources import load_group
+from extractor_core.vfs_overlay import resolve_vfs_file
 from extractor_core.scene_tables import TableValue, read_scene_table
 from endfield_character_cache import (
     CharacterCacheError,
@@ -1057,7 +1058,7 @@ def read_independent_npc_catalog(
     provider_stamp = source_stamp(provider_path)
     cached_provider = cache.lookup_fingerprint(provider_path, _NPC_PROVIDER_SCHEMA, check_cancelled)
     group_headers = tuple(
-        vfs_root / group_hash / f"{group_hash}.blc"
+        resolve_vfs_file(vfs_root, group_hash, f"{group_hash}.blc")
         for group_hash in (_TABLE_GROUP, _JSON_GROUP)
     )
     header_fingerprints = tuple(

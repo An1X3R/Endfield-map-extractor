@@ -15,6 +15,7 @@ from uuid import uuid4
 from typing import TypedDict
 
 from endfield_character_cache import CharacterDataCache, CharacterSourceChangedError, CharacterSourceStamp, character_bundle_closure, source_stamp
+from extractor_core.vfs_overlay import resolve_vfs_file
 
 
 @dataclass(frozen=True)
@@ -63,8 +64,9 @@ def prepared_identity(cache: CharacterDataCache, game: Path, database: Path, inv
             if len(rows) != 1:
                 raise ValueError(f'Prepared cache requires a unique VFS bundle: provider={name}, matches={len(rows)}')
             group, chunk = rows[0]
-            directory = game / 'Endfield_Data/StreamingAssets/VFS' / group
-            storage.update((directory / (group + '.blc'), directory / (chunk + '.chk')))
+            vfs_root = game / 'Endfield_Data/StreamingAssets/VFS'
+            storage.update((resolve_vfs_file(vfs_root, group, group + '.blc'),
+                            resolve_vfs_file(vfs_root, group, chunk + '.chk')))
     sources = tuple(sorted({database, inventory, *files, *storage}))
     stamps = tuple(source_stamp(path) for path in sources)
     hashed = [asdict(cache.fingerprint_file(path, 'character-prepared-input/1', check_cancelled))

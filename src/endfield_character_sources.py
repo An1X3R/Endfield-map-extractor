@@ -12,6 +12,7 @@ from endfield_scene_discovery import observe_helper
 from endfield_scene_resources import validate_scan
 from endfield_scene_scanner import run_scanner_shards, scan_index_rows, scanner_capacity
 from extractor_core.resources import extract_bootstrap_metadata, build_resource_database, write_bundle_scan_index
+from extractor_core.vfs_overlay import vfs_source_roots
 
 
 Progress = Callable[[str, float, str], None]
@@ -47,7 +48,9 @@ def verify_game_source(game: Path, expected: list[dict[str, object]], check_canc
 def game_source_stamps(game: Path) -> list[dict[str, object]]:
     """Include VFS chunks as well as headers so an in-place game update invalidates readiness."""
     vfs = game / "Endfield_Data/StreamingAssets/VFS"
-    paths = sorted((*vfs.glob("*/*.blc"), *vfs.glob("*/*.chk")), key=lambda path: str(path).casefold())
+    paths = sorted((path for root in vfs_source_roots(vfs)
+                    for pattern in ("*/*.blc", "*/*.chk") for path in root.glob(pattern)),
+                   key=lambda path: str(path).casefold())
     if not paths:
         raise FileNotFoundError(f"Character VFS source groups are absent: {vfs}")
     return [asdict(source_stamp(path)) for path in (game / "Endfield.exe", *paths)]
